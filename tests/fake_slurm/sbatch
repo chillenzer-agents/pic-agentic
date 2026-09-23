@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+"""Test double for ``sbatch``: executes the --wrap body locally.
+
+It mimics the parts of the SLURM contract the design relies on:
+
+* ``--parsable`` prints the bare job id;
+* otherwise the human line ``Submitted batch job <id>`` is printed;
+* the job writes its stdout to the ``--output`` file and a small state file
+  that ``scontrol`` reads back.
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm"))
+COUNTER = STATE_DIR / "counter"
+#: First job id handed out; higher than any value the tests assume.
+_FIRST_JOB_ID = 4700
+
+
+def next_job_id() -> int:
+    """Return the next job id, persisting the counter under ``STATE_DIR``."""
+    STATE_DIR.mkdir(exist_ok=True, parents=True)
+    value = _FIRST_JOB_ID
+    if COUNTER.exists():
+        value = int(COUNTER.read_text(encoding="utf-8").strip())
+    value += 1
+    COUNTER.write_text(str(value), encoding="utf-8")
+    return value
+
+
+def parse_args(argv: list[str]) -> tuple[str | None, str | None, bool]:
+    """Split the supported ``sbatch`` arguments out of ``argv``."""
+    wrap = None
+    output = None
+    parsable = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--wrap="):
+            wrap = arg.split("=", 1)[1]
+        elif arg.startswith("--output="):
+            output = arg.split("=", 1)[1]
+        elif arg == "--parsable":
+            parsable = True
+        elif arg in {"--wrap", "--output"} and i + 1 < len(argv):
+            i += 1
+            if arg == "--wrap":
+                wrap = argv[i]
+            else:
+                output = argv[i]
+        i += 1
+    return wrap, output, parsable
+
+
+def main(argv: list[str]) -> int:
+    """Run the fake ``sbatch`` and return its exit code."""
+    wrap, output, parsable = parse_args(argv)
+    if wrap is None:
+        print("sbatch: error: no --wrap given", file=sys.stderr)
+        return 1
+
+    job_id = next_job_id()
+    state_file = STATE_DIR / f"{job_id}.state"
+    state_file.write_text("RUNNING\n", encoding="utf-8")
+
+    # Execute the wrap body locally through the shell, exactly as SLURM would
+    # on the compute node.
+    completed = subprocess.run(["/bin/sh", "-c", wrap], capture_output=True, check=False)
+    text = completed.stdout.decode("utf-8", "replace") + completed.stderr.decode("utf-8", "replace")
+    if output:
+        Path(output).write_text(text, encoding="utf-8")
+    state = "COMPLETED" if completed.returncode == 0 else "FAILED"
+    state_file.write_text(f"{state}\n{completed.returncode}\n", encoding="utf-8")
+
+    print(str(job_id) if parsable else f"Submitted batch job {job_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pic-agentic"
+version = "0.0.1"
+description = "MCP server and simulation-side client for LLM-driven remote PIConGPU simulations"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Julian Lenz", email = "j.lenz@hzdr.de" }]
+# Code is MIT; prose/docs are CC-BY-4.0 (see LICENSE.md). Both texts ship in
+# the distribution so downstream consumers see the split.
+license = "MIT"
+license-files = ["COPYING", "LICENSES/*.txt"]
+keywords = ["PIConGPU", "MCP", "Matrix", "HPC", "SLURM", "LLM", "agent"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+urls = { Repository = "https://github.com/chillenzer-agents/pic-agentic" }
+dependencies = [
+  "mcp==2.1.1",
+  "matrix-nio==0.26.0",
+  "pydantic>=2.12",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.16",
+]
+
+[project.scripts]
+pic-agentic-mcp = "pic_agentic.server.__main__:main"
+pic-agentic-simclient = "pic_agentic.simclient.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pic_agentic"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-config --strict-markers"
+markers = [
+  "integration: requires a local homeserver or SLURM (skipped when unavailable)",
+]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# Everything ruff offers; the ignore list below is the deliberate exception
+# ledger, so a new rule family is on by default and must be argued off. Each
+# entry carries the reason it is off.
+select = ["ALL"]
+# Preview carries the pydoclint (DOC) family used below.
+preview = true
+ignore = [
+  # Whitespace rules owned by `ruff format`.
+  "E1",
+  "E2",
+  "COM",
+  # Keep the D211/D212 half of the incompatible pydocstyle preview pairs.
+  "D203",
+  "D213",
+  # `assert` states internal invariants and narrows types in library code.
+  "S101",
+  # RCP envelopes and JSON payloads are dynamically typed by design.
+  "ANN401",
+  # Short local path/URL operations in async handlers; there is no trio/anyio
+  # runtime here, so the anyio.path variants do not apply.
+  "ASYNC210",
+  "ASYNC240",
+  # The SLURM seam runs subprocess with argument arrays and never a shell.
+  "S404",
+  "S603",
+  # Constructors legitimately take many keyword arguments.
+  "PLR0913",
+  # CLI entry points print by design.
+  "T201",
+]
+
+[tool.ruff.lint.flake8-copyright]
+# The copyright notice is the SPDX tag the REUSE hook validates repo-wide;
+# this rule only guards that Python files carry it at all.
+notice-rgx = "SPDX-FileCopyrightText: \\d{4}(-\\d{4})?"
+author = "Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are not shipped API: no docstrings/annotations required, and they
+# legitimately reach into internals and use fixture-style bare asserts.
+"tests/**" = [
+  "ANN001",
+  "ANN201",
+  "ANN202",
+  "ARG001",
+  "BLE001",
+  "D101",
+  "D102",
+  "D103",
+  "D107",
+  "DOC201",
+  "DOC501",
+  "INP001",
+  "PLC0415",
+  "PLR2004",
+  "PT017",
+  "RUF029",
+  "S105",
+  "S106",
+  "S108",
+  "SLF001",
+  "TC001",
+  "TC003",
+]
+# The fake SLURM executables are standalone scripts, not importable modules.
+"tests/fake_slurm/*" = ["INP001"]
+# This test deliberately mirrors C++ std::setw percent formatting.
+"tests/test_progress_parser.py" = ["UP031"]
+# Standalone dev script: urllib to a local homeserver is the point.
+"scripts/*" = ["ANN001", "ANN201", "D103", "INP001", "S310"]

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+version = 1
+
+# All committed files carry an inline SPDX header. This table is the home for
+# files that cannot carry one (generated artifacts, JSON, plain git config);
+# add an [[annotations]] block here rather than leaving a file unattributed.
+
+# .python-version is a bare version string with no comment syntax.
+[[annotations]]
+path = [".python-version"]
+SPDX-FileCopyrightText = "2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf"
+SPDX-License-Identifier = "MIT"
