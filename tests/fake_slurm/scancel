@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Test double for ``scancel``."""
 
 import os
 import sys
+from pathlib import Path
 
-STATE_DIR = os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm")
+STATE_DIR = Path(os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm"))
+_DEFAULT_SIGNAL = "USR2"
 
 
 def main(argv: list[str]) -> int:
-    signal = "USR2"
+    """Record the cancel in the job's state file and return the exit code."""
+    signal = _DEFAULT_SIGNAL
     job_id = None
     for arg in argv:
         if arg.startswith("--signal="):
@@ -18,10 +26,10 @@ def main(argv: list[str]) -> int:
     if job_id is None:
         print("scancel: error: no job id", file=sys.stderr)
         return 1
-    state_file = os.path.join(STATE_DIR, f"{job_id}.state")
-    if os.path.exists(state_file):
-        with open(state_file, "w") as handle:
-            handle.write(("CANCELLED\n" if signal == "KILL" else "RUNNING\n") + "0\n")
+    state_file = STATE_DIR / f"{job_id}.state"
+    if state_file.exists():
+        state = "CANCELLED" if signal == "KILL" else "RUNNING"
+        state_file.write_text(f"{state}\n0\n", encoding="utf-8")
     print(f"scancel: sent {signal} to job {job_id}")
     return 0
 

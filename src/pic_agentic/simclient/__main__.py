@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Run the simulation-side client: ``python -m pic_agentic.simclient``.
 
 This is the M1 standalone client (design section 8.1): it joins the room,
@@ -18,6 +22,7 @@ from pic_agentic.transport.matrix import MatrixTransport
 
 
 async def run() -> None:
+    """Run the simulation-side client until interrupted."""
     config = Config.load()
     config.require("homeserver", "user_id", "access_token", "room_id", "rcp_secret", "message_dir")
     transport = MatrixTransport(
@@ -38,7 +43,6 @@ async def run() -> None:
         poll_interval_s=float(os.environ.get("PIC_AGENTIC_POLL_INTERVAL_S", "5")),
         allowed_sender_user_id=os.environ.get("PIC_AGENTIC_ALLOWED_SENDER"),
     )
-    print(f"simclient up: sim={sim} room={config.room_id}")
     try:
         await client.serve()
     finally:
@@ -46,6 +50,7 @@ async def run() -> None:
 
 
 def main() -> None:
+    """Console-script entry point for ``pic-agentic-simclient``."""
     logging.basicConfig(level=logging.INFO)
     asyncio.run(run())
 

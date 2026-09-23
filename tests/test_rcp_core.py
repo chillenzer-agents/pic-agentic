@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Unit tests for the transport-agnostic RCP core."""
 
 from __future__ import annotations
@@ -32,24 +36,24 @@ def make(kind=Kind.COMMAND, type_="hello", seq=1, role=SenderRole.MCP_SERVER, pa
     )
 
 
-def test_canonical_bytes_is_deterministic_and_sorted():
+def test_canonical_bytes_is_deterministic_and_sorted() -> None:
     assert canonical_bytes({"b": 1, "a": {"d": 2, "c": 3}}) == b'{"a":{"c":3,"d":2},"b":1}'
 
 
-def test_sign_verify_roundtrip():
+def test_sign_verify_roundtrip() -> None:
     msg = make()
     msg.sign(SECRET)
     assert msg.verify(SECRET)
 
 
-def test_verify_rejects_tampered_payload():
+def test_verify_rejects_tampered_payload() -> None:
     msg = make()
     msg.sign(SECRET)
     msg.payload["message"] = "tampered"
     assert not msg.verify(SECRET)
 
 
-def test_verify_binds_sender_role_and_in_reply_to():
+def test_verify_binds_sender_role_and_in_reply_to() -> None:
     msg = make()
     msg.sign(SECRET)
     msg.sender_role = SenderRole.SIMCLIENT
@@ -60,7 +64,7 @@ def test_verify_binds_sender_role_and_in_reply_to():
     assert not msg2.verify(SECRET)
 
 
-def test_verify_rejects_missing_or_foreign_signature():
+def test_verify_rejects_missing_or_foreign_signature() -> None:
     assert not make().verify(SECRET)
     assert not verify(SECRET, {"a": 1}, "not-a-sig")
     assert not verify(SECRET, {"a": 1}, "hmac-sha256:deadbeef")
@@ -68,7 +72,7 @@ def test_verify_rejects_missing_or_foreign_signature():
     assert not verify("another-secret", {"a": 1}, good)
 
 
-def test_envelope_dict_roundtrip_through_matrix_content():
+def test_envelope_dict_roundtrip_through_matrix_content() -> None:
     msg = make().sign(SECRET)
     content = msg.to_content(SECRET)
     assert content["msgtype"] == "m.text"
@@ -79,7 +83,7 @@ def test_envelope_dict_roundtrip_through_matrix_content():
     assert restored.verify(SECRET)
 
 
-def test_body_stays_human_readable():
+def test_body_stays_human_readable() -> None:
     msg = make(payload={"cmd_id": "abc123", "message": "Hello World"})
     assert "Hello World" in msg.body()
     long = make(payload={"cmd_id": "abc", "message": "x" * 200})
@@ -87,7 +91,7 @@ def test_body_stays_human_readable():
     assert len(long.body()) < 160
 
 
-def test_per_sender_sequence_counts_independently():
+def test_per_sender_sequence_counts_independently() -> None:
     state = SequenceState()
     assert state.next_seq("simA", SenderRole.MCP_SERVER) == 1
     assert state.next_seq("simA", SenderRole.MCP_SERVER) == 2
@@ -97,7 +101,7 @@ def test_per_sender_sequence_counts_independently():
     assert state.highest("simA", SenderRole.SIMCLIENT) == 5
 
 
-def test_dedup_keys_on_sim_role_seq_type():
+def test_dedup_keys_on_sim_role_seq_type() -> None:
     store = DedupStore()
     first = make(seq=1)
     duplicate = make(seq=1)
@@ -110,7 +114,7 @@ def test_dedup_keys_on_sim_role_seq_type():
     assert store.seen(make(seq=2)) is True
 
 
-def test_dedup_store_is_bounded():
+def test_dedup_store_is_bounded() -> None:
     store = DedupStore(maxlen=2)
     msgs = [make(seq=i) for i in range(3)]
     for m in msgs:
@@ -118,14 +122,16 @@ def test_dedup_store_is_bounded():
     assert store.seen(make(seq=0)) is True
 
 
-def test_new_secret_and_cmd_id_shapes():
+def test_new_secret_and_cmd_id_shapes() -> None:
     s = new_secret_hex()
-    assert len(s) == 64 and int(s, 16) >= 0
+    assert len(s) == 64
+    assert int(s, 16) >= 0
     c = new_cmd_id()
-    assert len(c) == 32 and int(c, 16) >= 0
+    assert len(c) == 32
+    assert int(c, 16) >= 0
 
 
 @pytest.mark.parametrize("kind", list(Kind))
-def test_all_kinds_roundtrip(kind):
+def test_all_kinds_roundtrip(kind) -> None:
     msg = make(kind=kind).sign(SECRET)
     assert RcpMessage.from_dict(msg.to_dict()).kind is kind

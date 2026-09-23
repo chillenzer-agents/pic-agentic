@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Best-effort parser for the PIConGPU per-step progress line.
 
 The exact format is emitted by ``SimulationHelper.cpp`` (rank 0 only)::
@@ -26,7 +30,7 @@ from dataclasses import dataclass
 
 #: Capture groups: 1=percent, 2=step, 3=elapsed, 4=avg_per_step.
 PROGRESS_RE = re.compile(
-    r"^\s*(\d{1,3}) % = \s*(\d+) \| time elapsed:\s*(\S(?:.*\S)?) \| avg time per step:\s*(\S(?:.*\S)?)\s*$"
+    r"^\s*(\d{1,3}) % = \s*(\d+) \| time elapsed:\s*(\S(?:.*\S)?) \| avg time per step:\s*(\S(?:.*\S)?)\s*$",
 )
 
 _UNIT_MS = {"h": 3_600_000, "min": 60_000, "sec": 1_000, "msec": 1}
@@ -35,6 +39,8 @@ _TOKEN_RE = re.compile(r"(\d+)\s*(msec|sec|min|h)")
 
 @dataclass(frozen=True)
 class ProgressLine:
+    """One parsed PIConGPU per-step progress line."""
+
     percent: int
     step: int
     elapsed: str
@@ -43,7 +49,15 @@ class ProgressLine:
     avg_per_step_ms: int | None = None
 
     def eta_seconds(self, total_steps: int) -> float | None:
-        """Derived ETA: ``avg_per_step * steps_remaining`` (best-effort)."""
+        """Derive a best-effort ETA from the average time per step.
+
+        Args:
+            total_steps: The simulation's total step count.
+
+        Returns:
+            The estimated remaining wall-clock seconds, or None if unknown.
+
+        """
         if self.avg_per_step_ms is None or total_steps <= 0:
             return None
         remaining = max(0, total_steps - self.step)
@@ -51,7 +65,15 @@ class ProgressLine:
 
 
 def parse_time_ms(text: str) -> int | None:
-    """Parse ``Hh Mmin Ssec mmm msec`` (zero components omitted) into ms."""
+    """Parse ``Hh Mmin Ssec mmm msec`` (zero components omitted) into ms.
+
+    Args:
+        text: A ``printTime``-style duration token.
+
+    Returns:
+        The duration in milliseconds, or None if no component was found.
+
+    """
     total = 0
     found = False
     for value, unit in _TOKEN_RE.findall(text):
@@ -61,7 +83,15 @@ def parse_time_ms(text: str) -> int | None:
 
 
 def parse_progress_line(line: str) -> ProgressLine | None:
-    """Return a :class:`ProgressLine` or ``None`` if ``line`` is not progress."""
+    """Parse a PIConGPU progress line.
+
+    Args:
+        line: A candidate stdout line.
+
+    Returns:
+        The parsed :class:`ProgressLine`, or None if ``line`` is not progress.
+
+    """
     match = PROGRESS_RE.match(line)
     if not match:
         return None

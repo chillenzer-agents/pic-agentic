@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Full M1 acceptance E2E: MCP stdio client -> Synapse -> simclient -> fake SLURM.
 
 Requires a local Synapse with the two bot accounts and room from
@@ -10,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -19,26 +25,20 @@ from pic_agentic.rcp import new_secret_hex
 
 BOTS_FILE = Path("/run/terok/work/bots.json")
 FAKE_BIN = Path(__file__).parent / "fake_slurm"
+PROVISION_SCRIPT = Path(__file__).parent.parent / "scripts" / "dev_synapse.py"
 
 pytestmark = pytest.mark.skipif(not BOTS_FILE.exists(), reason="local Synapse not provisioned")
 
 
-@pytest.fixture()
+@pytest.fixture
 def bots(tmp_path):
     """Provision a fresh room with the two bot tokens for this test run."""
-    import subprocess
-
     out = tmp_path / "bots.json"
     proc = subprocess.run(
-        [
-            sys.executable,
-            str(Path(__file__).parent.parent / "scripts" / "dev_synapse.py"),
-            "--new-room",
-            "--out",
-            str(out),
-        ],
+        [sys.executable, str(PROVISION_SCRIPT), "--new-room", "--out", str(out)],
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode != 0 or not out.exists():
         pytest.skip(f"could not provision local Synapse: {proc.stderr or proc.stdout}")
@@ -46,16 +46,17 @@ def bots(tmp_path):
 
 
 async def _reachable(homeserver: str) -> bool:
-    import urllib.request
-
+    """Return whether the local homeserver answers ``/_matrix/client/versions``."""
+    url = homeserver + "/_matrix/client/versions"
     try:
-        with urllib.request.urlopen(homeserver + "/_matrix/client/versions", timeout=5) as response:
+        # The scheme is a test-fixture localhost URL, never user input.
+        with urllib.request.urlopen(url, timeout=5) as response:  # ruff: ignore[suspicious-url-open-usage]
             return response.status == 200
     except Exception:
         return False
 
 
-def test_hello_e2e_through_stdio_and_synapse(bots, tmp_path, monkeypatch):
+def test_hello_e2e_through_stdio_and_synapse(bots, tmp_path, monkeypatch) -> None:
     if not asyncio.run(_reachable(bots["hs"])):
         pytest.skip("Synapse not reachable")
 
@@ -77,7 +78,7 @@ def test_hello_e2e_through_stdio_and_synapse(bots, tmp_path, monkeypatch):
             "PIC_AGENTIC_JOB_WAIT_TIMEOUT_S": "30",
             "PIC_AGENTIC_ACK_TIMEOUT_S": "45",
             "PIC_AGENTIC_NIO_STORE_DIR": str(tmp_path / "nio-mcp"),
-        }
+        },
     )
 
     async def scenario():
@@ -121,13 +122,11 @@ def test_hello_e2e_through_stdio_and_synapse(bots, tmp_path, monkeypatch):
             },
         )
         try:
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools = await session.list_tools()
-                    assert any(tool.name == "hello" for tool in tools.tools)
-                    result = await session.call_tool("hello", {"message": "Hello World from E2E"})
-                    return result
+            async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                assert any(tool.name == "hello" for tool in tools.tools)
+                return await session.call_tool("hello", {"message": "Hello World from E2E"})
         finally:
             serve.cancel()
             await sim_transport.close()
@@ -137,5 +136,6 @@ def test_hello_e2e_through_stdio_and_synapse(bots, tmp_path, monkeypatch):
     assert result.structured_content is not None
     sc = result.structured_content
     assert sc["ok"] is True, sc
-    assert isinstance(sc["job_id"], int) and sc["job_id"] > 0
+    assert isinstance(sc["job_id"], int)
+    assert sc["job_id"] > 0
     assert "Hello World from E2E" in (sc["cluster_output"] or "")

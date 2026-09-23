@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Shell-safety helpers for inbound RCP payloads (design section 6.4)."""
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ MAX_MESSAGE_BYTES = 4096
 
 
 class UnsafePathError(ValueError):
-    pass
+    """Raised when an RCP payload path is not safe to write to."""
 
 
 def validate_message_path(path: str, base_dir: str) -> Path:
@@ -21,28 +25,58 @@ def validate_message_path(path: str, base_dir: str) -> Path:
     The MCP server generates the path; the simclient re-checks it as
     defence in depth so a buggy or compromised server cannot cause a write
     outside the configured directory.
+
+    Args:
+        path: The server-generated path to validate.
+        base_dir: Directory the path must stay inside.
+
+    Returns:
+        The normalised path.
+
+    Raises:
+        UnsafePathError: If the path is empty, padded, relative, unsafe, or
+            escapes ``base_dir``.
+
     """
     if path != path.strip() or not path:
-        raise UnsafePathError("path must be a non-empty, unpadded string")
+        msg = "path must be a non-empty, unpadded string"
+        raise UnsafePathError(msg)
     if not path.startswith("/"):
-        raise UnsafePathError(f"path must be absolute: {path!r}")
+        msg = f"path must be absolute: {path!r}"
+        raise UnsafePathError(msg)
     if not SAFE_CHARSET.match(path):
-        raise UnsafePathError(f"path has characters outside the safe charset: {path!r}")
+        msg = f"path has characters outside the safe charset: {path!r}"
+        raise UnsafePathError(msg)
     base = Path(base_dir).resolve()
     resolved = Path(os.path.normpath(path))
     if resolved != base and base not in resolved.parents:
-        raise UnsafePathError(f"path escapes base directory {base_dir!r}: {path!r}")
+        msg = f"path escapes base directory {base_dir!r}: {path!r}"
+        raise UnsafePathError(msg)
     return resolved
 
 
 def safe_write_message(path: str, base_dir: str, *, default: str = "") -> Path:
-    """Validate ``path`` then write the message file atomically."""
+    """Validate ``path`` then write the message file atomically.
+
+    Args:
+        path: The server-generated target path.
+        base_dir: Directory the path must stay inside.
+        default: The message text to write.
+
+    Returns:
+        The path that was written.
+
+    Raises:
+        UnsafePathError: If the path is unsafe or the message is too large.
+
+    """
     target = validate_message_path(path, base_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
-    text = default if default else ""
+    text = default or ""
     data = text.encode("utf-8")
     if len(data) > MAX_MESSAGE_BYTES:
-        raise UnsafePathError(f"message exceeds {MAX_MESSAGE_BYTES} bytes")
+        msg = f"message exceeds {MAX_MESSAGE_BYTES} bytes"
+        raise UnsafePathError(msg)
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_bytes(data)
     tmp.replace(target)

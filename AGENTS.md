@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+
+SPDX-License-Identifier: MIT
+-->
+
 # AGENTS.md
 
 ## Commands
@@ -5,16 +11,25 @@
 ```bash
 uv venv .venv --python 3.13
 uv pip install --python .venv/bin/python -e '.[dev]'
-.venv/bin/python -m pytest        # test suite
-uvx ruff check src tests          # lint
-uvx ruff format src tests         # format
-uvx pre-commit run --all-files    # all hooks
+.venv/bin/python -m pytest        # test suite (offline subset)
+uvx ruff check src tests scripts  # lint (select = ALL)
+uvx ruff format src tests scripts # format
+uvx pre-commit run --all-files    # all hooks (ruff, reuse, hygiene)
 ```
 
 ## Conventions
 
-- Python 3.10+; pinned runtime deps in `pyproject.toml` (`mcp==2.1.1`,
-  `matrix-nio==0.26.0`). Do not float these without checking the API.
+- Python 3.11+ (see `.python-version`); pinned runtime deps in `pyproject.toml`
+  (`mcp==2.1.1`, `matrix-nio==0.26.0`). Do not float these without checking the
+  API.
+- **Ruff is the only Python linter/formatter** and runs with `select = ["ALL"]`
+  plus `preview`. Add to the `ignore` ledger in `pyproject.toml` only with a
+  written reason; never silence a rule inline without a comment.
+- **REUSE compliance is mandatory**: every new file gets an SPDX header (the
+  copyright tag plus the MIT license tag); use `reuse annotate` or add an
+  `[[annotations]]` block in `REUSE.toml` when the file cannot carry a comment.
+  Run `uvx reuse lint` before pushing.
+- License is MIT (see `COPYING`).
 - Never interpolate LLM/tool input into a shell command. The only values that
   may reach a shell are server-generated identifiers with the safe charset
   `[A-Za-z0-9._/-]` or absolute paths to server-controlled files.

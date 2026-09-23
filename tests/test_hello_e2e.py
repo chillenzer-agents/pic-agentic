@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """End-to-end ``hello`` test over the in-memory transport and fake SLURM.
 
 This exercises the M1 acceptance path without a cluster or homeserver:
@@ -14,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from pic_agentic.rcp import new_secret_hex
-from pic_agentic.server.hello import AckTimeout, HelloService
+from pic_agentic.server.hello import AckTimeoutError, HelloService
 from pic_agentic.simclient import SimClient
 from pic_agentic.slurm import SlurmClient
 from pic_agentic.transport.memory import MemoryTransport
@@ -24,7 +28,7 @@ SECRET = new_secret_hex()
 SIM = "7f3a2b1c"
 
 
-@pytest.fixture()
+@pytest.fixture
 def shared_dir(tmp_path, monkeypatch):
     state = tmp_path / "fake-slurm"
     monkeypatch.setenv("FAKE_SLURM_STATE", str(state))
@@ -46,7 +50,7 @@ async def _run_pair(shared_dir: Path, message: str, *, wait_timeout: float = 60.
         poll_interval_s=0.05,
     )
 
-    async def pump():
+    async def pump() -> None:
         async for msg in mcp_t.receive():
             service.on_message(msg)
 
@@ -62,16 +66,17 @@ async def _run_pair(shared_dir: Path, message: str, *, wait_timeout: float = 60.
     return outcome
 
 
-async def test_hello_round_trip(shared_dir):
+async def test_hello_round_trip(shared_dir) -> None:
     outcome = await _run_pair(shared_dir, "Hello World")
     assert outcome.acked
     assert outcome.ok, outcome.error
-    assert isinstance(outcome.job_id, int) and outcome.job_id > 0
+    assert isinstance(outcome.job_id, int)
+    assert outcome.job_id > 0
     assert outcome.cluster_output is not None
     assert "Hello World" in outcome.cluster_output
 
 
-async def test_hello_message_is_not_shell_interpolated(shared_dir):
+async def test_hello_message_is_not_shell_interpolated(shared_dir) -> None:
     payload = "$(touch /tmp/pwned); `id`; '; rm -rf /"
     outcome = await _run_pair(shared_dir, payload)
     assert outcome.ok, outcome.error
@@ -81,7 +86,7 @@ async def test_hello_message_is_not_shell_interpolated(shared_dir):
     assert not Path("/tmp/pwned").exists()
 
 
-async def test_message_file_is_written_under_base_dir(shared_dir):
+async def test_message_file_is_written_under_base_dir(shared_dir) -> None:
     outcome = await _run_pair(shared_dir, "hi")
     msgs = list((shared_dir / "msg").glob("*.txt"))
     assert len(msgs) == 1
@@ -89,7 +94,7 @@ async def test_message_file_is_written_under_base_dir(shared_dir):
     assert outcome.job_id is not None
 
 
-async def test_rejects_unsigned_commands(shared_dir):
+async def test_rejects_unsigned_commands(shared_dir) -> None:
     from pic_agentic.protocol.hello import build_hello_command
 
     mcp_t, sim_t = MemoryTransport.create_pair()
@@ -107,10 +112,10 @@ async def test_rejects_unsigned_commands(shared_dir):
     assert result is None
 
 
-async def test_rejects_path_outside_base_dir(shared_dir):
+async def test_rejects_path_outside_base_dir(shared_dir) -> None:
     from pic_agentic.protocol.hello import build_hello_command
 
-    mcp_t, sim_t = MemoryTransport.create_pair()
+    _mcp_t, sim_t = MemoryTransport.create_pair()
     simclient = SimClient(
         sim=SIM,
         secret=SECRET,
@@ -124,8 +129,8 @@ async def test_rejects_path_outside_base_dir(shared_dir):
     assert ack.payload["error"].startswith("unexpected:path escapes")
 
 
-async def test_duplicate_command_is_idempotent(shared_dir):
-    mcp_t, sim_t = MemoryTransport.create_pair()
+async def test_duplicate_command_is_idempotent(shared_dir) -> None:
+    _mcp_t, sim_t = MemoryTransport.create_pair()
     service = HelloService(sim=SIM, secret=SECRET, message_dir=str(shared_dir))
     simclient = SimClient(
         sim=SIM,
@@ -144,10 +149,10 @@ async def test_duplicate_command_is_idempotent(shared_dir):
     assert len(jobs) == 1
 
 
-async def test_rejects_command_from_unexpected_transport_sender(shared_dir):
+async def test_rejects_command_from_unexpected_transport_sender(shared_dir) -> None:
     from pic_agentic.protocol.hello import build_hello_command
 
-    mcp_t, sim_t = MemoryTransport.create_pair()
+    _mcp_t, sim_t = MemoryTransport.create_pair()
     simclient = SimClient(
         sim=SIM,
         secret=SECRET,
@@ -157,18 +162,19 @@ async def test_rejects_command_from_unexpected_transport_sender(shared_dir):
         allowed_sender_user_id="@mcpserver:localhost",
     )
     command = build_hello_command(sim=SIM, seq=1, message_path=str(shared_dir / "msg" / "s.txt"), message="x").sign(
-        SECRET
+        SECRET,
     )
     command.transport_sender = "@intruder:localhost"
     assert await simclient.handle(command) is None
 
     command.transport_sender = "@mcpserver:localhost"
     ack = await simclient.handle(command)
-    assert ack is not None and ack.payload.get("error") is None
+    assert ack is not None
+    assert ack.payload.get("error") is None
 
 
-async def test_ack_timeout_when_no_simclient(shared_dir):
+async def test_ack_timeout_when_no_simclient(shared_dir) -> None:
     mcp_t, _sim_t = MemoryTransport.create_pair()
     service = HelloService(sim=SIM, secret=SECRET, message_dir=str(shared_dir), ack_timeout_s=0.2)
-    with pytest.raises(AckTimeout):
+    with pytest.raises(AckTimeoutError):
         await service.hello(mcp_t.send, "nobody home")

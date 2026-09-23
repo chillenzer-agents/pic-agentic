@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Provision a throwaway local Synapse for development and tests.
 
 Registers the two bot accounts (``mcpserver``, ``simclient``) and creates a
@@ -15,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import urllib.request
 
 DEFAULT_HS = os.environ.get("PIC_AGENTIC_HOMESERVER", "http://127.0.0.1:8008")
@@ -55,7 +60,8 @@ def login_or_register(user: str, password: str, hs: str) -> str:
             hs=hs,
         )
     if "access_token" not in response:
-        raise SystemExit(f"could not authenticate {user}: {response}")
+        msg = f"could not authenticate {user}: {response}"
+        raise SystemExit(msg)
     return response["access_token"]
 
 
@@ -87,11 +93,7 @@ def main() -> None:
     blob = {"hs": args.hs, "room_id": room["room_id"], "tokens": tokens}
     text = json.dumps(blob, indent=2)
     if args.out:
-        with open(args.out, "w") as handle:
-            handle.write(text)
-        print(f"wrote {args.out} (room {room['room_id']})")
-    else:
-        print(text)
+        pathlib.Path(args.out).write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":

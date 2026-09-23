@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Remote control protocol (RCP) carried in Matrix room messages.
 
 The protocol shape (envelope, simulation tag, event taxonomy) is deliberately

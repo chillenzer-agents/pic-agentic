@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Contract tests for the SLURM seam against the fake CLI."""
 
 from __future__ import annotations
@@ -12,13 +16,13 @@ from pic_agentic.slurm.client import validate_shared_path
 FAKE_BIN = Path(__file__).parent / "fake_slurm"
 
 
-@pytest.fixture()
+@pytest.fixture
 def fake_env(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_SLURM_STATE", str(tmp_path / "state"))
     return tmp_path
 
 
-async def test_parsable_job_id(fake_env):
+async def test_parsable_job_id(fake_env) -> None:
     msg = fake_env / "m.txt"
     msg.write_text("hello")
     client = SlurmClient(bin_dir=str(FAKE_BIN))
@@ -27,7 +31,7 @@ async def test_parsable_job_id(fake_env):
     assert (fake_env / "o.txt").read_text() == "hello"
 
 
-async def test_wait_for_job_reaches_completed(fake_env):
+async def test_wait_for_job_reaches_completed(fake_env) -> None:
     msg = fake_env / "m.txt"
     msg.write_text("done")
     client = SlurmClient(bin_dir=str(FAKE_BIN))
@@ -37,13 +41,13 @@ async def test_wait_for_job_reaches_completed(fake_env):
     assert info.state.terminal
 
 
-async def test_parse_human_output_fallback():
+async def test_parse_human_output_fallback() -> None:
     assert SlurmClient.parse_job_id("Submitted batch job 12345") == 12345
     assert SlurmClient.parse_job_id("12345\n") == 12345
     assert SlurmClient.parse_job_id("nonsense") is None
 
 
-async def test_signal_requires_fixed_set(fake_env):
+async def test_signal_requires_fixed_set(fake_env) -> None:
     client = SlurmClient(bin_dir=str(FAKE_BIN))
     with pytest.raises(SlurmError):
         await client.signal(4701, "TERM")
@@ -51,7 +55,7 @@ async def test_signal_requires_fixed_set(fake_env):
         await client.signal(4701, "9; rm -rf /")
 
 
-async def test_cancel_modes(fake_env):
+async def test_cancel_modes(fake_env) -> None:
     client = SlurmClient(bin_dir=str(FAKE_BIN))
     await client.cancel(4701, "graceful")
     await client.cancel(4701, "hard")
@@ -59,7 +63,7 @@ async def test_cancel_modes(fake_env):
         await client.cancel(4701, "nonsense")
 
 
-def test_validate_shared_path_accepts_inside_base(tmp_path):
+def test_validate_shared_path_accepts_inside_base(tmp_path) -> None:
     base = tmp_path / "shared"
     base.mkdir()
     target = base / "msg" / "a.txt"
@@ -75,14 +79,14 @@ def test_validate_shared_path_accepts_inside_base(tmp_path):
         "/tmp/$(whoami)",
     ],
 )
-def test_validate_shared_path_rejects_unsafe(tmp_path, path):
+def test_validate_shared_path_rejects_unsafe(tmp_path, path) -> None:
     base = tmp_path / "shared"
     base.mkdir()
     with pytest.raises(SlurmError):
         validate_shared_path(path, str(base))
 
 
-def test_validate_shared_path_rejects_escape_via_dotdot(tmp_path):
+def test_validate_shared_path_rejects_escape_via_dotdot(tmp_path) -> None:
     base = tmp_path / "shared"
     base.mkdir()
     with pytest.raises(SlurmError):

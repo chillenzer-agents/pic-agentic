@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Test double for ``scontrol show job <id>``."""
 
 import os
 import sys
+from pathlib import Path
 
-STATE_DIR = os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm")
+STATE_DIR = Path(os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm"))
 
 
 def main(argv: list[str]) -> int:
+    """Print the fake ``scontrol`` report and return the exit code."""
     if len(argv) < 3 or argv[0] != "show" or argv[1] != "job":
         print("scontrol: error: unsupported invocation", file=sys.stderr)
         return 1
     job_id = argv[2]
-    state_file = os.path.join(STATE_DIR, f"{job_id}.state")
-    if not os.path.exists(state_file):
+    state_file = STATE_DIR / f"{job_id}.state"
+    if not state_file.exists():
         print(f"scontrol: error: Job {job_id} not found", file=sys.stderr)
         return 1
-    with open(state_file) as handle:
-        lines = handle.read().split()
+    lines = state_file.read_text(encoding="utf-8").split()
     state = lines[0] if lines else "UNKNOWN"
     exit_code = int(lines[1]) if len(lines) > 1 else 0
     # Mirror real `scontrol show job` layout: one attribute per line,

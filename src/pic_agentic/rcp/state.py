@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Per-sender sequencing and deduplication state."""
 
 from __future__ import annotations
 
 from collections import deque
+from typing import TYPE_CHECKING
 
-from pic_agentic.rcp.envelope import RcpMessage, SenderRole
+if TYPE_CHECKING:
+    from pic_agentic.rcp.envelope import RcpMessage, SenderRole
 
 
 class SequenceState:
@@ -15,21 +21,49 @@ class SequenceState:
     """
 
     def __init__(self) -> None:
+        """Start with no observed sequences."""
         self._counters: dict[tuple[str, str], int] = {}
 
     def next_seq(self, sim: str, role: SenderRole) -> int:
+        """Return and advance the sender's next sequence number.
+
+        Args:
+            sim: Simulation id.
+            role: Sender role whose counter to advance.
+
+        Returns:
+            The next sequence number (1-based).
+
+        """
         key = (sim, role.value)
         value = self._counters.get(key, 0) + 1
         self._counters[key] = value
         return value
 
     def observe(self, sim: str, role: SenderRole, seq: int) -> None:
-        """Track the highest seen seq (used by receivers)."""
+        """Track the highest sequence number seen for a sender.
+
+        Args:
+            sim: Simulation id.
+            role: Sender role the sequence belongs to.
+            seq: Observed sequence number.
+
+        """
         key = (sim, role.value)
         if seq > self._counters.get(key, 0):
             self._counters[key] = seq
 
     def highest(self, sim: str, role: SenderRole) -> int:
+        """Return the highest sequence number seen for a sender.
+
+        Args:
+            sim: Simulation id.
+            role: Sender role to query.
+
+        Returns:
+            The highest observed sequence number, or 0 if none was seen.
+
+        """
         return self._counters.get((sim, role.value), 0)
 
 
@@ -40,12 +74,21 @@ class DedupStore:
     """
 
     def __init__(self, maxlen: int = 4096) -> None:
+        """Create a store retaining at most ``maxlen`` recent keys."""
         self._seen: set[tuple[str, str, int, str]] = set()
         self._order: deque[tuple[str, str, int, str]] = deque()
         self._maxlen = maxlen
 
     def seen(self, message: RcpMessage) -> bool:
-        """Return True and record the key if it is new; False if a duplicate."""
+        """Record the message key and report whether it is new.
+
+        Args:
+            message: The received message.
+
+        Returns:
+            True if the key is new; False if it is a duplicate.
+
+        """
         key = message.dedup_key()
         if key in self._seen:
             return False

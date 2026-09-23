@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """MCP-side ``hello`` orchestration (design sections 4.1, 8.1).
 
 The service is transport-agnostic so it can be driven by Matrix in production
@@ -8,15 +12,21 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from pic_agentic.protocol.hello import HELLO_ACK, build_hello_command
-from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState
+from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
+
+#: Async sender signature used to dispatch one RCP message.
+SendFn = Callable[[RcpMessage], Awaitable[str]]
 
 
 @dataclass
 class HelloOutcome:
+    """The MCP-side result of one ``hello`` exchange."""
+
     ok: bool
     sim: str
     cmd_id: str
@@ -26,8 +36,8 @@ class HelloOutcome:
     error: str | None = None
 
 
-class AckTimeout(RuntimeError):
-    pass
+class AckTimeoutError(RuntimeError):
+    """Raised when no ack arrives within the configured wait."""
 
 
 class HelloService:
@@ -42,6 +52,16 @@ class HelloService:
         ack_timeout_s: float = 90.0,
         resend_once: bool = True,
     ) -> None:
+        """Create a service for one simulation.
+
+        Args:
+            sim: Simulation id.
+            secret: Shared per-simulation RCP secret.
+            message_dir: Shared-filesystem base directory for payload files.
+            ack_timeout_s: Maximum wait for an ack per attempt.
+            resend_once: Whether to re-send the command once on timeout.
+
+        """
         self.sim = sim
         self.secret = secret
         self.message_dir = Path(message_dir)
@@ -51,12 +71,28 @@ class HelloService:
         self._pending: dict[str, asyncio.Future[RcpMessage]] = {}
 
     def message_path_for(self, cmd_id: str) -> str:
-        """Server-generated absolute path with a safe charset (section 6.4)."""
+        """Return the server-generated path for a command's message file.
+
+        Args:
+            cmd_id: The command id.
+
+        Returns:
+            An absolute path with a safe charset (design section 6.4).
+
+        """
         return str(self.message_dir / "msg" / f"{self.sim}-{cmd_id}.txt")
 
     def build_command(self, message: str, *, cmd_id: str | None = None) -> RcpMessage:
-        from pic_agentic.rcp import new_cmd_id
+        """Build and sign a ``hello`` command.
 
+        Args:
+            message: The LLM-supplied message text.
+            cmd_id: Optional command id (generated when omitted).
+
+        Returns:
+            The signed ``rcp.hello`` command.
+
+        """
         command_id = cmd_id or new_cmd_id()
         seq = self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER)
         return build_hello_command(
@@ -68,11 +104,15 @@ class HelloService:
         ).sign(self.secret)
 
     def on_message(self, message: RcpMessage) -> None:
-        """Feed inbound messages here; resolves a pending ack future.
+        """Feed an inbound message; resolve its pending ack future.
 
         Only signed acks from the simulation-side client count.  In particular
         the Matrix transport echoes our own outbound commands back through
         ``receive()``, and those must never resolve the future.
+
+        Args:
+            message: An inbound RCP message.
+
         """
         if message.kind is not Kind.ACK:
             return
@@ -87,10 +127,19 @@ class HelloService:
         if future is not None and not future.done():
             future.set_result(message)
 
-    async def hello(self, send, message: str = "Hello World") -> HelloOutcome:
-        """Send a ``hello`` command via ``send`` and wait for its ack.
+    async def hello(self, send: SendFn, message: str = "Hello World") -> HelloOutcome:
+        """Send a ``hello`` command and wait for its ack.
 
-        ``send`` is an async callable ``send(RcpMessage) -> event_id``.
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            message: The LLM-supplied message text.
+
+        Returns:
+            The outcome of the exchange.
+
+        Raises:
+            AckTimeoutError: If no ack arrives within the configured wait.
+
         """
         command = self.build_command(message)
         cmd_id = str(command.payload["cmd_id"])
@@ -108,9 +157,10 @@ class HelloService:
                 try:
                     ack = await asyncio.wait_for(future, timeout=self.ack_timeout_s)
                     break
-                except (asyncio.TimeoutError, TimeoutError):
+                except TimeoutError:
                     if attempt == attempts - 1:
-                        raise AckTimeout(f"no ack for command {cmd_id} within {self.ack_timeout_s}s") from None
+                        msg = f"no ack for command {cmd_id} within {self.ack_timeout_s}s"
+                        raise AckTimeoutError(msg) from None
         finally:
             self._pending.pop(cmd_id, None)
         assert ack is not None
@@ -126,4 +176,10 @@ class HelloService:
 
 
 def default_message_dir() -> str:
+    """Return the default shared-filesystem message directory.
+
+    Returns:
+        ``$PIC_AGENTIC_MESSAGE_DIR`` or a per-user default below ``$HOME``.
+
+    """
     return os.environ.get("PIC_AGENTIC_MESSAGE_DIR", str(Path.home() / ".local/share/pic-agentic/shared"))

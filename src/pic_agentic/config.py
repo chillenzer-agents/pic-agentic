@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Configuration loading for the MCP server and the simulation-side client.
 
 Credentials come from the environment first, then a 0600 TOML file at
@@ -8,10 +12,9 @@ stored in the repository or echoed into the LLM context.
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-
-import tomllib
 
 DEFAULT_CONFIG_PATH = Path("~/.config/pic-agentic/config.toml").expanduser()
 
@@ -29,9 +32,16 @@ ENV_MAP = {
     "nio_store_dir": "PIC_AGENTIC_NIO_STORE_DIR",
 }
 
+#: Fields parsed as floats when read from the environment or the TOML file.
+_FLOAT_FIELDS = ("job_wait_timeout_s", "ack_timeout_s")
+
+REDACTED = "[REDACTED]"
+
 
 @dataclass
 class Config:
+    """The merged environment/TOML configuration of one RCP party."""
+
     homeserver: str = ""
     room_id: str = ""
     access_token: str = ""
@@ -50,6 +60,17 @@ class Config:
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:
+        """Build a configuration from the TOML file and the environment.
+
+        Environment values take precedence over the ``[pic_agentic]`` table.
+
+        Args:
+            path: Config path override; defaults to ``DEFAULT_CONFIG_PATH``.
+
+        Returns:
+            The merged configuration.
+
+        """
         data: dict[str, object] = {}
         cfg_path = path or DEFAULT_CONFIG_PATH
         if cfg_path.exists():
@@ -58,28 +79,45 @@ class Config:
         for key, env in ENV_MAP.items():
             if env in os.environ:
                 data[key] = os.environ[env]
-        known = {f for f in cls.__dataclass_fields__}
+        known = set(cls.__dataclass_fields__)
         filtered = {k: v for k, v in data.items() if k in known}
-        if "job_wait_timeout_s" in filtered:
-            filtered["job_wait_timeout_s"] = float(filtered["job_wait_timeout_s"])
-        if "ack_timeout_s" in filtered:
-            filtered["ack_timeout_s"] = float(filtered["ack_timeout_s"])
+        for field_name in _FLOAT_FIELDS:
+            if field_name in filtered:
+                filtered[field_name] = float(filtered[field_name])
         return cls(**filtered)
 
     def require(self, *names: str) -> None:
+        """Assert that the named fields are set.
+
+        Args:
+            *names: Field names that must be non-empty.
+
+        Raises:
+            ConfigError: If any named field is empty.
+
+        """
         missing = [n for n in names if not getattr(self, n, "")]
         if missing:
-            raise ConfigError(f"missing required configuration: {', '.join(missing)}")
+            msg = f"missing required configuration: {', '.join(missing)}"
+            raise ConfigError(msg)
 
     def redact(self, text: str) -> str:
-        """Replace known secrets in ``text`` (design section 6.1)."""
+        """Replace known secrets in ``text``.
+
+        Args:
+            text: The string about to leave toward the LLM.
+
+        Returns:
+            ``text`` with every configured secret replaced by ``[REDACTED]``.
+
+        """
         if not text:
             return text
         for secret in (self.access_token, self.rcp_secret):
             if secret:
-                text = text.replace(secret, "[REDACTED]")
+                text = text.replace(secret, REDACTED)
         return text
 
 
 class ConfigError(RuntimeError):
-    pass
+    """Raised when required configuration is missing."""

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """M1 ``hello`` command/ack RCP messages (design sections 2.4, 8.1).
 
 Shell-safety contract (design section 6.4): the LLM-supplied ``message`` never
@@ -29,6 +33,10 @@ def build_hello_command(
     The payload carries the LLM-supplied ``message`` as *data* and a
     server-generated absolute ``message_path``.  The simclient writes the
     message to that path; the message text is never passed to a shell.
+
+    Returns:
+        The unsigned ``rcp.hello`` command message.
+
     """
     return RcpMessage(
         sim=sim,
@@ -51,7 +59,12 @@ def build_hello_ack(
     cluster_output: str | None,
     error: str | None = None,
 ) -> RcpMessage:
-    """simclient -> room acknowledgement of a ``hello`` command."""
+    """Build the simclient-to-room acknowledgement of a ``hello`` command.
+
+    Returns:
+        The unsigned ``rcp.hello_ack`` message.
+
+    """
     payload: dict[str, object] = {
         "cmd_id": cmd_id,
         "job_id": job_id,

@@ -1,51 +1,100 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """In-process transport for tests and the offline direct-echo M1 variant."""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from pic_agentic.rcp.envelope import RcpMessage
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from pic_agentic.rcp.envelope import RcpMessage
+
+#: Poll interval for the receive iterator so ``close`` is noticed promptly.
+_POLL_INTERVAL_S = 0.05
 
 
+@dataclass
+class _ChannelState:
+    """Closure flag shared by both ends of one channel."""
+
+    closed: bool = False
+    counter: int = 0
+
+
+@dataclass
 class MemoryTransport:
     """One end of a two-party in-process channel.
 
     Use :meth:`create_pair` to obtain two wired ends.  Messages sent on one end
-    appear on the other end's ``receive()`` iterator.
+    appear on the other end's :meth:`receive` iterator.
     """
 
-    def __init__(self) -> None:
-        self._inbox: asyncio.Queue[RcpMessage] = asyncio.Queue()
-        self._peer: MemoryTransport | None = None
-        self._counter = 0
-        self.closed = False
+    inbox: asyncio.Queue[RcpMessage] = field(default_factory=asyncio.Queue)
+    peer_inbox: asyncio.Queue[RcpMessage] | None = None
+    state: _ChannelState = field(default_factory=_ChannelState)
 
     @classmethod
     def create_pair(cls) -> tuple[MemoryTransport, MemoryTransport]:
+        """Create two wired ends of one channel.
+
+        Returns:
+            The ``(left, right)`` transport pair.
+
+        """
         left, right = cls(), cls()
-        left._peer = right
-        right._peer = left
+        left.peer_inbox = right.inbox
+        right.peer_inbox = left.inbox
+        right.state = left.state
         return left, right
 
+    @property
+    def closed(self) -> bool:
+        """Whether the channel has been closed."""
+        return self.state.closed
+
     async def send(self, message: RcpMessage) -> str:
+        """Queue ``message`` for the peer end.
+
+        Args:
+            message: The RCP message to deliver.
+
+        Returns:
+            A synthetic transport event id.
+
+        Raises:
+            RuntimeError: If the transport is closed or unpaired.
+
+        """
         if self.closed:
-            raise RuntimeError("transport is closed")
-        if self._peer is None:
-            raise RuntimeError("transport is not paired")
-        self._counter += 1
-        await self._peer._inbox.put(message)
-        return f"$memory{self._counter}"
+            msg = "transport is closed"
+            raise RuntimeError(msg)
+        if self.peer_inbox is None:
+            msg = "transport is not paired"
+            raise RuntimeError(msg)
+        self.state.counter += 1
+        await self.peer_inbox.put(message)
+        return f"$memory{self.state.counter}"
 
     async def receive(self) -> AsyncIterator[RcpMessage]:
+        """Yield messages delivered by the peer until the channel closes.
+
+        Yields:
+            Each inbound :class:`RcpMessage`.
+
+        """
         while not self.closed:
             try:
-                message = await asyncio.wait_for(self._inbox.get(), timeout=0.05)
-            except (asyncio.TimeoutError, TimeoutError):
+                message = await asyncio.wait_for(self.inbox.get(), timeout=_POLL_INTERVAL_S)
+            except TimeoutError:
                 continue
             yield message
 
     async def close(self) -> None:
-        self.closed = True
-        if self._peer is not None:
-            self._peer.closed = True
+        """Close the channel for both ends."""
+        self.state.closed = True

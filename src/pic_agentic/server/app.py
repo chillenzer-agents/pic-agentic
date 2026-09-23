@@ -1,19 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """MCP stdio server exposing the M1 ``hello`` tool (design sections 4, 8.1)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
-from pic_agentic.config import Config
 from pic_agentic.server.hello import HelloOutcome, HelloService
 from pic_agentic.transport.matrix import MatrixTransport
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from pic_agentic.config import Config
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +29,13 @@ class HelloRuntime:
     """Owns the Matrix transport and the async RCP service."""
 
     def __init__(self, config: Config, sim: str) -> None:
+        """Create the runtime (the transport starts in :meth:`start`).
+
+        Args:
+            config: Resolved configuration.
+            sim: Simulation id the server operates under.
+
+        """
         self.config = config
         self.sim = sim
         self.service = HelloService(
@@ -34,6 +48,7 @@ class HelloRuntime:
         self._pump: asyncio.Task | None = None
 
     async def start(self) -> None:
+        """Open the Matrix transport and start pumping inbound messages."""
         config = self.config
         config.require("homeserver", "user_id", "access_token", "room_id", "rcp_secret", "message_dir")
         self._transport = MatrixTransport(
@@ -49,15 +64,32 @@ class HelloRuntime:
         self._pump = asyncio.create_task(self._pump_forever())
 
     async def _pump_forever(self) -> None:
-        assert self._transport is not None
+        if self._transport is None:
+            msg = "runtime is not started"
+            raise RuntimeError(msg)
         async for message in self._transport.receive():
             self.service.on_message(message)
 
     async def hello(self, message: str) -> HelloOutcome:
-        assert self._transport is not None
+        """Run one ``hello`` exchange.
+
+        Args:
+            message: The LLM-supplied message text.
+
+        Returns:
+            The outcome of the exchange.
+
+        Raises:
+            RuntimeError: If the runtime has not been started.
+
+        """
+        if self._transport is None:
+            msg = "runtime is not started"
+            raise RuntimeError(msg)
         return await self.service.hello(self._transport.send, message)
 
     async def stop(self) -> None:
+        """Cancel the pump and close the transport."""
         if self._pump:
             self._pump.cancel()
         if self._transport:
@@ -65,7 +97,12 @@ class HelloRuntime:
 
 
 def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
-    """Create the MCP server and its runtime, wired together via lifespan."""
+    """Create the MCP server and its runtime, wired together via lifespan.
+
+    Returns:
+        The ``(server, runtime)`` pair.
+
+    """
     runtime = HelloRuntime(config, sim)
 
     @asynccontextmanager

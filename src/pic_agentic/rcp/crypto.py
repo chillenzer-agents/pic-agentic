@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Signing primitives for the remote control protocol.
 
 Messages are signed with HMAC-SHA256 over a canonical JSON encoding of the
@@ -26,18 +30,33 @@ SIG_ALGORITHM = "sha256"
 
 
 def canonical_bytes(obj: Any) -> bytes:
-    """Deterministic JSON encoding used as the signed byte string."""
+    """Encode ``obj`` as the deterministic signed byte string.
+
+    Returns:
+        The sorted-key, separator-normalised, ASCII JSON encoding of ``obj``.
+
+    """
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
 def sign(secret: str, obj: Any) -> str:
-    """Return ``hmac-sha256:<hex>`` over the canonical encoding of ``obj``."""
+    """Sign the canonical encoding of ``obj`` with ``secret``.
+
+    Returns:
+        The signature string ``hmac-sha256:<hex>``.
+
+    """
     digest = hmac.new(secret.encode("utf-8"), canonical_bytes(obj), hashlib.sha256).hexdigest()
     return f"{SIG_PREFIX}:{digest}"
 
 
 def verify(secret: str, obj: Any, signature: str) -> bool:
-    """Constant-time verification of ``signature`` against ``obj``."""
+    """Verify ``signature`` against the canonical encoding of ``obj``.
+
+    Returns:
+        True if ``signature`` is a valid HMAC of ``obj`` under ``secret``.
+
+    """
     if not isinstance(signature, str) or not signature.startswith(f"{SIG_PREFIX}:"):
         return False
     expected = sign(secret, obj)
@@ -45,10 +64,20 @@ def verify(secret: str, obj: Any, signature: str) -> bool:
 
 
 def new_secret_hex(nbytes: int = 32) -> str:
-    """Generate a fresh per-simulation RCP secret."""
+    """Generate a fresh per-simulation RCP secret.
+
+    Returns:
+        A random lowercase hex string of ``2 * nbytes`` characters.
+
+    """
     return secrets.token_hex(nbytes)
 
 
 def new_cmd_id() -> str:
-    """Generate a stable command id used for idempotency across re-sends."""
+    """Generate a stable command id used for idempotency across re-sends.
+
+    Returns:
+        A random 32-character lowercase hex UUID.
+
+    """
     return uuid.uuid4().hex

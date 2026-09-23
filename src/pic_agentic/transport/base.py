@@ -1,11 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Transport interface."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from pic_agentic.rcp.envelope import RcpMessage
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from pic_agentic.rcp.envelope import RcpMessage
 
 
 class Transport(Protocol):

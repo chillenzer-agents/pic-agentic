@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Test double for ``sbatch``: executes the --wrap body locally.
 
 It mimics the parts of the SLURM contract the design relies on:
@@ -10,28 +15,29 @@ It mimics the parts of the SLURM contract the design relies on:
 """
 
 import os
-import re
 import subprocess
 import sys
-import time
+from pathlib import Path
 
-STATE_DIR = os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm")
-COUNTER = os.path.join(STATE_DIR, "counter")
+STATE_DIR = Path(os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm"))
+COUNTER = STATE_DIR / "counter"
+#: First job id handed out; higher than any value the tests assume.
+_FIRST_JOB_ID = 4700
 
 
 def next_job_id() -> int:
-    os.makedirs(STATE_DIR, exist_ok=True)
-    value = 4700
-    if os.path.exists(COUNTER):
-        with open(COUNTER) as handle:
-            value = int(handle.read().strip())
+    """Return the next job id, persisting the counter under ``STATE_DIR``."""
+    STATE_DIR.mkdir(exist_ok=True, parents=True)
+    value = _FIRST_JOB_ID
+    if COUNTER.exists():
+        value = int(COUNTER.read_text(encoding="utf-8").strip())
     value += 1
-    with open(COUNTER, "w") as handle:
-        handle.write(str(value))
+    COUNTER.write_text(str(value), encoding="utf-8")
     return value
 
 
-def main(argv: list[str]) -> int:
+def parse_args(argv: list[str]) -> tuple[str | None, str | None, bool]:
+    """Split the supported ``sbatch`` arguments out of ``argv``."""
     wrap = None
     output = None
     parsable = False
@@ -44,39 +50,39 @@ def main(argv: list[str]) -> int:
             output = arg.split("=", 1)[1]
         elif arg == "--parsable":
             parsable = True
-        elif arg in ("--wrap", "--output") and i + 1 < len(argv):
+        elif arg in {"--wrap", "--output"} and i + 1 < len(argv):
             i += 1
             if arg == "--wrap":
                 wrap = argv[i]
             else:
                 output = argv[i]
         i += 1
+    return wrap, output, parsable
 
+
+def main(argv: list[str]) -> int:
+    """Run the fake ``sbatch`` and return its exit code."""
+    wrap, output, parsable = parse_args(argv)
     if wrap is None:
         print("sbatch: error: no --wrap given", file=sys.stderr)
         return 1
 
     job_id = next_job_id()
-    os.makedirs(STATE_DIR, exist_ok=True)
-    state_file = os.path.join(STATE_DIR, f"{job_id}.state")
-    with open(state_file, "w") as handle:
-        handle.write("RUNNING\n")
+    state_file = STATE_DIR / f"{job_id}.state"
+    state_file.write_text("RUNNING\n", encoding="utf-8")
 
     # Execute the wrap body locally through the shell, exactly as SLURM would
     # on the compute node.
-    completed = subprocess.run(["/bin/sh", "-c", wrap], capture_output=True)
+    completed = subprocess.run(["/bin/sh", "-c", wrap], capture_output=True, check=False)
     text = completed.stdout.decode("utf-8", "replace") + completed.stderr.decode("utf-8", "replace")
     if output:
-        with open(output, "w") as handle:
-            handle.write(text)
-    with open(state_file, "w") as handle:
-        handle.write(("COMPLETED\n" if completed.returncode == 0 else "FAILED\n") + f"{completed.returncode}\n")
+        Path(output).write_text(text, encoding="utf-8")
+    state = "COMPLETED" if completed.returncode == 0 else "FAILED"
+    state_file.write_text(f"{state}\n{completed.returncode}\n", encoding="utf-8")
 
     print(str(job_id) if parsable else f"Submitted batch job {job_id}")
     return 0
 
 
 if __name__ == "__main__":
-    _ = re
-    _ = time
     sys.exit(main(sys.argv[1:]))

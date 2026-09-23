@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Matrix transport built on matrix-nio (pinned 0.26.0).
 
 Matrix carries small RCP metadata messages only; heavy data never travels
@@ -10,14 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
-from typing import Any
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from nio import AsyncClient, AsyncClientConfig, RoomMessageText, SyncResponse
 
 from pic_agentic.rcp.envelope import RCP_NAMESPACE, RcpMessage
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
 log = logging.getLogger(__name__)
+
+#: Retry delay after a failed Matrix sync.
+_SYNC_RETRY_S = 1.0
 
 
 class MatrixTransport:
@@ -33,8 +44,20 @@ class MatrixTransport:
         sync_timeout_ms: int = 10_000,
         store_path: str | None = None,
     ) -> None:
+        """Create a Matrix transport for one room.
+
+        Args:
+            homeserver: Homeserver base URL.
+            user_id: Bot user id.
+            access_token: Bot access token.
+            room_id: The RCP room id.
+            sync_timeout_ms: Long-poll timeout for ``/sync``.
+            store_path: Optional matrix-nio store directory.
+
+        """
         config = AsyncClientConfig(store_sync_tokens=True, encryption_enabled=False)
-        store = store_path or f"/tmp/pic-agentic-nio-{user_id.replace('@', '').replace(':', '-')}"
+        default_store = Path(tempfile.gettempdir()) / f"pic-agentic-nio-{user_id.replace('@', '').replace(':', '-')}"
+        store = store_path or str(default_store)
         self._client = AsyncClient(homeserver, user_id, config=config, store_path=store)
         self._client.access_token = access_token
         self._room_id = room_id
@@ -43,14 +66,29 @@ class MatrixTransport:
         self._closed = False
 
     async def send(self, message: RcpMessage) -> str:
+        """Send one signed RCP message to the room.
+
+        Args:
+            message: The signed RCP message.
+
+        Returns:
+            The Matrix event id.
+
+        Raises:
+            ValueError: If the message is not signed.
+            RuntimeError: If ``room_send`` reports a failure.
+
+        """
         if message.sig is None:
-            raise ValueError("refusing to send an unsigned RCP message")
+            msg = "refusing to send an unsigned RCP message"
+            raise ValueError(msg)
         # to_content re-signs only when sig is None, which we have excluded.
         content: dict[str, Any] = message.to_content()
         response = await self._client.room_send(self._room_id, "m.room.message", content)
         event_id = getattr(response, "event_id", None)
         if event_id is None:
-            raise RuntimeError(f"room_send failed: {getattr(response, 'message', response)}")
+            msg = f"room_send failed: {getattr(response, 'message', response)}"
+            raise RuntimeError(msg)
         return str(event_id)
 
     async def _sync(self) -> SyncResponse:
@@ -60,19 +98,33 @@ class MatrixTransport:
         return response
 
     async def backfill(self) -> list[RcpMessage]:
-        """Fetch currently known RCP messages without blocking forever."""
+        """Fetch currently known RCP messages.
+
+        Returns:
+            The RCP messages in the room timeline at this point.
+
+        """
         response = await self._sync()
         return self._extract(response)
 
     async def receive(self) -> AsyncIterator[RcpMessage]:
+        """Yield RCP messages as they arrive.
+
+        Yields:
+            Each inbound :class:`RcpMessage`.
+
+        Raises:
+            asyncio.CancelledError: If the consuming task is cancelled.
+
+        """
         while not self._closed:
             try:
                 response = await self._sync()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # pragma: no cover - network errors
+            except Exception as exc:  # ruff: ignore[blind-except] - sync may raise many network errors  # pragma: no cover
                 log.warning("matrix sync failed: %s", exc)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(_SYNC_RETRY_S)
                 continue
             for message in self._extract(response):
                 yield message
@@ -104,8 +156,10 @@ class MatrixTransport:
 
     @property
     def client(self) -> AsyncClient:
+        """The underlying matrix-nio client."""
         return self._client
 
     async def close(self) -> None:
+        """Close the sync loop and the underlying client."""
         self._closed = True
         await self._client.close()

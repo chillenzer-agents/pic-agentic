@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+
+SPDX-License-Identifier: MIT
+-->
+
 # PIC-Agentic
 
 Agentic research infrastructure for PIConGPU: an MCP server and a
@@ -102,15 +108,33 @@ table is also read, with the environment taking precedence):
 | `PIC_AGENTIC_ACK_TIMEOUT_S` | MCP-server ack wait (default 90) |
 | `PIC_AGENTIC_NIO_STORE_DIR` | Optional matrix-nio store directory |
 
-## Tests
+## Tests and tooling
 
 ```bash
 .venv/bin/python -m pytest          # offline suite (MemoryTransport + fake SLURM)
-pre-commit run --all-files
+uvx pre-commit run --all-files      # ruff, reuse, hygiene hooks
 ```
 
+- **Ruff is the only Python linter and formatter**, configured with
+  `select = ["ALL"]` plus `preview` in `pyproject.toml`. The `ignore` list is a
+  deliberate exception ledger: every entry carries the reason it is off, so a
+  new rule family is on by default and must be argued off. The one
+  `per-file-ignore` set covers tests (not shipped API) and the standalone dev
+  scripts.
+- **REUSE** is enforced by the `reuse` pre-commit hook and by CI. Every
+  committed file carries an SPDX header; files that cannot (`.python-version`,
+  generated artifacts) are attributed in `REUSE.toml`.
+- `pyproject.toml` is metadata-only for packaging; the license is declared as
+  the SPDX expression `MIT` with `COPYING` as the license file.
+
 `tests/test_e2e_synapse.py` runs the full path over a live local Synapse and
-skips automatically when one is not reachable.
+skips automatically when one is not reachable. Tests marked `integration`
+require a homeserver or SLURM and are excluded from the offline run.
+
+## License
+
+MIT (see `COPYING`). Each file additionally carries an SPDX header; the REUSE
+compliance status can be checked with `reuse lint`.
 
 ## Known deviations from the design document
 

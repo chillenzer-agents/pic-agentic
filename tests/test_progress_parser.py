@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
 """Progress-line parser tests.
 
 The `emu_line` helper reproduces the exact C++ `std::setw` stream from
@@ -58,7 +62,7 @@ DOC_EXAMPLE_2 = " 25 % = 12345678 | time elapsed:  25h  1min  1sec   0msec | avg
         (75, 7500000, (0, 59, 59, 999), (0, 0, 1, 1)),
     ],
 )
-def test_parses_code_generated_progress_lines(pct, step, elapsed, avg):
+def test_parses_code_generated_progress_lines(pct, step, elapsed, avg) -> None:
     parsed = parse_progress_line(emu_line(pct, step, elapsed, avg))
     assert parsed is not None
     assert parsed.percent == pct
@@ -69,14 +73,14 @@ def test_parses_code_generated_progress_lines(pct, step, elapsed, avg):
     assert parsed.avg_per_step == _print_time(*avg).strip()
 
 
-def test_doc_worked_examples_are_code_accurate():
+def test_doc_worked_examples_are_code_accurate() -> None:
     assert emu_line(5, 500, (0, 1, 2, 345), (0, 0, 1, 234)) == DOC_EXAMPLE_1
     assert emu_line(25, 12345678, (25, 1, 1, 0), (0, 1, 30, 61)) == DOC_EXAMPLE_2
     for line in (DOC_EXAMPLE_1, DOC_EXAMPLE_2):
         assert parse_progress_line(line) is not None
 
 
-def test_captures_both_time_fields():
+def test_captures_both_time_fields() -> None:
     parsed = parse_progress_line(DOC_EXAMPLE_1)
     assert parsed is not None
     assert parsed.elapsed == "1min  2sec 345msec"
@@ -85,7 +89,7 @@ def test_captures_both_time_fields():
     assert parsed.avg_per_step_ms == 1_234
 
 
-def test_eta_is_derived_from_avg():
+def test_eta_is_derived_from_avg() -> None:
     parsed = parse_progress_line(emu_line(25, 2500, (0, 1, 0, 0), (0, 0, 2, 0)))
     assert parsed is not None
     assert parsed.eta_seconds(10000) == pytest.approx(2.0 * 7500)
@@ -101,7 +105,7 @@ def test_eta_is_derived_from_avg():
         "  5%=500",
     ],
 )
-def test_rejects_non_progress_lines(line):
+def test_rejects_non_progress_lines(line) -> None:
     assert parse_progress_line(line) is None
 
 
@@ -115,5 +119,5 @@ def test_rejects_non_progress_lines(line):
         ("0msec", 0),
     ],
 )
-def test_parse_time_ms(text, expected):
+def test_parse_time_ms(text, expected) -> None:
     assert parse_time_ms(text) == expected
