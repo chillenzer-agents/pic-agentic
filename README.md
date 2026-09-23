@@ -33,7 +33,9 @@ LLM agent --MCP stdio--> MCP server --Matrix--> simclient --sbatch--> SLURM
 | `src/pic_agentic/slurm/` | Injection-safe `sbatch`/`scontrol`/`scancel` wrappers |
 | `src/pic_agentic/simclient/` | Simulation-side client (`hello` handler) |
 | `src/pic_agentic/server/` | MCP stdio server exposing the `hello` tool |
-| `scripts/dev_synapse.py` | Provision a throwaway local Synapse (bots + room) |
+| `scripts/setup_synapse.sh` | Create a throwaway local Synapse venv + config |
+| `scripts/start_synapse.sh` | Start that Synapse (logs errors instead of swallowing them) |
+| `scripts/dev_synapse.py` | Provision bots + a fresh RCP room on a running homeserver |
 | `scripts/dev_level2.py` | One-shot full-stack smoke test (room + simclient + fake MCP client) |
 | `tests/fake_slurm/` | Local `sbatch`/`scontrol`/`scancel` doubles |
 
@@ -48,11 +50,22 @@ uv pip install --python .venv/bin/python -e '.[dev]'
 
 ## Run the M1 PoC
 
-1. Provision a local homeserver and room (development shortcut; production
-   uses Helmholtz Matrix, see config below):
+0. Start a local homeserver (development only; production points at Helmholtz
+   Matrix, see config below). The two helpers create and run a throwaway
+   Synapse; both take `SYNAPSE_HOME` (default `~/synapse`):
 
    ```bash
-   # with a local Synapse listening on http://127.0.0.1:8008
+   scripts/setup_synapse.sh     # once: venv + config + dev settings
+   scripts/start_synapse.sh     # foreground; returns when the endpoint answers
+   ```
+
+   `start_synapse.sh` logs to `$SYNAPSE_HOME/synapse.log` and prints its tail
+   when startup fails, so errors are never swallowed. It assumes the default
+   homeserver URL `http://127.0.0.1:8008` (override with `SYNAPSE_URL`).
+
+1. Provision a room (development shortcut; production uses Helmholtz Matrix):
+
+   ```bash
    python scripts/dev_synapse.py --new-room --out bots.json
    ```
 
