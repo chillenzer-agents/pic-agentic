@@ -34,6 +34,7 @@ LLM agent --MCP stdio--> MCP server --Matrix--> simclient --sbatch--> SLURM
 | `src/pic_agentic/simclient/` | Simulation-side client (`hello` handler) |
 | `src/pic_agentic/server/` | MCP stdio server exposing the `hello` tool |
 | `scripts/dev_synapse.py` | Provision a throwaway local Synapse (bots + room) |
+| `scripts/dev_level2.py` | One-shot full-stack smoke test (room + simclient + fake MCP client) |
 | `tests/fake_slurm/` | Local `sbatch`/`scontrol`/`scancel` doubles |
 
 ## Install
@@ -79,6 +80,21 @@ uv pip install --python .venv/bin/python -e '.[dev]'
 
    Call the `hello` tool; the result carries the SLURM `job_id` and the output
    the job printed.
+
+### One-shot smoke test
+
+Steps 1-3 are wrapped by `scripts/dev_level2.py`, which also acts as the fake
+MCP client: it provisions a fresh room, starts the simclient against the fake
+SLURM doubles, drives `pic_agentic.server` over stdio, prints the `hello`
+result and the written artifacts, and tears everything down. It only needs the
+homeserver to be reachable (it does not start Synapse):
+
+```bash
+python scripts/dev_level2.py                    # temp workspace, cleaned up
+python scripts/dev_level2.py --shared-dir /tmp/level2 --keep
+```
+
+It exits non-zero if the round trip does not produce a job id.
 
 ## Security model (M1)
 
