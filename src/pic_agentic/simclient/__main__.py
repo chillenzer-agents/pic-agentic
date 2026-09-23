@@ -15,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 
+from pic_agentic.auth import MasTokenStore
 from pic_agentic.config import Config
 from pic_agentic.simclient import SimClient
 from pic_agentic.slurm import SlurmClient
@@ -25,12 +26,16 @@ async def run() -> None:
     """Run the simulation-side client until interrupted."""
     config = Config.load()
     config.require("homeserver", "user_id", "access_token", "room_id", "rcp_secret", "message_dir")
+    token_provider = None
+    if config.has_refresh_chain():
+        token_provider = MasTokenStore.from_config(config).access_token
     transport = MatrixTransport(
         config.homeserver,
         config.user_id,
         config.access_token,
         config.room_id,
         store_path=config.nio_store_dir or None,
+        token_provider=token_provider,
     )
     sim = os.environ.get("PIC_AGENTIC_SIM", "poc")
     client = SimClient(

@@ -70,6 +70,9 @@ def test_hello_e2e_through_stdio_and_synapse(bots, tmp_path, monkeypatch) -> Non
         {
             "PIC_AGENTIC_HOMESERVER": bots["hs"],
             "PIC_AGENTIC_ROOM_ID": bots["room_id"],
+            # Keep the run hermetic: never read a developer's real 0600 config
+            # (which may carry a live MAS refresh chain).
+            "PIC_AGENTIC_CONFIG": str(tmp_path / "no-such-config.toml"),
             "PIC_AGENTIC_RCP_SECRET": secret,
             "PIC_AGENTIC_MESSAGE_DIR": str(shared),
             "PIC_AGENTIC_SIM": "e2esim",

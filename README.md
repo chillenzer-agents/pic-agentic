@@ -48,6 +48,35 @@ uv venv .venv --python 3.13
 uv pip install --python .venv/bin/python -e '.[dev]'
 ```
 
+## Authentication (MAS-fronted homeservers)
+
+Production homeservers such as `chat.academiccloud.de` are fronted by Matrix
+Authentication Service (MAS): there is no password login, access tokens expire
+after ~5 minutes, and refresh tokens **rotate** (each refresh consumes the old
+one). `matrix-nio` has no refresh support, so the token lifecycle lives in
+`src/pic_agentic/auth/`.
+
+Bootstrap once with the OAuth device-code flow:
+
+```bash
+python scripts/mas_login.py          # prints a code + URL; writes the 0600 config
+```
+
+The token store refreshes on demand and keeps the live pair in a shared 0600
+cache guarded by a file lock, so the MCP server and the simclient (which may
+share one account) never invalidate each other's rotating refresh token.
+
+Two non-obvious requirements, both verified against a live MAS:
+
+- The grant **must** include a device scope
+  (`urn:matrix:org.matrix.msc2967.client:device:<id>`); MAS only provisions a
+  homeserver device when that scope is present, and Synapse rejects
+  `m.room.message` sends from a device-less session (`mas_login.py` adds it).
+- Access tokens are short lived, so refresh is mandatory for any run longer
+  than a few minutes.
+
+Local Synapse needs none of this: it uses static tokens.
+
 ## Run the M1 PoC
 
 0. Start a local homeserver (development only; production points at Helmholtz
@@ -136,6 +165,10 @@ table is also read, with the environment taking precedence):
 | `PIC_AGENTIC_JOB_WAIT_TIMEOUT_S` | Simclient job wait (default 60) |
 | `PIC_AGENTIC_ACK_TIMEOUT_S` | MCP-server ack wait (default 90) |
 | `PIC_AGENTIC_NIO_STORE_DIR` | Optional matrix-nio store directory |
+| `PIC_AGENTIC_CLIENT_ID` | MAS OAuth client id (public; from `mas_login.py`) |
+| `PIC_AGENTIC_TOKEN_ENDPOINT` | MAS token endpoint for refresh |
+| `PIC_AGENTIC_REFRESH_TOKEN` | Rotating refresh token (see `mas_login.py`) |
+| `PIC_AGENTIC_TOKEN_CACHE_PATH` | Optional shared 0600 token-cache override |
 
 ## Tests and tooling
 
