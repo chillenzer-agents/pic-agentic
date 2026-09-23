@@ -11,10 +11,17 @@ simclient writes the message there, and the job body is ``cat '<path>'``.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, new_cmd_id
 
-HELLO = "rcp.hello"
-HELLO_ACK = "rcp.hello_ack"
+
+class HelloType(StrEnum):
+    """RCP ``type`` values of the M1 ``hello`` exchange."""
+
+    COMMAND = "rcp.hello"
+    ACK = "rcp.hello_ack"
+
 
 DEFAULT_MESSAGE = "Hello World"
 
@@ -41,7 +48,7 @@ def build_hello_command(
     return RcpMessage(
         sim=sim,
         kind=Kind.COMMAND,
-        type=HELLO,
+        type=HelloType.COMMAND,
         seq=seq,
         sender_role=SenderRole.MCP_SERVER,
         in_reply_to=in_reply_to,
@@ -75,7 +82,7 @@ def build_hello_ack(
     return RcpMessage(
         sim=sim,
         kind=Kind.ACK,
-        type=HELLO_ACK,
+        type=HelloType.ACK,
         seq=seq,
         sender_role=SenderRole.SIMCLIENT,
         in_reply_to=in_reply_to,

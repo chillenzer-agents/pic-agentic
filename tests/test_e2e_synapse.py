@@ -105,7 +105,7 @@ def test_hello_e2e_through_stdio_and_synapse(bots, tmp_path, monkeypatch) -> Non
             secret=secret,
             transport=sim_transport,
             slurm=SlurmClient(bin_dir=str(FAKE_BIN), timeout_s=40),
-            message_dir=str(shared),
+            message_dir=shared,
             job_wait_timeout_s=30,
             poll_interval_s=0.2,
         )

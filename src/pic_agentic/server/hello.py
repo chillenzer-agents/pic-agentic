@@ -17,7 +17,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, computed_field
 
-from pic_agentic.protocol.hello import HELLO_ACK, build_hello_command
+from pic_agentic.protocol.hello import HelloType, build_hello_command
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 
 #: Async sender signature used to dispatch one RCP message.
@@ -52,7 +52,7 @@ class HelloService:
         self,
         sim: str,
         secret: str,
-        message_dir: str,
+        message_dir: Path,
         *,
         ack_timeout_s: float = 90.0,
         resend_once: bool = True,
@@ -69,7 +69,7 @@ class HelloService:
         """
         self.sim = sim
         self.secret = secret
-        self.message_dir = Path(message_dir)
+        self.message_dir = message_dir
         self.ack_timeout_s = ack_timeout_s
         self.resend_once = resend_once
         self.sequences = SequenceState()
@@ -119,18 +119,20 @@ class HelloService:
             message: An inbound RCP message.
 
         """
-        if message.kind is not Kind.ACK:
-            return
-        if message.type != HELLO_ACK:
-            return
-        if message.sender_role is not SenderRole.SIMCLIENT:
-            return
-        if message.sim != self.sim or not message.verify(self.secret):
-            return
-        cmd_id = str(message.payload.get("cmd_id", ""))
-        future = self._pending.get(cmd_id)
-        if future is not None and not future.done():
-            future.set_result(message)
+        # Dotting the enum members keeps the pattern a comparison rather than a
+        # capture (a bare name would match everything).  A non-matching message
+        # simply falls through and is ignored.
+        match message:
+            case RcpMessage(
+                kind=Kind.ACK,
+                type=HelloType.ACK,
+                sender_role=SenderRole.SIMCLIENT,
+                sim=self.sim,
+            ) if message.verify(self.secret):
+                cmd_id = str(message.payload.get("cmd_id", ""))
+                future = self._pending.get(cmd_id)
+                if future is not None and not future.done():
+                    future.set_result(message)
 
     async def hello(self, send: SendFn, message: str = "Hello World") -> HelloOutcome:
         """Send a ``hello`` command and wait for its ack.
@@ -179,11 +181,12 @@ class HelloService:
         )
 
 
-def default_message_dir() -> str:
+def default_message_dir() -> Path:
     """Return the default shared-filesystem message directory.
 
     Returns:
         ``$PIC_AGENTIC_MESSAGE_DIR`` or a per-user default below ``$HOME``.
 
     """
-    return os.environ.get("PIC_AGENTIC_MESSAGE_DIR", str(Path.home() / ".local/share/pic-agentic/shared"))
+    configured = os.environ.get("PIC_AGENTIC_MESSAGE_DIR")
+    return Path(configured) if configured else Path.home() / ".local/share/pic-agentic/shared"

@@ -38,7 +38,7 @@ async def run() -> None:
         secret=config.rcp_secret,
         transport=transport,
         slurm=SlurmClient(bin_dir=config.slurm_bin_dir, timeout_s=config.job_wait_timeout_s + 10),
-        message_dir=str(Path(config.message_dir).resolve()),
+        message_dir=Path(config.message_dir).resolve(),
         job_wait_timeout_s=config.job_wait_timeout_s,
         poll_interval_s=float(os.environ.get("PIC_AGENTIC_POLL_INTERVAL_S", "5")),
         allowed_sender_user_id=os.environ.get("PIC_AGENTIC_ALLOWED_SENDER"),

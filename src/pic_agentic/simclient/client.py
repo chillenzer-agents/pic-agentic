@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
-from pic_agentic.protocol.hello import HELLO, build_hello_ack
+from pic_agentic.protocol.hello import HelloType, build_hello_ack
 from pic_agentic.rcp import DedupStore, Kind, RcpMessage, SenderRole, SequenceState
 from pic_agentic.simclient.safety import safe_write_message
 from pic_agentic.slurm import JobInfo, SlurmClient, SlurmError
@@ -47,7 +47,7 @@ class SimClient:
         secret: str,
         transport: Transport,
         slurm: SlurmClient,
-        message_dir: str,
+        message_dir: Path,
         job_wait_timeout_s: float = 60.0,
         poll_interval_s: float = 0.2,
         allowed_sender_user_id: str | None = None,
@@ -69,7 +69,7 @@ class SimClient:
         self.secret = secret
         self.transport = transport
         self.slurm = slurm
-        self.message_dir = Path(message_dir)
+        self.message_dir = message_dir
         self.job_wait_timeout_s = job_wait_timeout_s
         self.poll_interval_s = poll_interval_s
         self.allowed_sender_user_id = allowed_sender_user_id
@@ -107,7 +107,7 @@ class SimClient:
         if not self._accepts(message):
             return None
         self.sequences.observe(message.sim, message.sender_role, message.seq)
-        if message.type != HELLO:
+        if message.type != HelloType.COMMAND:
             await self._ack(message, cmd_id=message.payload.get("cmd_id"), error="rejected_by_policy")
             return None
         return await self._handle_hello(message)

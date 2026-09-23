@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mcp.server import MCPServer
@@ -41,7 +42,7 @@ class HelloRuntime:
         self.service = HelloService(
             sim=sim,
             secret=config.rcp_secret,
-            message_dir=config.message_dir,
+            message_dir=Path(config.message_dir),
             ack_timeout_s=config.ack_timeout_s,
         )
         self._transport: MatrixTransport | None = None
