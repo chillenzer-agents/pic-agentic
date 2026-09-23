@@ -10,11 +10,20 @@ evolve separately.
 """
 
 from pic_agentic.rcp.crypto import canonical_bytes, new_cmd_id, new_secret_hex, sign, verify
-from pic_agentic.rcp.envelope import RCP_NAMESPACE, VERSION, Kind, RcpMessage, SenderRole, now_ts
+from pic_agentic.rcp.envelope import (
+    RCP_NAMESPACE,
+    SIGNED_FIELDS,
+    VERSION,
+    Kind,
+    RcpMessage,
+    SenderRole,
+    now_ts,
+)
 from pic_agentic.rcp.state import DedupStore, SequenceState
 
 __all__ = [
     "RCP_NAMESPACE",
+    "SIGNED_FIELDS",
     "VERSION",
     "DedupStore",
     "Kind",

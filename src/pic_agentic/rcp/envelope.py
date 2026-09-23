@@ -2,22 +2,29 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""RCP message envelope (version 0)."""
+"""RCP message envelope (version 0).
+
+The envelope is a pydantic model: validation and (de)serialisation come from
+the model itself, and the signed payload is a filtered JSON dump so the wire
+format and the signed bytes cannot drift apart.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.rcp.crypto import sign, verify
 
 RCP_NAMESPACE = "io.picongpu.rcp"
 VERSION = 0
 
-#: Envelope fields that participate in the HMAC (everything except ``sig``).
-SIGNED_FIELDS = ("version", "sim", "kind", "type", "seq", "ts", "sender_role", "in_reply_to", "payload")
+#: Envelope fields that participate in the HMAC (everything except ``sig`` and
+#: the transport-only metadata fields).
+SIGNED_FIELDS = frozenset({"version", "sim", "kind", "type", "seq", "ts", "sender_role", "in_reply_to", "payload"})
 
 #: Payload keys echoed into the human-readable room body, in this order.
 _BODY_KEYS = ("cmd_id", "job_id", "submit_system", "state", "step", "percent", "message")
@@ -53,58 +60,49 @@ def now_ts() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-@dataclass
-class RcpMessage:
+class RcpMessage(BaseModel):
     """A single RCP message carried in one ``m.room.message`` event."""
+
+    # ``type`` intentionally shadows the builtin: it is the protocol field name.
+    model_config = ConfigDict(extra="forbid")
 
     sim: str
     kind: Kind
     type: str
     seq: int
     sender_role: SenderRole
-    payload: dict[str, Any] = field(default_factory=dict)
-    ts: str = field(default_factory=now_ts)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    ts: str = Field(default_factory=now_ts)
     in_reply_to: str | None = None
     version: int = VERSION
     sig: str | None = None
     #: Matrix user id of the transport-level sender.  Set by the transport on
     #: receive; NOT part of the signed envelope (it is transport metadata used
     #: for the design's defence-in-depth identity check, section 6.4).
-    transport_sender: str | None = None
+    transport_sender: str | None = Field(default=None, exclude=True)
     #: Transport-level event id of the message that carried this envelope.
     #: Set by the transport on receive; used to fill ``in_reply_to`` on acks.
-    transport_event_id: str | None = None
+    transport_event_id: str | None = Field(default=None, exclude=True)
 
-    def signed_dict(self) -> dict[str, Any]:
+    def signed_payload(self) -> dict[str, Any]:
         """Return the envelope fields covered by the signature.
 
         Returns:
-            The signed field mapping in canonical form.
+            The signed fields as a JSON-mode mapping (enums as strings), which
+            is exactly the subset hashed by :func:`~pic_agentic.rcp.crypto.sign`.
 
         """
-        data: dict[str, Any] = {
-            "version": self.version,
-            "sim": self.sim,
-            "kind": self.kind.value,
-            "type": self.type,
-            "seq": self.seq,
-            "ts": self.ts,
-            "sender_role": self.sender_role.value,
-            "in_reply_to": self.in_reply_to,
-            "payload": self.payload,
-        }
-        return data
+        return self.model_dump(mode="json", include=set(SIGNED_FIELDS))
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the full envelope including the signature.
+        """Return the full wire envelope including the signature.
 
         Returns:
-            The signed field mapping plus the ``sig`` entry.
+            The signed fields plus ``sig``; the transport-only metadata fields
+            are excluded by the model.
 
         """
-        data = self.signed_dict()
-        data["sig"] = self.sig
-        return data
+        return self.model_dump(mode="json")
 
     def sign(self, secret: str) -> RcpMessage:
         """Sign this message in place.
@@ -113,7 +111,7 @@ class RcpMessage:
             ``self``, signed, for call chaining.
 
         """
-        self.sig = sign(secret, self.signed_dict())
+        self.sig = sign(secret, self.signed_payload())
         return self
 
     def verify(self, secret: str) -> bool:
@@ -125,7 +123,7 @@ class RcpMessage:
         """
         if self.sig is None:
             return False
-        return verify(secret, self.signed_dict(), self.sig)
+        return verify(secret, self.signed_payload(), self.sig)
 
     def dedup_key(self) -> tuple[str, str, int, str]:
         """Return the receiver's deduplication key.
@@ -177,27 +175,16 @@ class RcpMessage:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RcpMessage:
-        """Build a message from a raw envelope mapping.
+        """Build a message from a raw wire envelope mapping.
 
         Args:
-            data: The envelope mapping (without transport metadata).
+            data: The envelope mapping, typically from a Matrix event.
 
         Returns:
-            The reconstructed message.
+            The validated message.
 
         """
-        return cls(
-            version=int(data.get("version", VERSION)),
-            sim=str(data["sim"]),
-            kind=Kind(data["kind"]),
-            type=str(data["type"]),
-            seq=int(data["seq"]),
-            ts=str(data["ts"]),
-            sender_role=SenderRole(data["sender_role"]),
-            in_reply_to=data.get("in_reply_to"),
-            payload=dict(data.get("payload") or {}),
-            sig=data.get("sig"),
-        )
+        return cls.model_validate(data)
 
     @classmethod
     def from_content(cls, content: dict[str, Any]) -> RcpMessage:
@@ -207,7 +194,7 @@ class RcpMessage:
             content: A Matrix event content mapping.
 
         Returns:
-            The reconstructed message.
+            The validated message.
 
         Raises:
             TypeError: If ``content`` carries no RCP envelope mapping.

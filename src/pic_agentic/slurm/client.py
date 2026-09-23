@@ -15,9 +15,10 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
-from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from pydantic import BaseModel
 
 SAFE_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
 SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
@@ -51,8 +52,7 @@ class SlurmJobState(StrEnum):
         }
 
 
-@dataclass
-class JobInfo:
+class JobInfo(BaseModel):
     """A snapshot of one SLURM job."""
 
     job_id: int

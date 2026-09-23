@@ -13,8 +13,9 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from pathlib import Path
+
+from pydantic import BaseModel, computed_field
 
 from pic_agentic.protocol.hello import HELLO_ACK, build_hello_command
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
@@ -23,17 +24,21 @@ from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd
 SendFn = Callable[[RcpMessage], Awaitable[str]]
 
 
-@dataclass
-class HelloOutcome:
+class HelloOutcome(BaseModel):
     """The MCP-side result of one ``hello`` exchange."""
 
-    ok: bool
     sim: str
     cmd_id: str
     job_id: int | None
     cluster_output: str | None
     acked: bool
     error: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        """Whether the exchange completed without an error."""
+        return not self.error
 
 
 class AckTimeoutError(RuntimeError):
@@ -165,7 +170,6 @@ class HelloService:
             self._pending.pop(cmd_id, None)
         assert ack is not None
         return HelloOutcome(
-            ok=not ack.payload.get("error"),
             sim=self.sim,
             cmd_id=cmd_id,
             job_id=ack.payload.get("job_id"),

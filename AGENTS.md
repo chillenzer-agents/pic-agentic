@@ -25,6 +25,11 @@ uvx pre-commit run --all-files    # all hooks (ruff, reuse, hygiene)
 - **Ruff is the only Python linter/formatter** and runs with `select = ["ALL"]`
   plus `preview`. Add to the `ignore` ledger in `pyproject.toml` only with a
   written reason; never silence a rule inline without a comment.
+- **Data is pydantic**: wire messages, config, parser results and job/result
+  value objects are `pydantic.BaseModel`s so validation and (de)serialisation
+  come from the model. Only live objects that hold runtime resources (the
+  transports, `SlurmClient`) are plain classes. When a field is protocol data,
+  it belongs in the model, not in a parallel `to_dict`.
 - **REUSE compliance is mandatory**: every new file gets an SPDX header (the
   copyright tag plus a license tag); use `reuse annotate` or add an
   `[[annotations]]` block in `REUSE.toml` when the file cannot carry a comment.

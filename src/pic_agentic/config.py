@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
 from pathlib import Path
+
+from pydantic import BaseModel
 
 DEFAULT_CONFIG_PATH = Path("~/.config/pic-agentic/config.toml").expanduser()
 
@@ -32,15 +33,16 @@ ENV_MAP = {
     "nio_store_dir": "PIC_AGENTIC_NIO_STORE_DIR",
 }
 
-#: Fields parsed as floats when read from the environment or the TOML file.
-_FLOAT_FIELDS = ("job_wait_timeout_s", "ack_timeout_s")
-
 REDACTED = "[REDACTED]"
 
 
-@dataclass
-class Config:
-    """The merged environment/TOML configuration of one RCP party."""
+class Config(BaseModel):
+    """The merged environment/TOML configuration of one RCP party.
+
+    Pydantic parses the TOML/environment strings into the declared types
+    (e.g. ``PIC_AGENTIC_ACK_TIMEOUT_S`` into ``float``), so ``load`` only has
+    to merge the sources and filter unknown keys.
+    """
 
     homeserver: str = ""
     room_id: str = ""
@@ -79,12 +81,10 @@ class Config:
         for key, env in ENV_MAP.items():
             if env in os.environ:
                 data[key] = os.environ[env]
-        known = set(cls.__dataclass_fields__)
-        filtered = {k: v for k, v in data.items() if k in known}
-        for field_name in _FLOAT_FIELDS:
-            if field_name in filtered:
-                filtered[field_name] = float(filtered[field_name])
-        return cls(**filtered)
+        # Unknown keys are ignored: the config file may carry settings for
+        # other tools, and pydantic would otherwise reject them.
+        filtered = {k: v for k, v in data.items() if k in cls.model_fields}
+        return cls.model_validate(filtered)
 
     def require(self, *names: str) -> None:
         """Assert that the named fields are set.

@@ -27,7 +27,7 @@ LLM agent --MCP stdio--> MCP server --Matrix--> simclient --sbatch--> SLURM
 
 | Path | Purpose |
 |------|---------|
-| `src/pic_agentic/rcp/` | RCP envelope, HMAC signing, sequencing, dedup |
+| `src/pic_agentic/rcp/` | RCP envelope (pydantic model), HMAC signing, sequencing, dedup |
 | `src/pic_agentic/parsing/` | PIConGPU stdout progress-line parser |
 | `src/pic_agentic/transport/` | `MatrixTransport` (matrix-nio) and `MemoryTransport` |
 | `src/pic_agentic/slurm/` | Injection-safe `sbatch`/`scontrol`/`scancel` wrappers |

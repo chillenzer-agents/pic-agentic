@@ -10,6 +10,8 @@ import pytest
 
 from pic_agentic.rcp import (
     RCP_NAMESPACE,
+    SIGNED_FIELDS,
+    VERSION,
     DedupStore,
     Kind,
     RcpMessage,
@@ -135,3 +137,39 @@ def test_new_secret_and_cmd_id_shapes() -> None:
 def test_all_kinds_roundtrip(kind) -> None:
     msg = make(kind=kind).sign(SECRET)
     assert RcpMessage.from_dict(msg.to_dict()).kind is kind
+
+
+def test_model_validates_and_coerces_types() -> None:
+    # A raw wire dict with string numbers and a foreign payload key validates,
+    # because pydantic parses the declared field types.
+    msg = RcpMessage.model_validate(
+        {"sim": "s", "kind": "command", "type": "hello", "seq": "7", "sender_role": "mcpserver"},
+    )
+    assert msg.seq == 7
+    assert msg.version == VERSION
+    assert msg.payload == {}
+
+
+def test_model_rejects_unknown_kind() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        RcpMessage.model_validate({"sim": "s", "kind": "bogus", "type": "t", "seq": 1, "sender_role": "mcpserver"})
+
+
+def test_wire_dict_excludes_transport_metadata() -> None:
+    msg = make().sign(SECRET)
+    msg.transport_sender = "@someone:hs"
+    msg.transport_event_id = "$evt"
+    wire = msg.to_dict()
+    assert "transport_sender" not in wire
+    assert "transport_event_id" not in wire
+    # The signed subset is exactly the documented signed fields.
+    assert set(msg.signed_payload()) == SIGNED_FIELDS
+
+
+def test_sig_not_covered_by_signature() -> None:
+    msg = make().sign(SECRET)
+    msg.sig = "hmac-sha256:" + "0" * 64
+    # A forged sig does not verify, but the signed payload is unaffected by it.
+    assert not msg.verify(SECRET)

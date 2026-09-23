@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -19,25 +18,35 @@ if TYPE_CHECKING:
 _POLL_INTERVAL_S = 0.05
 
 
-@dataclass
 class _ChannelState:
     """Closure flag shared by both ends of one channel."""
 
-    closed: bool = False
-    counter: int = 0
+    def __init__(self) -> None:
+        """Start an open channel with no messages sent yet."""
+        self.closed = False
+        self.counter = 0
 
 
-@dataclass
 class MemoryTransport:
     """One end of a two-party in-process channel.
 
     Use :meth:`create_pair` to obtain two wired ends.  Messages sent on one end
     appear on the other end's :meth:`receive` iterator.
+
+    This is deliberately a plain class, not a pydantic model: it holds live
+    :class:`asyncio.Queue` objects that are not data to validate or serialise.
     """
 
-    inbox: asyncio.Queue[RcpMessage] = field(default_factory=asyncio.Queue)
-    peer_inbox: asyncio.Queue[RcpMessage] | None = None
-    state: _ChannelState = field(default_factory=_ChannelState)
+    def __init__(
+        self,
+        inbox: asyncio.Queue[RcpMessage] | None = None,
+        peer_inbox: asyncio.Queue[RcpMessage] | None = None,
+        state: _ChannelState | None = None,
+    ) -> None:
+        """Create an unpaired end; prefer :meth:`create_pair`."""
+        self.inbox: asyncio.Queue[RcpMessage] = inbox if inbox is not None else asyncio.Queue()
+        self.peer_inbox = peer_inbox
+        self.state = state if state is not None else _ChannelState()
 
     @classmethod
     def create_pair(cls) -> tuple[MemoryTransport, MemoryTransport]:

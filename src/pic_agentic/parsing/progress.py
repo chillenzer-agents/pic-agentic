@@ -26,7 +26,8 @@ parser as best-effort and fall back to openPMD iteration metadata.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+
+from pydantic import BaseModel, ConfigDict
 
 #: Capture groups: 1=percent, 2=step, 3=elapsed, 4=avg_per_step.
 PROGRESS_RE = re.compile(
@@ -37,9 +38,10 @@ _UNIT_MS = {"h": 3_600_000, "min": 60_000, "sec": 1_000, "msec": 1}
 _TOKEN_RE = re.compile(r"(\d+)\s*(msec|sec|min|h)")
 
 
-@dataclass(frozen=True)
-class ProgressLine:
+class ProgressLine(BaseModel):
     """One parsed PIConGPU per-step progress line."""
+
+    model_config = ConfigDict(frozen=True)
 
     percent: int
     step: int

@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from pydantic import BaseModel
 
 from pic_agentic.protocol.hello import HELLO, build_hello_ack
 from pic_agentic.rcp import DedupStore, Kind, RcpMessage, SenderRole, SequenceState
@@ -28,8 +29,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class HelloResult:
+class HelloResult(BaseModel):
     """Outcome of one ``hello`` command execution."""
 
     job_id: int | None
