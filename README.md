@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
 
-SPDX-License-Identifier: MIT
+SPDX-License-Identifier: CC-BY-4.0
 -->
 
 # PIC-Agentic
@@ -133,8 +133,13 @@ require a homeserver or SLURM and are excluded from the offline run.
 
 ## License
 
-MIT (see `COPYING`). Each file additionally carries an SPDX header; the REUSE
-compliance status can be checked with `reuse lint`.
+Split license, per REUSE:
+
+- **Code** (Python, tests, config, scripts): **MIT** — see `COPYING`.
+- **Prose** (documentation such as this README and `AGENTS.md`): **CC-BY-4.0**.
+
+Each file carries the matching SPDX header; `reuse lint` checks compliance and
+`reuse spdx` emits the full bill of materials. See `LICENSE.md` for details.
 
 ## Known deviations from the design document
 

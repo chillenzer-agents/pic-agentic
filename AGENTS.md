@@ -1,7 +1,7 @@
 <!--
 SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
 
-SPDX-License-Identifier: MIT
+SPDX-License-Identifier: CC-BY-4.0
 -->
 
 # AGENTS.md
@@ -26,10 +26,11 @@ uvx pre-commit run --all-files    # all hooks (ruff, reuse, hygiene)
   plus `preview`. Add to the `ignore` ledger in `pyproject.toml` only with a
   written reason; never silence a rule inline without a comment.
 - **REUSE compliance is mandatory**: every new file gets an SPDX header (the
-  copyright tag plus the MIT license tag); use `reuse annotate` or add an
+  copyright tag plus a license tag); use `reuse annotate` or add an
   `[[annotations]]` block in `REUSE.toml` when the file cannot carry a comment.
   Run `uvx reuse lint` before pushing.
-- License is MIT (see `COPYING`).
+- License split: **code is MIT** (see `COPYING`); **prose/docs are CC-BY-4.0**
+  (see `LICENSE.md`). Use the matching SPDX identifier in new files.
 - Never interpolate LLM/tool input into a shell command. The only values that
   may reach a shell are server-generated identifiers with the safe charset
   `[A-Za-z0-9._/-]` or absolute paths to server-controlled files.

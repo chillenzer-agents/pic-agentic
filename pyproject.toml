@@ -13,8 +13,10 @@ description = "MCP server and simulation-side client for LLM-driven remote PICon
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Julian Lenz", email = "j.lenz@hzdr.de" }]
+# Code is MIT; prose/docs are CC-BY-4.0 (see LICENSE.md). Both texts ship in
+# the distribution so downstream consumers see the split.
 license = "MIT"
-license-files = ["COPYING"]
+license-files = ["COPYING", "LICENSES/*.txt"]
 keywords = ["PIConGPU", "MCP", "Matrix", "HPC", "SLURM", "LLM", "agent"]
 classifiers = [
   "Development Status :: 3 - Alpha",
