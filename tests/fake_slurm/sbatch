@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Test double for ``sbatch``: executes the --wrap body locally.
+
+It mimics the parts of the SLURM contract the design relies on:
+
+* ``--parsable`` prints the bare job id;
+* otherwise the human line ``Submitted batch job <id>`` is printed;
+* the job writes its stdout to the ``--output`` file and a small state file
+  that ``scontrol`` reads back.
+"""
+
+import os
+import re
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm")
+COUNTER = os.path.join(STATE_DIR, "counter")
+
+
+def next_job_id() -> int:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    value = 4700
+    if os.path.exists(COUNTER):
+        with open(COUNTER) as handle:
+            value = int(handle.read().strip())
+    value += 1
+    with open(COUNTER, "w") as handle:
+        handle.write(str(value))
+    return value
+
+
+def main(argv: list[str]) -> int:
+    wrap = None
+    output = None
+    parsable = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--wrap="):
+            wrap = arg.split("=", 1)[1]
+        elif arg.startswith("--output="):
+            output = arg.split("=", 1)[1]
+        elif arg == "--parsable":
+            parsable = True
+        elif arg in ("--wrap", "--output") and i + 1 < len(argv):
+            i += 1
+            if arg == "--wrap":
+                wrap = argv[i]
+            else:
+                output = argv[i]
+        i += 1
+
+    if wrap is None:
+        print("sbatch: error: no --wrap given", file=sys.stderr)
+        return 1
+
+    job_id = next_job_id()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    state_file = os.path.join(STATE_DIR, f"{job_id}.state")
+    with open(state_file, "w") as handle:
+        handle.write("RUNNING\n")
+
+    # Execute the wrap body locally through the shell, exactly as SLURM would
+    # on the compute node.
+    completed = subprocess.run(["/bin/sh", "-c", wrap], capture_output=True)
+    text = completed.stdout.decode("utf-8", "replace") + completed.stderr.decode("utf-8", "replace")
+    if output:
+        with open(output, "w") as handle:
+            handle.write(text)
+    with open(state_file, "w") as handle:
+        handle.write(("COMPLETED\n" if completed.returncode == 0 else "FAILED\n") + f"{completed.returncode}\n")
+
+    print(str(job_id) if parsable else f"Submitted batch job {job_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    _ = re
+    _ = time
+    sys.exit(main(sys.argv[1:]))
