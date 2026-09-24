@@ -30,7 +30,7 @@ from pic_agentic.version import WIRE_FORMAT_VERSION
 FIXTURE = Path(__file__).parent / "fixtures" / "pypicongpu_runner.json"
 #: Schema hash of the pinned tree (see pyproject [sim] pin); regenerated when
 #: the pin moves.  Guards against silent picongpu schema drift in CI.
-PINNED_SCHEMA_HASH = "e26f53dd3d39295c3f2fe09a49ebc568e8b81d8f1436514115860d993c836561"
+PINNED_SCHEMA_HASH = "f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9"
 
 
 def _runner_dump() -> dict:
@@ -142,7 +142,30 @@ def test_params_round_trip_and_default_submit_system() -> None:
     params = SubmitParams(build_jobs=4)
     command = build_submit_command(sim="s", seq=1, payload_path="/p", payload=_payload(), params=params)
     assert command.payload["params"]["submit_system"] == DEFAULT_SUBMIT_SYSTEM
-    assert params.as_flags() == {"build_jobs": 4, "submit_system": DEFAULT_SUBMIT_SYSTEM, "build_force": False}
+    # picongpu_flags maps the design's build_* names to the aliases the pinned
+    # PicBuildFlags/TBGFlags actually accept, and drops unset options (a False
+    # build_force is dropped so picongpu keeps its own default).
+    assert params.picongpu_flags() == {"jobs": 4, "submit": DEFAULT_SUBMIT_SYSTEM}
+
+
+def test_params_maps_every_field_to_its_picongpu_alias() -> None:
+    params = SubmitParams(
+        build_jobs=8,
+        build_cmake="-DX=1",
+        build_preset=3,
+        build_force=True,
+        cfg_file="my.cfg",
+        overwrite_vars=["a=1"],
+    )
+    assert params.picongpu_flags() == {
+        "jobs": 8,
+        "cmake": "-DX=1",
+        "preset": 3,
+        "force": True,
+        "cfg": "my.cfg",
+        "submit": "sbatch",
+        "o": ["a=1"],
+    }
 
 
 def test_ack_and_event_shape() -> None:

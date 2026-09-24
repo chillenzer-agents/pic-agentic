@@ -106,12 +106,38 @@ def picongpu_revision() -> str:
     return _installed_commit_id() or ""
 
 
-@lru_cache(maxsize=1)
-def runner_schema_hash() -> str:
-    """Return the SHA-256 of the canonical ``Runner`` JSON schema.
+def normalise_schema_paths(value: Any) -> Any:
+    """Replace absolute-path strings in a schema with a placeholder.
+
+    The ``Runner`` schema's ``template_dir`` default is the install-time
+    absolute path to the package templates, so hashing the raw schema would
+    make the hash depend on the (different) venv prefixes on the sender and the
+    cluster, defeating the drift check.  Only path *strings* are normalised;
+    names, types and annotations are untouched.
+
+    Args:
+        value: A JSON-decoded schema fragment.
 
     Returns:
-        The hex digest used as the robust drift check.
+        The fragment with absolute-path strings replaced by ``"<abs>"``.
+
+    """
+    if isinstance(value, str):
+        return "<abs>" if value.startswith("/") else value
+    if isinstance(value, dict):
+        return {key: normalise_schema_paths(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalise_schema_paths(item) for item in value]
+    return value
+
+
+@lru_cache(maxsize=1)
+def runner_schema_hash() -> str:
+    """Return a path-independent SHA-256 of the ``Runner`` JSON schema.
+
+    Returns:
+        The hex digest used as the robust, install-location-independent drift
+        check.
 
     Raises:
         PicongpuUnavailableError: If PIConGPU is not installed.
@@ -122,8 +148,8 @@ def runner_schema_hash() -> str:
     except ImportError as exc:
         msg = "PIConGPU is not installed (install the 'sim' extra)"
         raise PicongpuUnavailableError(msg) from exc
-    canonical = canonical_bytes(Runner.model_json_schema()).decode("ascii")
-    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+    normalised = normalise_schema_paths(Runner.model_json_schema())
+    return hashlib.sha256(canonical_bytes(normalised)).hexdigest()
 
 
 def local_provenance() -> dict[str, str]:

@@ -21,6 +21,8 @@ import pytest
 from pic_agentic.protocol.simulation import (
     SimulationPayload,
     SimulationState,
+    SimulationType,
+    SubmitParams,
     UnsupportedPayloadError,
     build_submit_command,
 )
@@ -29,6 +31,7 @@ from pic_agentic.server.simulation import SubmitService
 from pic_agentic.simclient import SimClient
 from pic_agentic.simclient import simulation as sim_mod
 from pic_agentic.simclient.simulation import SubmitConfig
+from pic_agentic.simulation_build import BuiltSimulation
 from pic_agentic.slurm import SlurmClient
 from pic_agentic.transport.memory import MemoryTransport
 
@@ -74,18 +77,23 @@ def fake_runner(monkeypatch):
     """Stub the runner rebuild and the local submit-system probe."""
     created: list[_FakeRunner] = []
 
-    def fake_from_payload(payload, config):
-        runner = _FakeRunner(config.setup_root / payload.sim_id / "run")
+    def fake_from_payload(payload, config, token):
+        runner = _FakeRunner(config.setup_root / payload.sim_id / token / "run")
         created.append(runner)
         return runner
 
-    monkeypatch.setattr(sim_mod, "_runner_from_payload", fake_from_payload)
-    monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: "")
+    monkeypatch.setattr(sim_mod, "runner_from_payload", fake_from_payload)
+    monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: "sbatch")
     return created
 
 
-async def _fake_builder(*, script_path, interpreter="", **_kw: object) -> dict:
-    return _runner_dump()
+async def _fake_builder(*, script_path, interpreter="", **_kw: object) -> BuiltSimulation:
+    return BuiltSimulation(
+        runner=_runner_dump(),
+        picongpu_version="0.9.0-dev",
+        picongpu_revision="04855606583209a09659a0c81553bddf2ce7bdac",
+        schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
+    )
 
 
 def _make_pair(shared_dir, *, builder=_fake_builder):
@@ -212,7 +220,8 @@ async def test_submit_rejects_changed_payload_same_cmd_id(shared_dir, tmp_path, 
     await client.handle(command)
     assert len(fake_runner) == 1
 
-    # Same cmd_id, different payload hash: executed as a new simulation.
+    # Same cmd_id, different payload hash: rejected, so the original record is
+    # not clobbered (a real resubmission gets a fresh cmd_id).
     changed = dict(_runner_dump())
     changed["sim"] = {**changed["sim"], "delta_t_si": 2e-15}
     payload = SimulationPayload.build(picongpu_version="", picongpu_revision="", schema_hash="", runner_dump=changed)
@@ -230,8 +239,12 @@ async def test_submit_rejects_changed_payload_same_cmd_id(shared_dir, tmp_path, 
         payload.model_dump_json(exclude_computed_fields=True).encode(),
     )
     new_command.transport_event_id = "$changed"
-    await client.handle(new_command)
-    assert len(fake_runner) == 2
+    ack = await client.handle(new_command)
+    assert ack is not None
+    assert ack.payload["error_code"] == "rejected_by_policy"
+    assert "cmd_id_conflict" in ack.payload["error"]
+    # Nothing was executed for the changed payload.
+    assert len(fake_runner) == 1
 
 
 async def test_submit_reports_hash_mismatch(shared_dir, tmp_path, fake_runner) -> None:
@@ -289,7 +302,142 @@ async def test_submit_rejected_when_handler_disabled(shared_dir, tmp_path, fake_
     _cmd_id, _payload, command = await service.build_payload(script)
     ack = await disabled.handle(command)
     assert ack is not None
+    # Regression: the rejection must be a submit-shaped ack, not a hello_ack,
+    # or the sender's SubmitService never resolves its future and times out.
+    assert ack.type == SimulationType.ACK
     assert ack.payload["error"] == "rejected_by_policy"
+    assert ack.payload["error_code"] == "rejected_by_policy"
+    assert ack.payload["state"] == SimulationState.FAILED.value
+
+
+async def test_submit_rejects_non_sbatch_submit_system(shared_dir, tmp_path, fake_runner) -> None:
+    from pic_agentic.protocol.simulation import build_submit_command as _build
+
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    cmd_id, payload, _command = await service.build_payload(script)
+    # A command asking for local bash must be rejected outright.
+    local = _build(
+        sim=SIM,
+        seq=1,
+        payload_path=service.payload_path_for(cmd_id),
+        payload=payload,
+        params=SubmitParams(submit_system="bash"),
+        cmd_id=cmd_id,
+    ).sign(SECRET)
+    # Re-write the payload file the command points at (build_payload wrote it).
+    ack = await client.handle(local)
+    assert ack is not None
+    assert ack.payload["error_code"] == "submit_system_mismatch"
+
+
+async def test_submit_mismatched_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: "bash")
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id, _payload, command = await service.build_payload(script)
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload["error_code"] == "submit_system_mismatch"
+
+
+async def test_submit_accepts_when_local_submit_system_unset(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    # An unset tbg_submit is fine: the explicit submit=sbatch flag still wins.
+    monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: None)
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id, _payload, command = await service.build_payload(script)
+    # sbatch requested, local unset: accepted (we only reject a known
+    # contradiction), so this documents the current policy.
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload.get("error_code") is None
+
+
+async def test_submit_bad_params_is_reported_not_crashed(shared_dir, tmp_path, fake_runner) -> None:
+    from pic_agentic.protocol.simulation import build_submit_command as _build
+
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    cmd_id, payload, _command = await service.build_payload(script)
+    bad = _build(
+        sim=SIM,
+        seq=1,
+        payload_path=service.payload_path_for(cmd_id),
+        payload=payload,
+        params=SubmitParams(),
+        cmd_id=cmd_id,
+    ).sign(SECRET)
+    bad.payload["params"] = {"build_jobs": "not-an-int", "bogus": 1}
+    # Re-sign after tampering so the signature still verifies.
+    bad.sign(SECRET)
+    ack = await client.handle(bad)
+    assert ack is not None
+    assert ack.payload["error_code"] == "payload_invalid"
+
+
+def test_per_command_token_must_be_safe_hex(shared_dir) -> None:
+    # The command id comes from the wire, so a traversal/absolute token must be
+    # rejected before any directory is built.
+    from pic_agentic.protocol.simulation import SimulationPayload
+    from pic_agentic.simclient.simulation import (
+        SimulationErrorCode,
+        SimulationExecutionError,
+        SubmitConfig,
+        runner_from_payload,
+    )
+
+    payload = SimulationPayload(
+        picongpu_version="",
+        schema_hash="",
+        simulation={"sim": json.loads(FIXTURE.read_text())["sim"]},
+    )
+    config = SubmitConfig(message_dir=shared_dir, setup_root=shared_dir / "sims")
+    for bad in ("/etc/cron.d", "../../../../tmp/evil", "a/b", "", "ABCDEF.."):
+        with pytest.raises(SimulationExecutionError) as excinfo:
+            # Skip only if PIConGPU is absent; the token check precedes it.
+            runner_from_payload(payload, config, bad)
+        assert excinfo.value.code is SimulationErrorCode.PATH_UNSAFE
+
+
+async def test_resubmission_with_new_cmd_id_gets_a_fresh_directory(shared_dir, tmp_path, fake_runner) -> None:
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id1, _p1, command1 = await service.build_payload(script)
+    _cmd_id2, _p2, command2 = await service.build_payload(script)
+    assert command1.payload["cmd_id"] != command2.payload["cmd_id"]
+    _cmd_id3, _p3, command3 = await service.build_payload(script)
+    # Identical simulation content -> identical sim_id, distinct cmd_id: the
+    # generated directories must differ so generate() does not collide.
+    assert command1.payload["header"]["sim_id"] == command3.payload["header"]["sim_id"]
+    await client.handle(command1)
+    await client.handle(command3)
+    assert len(fake_runner) == 2
+    assert fake_runner[0].run_dir != fake_runner[1].run_dir
+
+
+async def test_replay_of_failed_submission_reports_failure(shared_dir, tmp_path, fake_runner) -> None:
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id, _payload, command = await service.build_payload(script)
+    # Force a pre-accept failure by asking for a non-sbatch system.
+    command.payload["params"]["submit_system"] = "bash"
+    command.sign(SECRET)
+    first = await client.handle(command)
+    assert first is not None
+    assert first.payload["error_code"] == "submit_system_mismatch"
+    # The replay must report the failure too, not a successful re-ack.
+    command.transport_event_id = "$replay"
+    second = await client.handle(command)
+    assert second is not None
+    assert second.payload["error"] is not None
+    assert second.payload["state"] == SimulationState.FAILED.value
 
 
 async def test_submit_rejects_unsupported_simulation_key(shared_dir, tmp_path, fake_runner) -> None:

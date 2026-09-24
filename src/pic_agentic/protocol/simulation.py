@@ -73,6 +73,14 @@ class SubmitParams(BaseModel):
 
     Only flags that are not cluster-local policy are accepted; unlike the
     ``rc_params`` they are validated JSON scalars, never shell code.
+
+    The field names mirror the design's tool signature (``build_*``/``cfg_*``);
+    :meth:`picongpu_flags` maps them to the aliases the pinned
+    ``PicBuildFlags``/``TBGFlags`` models actually accept (``jobs``, ``cmake``,
+    ``preset``, ``force``, ``cfg``, ``submit``).  Passing the field names
+    straight through is silently ignored by pydantic (their validation aliases
+    do not include the ``build_`` prefix; ``populate_by_name`` is off), which
+    would drop ``submit_system`` and run the job locally via ``bash``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -82,18 +90,35 @@ class SubmitParams(BaseModel):
     build_preset: int | None = None
     build_force: bool = False
     cfg_file: str | None = None
-    #: The simclient enforces this; the workflow default is ``"bash"`` (local).
+    #: The submit command; the simclient enforces its local ``tbg_submit``
+    #: matches this.  A NON-sbatch value cannot be requested over the wire:
+    #: ``prepare_submit`` rejects anything but ``sbatch`` outright.
     submit_system: str = DEFAULT_SUBMIT_SYSTEM
-    overwrite_vars: dict[str, str] | None = None
+    overwrite_vars: list[str] | None = None
 
-    def as_flags(self) -> dict[str, Any]:
-        """Return only the explicitly set flags for ``Runner.generate(**flags)``.
+    def picongpu_flags(self) -> dict[str, Any]:
+        """Map to the aliases ``Runner.generate(**flags)`` forwards to picongpu.
 
         Returns:
-            A mapping with ``None`` values dropped.
+            The flags with ``build_``/``cfg_`` names translated and unset
+            options dropped (so picongpu keeps its own defaults).
 
         """
-        return {k: v for k, v in self.model_dump().items() if v is not None}
+        mapping = {
+            "build_jobs": "jobs",
+            "build_cmake": "cmake",
+            "build_preset": "preset",
+            "cfg_file": "cfg",
+            "submit_system": "submit",
+            # The pinned TBGFlags accepts overwrite_vars only under the short
+            # ``o`` alias (it has no populate_by_name), so the long name alone
+            # would be silently ignored.
+            "overwrite_vars": "o",
+        }
+        flags = {alias: getattr(self, field) for field, alias in mapping.items() if getattr(self, field) is not None}
+        if self.build_force:
+            flags["force"] = True
+        return flags
 
 
 def simulation_spec_from_runner_dump(runner_dump: dict[str, Any]) -> dict[str, Any]:

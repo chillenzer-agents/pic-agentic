@@ -32,11 +32,10 @@ from pic_agentic.protocol.simulation import (
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 from pic_agentic.server.hello import AckTimeoutError, SendFn
 from pic_agentic.simclient.safety import write_payload
-from pic_agentic.simulation_build import SimulationBuildError, build_runner_dump
-from pic_agentic.version import local_provenance
+from pic_agentic.simulation_build import BuiltSimulation, SimulationBuildError, build_runner_dump
 
 #: Signature of the injectable runner-dump builder (test seam).
-RunnerDumpBuilder = Callable[..., Awaitable[dict[str, object]]]
+RunnerDumpBuilder = Callable[..., Awaitable[BuiltSimulation]]
 
 
 class SubmitOutcome(BaseModel):
@@ -129,13 +128,15 @@ class SubmitService:
 
         """
         command_id = cmd_id or new_cmd_id()
-        dump = await self.runner_dump_builder(script_path=script_path, interpreter=self.picongpu_python)
-        provenance = local_provenance()
+        built = await self.runner_dump_builder(script_path=script_path, interpreter=self.picongpu_python)
+        # Provenance comes from the *child* that produced the dump, not from the
+        # server process: the server may run a different interpreter (and, with
+        # PIC_AGENTIC_PICONGPU_PYTHON, may not have PIConGPU at all).
         payload = SimulationPayload.build(
-            picongpu_version=provenance["picongpu_version"],
-            picongpu_revision=self.picongpu_revision or provenance["picongpu_revision"],
-            schema_hash=provenance["schema_hash"],
-            runner_dump=dump,
+            picongpu_version=built.picongpu_version,
+            picongpu_revision=self.picongpu_revision or built.picongpu_revision,
+            schema_hash=built.schema_hash,
+            runner_dump=built.runner,
         )
         payload.check_allowlist()
         path = self.payload_path_for(command_id)

@@ -30,6 +30,7 @@ from pic_agentic.protocol.simulation import (
 from pic_agentic.rcp import DedupStore, Kind, RcpMessage, SenderRole, SequenceState
 from pic_agentic.simclient.safety import safe_write_message
 from pic_agentic.simclient.simulation import (
+    SimulationErrorCode,
     SimulationExecutionError,
     SubmitConfig,
     execute_submit,
@@ -77,6 +78,8 @@ class ProcessedCommand(BaseModel):
     payload_hash: str | None = None
     sim_id: str | None = None
     state: str | None = None
+    #: Machine-readable code of a recorded failure (``hello`` leaves it unset).
+    error_code: str | None = None
 
     def to_result(self) -> HelloResult:
         """Return the execution result to replay in an ack.
@@ -179,9 +182,31 @@ class SimClient:
             return await self._handle_hello(message)
         if message.type == SimulationType.COMMAND:
             if self.submit_config is None:
-                return await self._ack(message, cmd_id=message.payload.get("cmd_id"), error="rejected_by_policy")
+                return await self._reject_submit(message, error="rejected_by_policy")
             return await self._handle_submit(message)
         return await self._ack(message, cmd_id=message.payload.get("cmd_id"), error="rejected_by_policy")
+
+    async def _reject_submit(self, message: RcpMessage, *, error: str) -> RcpMessage:
+        """Send a submit-shaped rejection (never a ``hello_ack``).
+
+        Returns:
+            The signed acknowledgement that was sent.
+
+        """
+        cmd_id = str(message.payload.get("cmd_id", ""))
+        header = message.payload.get("header")
+        header = header if isinstance(header, dict) else {}
+        ack = self._build_submit_ack(
+            message,
+            cmd_id=cmd_id,
+            sim_id=str(header.get("sim_id", "")),
+            state=SimulationState.FAILED.value,
+            job_id=None,
+            error=error,
+            error_code=SimulationErrorCode.REJECTED,
+        )
+        await self.transport.send(ack)
+        return ack
 
     @staticmethod
     def _read_outcome(info: JobInfo, outfile: str) -> tuple[str | None, str | None]:
@@ -307,31 +332,83 @@ class SimClient:
         await self.transport.send(ack)
         return ack
 
+    async def _submit_replay_ack(
+        self,
+        message: RcpMessage,
+        existing: ProcessedCommand,
+        *,
+        cmd_id: str,
+        sim_id: str,
+        payload_hash: str,
+    ) -> RcpMessage | None:
+        """Handle an already-seen ``cmd_id``.
+
+        Returns:
+            The signed ack to re-send, or None when the command is genuinely new
+            and should be executed.
+
+        """
+        if existing.payload_hash and payload_hash and existing.payload_hash != payload_hash:
+            # A *different* payload under an already-executed cmd_id is a sender
+            # bug or an attack: executing it would also overwrite the stored
+            # record, so the original could later be re-run.  Reject and keep
+            # the original record; a real resubmission always gets a new cmd_id.
+            log.warning("rejecting submit command %s with a changed payload", cmd_id)
+            ack = self._build_submit_ack(
+                message,
+                cmd_id=cmd_id,
+                sim_id=sim_id,
+                state=SimulationState.FAILED.value,
+                job_id=None,
+                error="cmd_id_conflict: a different payload was already submitted under this cmd_id",
+                error_code=SimulationErrorCode.REJECTED,
+            )
+        elif existing.payload_hash == payload_hash and payload_hash:
+            log.info("re-acking already-processed submit command %s", cmd_id)
+            # A pending record means the process died mid-build: report that
+            # honestly instead of claiming acceptance (mirrors the hello path's
+            # already_submitted:outcome_unknown).  A finished record re-sends its
+            # stored terminal state and error.
+            if existing.completed:
+                state = existing.state or SimulationState.FAILED.value
+                error: str | None = existing.error
+                code: str | None = existing.error_code
+            else:
+                state = SimulationState.FAILED.value
+                error = "already_submitted:outcome_unknown"
+                code = SimulationErrorCode.REJECTED
+            ack = self._build_submit_ack(
+                message,
+                cmd_id=cmd_id,
+                sim_id=existing.sim_id or sim_id,
+                state=state,
+                job_id=existing.job_id,
+                error=error,
+                error_code=code,
+            )
+        else:
+            return None
+        await self.transport.send(ack)
+        return ack
+
     async def _handle_submit(self, message: RcpMessage) -> RcpMessage | None:
         cmd_id = str(message.payload.get("cmd_id", ""))
         header = message.payload.get("header")
         header = header if isinstance(header, dict) else {}
         payload_hash = str(header.get("payload_hash", ""))
         sim_id = str(header.get("sim_id", ""))
-        # Idempotency: same cmd_id + same payload hash is a replay (re-ack);
-        # same cmd_id + different payload is a new simulation, so it proceeds
-        # under a derived id to avoid clobbering the earlier record.
+        # Idempotency: same cmd_id + same payload hash is a replay (re-ack); a
+        # different payload under the same cmd_id is rejected; a changed
+        # simulation must use a fresh cmd_id.
         existing = self._processed.get(cmd_id) if cmd_id else None
-        if existing is not None and existing.payload_hash == payload_hash and payload_hash:
-            log.info("re-acking already-processed submit command %s", cmd_id)
-            ack = self._build_submit_ack(
-                message,
-                cmd_id=cmd_id,
-                sim_id=existing.sim_id or sim_id,
-                state=existing.state or SimulationState.ACCEPTED.value,
-                job_id=existing.job_id,
-                error_code=existing.error,
+        if existing is not None:
+            replay_ack = await self._submit_replay_ack(
+                message, existing, cmd_id=cmd_id, sim_id=sim_id, payload_hash=payload_hash
             )
-            await self.transport.send(ack)
-            return ack
-        # At this point the command is either new or a changed payload under an
-        # existing cmd_id (a matching replay returned above).  Persist *before*
-        # executing so a crash mid-build cannot cause a re-run on restart.
+            if replay_ack is not None:
+                return replay_ack
+        # A genuinely new command.  Persist *before* executing so a crash
+        # mid-build cannot cause a re-run on restart.
         if cmd_id:
             self._persist_processed(ProcessedCommand(cmd_id=cmd_id, payload_hash=payload_hash, sim_id=sim_id))
 
@@ -345,6 +422,7 @@ class SimClient:
                 params=message.payload.get("params"),
                 config=self.submit_config,
                 local_provenance=_local_provenance(),
+                token=cmd_id or payload_hash,
             )
         except SimulationExecutionError as exc:
             ack = self._build_submit_ack(
@@ -364,7 +442,8 @@ class SimClient:
                         payload_hash=payload_hash,
                         sim_id=sim_id,
                         state=SimulationState.FAILED.value,
-                        error=exc.code,
+                        error=str(exc),
+                        error_code=exc.code,
                     )
                 )
             await self.transport.send(ack)
@@ -412,7 +491,8 @@ class SimClient:
                         payload_hash=payload_hash,
                         sim_id=sim_id,
                         state=SimulationState.FAILED.value,
-                        error=exc.code,
+                        error=str(exc),
+                        error_code=exc.code,
                     )
                 )
             return accepted

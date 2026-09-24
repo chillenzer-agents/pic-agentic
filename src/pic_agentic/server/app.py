@@ -20,6 +20,7 @@ from pic_agentic.auth import MasTokenStore
 from pic_agentic.protocol.simulation import SubmitParams
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
 from pic_agentic.server.simulation import SubmitOutcome, SubmitService, resolve_script
+from pic_agentic.simclient.safety import UnsafePathError
 from pic_agentic.simulation_build import SimulationBuildError
 from pic_agentic.transport.matrix import MatrixTransport
 
@@ -211,7 +212,7 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         build_preset: int | None = None,
         build_force: bool = False,
         cfg_file: str | None = None,
-        overwrite_vars: dict[str, str] | None = None,
+        overwrite_vars: list[str] | None = None,
     ) -> dict[str, Any]:
         params = SubmitParams(
             build_jobs=build_jobs,
@@ -223,7 +224,7 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         )
         try:
             outcome = await runtime.submit(picmi_script, params=params)
-        except (AckTimeoutError, SimulationBuildError) as exc:
+        except (AckTimeoutError, SimulationBuildError, UnsafePathError, OSError) as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
         return _submit_outcome_dict(runtime, outcome)
 

@@ -16,12 +16,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from pic_agentic.protocol.simulation import (
+    DEFAULT_SUBMIT_SYSTEM,
     SimulationPayload,
     SimulationStage,
     SimulationState,
@@ -34,6 +36,10 @@ from pic_agentic.simclient.safety import UnsafePathError, validate_message_path
 
 log = logging.getLogger(__name__)
 
+#: Per-command directory token: the command id (or, defensively, the payload
+#: hash) -- lowercase hex only, so it can never traverse or be absolute.
+_TOKEN_RE = re.compile(r"^[0-9a-f]{8,64}$")
+
 
 class SimulationErrorCode(StrEnum):
     """Stable machine-readable error codes reported in acks and events."""
@@ -45,6 +51,7 @@ class SimulationErrorCode(StrEnum):
     HASH_MISMATCH = "hash_mismatch"
     VERSION_MISMATCH = "version_mismatch"
     SUBMIT_SYSTEM_MISMATCH = "submit_system_mismatch"
+    REJECTED = "rejected_by_policy"
     PICONGPU_UNAVAILABLE = "picongpu_unavailable"
     GENERATE_FAILED = "generate_failed"
     RUN_FAILED = "run_failed"
@@ -106,30 +113,62 @@ def check_payload_hash(raw: bytes, header: dict[str, Any]) -> None:
         raise SimulationExecutionError(SimulationErrorCode.HASH_MISMATCH, msg)
 
 
-def _detect_submit_system() -> str:
+def _detect_submit_system() -> str | None:
     """Return the local ``tbg_submit`` from the cluster rc params.
 
     Returns:
-        The configured submit command, or ``""`` when PIConGPU or the rc
+        The configured submit command, ``None`` when PIConGPU or the rc
         parameter is unavailable.
 
     """
     try:
         from picongpu import rc_params  # ruff: ignore[import-outside-top-level] - optional dependency
     except ImportError:
-        return ""
+        return None
     value = rc_params.get("tbg_submit", "")
-    return str(value) if value else ""
+    return str(value) if value else None
 
 
-def _runner_from_payload(payload: SimulationPayload, config: SubmitConfig) -> Any:
-    """Rebuild a fresh ``Runner`` with cluster-local directories.
+def _check_submit_system(requested: str) -> None:
+    """Reject a request that would not submit via SLURM ``sbatch``.
 
-    The payload's own directories are never read; only ``sim`` is taken.
+    The picongpu workflow default is ``"bash"`` (local execution on the
+    submission node, no SLURM job), so the request must itself be ``sbatch``
+    (the wire contract only supports SLURM), and a *configured* cluster-local
+    ``tbg_submit`` must not contradict it.  An unset ``tbg_submit`` is not an
+    error: the explicit ``submit="sbatch"`` flag still overrides the workflow
+    default, so the job lands on SLURM either way.
+
+    Args:
+        requested: The submit system the command asked for.
+
+    Raises:
+        SimulationExecutionError: If the request is not ``sbatch`` or a
+            configured cluster-local setting differs.
+
+    """
+    if requested != DEFAULT_SUBMIT_SYSTEM:
+        msg = f"only {DEFAULT_SUBMIT_SYSTEM!r} submissions are supported, got {requested!r}"
+        raise SimulationExecutionError(SimulationErrorCode.SUBMIT_SYSTEM_MISMATCH, msg)
+    local = _detect_submit_system()
+    if local is not None and local != requested:
+        msg = f"cluster tbg_submit={local!r} but the command requests {requested!r}"
+        raise SimulationExecutionError(SimulationErrorCode.SUBMIT_SYSTEM_MISMATCH, msg)
+
+
+def runner_from_payload(payload: SimulationPayload, config: SubmitConfig, token: str) -> Any:
+    """Rebuild a fresh ``Runner`` with cluster-local, per-command directories.
+
+    The payload's own directories are never read; only ``sim`` is taken.  The
+    ``token`` makes the directories unique per command: ``Runner.generate()``
+    asserts the setup directory does not exist, so a legitimate *resubmission*
+    of an identical simulation (a new ``cmd_id``) would otherwise collide with
+    the previous run's directory.  ``token`` is a validated hex command id.
 
     Args:
         payload: The validated payload.
         config: The cluster-local submit policy.
+        token: Per-command unique token (the ``cmd_id``).
 
     Returns:
         A ``pypicongpu.Runner`` instance.
@@ -139,21 +178,41 @@ def _runner_from_payload(payload: SimulationPayload, config: SubmitConfig) -> An
             does not validate against the local schema.
 
     """
+    if not _TOKEN_RE.match(token):
+        msg = f"unsafe per-command token: {token!r}"
+        raise SimulationExecutionError(SimulationErrorCode.PATH_UNSAFE, msg)
+    base = (config.setup_root / payload.sim_id / token).resolve()
+    # Defence in depth: even with a validated token, never build outside the
+    # configured root (pathlib discards earlier components on an absolute path).
+    root = config.setup_root.resolve()
+    if root != base and root not in base.parents:
+        msg = f"generated setup dir escapes {config.setup_root}: {base}"
+        raise SimulationExecutionError(SimulationErrorCode.PATH_UNSAFE, msg)
     try:
         from picongpu.pypicongpu.runner import Runner  # ruff: ignore[import-outside-top-level] - optional dependency
     except ImportError as exc:
         msg = "PIConGPU is not installed on the cluster"
         raise SimulationExecutionError(SimulationErrorCode.PICONGPU_UNAVAILABLE, msg) from exc
-    setup_dir = (config.setup_root / payload.sim_id / "input").absolute()
-    run_dir = (config.setup_root / payload.sim_id / "run").absolute()
-    dump: dict[str, Any] = {"sim": payload.simulation["sim"], "setup_dir": str(setup_dir), "run_dir": str(run_dir)}
+    setup_dir = (base / "input").absolute()
+    run_dir = (base / "run").absolute()
+    sim_dump = payload.simulation["sim"]
+    dump: dict[str, Any] = {"sim": sim_dump, "setup_dir": str(setup_dir), "run_dir": str(run_dir)}
     if config.template_dir:
         dump["template_dir"] = [config.template_dir]
     try:
-        return Runner.model_validate(dump)
+        runner = Runner.model_validate(dump)
     except Exception as exc:
         msg = f"simulation does not validate: {exc}"
         raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_INVALID, msg) from exc
+    # The nested pypicongpu models do not set ``extra="forbid"``, so an unknown
+    # field inside ``sim`` would be silently dropped instead of rejected.  The
+    # pin guarantees a lossless ``Runner`` round-trip, so a dump that does not
+    # reproduce itself carried something outside the schema: reject it as
+    # ``unsupported`` per the plan rather than running a silently altered sim.
+    if runner.sim.model_dump(mode="json") != sim_dump:
+        msg = "simulation carries fields outside the pinned pypicongpu schema"
+        raise SimulationExecutionError(SimulationErrorCode.UNSUPPORTED, msg)
+    return runner
 
 
 @dataclass
@@ -173,6 +232,7 @@ def prepare_submit(
     params: dict[str, Any] | None,
     config: SubmitConfig,
     local_provenance: dict[str, str],
+    token: str,
 ) -> PreparedSubmit:
     """Validate a submit command and rebuild its runner.
 
@@ -187,6 +247,7 @@ def prepare_submit(
         params: The command's build/run flags.
         config: Cluster-local submit policy.
         local_provenance: This install's provenance tuple.
+        token: Per-command unique token for the generated directories.
 
     Returns:
         The validated payload, flags and fresh runner.
@@ -213,6 +274,9 @@ def prepare_submit(
     if payload.payload_hash != str(header.get("payload_hash", "")):
         msg = "payload/header hash mismatch"
         raise SimulationExecutionError(SimulationErrorCode.HASH_MISMATCH, msg)
+    if payload.sim_id != str(header.get("sim_id", "")):
+        msg = f"payload sim_id {payload.sim_id} does not match header {header.get('sim_id')!r}"
+        raise SimulationExecutionError(SimulationErrorCode.HASH_MISMATCH, msg)
     try:
         payload.check_allowlist()
     except UnsupportedPayloadError as exc:
@@ -221,16 +285,17 @@ def prepare_submit(
     if mismatches:
         raise SimulationExecutionError(SimulationErrorCode.VERSION_MISMATCH, "; ".join(mismatches))
 
-    submit_params = SubmitParams.model_validate(params or {})
-    local_submit = _detect_submit_system()
-    if local_submit and local_submit != submit_params.submit_system:
-        msg = f"cluster tbg_submit={local_submit!r} but the command requests {submit_params.submit_system!r}"
-        raise SimulationExecutionError(SimulationErrorCode.SUBMIT_SYSTEM_MISMATCH, msg)
+    try:
+        submit_params = SubmitParams.model_validate(params or {})
+    except ValueError as exc:
+        msg = f"invalid submit params: {exc}"
+        raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_INVALID, msg) from exc
+    _check_submit_system(submit_params.submit_system)
 
     return PreparedSubmit(
         payload=payload,
         params=submit_params,
-        runner=_runner_from_payload(payload, config),
+        runner=runner_from_payload(payload, config, token),
         config=config,
     )
 
@@ -256,13 +321,14 @@ async def execute_submit(
 
     """
     runner = prepared.runner
-    flags = prepared.params.as_flags()
+    flags = prepared.params.picongpu_flags()
     # The cluster-local preset is a default: an explicit command flag wins.
-    if prepared.config.preset is not None and flags.get("build_preset") is None:
-        flags["build_preset"] = prepared.config.preset
-    # build stage: generate the setup (must not pre-exist).
+    if prepared.config.preset is not None and flags.get("preset") is None:
+        flags["preset"] = prepared.config.preset
+    # build stage: generate the setup (must not pre-exist).  generate() is
+    # synchronous and can run for minutes, so keep it off the event loop.
     try:
-        runner.generate(**flags)
+        await asyncio.to_thread(lambda: runner.generate(**flags))
     except Exception as exc:
         msg = f"generate failed: {exc}"
         raise SimulationExecutionError(SimulationErrorCode.GENERATE_FAILED, msg, SimulationStage.BUILD) from exc
