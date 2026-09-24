@@ -164,16 +164,20 @@ def write_config(path: Path, *, homeserver: str, auth_base: str, client_id: str,
 
         with path.open("rb") as handle:
             existing = tomllib.load(handle).get("pic_agentic", {})
-    values = {
-        "homeserver": homeserver,
-        "user_id": tokens.get("user_id", existing.get("user_id", "")),
-        "room_id": existing.get("room_id", ""),
-        "message_dir": existing.get("message_dir", ""),
-        "client_id": client_id,
-        "token_endpoint": f"{auth_base}/oauth2/token",
-        "access_token": tokens["access_token"],
-        "refresh_token": tokens.get("refresh_token", ""),
-    }
+    # Start from the existing settings so keys this script does not manage
+    # (e.g. ``rcp_secret``, ``slurm_bin_dir``, ``ack_timeout_s``) survive the
+    # rewrite; the token fields below override only what login owns.
+    values = {**existing}
+    values.update(
+        {
+            "homeserver": homeserver,
+            "user_id": tokens.get("user_id", existing.get("user_id", "")),
+            "client_id": client_id,
+            "token_endpoint": f"{auth_base}/oauth2/token",
+            "access_token": tokens["access_token"],
+            "refresh_token": tokens.get("refresh_token", ""),
+        }
+    )
     lines = ["# pic-agentic configuration (0600). Secrets; never commit.", "[pic_agentic]"]
     lines += [f'{key} = "{value}"' for key, value in values.items() if value]
     path.parent.mkdir(parents=True, exist_ok=True)

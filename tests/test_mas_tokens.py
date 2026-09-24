@@ -187,8 +187,64 @@ async def test_refresh_failure_is_surfaced(store) -> None:
         await s.access_token()
 
 
-def test_enabled_without_refresh_token(tmp_path) -> None:
+def test_store_without_refresh_token_cannot_refresh(tmp_path) -> None:
     s = MasTokenStore(token_endpoint="https://auth.test/oauth2/token", client_id="c", cache_path=tmp_path / "t.json")
-    assert s.enabled() is False
     with pytest.raises(TokenRefreshError):
         asyncio.run(s.access_token())
+
+
+def test_malformed_cache_does_not_log_secrets(tmp_path, caplog) -> None:
+    """A corrupt cache must not leak its raw token values through the log.
+
+    Pydantic's ``ValidationError`` embeds the input value, so logging ``exc``
+    verbatim would write the live access/refresh token at WARNING.
+    """
+    cache = tmp_path / "tokens.json"
+    cache.write_text('{"access_token": "SECRET-ACCESS-AAA", "refresh_token": "SECRET-REFRESH-BBB"}')
+    s = MasTokenStore(
+        token_endpoint="https://auth.test/oauth2/token",
+        client_id="c",
+        cache_path=cache,
+        refresh_token="refresh-1",
+    )
+    with caplog.at_level("WARNING"):
+        assert s._read_cache() is None
+    assert "SECRET-ACCESS-AAA" not in caplog.text
+    assert "SECRET-REFRESH-BBB" not in caplog.text
+    assert "expires_at" in caplog.text
+
+
+def test_non_json_cache_does_not_log_secrets(tmp_path, caplog) -> None:
+    cache = tmp_path / "tokens.json"
+    cache.write_text("{not json SECRET-ACCESS-AAA SECRET-REFRESH-BBB")
+    s = MasTokenStore(
+        token_endpoint="https://auth.test/oauth2/token",
+        client_id="c",
+        cache_path=cache,
+        refresh_token="refresh-1",
+    )
+    with caplog.at_level("WARNING"):
+        assert s._read_cache() is None
+    assert "SECRET-ACCESS-AAA" not in caplog.text
+    assert "SECRET-REFRESH-BBB" not in caplog.text
+
+
+def test_seed_token_is_treated_as_stale(tmp_path) -> None:
+    """The config seed token's real age is unknown, so it must refresh at once."""
+    s = MasTokenStore(
+        token_endpoint="https://auth.test/oauth2/token",
+        client_id="c",
+        cache_path=tmp_path / "t.json",
+        refresh_token="refresh-1",
+        access_token="old-token",
+        expires_in=0,
+    )
+    assert s._seed is not None
+    assert not s._seed.valid(skew_s=0)
+
+
+def test_write_cache_creates_0600(tmp_path) -> None:
+    cache = tmp_path / "tokens.json"
+    s = MasTokenStore(token_endpoint="https://auth.test/oauth2/token", client_id="c", cache_path=cache)
+    s._write_cache(MasTokens(access_token="a", refresh_token="r", expires_at=time.time() + 60))
+    assert (cache.stat().st_mode & 0o777) == 0o600

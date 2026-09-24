@@ -20,7 +20,6 @@ two processes cannot invalidate each other's grant.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import os
 import time
@@ -30,7 +29,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+
+try:  # fcntl is POSIX-only; the module stays importable on other platforms.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    fcntl = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -43,8 +47,6 @@ log = logging.getLogger(__name__)
 DEFAULT_EXPIRES_S = 300.0
 #: Refresh this many seconds before the access token actually expires.
 DEFAULT_SKEW_S = 30.0
-
-_MATRIX_API_SCOPE = "urn:matrix:org.matrix.msc2967.client:api:*"
 
 
 class TokenRefreshError(RuntimeError):
@@ -139,18 +141,17 @@ class MasTokenStore:
         self._local_lock = asyncio.Lock()
 
     @classmethod
-    def from_config(cls, config: Config) -> MasTokenStore | None:
-        """Build a store from configuration, or None for static-token servers.
+    def from_config(cls, config: Config) -> MasTokenStore:
+        """Build a store from configuration.
 
-        A local Synapse (or any server without a refresh token) has no
-        ``token_endpoint``/``refresh_token``, so the caller keeps using the
-        plain access token.
+        Callers gate this on :meth:`Config.has_refresh_chain`; a configuration
+        without a refresh chain is an error, not a ``None`` return.
 
         Args:
             config: The resolved configuration.
 
         Returns:
-            The store, or None when the configuration has no refresh chain.
+            The store for the configured refresh chain.
 
         Raises:
             TokenRefreshError: If the configuration lacks a refresh chain.
@@ -168,7 +169,10 @@ class MasTokenStore:
             cache_path=cache,
             refresh_token=config.refresh_token,
             access_token=config.access_token,
-            expires_in=DEFAULT_EXPIRES_S,
+            # The config access token's real age is unknown (MAS tokens live
+            # ~5 min), so treat the seed as immediately stale: the first call
+            # refreshes instead of risking a 401 from a token issued long ago.
+            expires_in=0.0,
         )
 
     @staticmethod
@@ -184,15 +188,6 @@ class MasTokenStore:
         """
         suffix = config.client_id or "default"
         return Path("~/.config/pic-agentic").expanduser() / f"mas-tokens-{suffix}.json"
-
-    def enabled(self) -> bool:
-        """Return whether the store can refresh (has an endpoint and refresh token).
-
-        Returns:
-            True if a refresh chain could be formed.
-
-        """
-        return bool(self.token_endpoint and (self._seed or self.cache_path.exists()))
 
     async def access_token(self) -> str:
         """Return a currently valid access token, refreshing when necessary.
@@ -281,7 +276,13 @@ class MasTokenStore:
         Yields:
             None once the cross-process lock is held.
 
+        Raises:
+            TokenRefreshError: If ``fcntl`` is unavailable (non-POSIX host).
+
         """
+        if fcntl is None:  # pragma: no cover - non-POSIX hosts only
+            msg = "cross-process token refresh requires a POSIX host (fcntl)"
+            raise TokenRefreshError(msg)
         lock_path = self.cache_path.with_suffix(self.cache_path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -310,8 +311,22 @@ class MasTokenStore:
             return None
         try:
             return MasTokens.model_validate_json(raw)
+        except ValidationError as exc:
+            # Never interpolate ``exc`` itself: pydantic embeds the input value
+            # (the raw access/refresh tokens) in its string form.  Log only the
+            # count and the field locations/types.
+            locations = ", ".join(
+                f"{'/'.join(str(part) for part in error['loc']) or '<root>'}:{error['type']}" for error in exc.errors()
+            )
+            log.warning(
+                "ignoring malformed token cache %s (%d error(s): %s)",
+                self.cache_path,
+                exc.error_count(),
+                locations,
+            )
+            return None
         except ValueError as exc:
-            log.warning("ignoring malformed token cache %s: %s", self.cache_path, exc)
+            log.warning("ignoring token cache %s with invalid content (%s)", self.cache_path, type(exc).__name__)
             return None
 
     def _write_cache(self, tokens: MasTokens) -> None:
@@ -323,9 +338,13 @@ class MasTokenStore:
         """
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
-        tmp.write_text(tokens.model_dump_json(), encoding="utf-8")
+        # Create the temp file already at 0600: ``write_text`` would honour the
+        # process umask first, leaving a brief group/other-readable window.
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(tokens.model_dump_json())
         tmp.chmod(0o600)
         tmp.replace(self.cache_path)
 
 
-__all__ = ["_MATRIX_API_SCOPE", "MasTokenStore", "MasTokens", "TokenRefreshError", "_tokens_from_response"]
+__all__ = ["MasTokenStore", "MasTokens", "TokenRefreshError", "_tokens_from_response"]

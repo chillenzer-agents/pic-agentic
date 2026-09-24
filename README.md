@@ -41,7 +41,7 @@ LLM agent --MCP stdio--> MCP server --Matrix--> simclient --sbatch--> SLURM
 
 ## Install
 
-Requires Python 3.10+ (`uv` recommended):
+Requires Python 3.11+ (`uv` recommended):
 
 ```bash
 uv venv .venv --python 3.13
@@ -145,7 +145,9 @@ It exits non-zero if the round trip does not produce a job id.
   a shell command. The simclient re-validates the path against a configured
   base directory and a safe charset.
 - Every RCP message is HMAC-SHA256 signed with a shared per-simulation secret;
-  receivers drop duplicates on `(sim, sender_role, seq, type)`.
+  receivers drop duplicates on the transport event id (falling back to
+  `(sim, sender_role, seq, type)` when the transport did not stamp one), and
+  re-sent commands are idempotent per `cmd_id`.
 - Credentials come from the environment or a 0600 config file and are redacted
   from all tool output.
 
@@ -209,7 +211,8 @@ These are recorded here because they are deliberate amendments to M0; they
 should be folded back into the design document.
 
 - **`cmd_id`**: command payloads carry a UUID `cmd_id`; the simclient ignores a
-  re-sent command with the same id.
+  re-sent command with the same id, re-sending the stored ack so a sender whose
+  original ack was lost does not time out.
 - **HMAC scope**: `sender_role` and `in_reply_to` are signed in addition to the
   fields listed in the design's section 2.1.
 - **Ack timeout**: the MCP-server ack wait must exceed the simclient job-wait
