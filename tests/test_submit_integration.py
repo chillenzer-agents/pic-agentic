@@ -36,6 +36,32 @@ def test_real_provenance_is_available() -> None:
 
 
 @pytest.mark.integration
+async def test_child_reports_the_same_provenance_as_version_py(tmp_path: Path) -> None:
+    """The child's inline schema hash must match ``version.py``'s.
+
+    The child cannot import ``pic_agentic`` (it may run under a different
+    interpreter), so it re-implements the normalisation.  This guards the two
+    implementations against drift, which would otherwise silently reject every
+    payload.
+    """
+    from pic_agentic.simulation_build import build_runner_dump
+
+    script = tmp_path / "sim.py"
+    script.write_text(
+        "from picongpu import picmi\n"
+        "grid = picmi.Cartesian3DGrid(number_of_cells=[8, 8, 8], lower_bound=[0, 0, 0], "
+        "upper_bound=[1e-6, 1e-6, 1e-6], lower_boundary_conditions=['periodic'] * 3, "
+        "upper_boundary_conditions=['periodic'] * 3)\n"
+        "solver = picmi.ElectromagneticSolver(method='Yee', grid=grid)\n"
+        "sim = picmi.Simulation(time_step_size=1e-15, max_steps=2, solver=solver)\n",
+        encoding="utf-8",
+    )
+    built = await build_runner_dump(script_path=script)
+    assert built.schema_hash == runner_schema_hash()
+    assert built.picongpu_version == picongpu_version()
+
+
+@pytest.mark.integration
 def test_schema_hash_is_path_independent() -> None:
     """The schema hash must not depend on the install prefix.
 
