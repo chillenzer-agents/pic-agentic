@@ -31,8 +31,11 @@ LLM agent --MCP stdio--> MCP server --Matrix--> simclient --sbatch--> SLURM
 | `src/pic_agentic/parsing/` | PIConGPU stdout progress-line parser |
 | `src/pic_agentic/transport/` | `MatrixTransport` (matrix-nio) and `MemoryTransport` |
 | `src/pic_agentic/slurm/` | Injection-safe `sbatch`/`scontrol`/`scancel` wrappers |
-| `src/pic_agentic/simclient/` | Simulation-side client (`hello` handler) |
-| `src/pic_agentic/server/` | MCP stdio server exposing the `hello` tool |
+| `src/pic_agentic/simclient/` | Simulation-side client (`hello` + `submit_simulation` handlers) |
+| `src/pic_agentic/server/` | MCP stdio server exposing `hello` and `submit_simulation` |
+| `src/pic_agentic/protocol/` | Typed RCP message constructors (M1 `hello`, M2 submit) |
+| `src/pic_agentic/simulation_build.py` | PICMI-script → `Runner` dump subprocess builder |
+| `src/pic_agentic/version.py` | Wire-format/PIConGPU provenance (version, revision, schema hash) |
 | `scripts/setup_synapse.sh` | Create a throwaway local Synapse venv + config |
 | `scripts/start_synapse.sh` | Start that Synapse (logs errors instead of swallowing them) |
 | `scripts/dev_synapse.py` | Provision bots + a fresh RCP room on a running homeserver |
@@ -47,6 +50,19 @@ Requires Python 3.11+ (`uv` recommended):
 uv venv .venv --python 3.13
 uv pip install --python .venv/bin/python -e '.[dev]'
 ```
+
+To build, serialise and run PyPIConGPU simulations, install the pinned
+PIConGPU + cwltool as well (`[sim]`). This is needed on whichever side converts
+a PICMI script into a `pypicongpu.Runner`: the MCP server (to build the
+payload) and the cluster simclient (to rebuild and run it):
+
+```bash
+uv pip install --python .venv/bin/python -e '.[dev,sim]'
+```
+
+The pin points at the `chillenzer-agents/picongpu` fork stack head that
+provides lossless `Runner` round-tripping (`pyproject.toml` `[sim]`). Installing
+it requires `git`; the offline test suite does not need it.
 
 ## Authentication (MAS-fronted homeservers)
 
@@ -138,6 +154,45 @@ python scripts/dev_level2.py --shared-dir /tmp/level2 --keep
 
 It exits non-zero if the round trip does not produce a job id.
 
+## M2 `submit_simulation`
+
+M2 adds a single MCP tool that turns a PICMI script into a running remote
+simulation. The wire format deliberately carries the **`pypicongpu.Runner`
+spec, not the picmi `Simulation`** (the picmi object does not serialise with
+raw callables; see `M2-SUBMIT-PLAN.md`).
+
+1. The MCP server writes the PICMI script to a temp file and runs it in a
+   **disposable subprocess** (never imports it in-process), then serialises the
+   `Runner` dump into a `SimulationPayload`. The payload carries a provenance
+   tuple — `wire_format_version`, `picongpu_version`, `picongpu_revision`,
+   `schema_hash` (SHA-256 of the `Runner` JSON schema), plus a `payload_hash`
+   and 8-hex `sim_id` — and is written to the shared file system. Only its
+   **path** travels in the Matrix command.
+2. The simclient re-validates the path, the byte hash and the provenance tuple
+   against its own install **before** importing PIConGPU; all cluster
+   locations (`setup_dir`, `run_dir`, `template_dir`) come from local config,
+   never the payload. It rebuilds a fresh `Runner`, `generate()`s the setup and
+   `run()`s the workflow (which invokes `sbatch`).
+3. Acknowledgements are deliberately coarse: the simclient acks `accepted`
+   immediately, then emits `simulation.submitted` (with the SLURM `job_id`
+   parsed from `submission_information.txt`) and `results.ready`; a stage
+   failure emits `simulation.failed{stage}`. Rejected commands report the
+   reason in the single ack instead of an event. Per-stage acks wait for
+   upstream PR #55.
+
+Enable the handler by pointing the cluster simclient at a writable shared
+directory (the `PIC_AGENTIC_SIM_SETUP_ROOT` environment variable; see
+`scripts/cluster_simclient.sh`). Cluster-local `rc_params` are never
+transmitted; the simclient asserts its local `tbg_submit` is `"sbatch"` so the
+workflow's local-`bash` default cannot silently submit a non-SLURM job.
+
+To exercise it against the cluster, after the `--setup`/`--run` connectivity
+check:
+
+```bash
+python scripts/local_mcp_check.py --submit --picmi-script ./my_simulation.py
+```
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path
@@ -171,6 +226,11 @@ table is also read, with the environment taking precedence):
 | `PIC_AGENTIC_TOKEN_ENDPOINT` | MAS token endpoint for refresh |
 | `PIC_AGENTIC_REFRESH_TOKEN` | Rotating refresh token (see `mas_login.py`) |
 | `PIC_AGENTIC_TOKEN_CACHE_PATH` | Optional shared 0600 token-cache override |
+| `PIC_AGENTIC_PICONGPU_REVISION` | Pinned PIConGPU revision carried in the payload |
+| `PIC_AGENTIC_PICONGPU_PYTHON` | Interpreter (with the `[sim]` extra) used to build the payload subprocess |
+| `PIC_AGENTIC_SIM_SETUP_ROOT` | Shared-FS root for generated setups (enables M2 submit) |
+| `PIC_AGENTIC_CLUSTER_TEMPLATE_DIR` | Cluster-local picongpu template directory |
+| `PIC_AGENTIC_CLUSTER_PRESET` | Cluster-local CMake preset name |
 
 ## Tests and tooling
 
@@ -193,7 +253,9 @@ uvx pre-commit run --all-files      # ruff, reuse, hygiene hooks
 
 `tests/test_e2e_synapse.py` runs the full path over a live local Synapse and
 skips automatically when one is not reachable. Tests marked `integration`
-require a homeserver or SLURM and are excluded from the offline run.
+require a homeserver, SLURM, or a PIConGPU install and are excluded from the
+offline run; `tests/test_submit_integration.py` skips unless PIConGPU is
+importable (run it in the `[sim]` venv to exercise the real `Runner`).
 
 ## License
 
@@ -220,3 +282,11 @@ should be folded back into the design document.
   "resend once" and a second job is submitted.
 - **Progress format**: only the elapsed-time field is `setw(25)`; the
   avg-per-step field has no outer `setw`. The regex is robust to both.
+- **M2 wire format**: the payload carries a `pypicongpu.Runner` *spec*, not the
+  picmi `Simulation`, and `rc_params` are never transmitted. The payload travels
+  by shared-file-system path (so it is not bound by Matrix's `m.room.message`
+  size limit); the command carries only its path plus a provenance header and
+  the JSON build/run flags.
+- **M2 acks**: coarse (`accepted`, then `simulation.submitted` /
+  `results.ready` / `simulation.failed{stage}` events). Per-stage acks are
+  deferred to upstream PR #55.

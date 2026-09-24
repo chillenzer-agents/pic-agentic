@@ -1,0 +1,251 @@
+{
+  "run_dir": "/cluster/sims/GOLDEN/run",
+  "setup_dir": "/cluster/sims/GOLDEN/input",
+  "sim": {
+    "base_density": 1e+25,
+    "binomial_current_interpolation": false,
+    "collisional_physics": {
+      "collisions": [],
+      "num_tmp_field_slots": 1,
+      "numerics_config": {
+        "cell_list_chunk_size": null,
+        "debug_screening_length": false,
+        "precision": 64
+      },
+      "screening_species": []
+    },
+    "customuserinput": null,
+    "delta_t_si": 1e-15,
+    "grid": {
+      "boundary_condition": {
+        "x": "0",
+        "y": "0",
+        "z": "1"
+      },
+      "cell_cnt": {
+        "x": 16,
+        "y": 16,
+        "z": 16
+      },
+      "cell_depth": 6.25e-08,
+      "cell_size": {
+        "x": 6.25e-08,
+        "y": 6.25e-08,
+        "z": 6.25e-08
+      },
+      "gpu_cnt": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "grid_dist": null,
+      "guard_size": null,
+      "has_z": true,
+      "sim_dim": 3,
+      "super_cell_size": {
+        "x": 8,
+        "y": 8,
+        "z": 4
+      },
+      "type_grid3d": true
+    },
+    "init_operations": [
+      {
+        "layout": {
+          "ppc": 2,
+          "type_random": true
+        },
+        "placed_species_copied": [],
+        "placed_species_initial": {
+          "attributes": [
+            {
+              "picongpu_name": "position<position_pic>"
+            },
+            {
+              "picongpu_name": "weighting"
+            },
+            {
+              "picongpu_name": "momentum"
+            }
+          ],
+          "constants": {
+            "charge": {
+              "charge_si": -1.602176634e-19
+            },
+            "density_ratio": null,
+            "element_properties": null,
+            "ground_state_ionization": null,
+            "mass": {
+              "mass_si": 9.109383713868749e-31
+            },
+            "synchrotron": null
+          },
+          "filter_name": "all",
+          "filter_typename": "All",
+          "name": "electron",
+          "pusher": "Boris",
+          "shape": "TSC",
+          "species_name": "electron",
+          "typename": "species_electron"
+        },
+        "profile": {
+          "density_si": 1.0,
+          "type_uniform": true
+        },
+        "type_simpledensity": true
+      },
+      {
+        "drift": null,
+        "species": {
+          "attributes": [
+            {
+              "picongpu_name": "position<position_pic>"
+            },
+            {
+              "picongpu_name": "weighting"
+            },
+            {
+              "picongpu_name": "momentum"
+            }
+          ],
+          "constants": {
+            "charge": {
+              "charge_si": -1.602176634e-19
+            },
+            "density_ratio": null,
+            "element_properties": null,
+            "ground_state_ionization": null,
+            "mass": {
+              "mass_si": 9.109383713868749e-31
+            },
+            "synchrotron": null
+          },
+          "filter_name": "all",
+          "filter_typename": "All",
+          "name": "electron",
+          "pusher": "Boris",
+          "shape": "TSC",
+          "species_name": "electron",
+          "typename": "species_electron"
+        },
+        "temperature": null,
+        "type_simplemomentum": true
+      }
+    ],
+    "laser": null,
+    "moving_window": null,
+    "output": [
+      {
+        "config": {
+          "distributed_amplitude": false,
+          "end": 0,
+          "folder_last_rad": "lastRad",
+          "folder_rad_per_gpu": "radPerGPU",
+          "folder_total_rad": "totalRad",
+          "last_radiation": false,
+          "num_accumulation_steps": 0,
+          "num_jobs": 2,
+          "observer": {
+            "N_observer": 1,
+            "component_expressions": {
+              "x": "1",
+              "y": "0",
+              "z": "0"
+            },
+            "index_to_direction": {
+              "x": "Integer(1)",
+              "y": "Integer(0)",
+              "z": "Integer(0)"
+            }
+          },
+          "open_pmd_checkpoint_config": "{}",
+          "open_pmd_checkpoint_extension": "h5",
+          "open_pmd_config": "{}",
+          "open_pmd_suffix": "_%T_0_0_0.h5",
+          "rad_per_gpu": false,
+          "radiation": {
+            "form_factor": "Gauss_spherical",
+            "frequencies": {
+              "N_omega": 2048,
+              "omega_max": 1.06e+16,
+              "omega_min": 0.0,
+              "type_linear_frequencies": true
+            },
+            "nyquist_factor": 0.5,
+            "verbose_level": 3
+          },
+          "start": 2,
+          "total_radiation": false,
+          "window_function": "None"
+        },
+        "period": {
+          "specs": []
+        },
+        "species": [],
+        "type_radiation": true
+      }
+    ],
+    "particle_filters": [],
+    "precision": 32,
+    "solver": {
+      "name": "Yee",
+      "type_yee": true
+    },
+    "species": [
+      {
+        "attributes": [
+          {
+            "picongpu_name": "position<position_pic>"
+          },
+          {
+            "picongpu_name": "weighting"
+          },
+          {
+            "picongpu_name": "momentum"
+          }
+        ],
+        "constants": {
+          "charge": {
+            "charge_si": -1.602176634e-19
+          },
+          "density_ratio": null,
+          "element_properties": null,
+          "ground_state_ionization": null,
+          "mass": {
+            "mass_si": 9.109383713868749e-31
+          },
+          "synchrotron": null
+        },
+        "filter_name": "all",
+        "filter_typename": "All",
+        "name": "electron",
+        "pusher": "Boris",
+        "shape": "TSC",
+        "species_name": "electron",
+        "typename": "species_electron"
+      }
+    ],
+    "synchrotron_params": {
+      "electron_recoil": true,
+      "first_synchrotron_function_params": {
+        "log_end": 7.0,
+        "num_sample_points": 8096
+      },
+      "interpolation_params": {
+        "max_Zq_exponent": 10.0,
+        "min_Zq_exponent": -50.0,
+        "number_table_entries": 512
+      },
+      "min_energy": null,
+      "supress_requirement_warning": false
+    },
+    "time_steps": 4,
+    "typical_ppc": 2,
+    "walltime": {
+      "walltime": "1:00:00"
+    }
+  },
+  "template_dir": [
+    "/cluster/picongpu/templates"
+  ]
+}

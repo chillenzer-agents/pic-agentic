@@ -40,6 +40,11 @@ ENV_MAP = {
     "token_endpoint": "PIC_AGENTIC_TOKEN_ENDPOINT",
     "refresh_token": "PIC_AGENTIC_REFRESH_TOKEN",
     "token_cache_path": "PIC_AGENTIC_TOKEN_CACHE_PATH",
+    "picongpu_revision": "PIC_AGENTIC_PICONGPU_REVISION",
+    "picongpu_python": "PIC_AGENTIC_PICONGPU_PYTHON",
+    "cluster_template_dir": "PIC_AGENTIC_CLUSTER_TEMPLATE_DIR",
+    "cluster_preset": "PIC_AGENTIC_CLUSTER_PRESET",
+    "sim_setup_root": "PIC_AGENTIC_SIM_SETUP_ROOT",
 }
 
 REDACTED = "[REDACTED]"
@@ -77,6 +82,22 @@ class Config(BaseModel):
     refresh_token: str = ""
     #: Optional override for the shared 0600 token cache path.
     token_cache_path: str = ""
+    #: Pinned PIConGPU revision carried in the ``simulation.submit`` payload and
+    #: checked by the simclient (design section 2.2; the wire-format drift
+    #: check).  Empty means "use the revision of the installed tree".
+    picongpu_revision: str = ""
+    #: Optional interpreter that has the pinned PIConGPU installed.  The MCP
+    #: server builds the simulation payload in a disposable subprocess with it;
+    #: empty means "the interpreter running the server".
+    picongpu_python: str = ""
+    #: Cluster-local template directory the simclient renders the setup from.
+    cluster_template_dir: str = ""
+    #: Cluster-local CMake configure preset number (``pic-build -p``).  Unset
+    #: uses the picongpu default preset.
+    cluster_preset: int | None = None
+    #: Base directory on the shared file system under which the simclient
+    #: creates per-simulation ``input``/``run`` directories.
+    sim_setup_root: str = ""
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

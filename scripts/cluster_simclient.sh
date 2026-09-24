@@ -26,11 +26,17 @@
 #   PIC_AGENTIC_BRANCH         git branch/tag to install, default "mas-refresh-auth"
 #   PIC_AGENTIC_WORKDIR        default "$HOME/pic-agentic"
 #   PIC_AGENTIC_MESSAGE_DIR    shared dir for message files, default "$WORKDIR/shared"
+#   PIC_AGENTIC_SIM_SETUP_ROOT shared dir for generated setups, default
+#                              "$WORKDIR/sims" (enables the M2 submit handler)
+#   PIC_AGENTIC_CLUSTER_TEMPLATE_DIR  cluster-local picongpu template dir
+#   PIC_AGENTIC_CLUSTER_PRESET cluster-local CMake configure preset number
+#   PIC_AGENTIC_PICONGPU_REVISION     pinned picongpu revision (drift check)
 #   PIC_AGENTIC_JOB_WAIT_TIMEOUT_S  default 600 (queue waits)
 #   PIC_AGENTIC_ACK_TIMEOUT_S  default 900
 #   PIC_AGENTIC_POLL_INTERVAL_S     default 2
 #   PIC_AGENTIC_SKIP_LOGIN=1   reuse an existing token config
 #   PIC_AGENTIC_NO_UPDATE=1    skip git fetch/pull
+#   PIC_AGENTIC_SKIP_SIM=1     install pic-agentic without the [sim] extra
 #   PYTHON                     python interpreter, default python3
 
 set -euo pipefail
@@ -42,6 +48,10 @@ SIM="${PIC_AGENTIC_SIM:-cluster}"
 BRANCH="${PIC_AGENTIC_BRANCH:-mas-refresh-auth}"
 WORKDIR="${PIC_AGENTIC_WORKDIR:-$HOME/pic-agentic}"
 MESSAGE_DIR="${PIC_AGENTIC_MESSAGE_DIR:-$WORKDIR/shared}"
+SIM_SETUP_ROOT="${PIC_AGENTIC_SIM_SETUP_ROOT:-$WORKDIR/sims}"
+CLUSTER_TEMPLATE_DIR="${PIC_AGENTIC_CLUSTER_TEMPLATE_DIR:-}"
+CLUSTER_PRESET="${PIC_AGENTIC_CLUSTER_PRESET:-}"
+PICONGPU_REVISION="${PIC_AGENTIC_PICONGPU_REVISION:-04855606583209a09659a0c81553bddf2ce7bdac}"
 JOB_WAIT_S="${PIC_AGENTIC_JOB_WAIT_TIMEOUT_S:-600}"
 ACK_S="${PIC_AGENTIC_ACK_TIMEOUT_S:-900}"
 POLL_S="${PIC_AGENTIC_POLL_INTERVAL_S:-2}"
@@ -112,7 +122,16 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 log "installing pic-agentic from $SRC (reuses the cache on re-runs)"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet -e "$SRC"
+if [ "${PIC_AGENTIC_SKIP_SIM:-0}" = "1" ]; then
+  log "installing without the [sim] extra (M1 hello only)"
+  "$VENV/bin/python" -m pip install --quiet -e "$SRC"
+else
+  # The [sim] extra pulls the pinned PIConGPU from the fork (lossless Runner
+  # round-trip) plus cwltool.  picongpu is installed as a git dependency of
+  # the extra, so the `sdist`/`wheel` build needs git on the login node.
+  log "installing with the [sim] extra (pinned picongpu + cwltool)"
+  "$VENV/bin/python" -m pip install --quiet -e "${SRC}[sim]"
+fi
 
 # 5. Interactive MAS device login (once).
 if [ "${PIC_AGENTIC_SKIP_LOGIN:-0}" = "1" ] && [ -f "$CONFIG" ]; then
@@ -126,6 +145,12 @@ fi
 mkdir -p "$MESSAGE_DIR"
 [ -w "$MESSAGE_DIR" ] || die "$MESSAGE_DIR is not writable"
 log "message dir: $MESSAGE_DIR"
+
+# 6b. Generated-setup root: enables the M2 submit handler when writable.
+if [ "${PIC_AGENTIC_SKIP_SIM:-0}" != "1" ]; then
+  mkdir -p "$SIM_SETUP_ROOT" || log "cannot create $SIM_SETUP_ROOT; M2 submit stays disabled"
+  log "sim setup root: $SIM_SETUP_ROOT"
+fi
 
 # 7. Run the simclient against the real SLURM from PATH.
 cat <<EOF
@@ -143,6 +168,16 @@ export PIC_AGENTIC_ROOM_ID="$ROOM_ID"
 export PIC_AGENTIC_RCP_SECRET="$RCP_SECRET"
 export PIC_AGENTIC_SIM="$SIM"
 export PIC_AGENTIC_MESSAGE_DIR="$MESSAGE_DIR"
+if [ "${PIC_AGENTIC_SKIP_SIM:-0}" != "1" ]; then
+  export PIC_AGENTIC_SIM_SETUP_ROOT="$SIM_SETUP_ROOT"
+  export PIC_AGENTIC_PICONGPU_REVISION="$PICONGPU_REVISION"
+  if [ -n "$CLUSTER_TEMPLATE_DIR" ]; then
+    export PIC_AGENTIC_CLUSTER_TEMPLATE_DIR="$CLUSTER_TEMPLATE_DIR"
+  fi
+  if [ -n "$CLUSTER_PRESET" ]; then
+    export PIC_AGENTIC_CLUSTER_PRESET="$CLUSTER_PRESET"
+  fi
+fi
 export PIC_AGENTIC_JOB_WAIT_TIMEOUT_S="$JOB_WAIT_S"
 export PIC_AGENTIC_ACK_TIMEOUT_S="$ACK_S"
 export PIC_AGENTIC_POLL_INTERVAL_S="$POLL_S"

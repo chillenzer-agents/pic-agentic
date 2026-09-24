@@ -43,6 +43,16 @@ dev = [
   "pytest-asyncio>=0.24",
   "ruff>=0.16",
 ]
+# PIConGPU + its workflow engine.  Needed on whichever side converts a PICMI
+# script into a pypicongpu ``Runner``: the MCP server (to serialise the
+# payload, see config ``picongpu_python``) and the cluster simclient (to
+# rebuild and run it).  Kept an extra so the pure-RCP transport install stays
+# light and Python-version bump proof.  The pin is the fork stack head that
+# carries lossless ``Runner`` round-trip; see M2-SUBMIT-PLAN.md section 1.
+sim = [
+  "picongpu @ git+https://github.com/chillenzer-agents/picongpu@04855606583209a09659a0c81553bddf2ce7bdac#subdirectory=lib/python",
+  "cwltool==3.2.20260720092025",
+]
 
 [project.scripts]
 pic-agentic-mcp = "pic_agentic.server.__main__:main"
@@ -50,6 +60,12 @@ pic-agentic-simclient = "pic_agentic.simclient.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pic_agentic"]
+
+# The [sim] extra pins PIConGPU to a git revision (the fork stack head), which
+# hatchling rejects unless direct references are explicitly allowed.  The
+# narrower alternative (an internal index) does not exist yet.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

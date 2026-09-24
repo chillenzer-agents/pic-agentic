@@ -4,7 +4,7 @@
 
 """Local MCP-side driver for the real-cluster connectivity check.
 
-Two modes:
+Three modes:
 
 * ``--setup`` creates a private room on the homeserver using the local account
   (see ``scripts/mas_login.py``), generates the shared RCP secret, and prints
@@ -16,6 +16,11 @@ Two modes:
   and calls the ``hello`` tool, retrying until the cluster simclient acks or
   ``--wait-s`` elapses.
 
+* ``--submit --picmi-script <path>`` calls the M2 ``submit_simulation`` tool
+  with a PICMI script instead, and reports the ``sim_id`` and coarse state.
+  The server needs the ``[sim]`` extra on the machine running this driver
+  (``PIC_AGENTIC_PICONGPU_PYTHON`` may point at another interpreter).
+
 The MCP server and the cluster simclient use the same Matrix account but log in
 separately, so each gets its own MAS session/device and its own refresh chain
 (no rotation conflict).  RCP messages are role-tagged, so the self-echo works.
@@ -25,6 +30,7 @@ Usage::
     python scripts/local_mcp_check.py --setup
     # ... start scripts/cluster_simclient.sh on the login node ...
     python scripts/local_mcp_check.py --run
+    python scripts/local_mcp_check.py --submit --picmi-script ./my_sim.py
 """
 
 from __future__ import annotations
@@ -147,11 +153,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _call_hello(state: dict, message: str) -> dict:
-    """Drive the MCP stdio server and call the hello tool once.
+def _server_env(state: dict) -> dict:
+    """Build the environment for the MCP stdio server subprocess.
 
     Returns:
-        The tool's structured content.
+        ``os.environ`` plus the per-run RCP/MCP settings.
 
     """
     env = dict(os.environ)
@@ -170,11 +176,41 @@ async def _call_hello(state: dict, message: str) -> dict:
             "PIC_AGENTIC_ACK_TIMEOUT_S": str(state.get("ack_timeout_s", 900)),
         }
     )
-    params = StdioServerParameters(command=sys.executable, args=["-m", "pic_agentic.server"], env=env)
+    return env
+
+
+async def _call_tool(state: dict, tool: str, arguments: dict) -> dict:
+    """Drive the MCP stdio server and call one tool once.
+
+    Returns:
+        The tool's structured content.
+
+    """
+    params = StdioServerParameters(command=sys.executable, args=["-m", "pic_agentic.server"], env=_server_env(state))
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
-        result = await session.call_tool("hello", {"message": message})
+        result = await session.call_tool(tool, arguments)
         return result.structured_content or {"ok": result.is_error is False}
+
+
+async def _call_hello(state: dict, message: str) -> dict:
+    """Call the ``hello`` tool once.
+
+    Returns:
+        The tool's structured content.
+
+    """
+    return await _call_tool(state, "hello", {"message": message})
+
+
+async def _call_submit(state: dict, script_path: str) -> dict:
+    """Call the ``submit_simulation`` tool once with a PICMI script path.
+
+    Returns:
+        The tool's structured content.
+
+    """
+    return await _call_tool(state, "submit_simulation", {"picmi_script": script_path})
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -213,22 +249,59 @@ def cmd_run(args: argparse.Namespace) -> int:
         time.sleep(15)
 
 
-def main() -> None:
-    """Parse arguments and dispatch to setup or run.
+def cmd_submit(args: argparse.Namespace) -> int:
+    """Drive the MCP server and call the M2 submit_simulation tool once.
+
+    Returns:
+        The process exit code.
 
     Raises:
-        SystemExit: With ``cmd_setup``/``cmd_run``'s exit code.
+        SystemExit: If the state or the PICMI script is missing.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    if not args.picmi_script:
+        msg = "--submit requires --picmi-script <path>"
+        raise SystemExit(msg)
+    script = Path(args.picmi_script).expanduser()
+    if not script.is_file():
+        msg = f"PICMI script not found: {script}"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["ack_timeout_s"] = args.ack_timeout_s
+    try:
+        result = asyncio.run(_call_submit(state, str(script.resolve())))
+    except Exception as exc:  # ruff: ignore[blind-except] - the server reports failure as data normally
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    print(json.dumps(result, indent=2), flush=True)
+    if not result.get("ok"):
+        print("\nFAILED: the submit command was not accepted.", file=sys.stderr)
+        return 1
+    print(f"\nSUBMIT ACCEPTED: sim_id={result.get('sim_id')} state={result.get('state')}")
+    print("Watch the room / run --run later for the simulation.submitted and results.ready events.")
+    return 0
+
+
+def main() -> None:
+    """Parse arguments and dispatch to setup, run, or submit.
+
+    Raises:
+        SystemExit: With the chosen command's exit code.
 
     """
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--setup", action="store_true", help="create a room + secret for the cluster run")
     mode.add_argument("--run", action="store_true", help="drive the MCP server and send hello")
+    mode.add_argument("--submit", action="store_true", help="drive the MCP server and call submit_simulation")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
+    parser.add_argument("--picmi-script", default="", help="PICMI script path for --submit")
     parser.add_argument("--wait-s", type=float, default=1800.0, help="overall wait for an ack")
-    parser.add_argument("--ack-timeout-s", type=float, default=900.0, help="per-hello ack wait")
+    parser.add_argument("--ack-timeout-s", type=float, default=900.0, help="per-attempt ack wait")
     parser.add_argument(
         "--message-dir",
         default="",
@@ -239,7 +312,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    raise SystemExit(cmd_setup(args) if args.setup else cmd_run(args))
+    if args.setup:
+        raise SystemExit(cmd_setup(args))
+    if args.submit:
+        raise SystemExit(cmd_submit(args))
+    raise SystemExit(cmd_run(args))
 
 
 if __name__ == "__main__":

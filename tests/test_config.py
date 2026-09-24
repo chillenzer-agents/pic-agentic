@@ -73,3 +73,29 @@ def test_redact_removes_secrets() -> None:
     assert "sec-456" not in text
     assert text.count("[REDACTED]") == 2
     assert not cfg.redact("")
+
+
+def test_m2_submit_fields_from_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PIC_AGENTIC_PICONGPU_REVISION", "abc123")
+    monkeypatch.setenv("PIC_AGENTIC_PICONGPU_PYTHON", "/opt/pic/bin/python")
+    monkeypatch.setenv("PIC_AGENTIC_CLUSTER_TEMPLATE_DIR", "/opt/pic/templates")
+    monkeypatch.setenv("PIC_AGENTIC_CLUSTER_PRESET", "3")
+    monkeypatch.setenv("PIC_AGENTIC_SIM_SETUP_ROOT", "/shared/sims")
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.picongpu_revision == "abc123"
+    assert cfg.picongpu_python == "/opt/pic/bin/python"
+    assert cfg.cluster_template_dir == "/opt/pic/templates"
+    assert cfg.cluster_preset == 3
+    assert cfg.sim_setup_root == "/shared/sims"
+
+
+def test_m2_submit_fields_from_toml_and_defaults(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[pic_agentic]\nsim_setup_root = "/srv/sims"\n')
+    cfg = Config.load(path)
+    assert cfg.sim_setup_root == "/srv/sims"
+    # Unset M2 fields default to empty (M2 submit handler stays disabled).
+    assert not cfg.picongpu_revision
+    assert not cfg.picongpu_python
+    assert not cfg.cluster_template_dir
+    assert not cfg.cluster_preset
