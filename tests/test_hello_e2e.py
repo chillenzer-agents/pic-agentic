@@ -156,6 +156,41 @@ async def test_duplicate_command_is_idempotent(shared_dir) -> None:
     assert len(jobs) == 1
 
 
+async def test_processed_command_survives_restart(shared_dir) -> None:
+    """A restart that backfills the room must not re-submit an executed command.
+
+    Regression from the live cluster run: the transport replays the timeline on
+    reconnect and the in-memory cmd_id set was lost on restart, so the simclient
+    re-executed a backfilled command and submitted a duplicate cluster job.
+    """
+    _mcp_t, sim_t = MemoryTransport.create_pair()
+    service = HelloService(sim=SIM, secret=SECRET, message_dir=shared_dir)
+    command = service.build_command("restart")
+
+    first = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        poll_interval_s=0.05,
+    )
+    assert await first.handle(command) is not None
+    assert len(list((shared_dir / "out").glob("*.out"))) == 1
+
+    # New process, same shared dir: the backfilled command must be ignored.
+    second = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        poll_interval_s=0.05,
+    )
+    assert await second.handle(command) is None
+    assert len(list((shared_dir / "out").glob("*.out"))) == 1
+
+
 async def test_rejects_command_from_unexpected_transport_sender(shared_dir) -> None:
     from pic_agentic.protocol.hello import build_hello_command
 

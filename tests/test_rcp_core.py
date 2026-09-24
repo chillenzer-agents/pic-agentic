@@ -103,16 +103,46 @@ def test_per_sender_sequence_counts_independently() -> None:
     assert state.highest("simA", SenderRole.SIMCLIENT) == 5
 
 
-def test_dedup_keys_on_sim_role_seq_type() -> None:
+def test_dedup_prefers_transport_event_id() -> None:
+    store = DedupStore()
+    first = make(seq=1)
+    first.transport_event_id = "$ev1"
+    # A redelivery of the same event is dropped ...
+    redelivery = make(seq=1)
+    redelivery.transport_event_id = "$ev1"
+    assert store.seen(first) is True
+    assert store.seen(redelivery) is False
+    # ... but a different event is not, even with the same seq/role/type.
+    other = make(seq=1)
+    other.transport_event_id = "$ev2"
+    assert store.seen(other) is True
+
+
+def test_dedup_distinct_commands_from_restarted_sender() -> None:
+    """Two distinct commands after a sender restart share seq=1.
+
+    Regression from the live cluster run: the MCP server's seq counter is
+    in-memory and restarts at 1 per process, so dedup on (sim, role, seq, type)
+    silently dropped every command after the first. Distinct transport events
+    must both be processed.
+    """
+    store = DedupStore()
+    a = make(seq=1, payload={"cmd_id": "a" * 32})
+    a.transport_event_id = "$restart-1"
+    b = make(seq=1, payload={"cmd_id": "b" * 32})
+    b.transport_event_id = "$restart-2"
+    assert store.seen(a) is True
+    assert store.seen(b) is True
+
+
+def test_dedup_falls_back_to_stable_key_without_event_id() -> None:
     store = DedupStore()
     first = make(seq=1)
     duplicate = make(seq=1)
     assert store.seen(first) is True
     assert store.seen(duplicate) is False
-    other_role = make(seq=1, role=SenderRole.SIMCLIENT)
-    assert store.seen(other_role) is True
-    other_type = make(seq=1, type_="ping")
-    assert store.seen(other_type) is True
+    assert store.seen(make(seq=1, role=SenderRole.SIMCLIENT)) is True
+    assert store.seen(make(seq=1, type_="ping")) is True
     assert store.seen(make(seq=2)) is True
 
 

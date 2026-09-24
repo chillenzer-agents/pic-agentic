@@ -75,7 +75,13 @@ class SimClient:
         self.allowed_sender_user_id = allowed_sender_user_id
         self.sequences = SequenceState()
         self.seen = DedupStore()
+        #: Command ids already executed.  Persisted under ``message_dir`` so a
+        #: restart that backfills the room does not re-submit cluster jobs for
+        #: commands it already ran (the transport replays the whole timeline on
+        #: reconnect).
         self._processed_commands: set[str] = set()
+        self._processed_path = message_dir / "processed-cmds.txt"
+        self._load_processed()
 
     def _accepts(self, message: RcpMessage) -> bool:
         if message.sim != self.sim or message.kind is not Kind.COMMAND:
@@ -148,14 +154,41 @@ class SimClient:
         result.error, result.cluster_output = self._read_outcome(info, outfile)
         return result
 
+    def _load_processed(self) -> None:
+        """Load persisted command ids, ignoring a missing or unreadable file."""
+        try:
+            text = self._processed_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            log.warning("cannot read %s: %s", self._processed_path, exc)
+            return
+        self._processed_commands = {line.strip() for line in text.splitlines() if line.strip()}
+
+    def _persist_processed(self, cmd_id: str) -> None:
+        """Append a command id to the durable idempotency file.
+
+        Args:
+            cmd_id: The executed command id.
+
+        """
+        try:
+            self._processed_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._processed_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{cmd_id}\n")
+        except OSError as exc:
+            log.warning("cannot persist processed id %s: %s", cmd_id, exc)
+
     async def _handle_hello(self, message: RcpMessage) -> RcpMessage | None:
         cmd_id = str(message.payload.get("cmd_id", ""))
-        # Idempotency: a re-sent command carries the same cmd_id; do not
-        # submit a second job.
-        if cmd_id in self._processed_commands:
-            log.info("ignoring re-sent hello command %s", cmd_id)
+        # Idempotency: a re-sent or backfilled command carries the same cmd_id;
+        # do not submit a second job.  The set survives restarts via the file.
+        if cmd_id and cmd_id in self._processed_commands:
+            log.info("ignoring already-processed hello command %s", cmd_id)
             return None
-        self._processed_commands.add(cmd_id)
+        if cmd_id:
+            self._processed_commands.add(cmd_id)
+            self._persist_processed(cmd_id)
         result = await self._execute_hello(message, cmd_id)
         ack = self._build_ack(message, cmd_id=cmd_id, result=result)
         await self.transport.send(ack)

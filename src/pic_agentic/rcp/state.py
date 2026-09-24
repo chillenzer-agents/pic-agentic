@@ -68,15 +68,17 @@ class SequenceState:
 
 
 class DedupStore:
-    """Bounded set of ``(sim, sender_role, seq, type)`` keys already processed.
+    """Bounded set of already-processed message keys.
 
-    Matrix delivery is at-least-once, so receivers must drop duplicates.
+    Matrix delivery is at-least-once, so receivers must drop duplicates.  The
+    key is ``RcpMessage.dedup_key()``: the transport event id when available
+    (unique per delivered event), else ``(sim, sender_role, seq, type)``.
     """
 
     def __init__(self, maxlen: int = 4096) -> None:
         """Create a store retaining at most ``maxlen`` recent keys."""
-        self._seen: set[tuple[str, str, int, str]] = set()
-        self._order: deque[tuple[str, str, int, str]] = deque()
+        self._seen: set[tuple[str, ...]] = set()
+        self._order: deque[tuple[str, ...]] = deque()
         self._maxlen = maxlen
 
     def seen(self, message: RcpMessage) -> bool:
