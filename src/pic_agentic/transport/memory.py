@@ -87,8 +87,13 @@ class MemoryTransport:
             msg = "transport is not paired"
             raise RuntimeError(msg)
         self.state.counter += 1
+        event_id = f"$memory{self.state.counter}"
+        # Mirror MatrixTransport: stamp the transport event id on receive so
+        # DedupStore attributes each delivery uniquely (the seq counter resets
+        # per process and must not be the primary dedup key).
+        message.transport_event_id = event_id
         await self.peer_inbox.put(message)
-        return f"$memory{self.state.counter}"
+        return event_id
 
     async def receive(self) -> AsyncIterator[RcpMessage]:
         """Yield messages delivered by the peer until the channel closes.

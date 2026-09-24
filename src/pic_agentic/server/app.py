@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
+from pic_agentic.auth import MasTokenStore
 from pic_agentic.server.hello import HelloOutcome, HelloService
 from pic_agentic.transport.matrix import MatrixTransport
 
@@ -52,12 +53,17 @@ class HelloRuntime:
         """Open the Matrix transport and start pumping inbound messages."""
         config = self.config
         config.require("homeserver", "user_id", "access_token", "room_id", "rcp_secret", "message_dir")
+        token_provider = None
+        if config.has_refresh_chain():
+            store = MasTokenStore.from_config(config)
+            token_provider = store.access_token
         self._transport = MatrixTransport(
             config.homeserver,
             config.user_id,
             config.access_token,
             config.room_id,
             store_path=config.nio_store_dir or None,
+            token_provider=token_provider,
         )
         # Drain anything already in the room before we start awaiting.
         for message in await self._transport.backfill():

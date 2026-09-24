@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+#: Upper bound on retained idempotency records, so the durable file cannot grow
+#: without limit on a long-lived message directory.
+_MAX_PROCESSED = 4096
+
 
 class HelloResult(BaseModel):
     """Outcome of one ``hello`` command execution."""
@@ -35,6 +40,35 @@ class HelloResult(BaseModel):
     job_id: int | None
     cluster_output: str | None
     error: str | None = None
+
+
+class ProcessedCommand(BaseModel):
+    """Durable idempotency record for one command.
+
+    The record is written *before* execution (so a crash mid-job cannot cause a
+    re-submission) and updated with the result afterwards.  Storing the result
+    lets a replay re-send the same ack instead of leaving the MCP sender to time
+    out on a command that already ran.
+    """
+
+    cmd_id: str
+    #: False while the job is still running (or the process died mid-execution).
+    completed: bool = False
+    job_id: int | None = None
+    cluster_output: str | None = None
+    error: str | None = None
+
+    def to_result(self) -> HelloResult:
+        """Return the execution result to replay in an ack.
+
+        Returns:
+            The stored result, or a sentinel error when the outcome is unknown
+            (the job started but no result was recorded before a restart).
+
+        """
+        if self.completed:
+            return HelloResult(job_id=self.job_id, cluster_output=self.cluster_output, error=self.error)
+        return HelloResult(job_id=self.job_id, cluster_output=None, error="already_submitted:outcome_unknown")
 
 
 class SimClient:
@@ -75,7 +109,17 @@ class SimClient:
         self.allowed_sender_user_id = allowed_sender_user_id
         self.sequences = SequenceState()
         self.seen = DedupStore()
-        self._processed_commands: set[str] = set()
+        #: Command ids already executed, mapped to their result.  Persisted
+        #: under ``message_dir`` so a restart that backfills the room does not
+        #: re-submit cluster jobs for commands it already ran, and so a replay
+        #: can re-send the original ack (the transport replays the whole
+        #: timeline on reconnect).  The store assumes one simclient per
+        #: ``message_dir`` (the supported topology); it is not cross-process
+        #: locked.  ``cluster_output`` is small for the M1 ``hello`` job and the
+        #: file is capped at :data:`_MAX_PROCESSED` records.
+        self._processed: dict[str, ProcessedCommand] = {}
+        self._processed_path = message_dir / "processed-cmds.jsonl"
+        self._load_processed()
 
     def _accepts(self, message: RcpMessage) -> bool:
         if message.sim != self.sim or message.kind is not Kind.COMMAND:
@@ -148,16 +192,91 @@ class SimClient:
         result.error, result.cluster_output = self._read_outcome(info, outfile)
         return result
 
+    def _load_processed(self) -> None:
+        """Load persisted command records, ignoring a missing or unreadable file."""
+        try:
+            text = self._processed_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            log.warning("cannot read %s: %s", self._processed_path, exc)
+            return
+        records: dict[str, ProcessedCommand] = {}
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = ProcessedCommand.model_validate_json(line)
+            except ValueError as exc:
+                log.warning(
+                    "ignoring malformed processed-command line in %s (%s)",
+                    self._processed_path,
+                    type(exc).__name__,
+                )
+                continue
+            records[record.cmd_id] = record
+        self._processed = records
+
+    def _persist_processed(self, record: ProcessedCommand) -> None:
+        """Append one record to the durable idempotency file.
+
+        Records are append-only and last-write-wins on load, so updating an
+        execution's outcome is just another append.  The file is compacted once
+        it holds more than :data:`_MAX_PROCESSED` records.
+
+        Args:
+            record: The command record (pending or completed) to persist.
+
+        """
+        try:
+            self._processed_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._processed_path.open("a", encoding="utf-8") as handle:
+                handle.write(record.model_dump_json() + "\n")
+        except OSError as exc:
+            log.warning("cannot persist processed id %s: %s", record.cmd_id, exc)
+            return
+        self._processed[record.cmd_id] = record
+        if len(self._processed) > _MAX_PROCESSED:
+            self._rewrite_processed()
+
+    def _rewrite_processed(self) -> None:
+        """Rewrite the idempotency file with only the most recent records."""
+        recent = list(self._processed.values())[-_MAX_PROCESSED:]
+        self._processed = {record.cmd_id: record for record in recent}
+        tmp = self._processed_path.with_suffix(self._processed_path.suffix + ".tmp")
+        try:
+            with os.fdopen(os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "w", encoding="utf-8") as handle:
+                for record in recent:
+                    handle.write(record.model_dump_json() + "\n")
+            tmp.replace(self._processed_path)
+        except OSError as exc:
+            log.warning("cannot compact %s: %s", self._processed_path, exc)
+
     async def _handle_hello(self, message: RcpMessage) -> RcpMessage | None:
         cmd_id = str(message.payload.get("cmd_id", ""))
-        # Idempotency: a re-sent command carries the same cmd_id; do not
-        # submit a second job.
-        if cmd_id in self._processed_commands:
-            log.info("ignoring re-sent hello command %s", cmd_id)
-            return None
-        self._processed_commands.add(cmd_id)
+        # Idempotency: a re-sent or backfilled command carries the same cmd_id;
+        # do not submit a second job.  Re-ack the stored result so a sender
+        # whose original ack was lost does not block until its timeout.
+        if cmd_id and cmd_id in self._processed:
+            log.info("re-acking already-processed hello command %s", cmd_id)
+            ack = self._build_ack(message, cmd_id=cmd_id, result=self._processed[cmd_id].to_result())
+            await self.transport.send(ack)
+            return ack
+        if cmd_id:
+            # Persist *before* executing so a crash mid-job cannot resubmit.
+            self._persist_processed(ProcessedCommand(cmd_id=cmd_id))
         result = await self._execute_hello(message, cmd_id)
         ack = self._build_ack(message, cmd_id=cmd_id, result=result)
+        if cmd_id:
+            self._persist_processed(
+                ProcessedCommand(
+                    cmd_id=cmd_id,
+                    completed=True,
+                    job_id=result.job_id,
+                    cluster_output=result.cluster_output,
+                    error=result.error,
+                )
+            )
         await self.transport.send(ack)
         return ack
 

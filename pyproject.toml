@@ -32,6 +32,9 @@ dependencies = [
   "mcp==2.1.1",
   "matrix-nio==0.26.0",
   "pydantic>=2.12",
+  # Used directly by the MAS token-refresh client (also a matrix-nio dependency,
+  # but we import it ourselves, so it is declared explicitly).
+  "aiohttp>=3.9",
 ]
 
 [project.optional-dependencies]

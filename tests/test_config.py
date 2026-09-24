@@ -31,6 +31,33 @@ def test_toml_is_read_and_env_wins(tmp_path, monkeypatch) -> None:
     assert Config.load(path).homeserver == "http://env-hs"
 
 
+def test_config_path_env_override(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "from-env.toml"
+    path.write_text('[pic_agentic]\nhomeserver = "http://env-path-hs"\n')
+    monkeypatch.setenv("PIC_AGENTIC_CONFIG", str(path))
+    assert Config.load().homeserver == "http://env-path-hs"
+
+
+def test_refresh_chain_and_redaction(tmp_path) -> None:
+    cfg = Config(
+        access_token="tok-1",
+        refresh_token="refresh-1",
+        rcp_secret="secret-1",
+        client_id="cid",
+        token_endpoint="https://auth.example/oauth2/token",
+    )
+    assert cfg.has_refresh_chain() is True
+    text = cfg.redact("tok-1 refresh-1 secret-1")
+    assert "tok-1" not in text
+    assert "refresh-1" not in text
+    assert "secret-1" not in text
+
+
+def test_no_refresh_chain_without_credentials() -> None:
+    assert Config(client_id="cid").has_refresh_chain() is False
+    assert Config(token_endpoint="u", client_id="c").has_refresh_chain() is False
+
+
 def test_require_lists_all_missing(tmp_path) -> None:
     cfg = Config.load(tmp_path / "missing.toml")
     with pytest.raises(ConfigError) as excinfo:

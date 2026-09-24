@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
@@ -47,8 +46,12 @@ def validate_message_path(path: str, base_dir: str) -> Path:
     if not SAFE_CHARSET.match(path):
         msg = f"path has characters outside the safe charset: {path!r}"
         raise UnsafePathError(msg)
+    # Resolve BOTH sides symmetrically: a cluster home or scratch directory is
+    # routinely a symlink (e.g. /home/<user> -> /data/home2/<user>), and if only
+    # the base were resolved the candidate would look like it escaped its own
+    # directory.  This matches validate_shared_path in slurm/client.py.
     base = Path(base_dir).resolve()
-    resolved = Path(os.path.normpath(path))
+    resolved = Path(path).resolve()
     if resolved != base and base not in resolved.parents:
         msg = f"path escapes base directory {base_dir!r}: {path!r}"
         raise UnsafePathError(msg)

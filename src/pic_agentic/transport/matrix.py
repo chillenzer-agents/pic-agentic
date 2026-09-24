@@ -23,7 +23,10 @@ from nio import AsyncClient, AsyncClientConfig, RoomMessageText, SyncResponse
 from pic_agentic.rcp.envelope import RCP_NAMESPACE, RcpMessage
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable, Callable
+
+    #: Returns a currently valid bearer token (refreshing when necessary).
+    TokenProvider = Callable[[], Awaitable[str]]
 
 log = logging.getLogger(__name__)
 
@@ -43,16 +46,19 @@ class MatrixTransport:
         *,
         sync_timeout_ms: int = 10_000,
         store_path: str | None = None,
+        token_provider: TokenProvider | None = None,
     ) -> None:
         """Create a Matrix transport for one room.
 
         Args:
             homeserver: Homeserver base URL.
             user_id: Bot user id.
-            access_token: Bot access token.
+            access_token: Bot access token (used until ``token_provider`` refreshes).
             room_id: The RCP room id.
             sync_timeout_ms: Long-poll timeout for ``/sync``.
             store_path: Optional matrix-nio store directory.
+            token_provider: Optional async callable returning a valid bearer
+                token; used for MAS servers whose access tokens expire.
 
         """
         config = AsyncClientConfig(store_sync_tokens=True, encryption_enabled=False)
@@ -60,10 +66,16 @@ class MatrixTransport:
         store = store_path or str(default_store)
         self._client = AsyncClient(homeserver, user_id, config=config, store_path=store)
         self._client.access_token = access_token
+        self._token_provider = token_provider
         self._room_id = room_id
         self._sync_timeout_ms = sync_timeout_ms
         self._since: str | None = None
         self._closed = False
+
+    async def _refresh_token(self) -> None:
+        """Swap in a fresh access token before a request, when configured."""
+        if self._token_provider is not None:
+            self._client.access_token = await self._token_provider()
 
     async def send(self, message: RcpMessage) -> str:
         """Send one signed RCP message to the room.
@@ -84,6 +96,7 @@ class MatrixTransport:
             raise ValueError(msg)
         # to_content re-signs only when sig is None, which we have excluded.
         content: dict[str, Any] = message.to_content()
+        await self._refresh_token()
         response = await self._client.room_send(self._room_id, "m.room.message", content)
         event_id = getattr(response, "event_id", None)
         if event_id is None:
@@ -92,6 +105,7 @@ class MatrixTransport:
         return str(event_id)
 
     async def _sync(self) -> SyncResponse:
+        await self._refresh_token()
         response = await self._client.sync(timeout=self._sync_timeout_ms, since=self._since, full_state=False)
         if isinstance(response, SyncResponse):
             self._since = response.next_batch

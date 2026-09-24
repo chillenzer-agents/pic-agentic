@@ -125,14 +125,28 @@ class RcpMessage(BaseModel):
             return False
         return verify(secret, self.signed_payload(), self.sig)
 
-    def dedup_key(self) -> tuple[str, str, int, str]:
+    def dedup_key(self) -> tuple[str, ...]:
         """Return the receiver's deduplication key.
 
+        Deduplication guards against at-least-once *delivery*, so the primary
+        key is the transport event id, which is unique per delivered event and
+        is set by the transport on receive.
+
+        The design's ``(sim, sender_role, seq, type)`` fallback is only safe for
+        a single process lifetime: ``seq`` is an in-memory per-sender counter
+        that restarts at 1 whenever the sending process restarts, so two
+        *distinct* commands from restarted MCP servers would otherwise collide
+        and the second would be silently dropped (observed live). Idempotency
+        of re-sent commands is handled separately by the ``cmd_id`` guard.
+
         Returns:
-            ``(sim, sender_role, seq, type)`` per the design.
+            The transport event id when present, else
+            ``(sim, sender_role, seq, type)``.
 
         """
-        return (self.sim, self.sender_role.value, self.seq, self.type)
+        if self.transport_event_id:
+            return (self.transport_event_id,)
+        return (self.sim, self.sender_role.value, str(self.seq), self.type)
 
     def body(self) -> str:
         """Return the short human-readable room line.
