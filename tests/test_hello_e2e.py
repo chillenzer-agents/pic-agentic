@@ -20,6 +20,7 @@ import pytest
 from pic_agentic.rcp import new_secret_hex
 from pic_agentic.server.hello import AckTimeoutError, HelloService
 from pic_agentic.simclient import SimClient
+from pic_agentic.simclient.client import ProcessedCommand
 from pic_agentic.slurm import SlurmClient
 from pic_agentic.transport.memory import MemoryTransport
 
@@ -149,11 +150,75 @@ async def test_duplicate_command_is_idempotent(shared_dir) -> None:
     )
     command = service.build_command("dup")
     first = await simclient.handle(command)
+    # A replay is a distinct delivery event (new transport event id) carrying the
+    # same cmd_id; dedup must not swallow it before the idempotency guard.
+    command.transport_event_id = "$memory-replay"
     second = await simclient.handle(command)
     assert first is not None
-    assert second is None  # re-sent command ignored
+    assert second is not None  # re-sent command is re-acked, not silently dropped
+    assert second.payload["cmd_id"] == first.payload["cmd_id"]
+    assert second.payload["job_id"] == first.payload["job_id"]
     jobs = list((shared_dir / "out").glob("*.out"))
     assert len(jobs) == 1
+
+
+async def test_replay_resends_ack_without_resubmitting(shared_dir) -> None:
+    """A lost ack replayed after a restart must be re-acked, not left to time out.
+
+    Regression from the live run: the processed-id guard returned ``None`` on a
+    replay, so ``HelloService`` blocked for the full ack timeout although the
+    job had already completed.  The stored result must be re-sent.
+    """
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    service = HelloService(sim=SIM, secret=SECRET, message_dir=shared_dir, ack_timeout_s=2.0)
+    command = service.build_command("replay")
+    cmd_id = str(command.payload["cmd_id"])
+
+    first = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        poll_interval_s=0.05,
+    )
+    original = await first.handle(command)
+    assert original is not None
+    assert len(list((shared_dir / "out").glob("*.out"))) == 1
+
+    # Simulate a restart whose original ack was lost: a fresh client loads the
+    # durable record and the sender replays the command through the pump.
+    second = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        poll_interval_s=0.05,
+    )
+    pump_task = asyncio.create_task(_pump(mcp_t, service))
+    serve_task = asyncio.create_task(second.serve())
+    try:
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        service._pending[cmd_id] = future
+        await mcp_t.send(command)
+        ack = await asyncio.wait_for(future, timeout=2.0)
+    finally:
+        serve_task.cancel()
+        pump_task.cancel()
+        await sim_t.close()
+        await mcp_t.close()
+
+    assert ack.payload["cmd_id"] == cmd_id
+    assert ack.payload["job_id"] == original.payload["job_id"]
+    assert ack.payload["cluster_output"] == original.payload["cluster_output"]
+    # The replay did not submit a second job.
+    assert len(list((shared_dir / "out").glob("*.out"))) == 1
+
+
+async def _pump(mcp_t, service) -> None:
+    async for msg in mcp_t.receive():
+        service.on_message(msg)
 
 
 async def test_processed_command_survives_restart(shared_dir) -> None:
@@ -178,7 +243,8 @@ async def test_processed_command_survives_restart(shared_dir) -> None:
     assert await first.handle(command) is not None
     assert len(list((shared_dir / "out").glob("*.out"))) == 1
 
-    # New process, same shared dir: the backfilled command must be ignored.
+    # New process, same shared dir: the backfilled command is re-acked, not
+    # re-executed.
     second = SimClient(
         sim=SIM,
         secret=SECRET,
@@ -187,8 +253,42 @@ async def test_processed_command_survives_restart(shared_dir) -> None:
         message_dir=shared_dir,
         poll_interval_s=0.05,
     )
-    assert await second.handle(command) is None
+    replayed = await second.handle(command)
+    assert replayed is not None
+    assert replayed.payload["job_id"] is not None
     assert len(list((shared_dir / "out").glob("*.out"))) == 1
+
+
+async def test_crash_before_result_is_not_resubmitted(shared_dir) -> None:
+    """A record persisted before execution (no outcome) must still block a resubmit."""
+    _mcp_t, sim_t = MemoryTransport.create_pair()
+    service = HelloService(sim=SIM, secret=SECRET, message_dir=shared_dir)
+    command = service.build_command("crash")
+    cmd_id = str(command.payload["cmd_id"])
+
+    stalled = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        poll_interval_s=0.05,
+    )
+    # Mimic the pre-execution record a crash would leave behind.
+    stalled._persist_processed(ProcessedCommand(cmd_id=cmd_id))
+
+    second = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        poll_interval_s=0.05,
+    )
+    ack = await second.handle(command)
+    assert ack is not None
+    assert ack.payload["error"] == "already_submitted:outcome_unknown"
+    assert not list((shared_dir / "out").glob("*.out"))
 
 
 async def test_rejects_command_from_unexpected_transport_sender(shared_dir) -> None:
