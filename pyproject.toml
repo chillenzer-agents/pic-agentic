@@ -50,7 +50,7 @@ dev = [
 # light and Python-version bump proof.  The pin is the fork stack head that
 # carries lossless ``Runner`` round-trip; see M2-SUBMIT-PLAN.md section 1.
 sim = [
-  "picongpu @ git+https://github.com/chillenzer-agents/picongpu@04855606583209a09659a0c81553bddf2ce7bdac#subdirectory=lib/python",
+  "picongpu @ git+https://github.com/chillenzer-agents/picongpu@91c3ee5fb4c9425b00d4673d9608f4370593cacf#subdirectory=lib/python",
   "cwltool==3.2.20260720092025",
 ]
 

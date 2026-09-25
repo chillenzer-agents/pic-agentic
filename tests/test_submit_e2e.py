@@ -92,7 +92,7 @@ async def _fake_builder(*, script_path, interpreter="", **_kw: object) -> BuiltS
     return BuiltSimulation(
         runner=_runner_dump(),
         picongpu_version="0.9.0-dev",
-        picongpu_revision="04855606583209a09659a0c81553bddf2ce7bdac",
+        picongpu_revision="91c3ee5fb4c9425b00d4673d9608f4370593cacf",
         schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
     )
 
