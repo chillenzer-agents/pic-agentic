@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -315,9 +316,9 @@ def prepare_submit(
     )
 
 
-#: Per-process buffer of the last workflow's cwltool ERROR output.  A shared
-#: buffer is acceptable because the simclient executes one submission at a time.
-_LAST_CWLT_ERROR = io.StringIO()
+#: Captured stderr of the last workflow execution.  A shared slot is acceptable
+#: because the simclient executes one submission at a time.
+_LAST_WORKFLOW_STDERR = ""
 
 #: Cap on the captured error text sent in a failure event.
 _MAX_ERROR_DETAIL = 4000
@@ -326,32 +327,62 @@ _MAX_SCAN_FILE_BYTES = 2_000_000
 #: Stop the cache scan after this many matching lines.
 _MAX_SCAN_HITS = 50
 
+#: Lines worth keeping from the captured stderr for the failure event.
+_ERROR_LINE_RE = re.compile(
+    r"error|fatal|not found|No such file|command not found|exited with status|permanentFail|missing expected",
+    re.IGNORECASE,
+)
+
 
 def _run_workflow(runner: Any) -> None:
-    """Run the CWL workflow, capturing cwltool's own ERROR log.
+    """Run the CWL workflow, capturing its stderr for failure reporting.
 
-    cwltool's exception is only ``Completed permanentFail``; the step command
-    error (e.g. ``cmake: command not found``) is emitted on the ``cwltool``
-    logger at ERROR level.  Attach a temporary handler to retain it.
+    cwltool raises only ``Completed permanentFail``; the actual step command
+    error (e.g. ``cmake: command not found``) is written to file descriptor 2
+    by cwltool and the step subprocess, bypassing both the ``cwltool`` logger
+    and Python-level ``sys.stderr`` redirection.  Redirect fd 2 to a temporary
+    file for the duration of the run and retain the matching lines.
 
     Args:
         runner: The ``pypicongpu.Runner`` to run.
 
     """
-    import logging  # ruff: ignore[import-outside-top-level] - only needed for this call
+    global _LAST_WORKFLOW_STDERR  # ruff: ignore[global-statement] - single-slot capture, one run at a time
+    _LAST_WORKFLOW_STDERR = ""
+    saved = os.dup(2)
+    read_fd, write_fd = os.pipe()
+    chunks: list[bytes] = []
 
-    handler = logging.StreamHandler(_LAST_CWLT_ERROR)
-    handler.setLevel(logging.ERROR)
-    logger = logging.getLogger("cwltool")
-    logger.addHandler(handler)
+    def reader() -> None:
+        # Tee: forward everything to the real stderr (so operator logs stay
+        # visible) and keep a copy for the failure event.
+        with os.fdopen(read_fd, "rb", closefd=True) as stream:
+            for chunk in iter(lambda: stream.read(4096), b""):
+                os.write(saved, chunk)
+                chunks.append(chunk)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
     try:
         runner.run()
     finally:
-        logger.removeHandler(handler)
+        # Restore fd 2 first so the pipe's write end closes and the reader sees
+        # EOF; only then join (and do NOT close ``saved`` before the join, the
+        # reader still writes to it).  Parse here, not after the try/finally:
+        # ``runner.run()`` raises ``Completed permanentFail``, which would
+        # otherwise skip the capture assignment.
+        os.dup2(saved, 2)
+        thread.join(timeout=10)
+        os.close(saved)
+        text = b"".join(chunks).decode("utf-8", errors="replace")
+        lines = [line.rstrip() for line in text.splitlines() if _ERROR_LINE_RE.search(line)]
+        _LAST_WORKFLOW_STDERR = "\n".join(lines)
 
 
 def _workflow_failure_detail(run_dir: Path) -> str:
-    """Return the captured cwltool error plus any retained step log.
+    """Return the captured workflow stderr plus any retained step log.
 
     Args:
         run_dir: The run directory (for the .cwl_cache fallback scan).
@@ -360,10 +391,7 @@ def _workflow_failure_detail(run_dir: Path) -> str:
         A truncated, redaction-ready error string (possibly empty).
 
     """
-    captured = _LAST_CWLT_ERROR.getvalue()
-    _LAST_CWLT_ERROR.seek(0)
-    _LAST_CWLT_ERROR.truncate(0)
-    detail = captured.strip()
+    detail = _LAST_WORKFLOW_STDERR.strip()
     if not detail:
         detail = _scan_retained_step_logs(run_dir)
     return detail[-_MAX_ERROR_DETAIL:]
