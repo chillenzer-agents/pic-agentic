@@ -18,6 +18,7 @@ from pathlib import Path
 from pic_agentic.auth import MasTokenStore
 from pic_agentic.config import Config
 from pic_agentic.simclient import SimClient
+from pic_agentic.simclient.simulation import SubmitConfig
 from pic_agentic.slurm import SlurmClient
 from pic_agentic.transport.matrix import MatrixTransport
 
@@ -38,15 +39,26 @@ async def run() -> None:
         token_provider=token_provider,
     )
     sim = os.environ.get("PIC_AGENTIC_SIM", "poc")
+    message_dir = Path(config.message_dir).resolve()
+    # The M2 submit handler is enabled only when a setup root is configured;
+    # without it the client stays M1-only (no cluster-local run dir).
+    submit_config = None
+    if config.sim_setup_root:
+        submit_config = SubmitConfig(
+            setup_root=Path(config.sim_setup_root).resolve(),
+            template_dir=config.cluster_template_dir,
+            preset=config.cluster_preset,
+        )
     client = SimClient(
         sim=sim,
         secret=config.rcp_secret,
         transport=transport,
         slurm=SlurmClient(bin_dir=config.slurm_bin_dir, timeout_s=config.job_wait_timeout_s + 10),
-        message_dir=Path(config.message_dir).resolve(),
+        message_dir=message_dir,
         job_wait_timeout_s=config.job_wait_timeout_s,
         poll_interval_s=float(os.environ.get("PIC_AGENTIC_POLL_INTERVAL_S", "5")),
         allowed_sender_user_id=os.environ.get("PIC_AGENTIC_ALLOWED_SENDER"),
+        submit_config=submit_config,
     )
     try:
         await client.serve()

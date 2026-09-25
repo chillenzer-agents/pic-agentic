@@ -4,7 +4,7 @@
 
 """Local MCP-side driver for the real-cluster connectivity check.
 
-Two modes:
+Three modes:
 
 * ``--setup`` creates a private room on the homeserver using the local account
   (see ``scripts/mas_login.py``), generates the shared RCP secret, and prints
@@ -16,6 +16,16 @@ Two modes:
   and calls the ``hello`` tool, retrying until the cluster simclient acks or
   ``--wait-s`` elapses.
 
+* ``--submit --picmi-script <path>`` calls the M2 ``submit_simulation`` tool
+  with a PICMI script instead, and reports the ``sim_id`` and coarse state.
+  The server needs the ``[sim]`` extra on the machine running this driver
+  (``PIC_AGENTIC_PICONGPU_PYTHON`` may point at another interpreter).
+
+* ``--watch`` reads the RCP room and prints the lifecycle events
+  (``simulation.submitted``/``workflow.finished``/``simulation.failed``) as they
+  arrive, until ``--wait-s`` elapses.  Use it in a second terminal after
+  ``--submit`` to follow the run.
+
 The MCP server and the cluster simclient use the same Matrix account but log in
 separately, so each gets its own MAS session/device and its own refresh chain
 (no rotation conflict).  RCP messages are role-tagged, so the self-echo works.
@@ -25,6 +35,8 @@ Usage::
     python scripts/local_mcp_check.py --setup
     # ... start scripts/cluster_simclient.sh on the login node ...
     python scripts/local_mcp_check.py --run
+    python scripts/local_mcp_check.py --submit --picmi-script ./my_sim.py
+    python scripts/local_mcp_check.py --watch
 """
 
 from __future__ import annotations
@@ -147,11 +159,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _call_hello(state: dict, message: str) -> dict:
-    """Drive the MCP stdio server and call the hello tool once.
+def _server_env(state: dict) -> dict:
+    """Build the environment for the MCP stdio server subprocess.
 
     Returns:
-        The tool's structured content.
+        ``os.environ`` plus the per-run RCP/MCP settings.
 
     """
     env = dict(os.environ)
@@ -161,20 +173,55 @@ async def _call_hello(state: dict, message: str) -> dict:
             "PIC_AGENTIC_ROOM_ID": state["room_id"],
             "PIC_AGENTIC_RCP_SECRET": state["rcp_secret"],
             "PIC_AGENTIC_SIM": state["sim"],
-            # Must be the CLUSTER path: the server builds it, the simclient
-            # writes and validates against its own message_dir.
+            # Used by the M1 hello path; the M2 payload travels inline, so this
+            # is only the simclient-side bookkeeping directory.
             "PIC_AGENTIC_MESSAGE_DIR": state["message_dir"],
             "PIC_AGENTIC_POLL_INTERVAL_S": "2",
             # The cluster side may wait in the SLURM queue; keep the ack wait
-            # generous and independent of the (fast) local message file write.
+            # generous.  The `accepted` ack is immediate, so this only bounds a
+            # missing/unreachable simclient.
             "PIC_AGENTIC_ACK_TIMEOUT_S": str(state.get("ack_timeout_s", 900)),
         }
     )
-    params = StdioServerParameters(command=sys.executable, args=["-m", "pic_agentic.server"], env=env)
+    # picongpu_python/revision may come from the state file or the environment.
+    for key in ("PIC_AGENTIC_PICONGPU_PYTHON", "PIC_AGENTIC_PICONGPU_REVISION"):
+        if state.get(key):
+            env[key] = state[key]
+    return env
+
+
+async def _call_tool(state: dict, tool: str, arguments: dict) -> dict:
+    """Drive the MCP stdio server and call one tool once.
+
+    Returns:
+        The tool's structured content.
+
+    """
+    params = StdioServerParameters(command=sys.executable, args=["-m", "pic_agentic.server"], env=_server_env(state))
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
-        result = await session.call_tool("hello", {"message": message})
+        result = await session.call_tool(tool, arguments)
         return result.structured_content or {"ok": result.is_error is False}
+
+
+async def _call_hello(state: dict, message: str) -> dict:
+    """Call the ``hello`` tool once.
+
+    Returns:
+        The tool's structured content.
+
+    """
+    return await _call_tool(state, "hello", {"message": message})
+
+
+async def _call_submit(state: dict, script_path: str) -> dict:
+    """Call the ``submit_simulation`` tool once with a PICMI script path.
+
+    Returns:
+        The tool's structured content.
+
+    """
+    return await _call_tool(state, "submit_simulation", {"picmi_script": script_path})
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -213,22 +260,150 @@ def cmd_run(args: argparse.Namespace) -> int:
         time.sleep(15)
 
 
-def main() -> None:
-    """Parse arguments and dispatch to setup or run.
+def cmd_submit(args: argparse.Namespace) -> int:
+    """Drive the MCP server and call the M2 submit_simulation tool once.
+
+    Returns:
+        The process exit code.
 
     Raises:
-        SystemExit: With ``cmd_setup``/``cmd_run``'s exit code.
+        SystemExit: If the state or the PICMI script is missing.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    if not args.picmi_script:
+        msg = "--submit requires --picmi-script <path>"
+        raise SystemExit(msg)
+    script = Path(args.picmi_script).expanduser()
+    if not script.is_file():
+        msg = f"PICMI script not found: {script}"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["ack_timeout_s"] = args.ack_timeout_s
+    if args.picongpu_python:
+        state["PIC_AGENTIC_PICONGPU_PYTHON"] = args.picongpu_python
+    try:
+        result = asyncio.run(_call_submit(state, str(script.resolve())))
+    except Exception as exc:  # ruff: ignore[blind-except] - the server reports failure as data normally
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    print(json.dumps(result, indent=2), flush=True)
+    if not result.get("ok"):
+        print("\nFAILED: the submit command was not accepted.", file=sys.stderr)
+        return 1
+    print(f"\nSUBMIT ACCEPTED: sim_id={result.get('sim_id')} state={result.get('state')}")
+    print("Watch the room / run --run later for the simulation.submitted and workflow.finished events.")
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Read the RCP room and print lifecycle events until the wait expires.
+
+    Returns:
+        The process exit code (0 on ``workflow.finished``, 1 on failure/timeout).
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    return asyncio.run(_watch(state, args.wait_s))
+
+
+async def _watch(state: dict, wait_s: float) -> int:
+    from pic_agentic.transport.matrix import (  # ruff: ignore[import-outside-top-level] - lazy transport import
+        MatrixTransport,
+    )
+
+    config = Config.load()
+    token_provider = MasTokenStore.from_config(config).access_token if config.has_refresh_chain() else None
+    transport = MatrixTransport(
+        state["homeserver"],
+        config.user_id or state["user_id"],
+        config.access_token,
+        state["room_id"],
+        store_path=os.environ.get("PIC_AGENTIC_NIO_STORE_DIR") or None,
+        token_provider=token_provider,
+    )
+    seen: set[str] = set()
+    deadline = time.monotonic() + wait_s
+    try:
+        for message in await transport.backfill():
+            seen.add(message.transport_event_id or message.dedup_key()[0])
+            rc = _print_event(message)
+            if rc is not None:
+                return rc
+        iterator = aiter(transport.receive())
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("\nNo terminal event before the wait expired.", file=sys.stderr)
+                return 1
+            try:
+                message = await asyncio.wait_for(anext(iterator), timeout=remaining)
+            except (TimeoutError, StopAsyncIteration):
+                print("\nNo terminal event before the wait expired.", file=sys.stderr)
+                return 1
+            if message.transport_event_id in seen:
+                continue
+            seen.add(message.transport_event_id or message.dedup_key()[0])
+            rc = _print_event(message)
+            if rc is not None:
+                return rc
+    finally:
+        await transport.close()
+
+
+def _print_event(message) -> int | None:
+    if not message.type.startswith("rcp.simulation"):
+        return None
+    state = message.payload.get("state")
+    job_id = message.payload.get("job_id")
+    print(f"[{message.type}] state={state} job_id={job_id}", flush=True)
+    error = message.payload.get("error")
+    if error:
+        print(f"    error: {error}", flush=True)
+    if state == "workflow.finished":
+        linked = message.payload.get("results_linked")
+        print(f"\nWORKFLOW FINISHED (results linked: {linked}).", flush=True)
+        return 0
+    if state == "simulation.failed":
+        print("\nSIMULATION FAILED.", file=sys.stderr, flush=True)
+        return 1
+    return None
+
+
+def main() -> None:
+    """Parse arguments and dispatch to setup, run, submit, or watch.
+
+    Raises:
+        SystemExit: With the chosen command's exit code.
 
     """
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--setup", action="store_true", help="create a room + secret for the cluster run")
     mode.add_argument("--run", action="store_true", help="drive the MCP server and send hello")
+    mode.add_argument("--submit", action="store_true", help="drive the MCP server and call submit_simulation")
+    mode.add_argument("--watch", action="store_true", help="follow lifecycle events in the RCP room")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
+    parser.add_argument("--picmi-script", default="", help="PICMI script path for --submit")
+    parser.add_argument(
+        "--picongpu-python",
+        default="",
+        help=(
+            "Interpreter with the [sim] extra that builds the payload subprocess "
+            "(PIC_AGENTIC_PICONGPU_PYTHON); defaults to the server's interpreter."
+        ),
+    )
     parser.add_argument("--wait-s", type=float, default=1800.0, help="overall wait for an ack")
-    parser.add_argument("--ack-timeout-s", type=float, default=900.0, help="per-hello ack wait")
+    parser.add_argument("--ack-timeout-s", type=float, default=900.0, help="per-attempt ack wait")
     parser.add_argument(
         "--message-dir",
         default="",
@@ -239,7 +414,13 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    raise SystemExit(cmd_setup(args) if args.setup else cmd_run(args))
+    if args.setup:
+        raise SystemExit(cmd_setup(args))
+    if args.submit:
+        raise SystemExit(cmd_submit(args))
+    if args.watch:
+        raise SystemExit(cmd_watch(args))
+    raise SystemExit(cmd_run(args))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Typed RCP message constructors for the M1 ``hello`` exchange."""
+"""Typed RCP message constructors for the M1/M2 exchanges."""
 
 from pic_agentic.protocol.hello import (
     DEFAULT_MESSAGE,
@@ -10,5 +10,38 @@ from pic_agentic.protocol.hello import (
     build_hello_ack,
     build_hello_command,
 )
+from pic_agentic.protocol.simulation import (
+    ALLOWED_SIMULATION_KEYS,
+    DEFAULT_SUBMIT_SYSTEM,
+    SimulationPayload,
+    SimulationStage,
+    SimulationState,
+    SimulationType,
+    SubmitParams,
+    UnsupportedPayloadError,
+    build_submit_ack,
+    build_submit_command,
+    build_submit_event,
+    provenance_mismatches,
+    simulation_spec_from_runner_dump,
+)
 
-__all__ = ["DEFAULT_MESSAGE", "HelloType", "build_hello_ack", "build_hello_command"]
+__all__ = [
+    "ALLOWED_SIMULATION_KEYS",
+    "DEFAULT_MESSAGE",
+    "DEFAULT_SUBMIT_SYSTEM",
+    "HelloType",
+    "SimulationPayload",
+    "SimulationStage",
+    "SimulationState",
+    "SimulationType",
+    "SubmitParams",
+    "UnsupportedPayloadError",
+    "build_hello_ack",
+    "build_hello_command",
+    "build_submit_ack",
+    "build_submit_command",
+    "build_submit_event",
+    "provenance_mismatches",
+    "simulation_spec_from_runner_dump",
+]
