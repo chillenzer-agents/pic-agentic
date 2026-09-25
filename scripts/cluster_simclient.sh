@@ -23,7 +23,7 @@
 #   PIC_AGENTIC_RCP_SECRET     shared per-simulation HMAC secret (required)
 #   PIC_AGENTIC_HOMESERVER     default https://chat.academiccloud.de
 #   PIC_AGENTIC_SIM            simulation id, default "cluster"
-#   PIC_AGENTIC_BRANCH         git branch/tag to install, default "mas-refresh-auth"
+#   PIC_AGENTIC_BRANCH         git branch/tag to install, default "main"
 #   PIC_AGENTIC_WORKDIR        default "$HOME/pic-agentic"
 #   PIC_AGENTIC_MESSAGE_DIR    shared dir for message files, default "$WORKDIR/shared"
 #   PIC_AGENTIC_SIM_SETUP_ROOT shared dir for generated setups, default
@@ -45,7 +45,7 @@ HOMESERVER="${PIC_AGENTIC_HOMESERVER:-https://chat.academiccloud.de}"
 ROOM_ID="${PIC_AGENTIC_ROOM_ID:-}"
 RCP_SECRET="${PIC_AGENTIC_RCP_SECRET:-}"
 SIM="${PIC_AGENTIC_SIM:-cluster}"
-BRANCH="${PIC_AGENTIC_BRANCH:-mas-refresh-auth}"
+BRANCH="${PIC_AGENTIC_BRANCH:-main}"
 WORKDIR="${PIC_AGENTIC_WORKDIR:-$HOME/pic-agentic}"
 MESSAGE_DIR="${PIC_AGENTIC_MESSAGE_DIR:-$WORKDIR/shared}"
 SIM_SETUP_ROOT="${PIC_AGENTIC_SIM_SETUP_ROOT:-$WORKDIR/sims}"

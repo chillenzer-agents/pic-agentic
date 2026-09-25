@@ -21,6 +21,11 @@ Three modes:
   The server needs the ``[sim]`` extra on the machine running this driver
   (``PIC_AGENTIC_PICONGPU_PYTHON`` may point at another interpreter).
 
+* ``--watch`` reads the RCP room and prints the lifecycle events
+  (``simulation.submitted``/``results.ready``/``simulation.failed``) as they
+  arrive, until ``--wait-s`` elapses.  Use it in a second terminal after
+  ``--submit`` to follow the run.
+
 The MCP server and the cluster simclient use the same Matrix account but log in
 separately, so each gets its own MAS session/device and its own refresh chain
 (no rotation conflict).  RCP messages are role-tagged, so the self-echo works.
@@ -31,6 +36,7 @@ Usage::
     # ... start scripts/cluster_simclient.sh on the login node ...
     python scripts/local_mcp_check.py --run
     python scripts/local_mcp_check.py --submit --picmi-script ./my_sim.py
+    python scripts/local_mcp_check.py --watch
 """
 
 from __future__ import annotations
@@ -291,8 +297,87 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Read the RCP room and print lifecycle events until the wait expires.
+
+    Returns:
+        The process exit code (0 on ``results.ready``, 1 on failure/timeout).
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    return asyncio.run(_watch(state, args.wait_s))
+
+
+async def _watch(state: dict, wait_s: float) -> int:
+    from pic_agentic.transport.matrix import (  # ruff: ignore[import-outside-top-level] - lazy transport import
+        MatrixTransport,
+    )
+
+    config = Config.load()
+    token_provider = MasTokenStore.from_config(config).access_token if config.has_refresh_chain() else None
+    transport = MatrixTransport(
+        state["homeserver"],
+        config.user_id or state["user_id"],
+        config.access_token,
+        state["room_id"],
+        store_path=os.environ.get("PIC_AGENTIC_NIO_STORE_DIR") or None,
+        token_provider=token_provider,
+    )
+    seen: set[str] = set()
+    deadline = time.monotonic() + wait_s
+    try:
+        for message in await transport.backfill():
+            seen.add(message.transport_event_id or message.dedup_key()[0])
+            rc = _print_event(message)
+            if rc is not None:
+                return rc
+        iterator = aiter(transport.receive())
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("\nNo terminal event before the wait expired.", file=sys.stderr)
+                return 1
+            try:
+                message = await asyncio.wait_for(anext(iterator), timeout=remaining)
+            except (TimeoutError, StopAsyncIteration):
+                print("\nNo terminal event before the wait expired.", file=sys.stderr)
+                return 1
+            if message.transport_event_id in seen:
+                continue
+            seen.add(message.transport_event_id or message.dedup_key()[0])
+            rc = _print_event(message)
+            if rc is not None:
+                return rc
+    finally:
+        await transport.close()
+
+
+def _print_event(message) -> int | None:
+    if not message.type.startswith("rcp.simulation"):
+        return None
+    state = message.payload.get("state")
+    job_id = message.payload.get("job_id")
+    print(f"[{message.type}] state={state} job_id={job_id}", flush=True)
+    error = message.payload.get("error")
+    if error:
+        print(f"    error: {error}", flush=True)
+    if state == "results.ready":
+        print("\nRESULTS READY.", flush=True)
+        return 0
+    if state == "simulation.failed":
+        print("\nSIMULATION FAILED.", file=sys.stderr, flush=True)
+        return 1
+    return None
+
+
 def main() -> None:
-    """Parse arguments and dispatch to setup, run, or submit.
+    """Parse arguments and dispatch to setup, run, submit, or watch.
 
     Raises:
         SystemExit: With the chosen command's exit code.
@@ -303,6 +388,7 @@ def main() -> None:
     mode.add_argument("--setup", action="store_true", help="create a room + secret for the cluster run")
     mode.add_argument("--run", action="store_true", help="drive the MCP server and send hello")
     mode.add_argument("--submit", action="store_true", help="drive the MCP server and call submit_simulation")
+    mode.add_argument("--watch", action="store_true", help="follow lifecycle events in the RCP room")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
@@ -331,6 +417,8 @@ def main() -> None:
         raise SystemExit(cmd_setup(args))
     if args.submit:
         raise SystemExit(cmd_submit(args))
+    if args.watch:
+        raise SystemExit(cmd_watch(args))
     raise SystemExit(cmd_run(args))
 
 
