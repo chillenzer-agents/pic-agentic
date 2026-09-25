@@ -9,7 +9,7 @@ disposable subprocess (the server never imports the script), wraps it in a
 :class:`~pic_agentic.protocol.simulation.SimulationPayload`, embeds it in the
 signed command and sends that.  It waits for the simclient's immediate
 ``accepted`` ack, so the LLM learns the ``sim_id`` right away; the later
-lifecycle events (``simulation.submitted``/``results.ready``/
+lifecycle events (``simulation.submitted``/``workflow.finished``/
 ``simulation.failed``) are recorded as they arrive for the M2 reporting tools.
 """
 

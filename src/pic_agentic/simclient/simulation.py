@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
@@ -422,6 +423,43 @@ def _scan_retained_step_logs(run_dir: Path) -> str:
     return "\n".join(hits[-20:])
 
 
+def link_run_results(run_dir: Path) -> bool:
+    """Link the simulation output into ``run_dir`` via the generated script.
+
+    The CWL workflow writes PIConGPU output inside its per-step cache directory
+    and generates ``link_results.sh`` to expose it as ``run_dir/simOutput``, but
+    never runs that script in the run directory.  Running it here makes
+    ``run_dir/simOutput`` present before the workflow-finished event, matching
+    the design's expectation that results are organised when the run finishes.
+
+    Args:
+        run_dir: The runner's run directory.
+
+    Returns:
+        True if the script ran successfully (or the link already exists), False
+        otherwise; a missing link is not fatal, the job may still be running.
+
+    """
+    run_dir = Path(run_dir)
+    if (run_dir / "simOutput").exists():
+        return True
+    script = run_dir / "link_results.sh"
+    if not script.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            ["/bin/bash", str(script), str(run_dir)],
+            cwd=str(run_dir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and (run_dir / "simOutput").exists()
+
+
 async def execute_submit(
     *,
     prepared: PreparedSubmit,
@@ -471,8 +509,9 @@ async def execute_submit(
     job_id = job_id_reader(runner.run_dir, prepared.payload)
     if job_id is not None:
         await emit(SimulationState.SUBMITTED, job_id=job_id, submit_system=prepared.params.submit_system)
-    await emit(SimulationState.RESULTS_READY, job_id=job_id)
-    return {"sim_id": prepared.payload.sim_id, "state": SimulationState.RESULTS_READY.value, "job_id": job_id}
+    link_ready = await asyncio.to_thread(link_run_results, runner.run_dir)
+    await emit(SimulationState.WORKFLOW_FINISHED, job_id=job_id, results_linked=link_ready)
+    return {"sim_id": prepared.payload.sim_id, "state": SimulationState.WORKFLOW_FINISHED.value, "job_id": job_id}
 
 
 __all__ = [

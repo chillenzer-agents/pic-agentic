@@ -64,6 +64,14 @@ class _FakeRunner:
         self.ran = True
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "submission_information.txt").write_text(f"Submitted batch job {JOB_ID}\n")
+        # The real workflow writes simOutput under its cache dir and generates
+        # link_results.sh (which the simclient then runs).
+        output = self.run_dir / ".cwl_cache" / "steps" / "simOutput"
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "openPMD").mkdir(exist_ok=True)
+        (self.run_dir / "link_results.sh").write_text(
+            f'#!/bin/bash\nln -s "{output}" "$1"\n',
+        )
 
 
 @pytest.fixture
@@ -153,11 +161,15 @@ async def test_submit_round_trip(shared_dir, tmp_path, fake_runner) -> None:
     events = service.events[outcome.cmd_id]
     states = [event.payload["state"] for event in events]
     assert SimulationState.SUBMITTED.value in states
-    assert SimulationState.RESULTS_READY.value in states
+    assert SimulationState.WORKFLOW_FINISHED.value in states
     submitted = next(e for e in events if e.payload["state"] == SimulationState.SUBMITTED.value)
     assert submitted.payload["job_id"] == JOB_ID
     # Provenance tuple is reported back to the sender.
     assert "picongpu_version" not in submitted.payload
+    finished = next(e for e in events if e.payload["state"] == SimulationState.WORKFLOW_FINISHED.value)
+    # The simclient runs the generated link_results.sh, so simOutput is present.
+    assert finished.payload["results_linked"] is True
+    assert (fake_runner[0].run_dir / "simOutput").exists()
 
 
 async def test_submit_payload_is_embedded_in_the_command(shared_dir, tmp_path, fake_runner) -> None:
@@ -189,7 +201,7 @@ async def test_submit_is_idempotent_on_replay(shared_dir, tmp_path, fake_runner)
     assert second is not None
     assert second.payload["cmd_id"] == first.payload["cmd_id"]
     # The replay re-acks the recorded terminal state, not a fresh accept.
-    assert second.payload["state"] == SimulationState.RESULTS_READY.value
+    assert second.payload["state"] == SimulationState.WORKFLOW_FINISHED.value
     # The replay did not rebuild the setup.
     assert len(fake_runner) == 1
 
@@ -214,7 +226,7 @@ async def test_submit_replay_after_restart_reacks_without_rebuilding(shared_dir,
     command.transport_event_id = "$backfill"
     replayed = await fresh.handle(command)
     assert replayed is not None
-    assert replayed.payload["state"] == SimulationState.RESULTS_READY.value
+    assert replayed.payload["state"] == SimulationState.WORKFLOW_FINISHED.value
     assert len(fake_runner) == 1
 
 
@@ -357,6 +369,26 @@ async def test_submit_bad_params_is_reported_not_crashed(shared_dir, tmp_path, f
     ack = await client.handle(command)
     assert ack is not None
     assert ack.payload["error_code"] == "payload_invalid"
+
+
+def test_link_run_results_runs_the_generated_script(tmp_path) -> None:
+    from pic_agentic.simclient.simulation import link_run_results
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    target = run_dir / ".cwl_cache" / "x" / "simOutput"
+    target.mkdir(parents=True)
+    (run_dir / "link_results.sh").write_text(f'#!/bin/bash\nln -s "{target}" "$1"\n')
+    assert link_run_results(run_dir) is True
+    assert (run_dir / "simOutput").exists()
+
+
+def test_link_run_results_missing_script_is_not_fatal(tmp_path) -> None:
+    from pic_agentic.simclient.simulation import link_run_results
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    assert link_run_results(run_dir) is False
 
 
 def test_per_command_token_must_be_safe_hex(shared_dir) -> None:

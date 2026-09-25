@@ -27,7 +27,7 @@ VERSION = 0
 SIGNED_FIELDS = frozenset({"version", "sim", "kind", "type", "seq", "ts", "sender_role", "in_reply_to", "payload"})
 
 #: Payload keys echoed into the human-readable room body, in this order.
-_BODY_KEYS = ("cmd_id", "job_id", "submit_system", "state", "step", "percent", "message")
+_BODY_KEYS = ("cmd_id", "job_id", "submit_system", "state", "results_linked", "step", "percent", "message")
 
 #: Maximum length of a payload value echoed into the room body.
 _BODY_VALUE_MAX = 60

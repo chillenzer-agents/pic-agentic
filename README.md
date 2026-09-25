@@ -179,10 +179,15 @@ raw callables; see `M2-SUBMIT-PLAN.md`).
    `run()`s the workflow (which invokes `sbatch`).
 3. Acknowledgements are deliberately coarse: the simclient acks `accepted`
    immediately, then emits `simulation.submitted` (with the SLURM `job_id`
-   parsed from `submission_information.txt`) and `results.ready`; a stage
-   failure emits `simulation.failed{stage}`. Rejected commands report the
-   reason in the single ack instead of an event. Per-stage acks wait for
-   upstream PR #55.
+   parsed from `submission_information.txt`) and `workflow.finished` once the
+   CWL workflow (build/prepare/submit/organize) has returned; a stage failure
+   emits `simulation.failed{stage}`. `workflow.finished` deliberately does not
+   claim the SLURM job finished — it may still be queued or running. The
+   simclient also runs the generated `link_results.sh` first, so
+   `run_dir/simOutput` is present when the event fires (reported as
+   `results_linked`). The design's `results.ready` is reserved for a later
+   job-state confirmation, deferred with per-stage events (upstream PR #55).
+   Rejected commands report the reason in the single ack instead of an event.
 
 Enable the handler by pointing the cluster simclient at a writable shared
 directory (the `PIC_AGENTIC_SIM_SETUP_ROOT` environment variable; see
@@ -299,5 +304,7 @@ should be folded back into the design document.
   encoding is required because Matrix's canonical JSON rejects floats in event
   content.
 - **M2 acks**: coarse (`accepted`, then `simulation.submitted` /
-  `results.ready` / `simulation.failed{stage}` events). Per-stage acks are
+  `workflow.finished` / `simulation.failed{stage}` events). `workflow.finished`
+  replaces the design's premature `results.ready`: it marks the CWL workflow
+  returning, not the SLURM job finishing. Per-stage/job-state events are
   deferred to upstream PR #55.

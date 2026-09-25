@@ -75,11 +75,18 @@ class SimulationType(StrEnum):
 
 
 class SimulationState(StrEnum):
-    """Coarse lifecycle state reported in acks and events (gap 9)."""
+    """Coarse lifecycle state reported in acks and events (gap 9).
+
+    ``workflow.finished`` marks the end of the CWL workflow the simclient
+    drives (build -> prepare -> submit -> organize).  It deliberately does not
+    claim the SLURM job finished, nor that results exist: the job may still be
+    queued or running.  The design's ``results.ready`` is reserved for a later
+    job-state confirmation (deferred with per-stage events, upstream #55).
+    """
 
     ACCEPTED = "accepted"
     SUBMITTED = "simulation.submitted"
-    RESULTS_READY = "results.ready"
+    WORKFLOW_FINISHED = "workflow.finished"
     FAILED = "simulation.failed"
 
 
@@ -414,6 +421,7 @@ def build_submit_event(
     error: str | None = None,
     error_code: str | None = None,
     submit_system: str | None = None,
+    results_linked: bool | None = None,
 ) -> RcpMessage:
     """Build one M2 lifecycle event.
 
@@ -430,6 +438,8 @@ def build_submit_event(
         payload["error"] = error
     if error_code:
         payload["error_code"] = error_code
+    if results_linked is not None:
+        payload["results_linked"] = results_linked
     return RcpMessage(
         sim=sim,
         kind=Kind.EVENT,

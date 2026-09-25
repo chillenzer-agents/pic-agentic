@@ -22,7 +22,7 @@ Three modes:
   (``PIC_AGENTIC_PICONGPU_PYTHON`` may point at another interpreter).
 
 * ``--watch`` reads the RCP room and prints the lifecycle events
-  (``simulation.submitted``/``results.ready``/``simulation.failed``) as they
+  (``simulation.submitted``/``workflow.finished``/``simulation.failed``) as they
   arrive, until ``--wait-s`` elapses.  Use it in a second terminal after
   ``--submit`` to follow the run.
 
@@ -293,7 +293,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print("\nFAILED: the submit command was not accepted.", file=sys.stderr)
         return 1
     print(f"\nSUBMIT ACCEPTED: sim_id={result.get('sim_id')} state={result.get('state')}")
-    print("Watch the room / run --run later for the simulation.submitted and results.ready events.")
+    print("Watch the room / run --run later for the simulation.submitted and workflow.finished events.")
     return 0
 
 
@@ -301,7 +301,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
     Returns:
-        The process exit code (0 on ``results.ready``, 1 on failure/timeout).
+        The process exit code (0 on ``workflow.finished``, 1 on failure/timeout).
 
     Raises:
         SystemExit: If no setup state exists.
@@ -367,8 +367,9 @@ def _print_event(message) -> int | None:
     error = message.payload.get("error")
     if error:
         print(f"    error: {error}", flush=True)
-    if state == "results.ready":
-        print("\nRESULTS READY.", flush=True)
+    if state == "workflow.finished":
+        linked = message.payload.get("results_linked")
+        print(f"\nWORKFLOW FINISHED (results linked: {linked}).", flush=True)
         return 0
     if state == "simulation.failed":
         print("\nSIMULATION FAILED.", file=sys.stderr, flush=True)

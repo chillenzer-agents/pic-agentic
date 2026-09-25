@@ -542,7 +542,7 @@ class SimClient:
                     job_id=result.get("job_id"),
                     payload_hash=payload_hash,
                     sim_id=str(result.get("sim_id", sim_id)),
-                    state=str(result.get("state", SimulationState.RESULTS_READY.value)),
+                    state=str(result.get("state", SimulationState.WORKFLOW_FINISHED.value)),
                 )
             )
         return accepted
@@ -596,6 +596,7 @@ class SimClient:
         error: str | None = None,
         error_code: str | None = None,
         submit_system: str | None = None,
+        results_linked: bool | None = None,
     ) -> RcpMessage:
         return build_submit_event(
             sim=self.sim,
@@ -608,6 +609,7 @@ class SimClient:
             error=error,
             error_code=error_code,
             submit_system=submit_system,
+            results_linked=results_linked,
         ).sign(self.secret)
 
     async def _ack(self, message: RcpMessage, *, cmd_id: object, error: str) -> RcpMessage:
