@@ -56,7 +56,6 @@ class HelloRuntime:
         self.submit_service = SubmitService(
             sim=sim,
             secret=config.rcp_secret,
-            message_dir=message_dir,
             picongpu_python=config.picongpu_python,
             picongpu_revision=config.picongpu_revision,
             ack_timeout_s=config.ack_timeout_s,

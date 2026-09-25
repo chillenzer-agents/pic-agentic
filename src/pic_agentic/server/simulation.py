@@ -6,10 +6,10 @@
 
 The service turns an LLM-supplied PICMI script into a ``Runner`` dump in a
 disposable subprocess (the server never imports the script), wraps it in a
-:class:`~pic_agentic.protocol.simulation.SimulationPayload`, writes the payload
-to the shared file system and sends the command.  It waits for the simclient's
-immediate ``accepted`` ack, so the LLM learns the ``sim_id`` right away; the
-later lifecycle events (``simulation.submitted``/``results.ready``/
+:class:`~pic_agentic.protocol.simulation.SimulationPayload`, embeds it in the
+signed command and sends that.  It waits for the simclient's immediate
+``accepted`` ack, so the LLM learns the ``sim_id`` right away; the later
+lifecycle events (``simulation.submitted``/``results.ready``/
 ``simulation.failed``) are recorded as they arrive for the M2 reporting tools.
 """
 
@@ -31,7 +31,6 @@ from pic_agentic.protocol.simulation import (
 )
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 from pic_agentic.server.hello import AckTimeoutError, SendFn
-from pic_agentic.simclient.safety import write_payload
 from pic_agentic.simulation_build import BuiltSimulation, SimulationBuildError, build_runner_dump
 
 #: Signature of the injectable runner-dump builder (test seam).
@@ -66,7 +65,6 @@ class SubmitService:
         self,
         sim: str,
         secret: str,
-        message_dir: Path,
         *,
         picongpu_python: str = "",
         picongpu_revision: str = "",
@@ -78,7 +76,6 @@ class SubmitService:
         Args:
             sim: Simulation id.
             secret: Shared per-simulation RCP secret.
-            message_dir: Shared-filesystem base directory for payload files.
             picongpu_python: Interpreter with the pinned PIConGPU install.
             picongpu_revision: Pinned revision carried in the payload header.
             ack_timeout_s: Maximum wait for the ``accepted`` ack.
@@ -87,7 +84,6 @@ class SubmitService:
         """
         self.sim = sim
         self.secret = secret
-        self.message_dir = message_dir
         self.picongpu_python = picongpu_python
         self.picongpu_revision = picongpu_revision
         self.ack_timeout_s = ack_timeout_s
@@ -97,18 +93,6 @@ class SubmitService:
         #: Lifecycle events observed so far, keyed by cmd_id (M2 reporting).
         self.events: dict[str, list[RcpMessage]] = {}
 
-    def payload_path_for(self, cmd_id: str) -> str:
-        """Return the server-generated path for a command's payload file.
-
-        Args:
-            cmd_id: The command id.
-
-        Returns:
-            An absolute path with a safe charset (design section 6.4).
-
-        """
-        return str(self.message_dir / "sim" / f"{self.sim}-{cmd_id}.json")
-
     async def build_payload(
         self,
         script_path: Path,
@@ -116,7 +100,7 @@ class SubmitService:
         params: SubmitParams | None = None,
         cmd_id: str | None = None,
     ) -> tuple[str, SimulationPayload, RcpMessage]:
-        """Build the payload, write it to the shared FS and build the command.
+        """Build the payload and embed it in the signed command.
 
         Args:
             script_path: Path to the PICMI script (already resolved).
@@ -139,17 +123,10 @@ class SubmitService:
             runner_dump=built.runner,
         )
         payload.check_allowlist()
-        path = self.payload_path_for(command_id)
-        # Computed fields (payload_hash/sim_id) are excluded from the file: they
-        # travel in the command header, and ``extra="forbid"`` would otherwise
-        # reject the payload on the simclient's validating re-read.
-        body = payload.model_dump_json(exclude_computed_fields=True)
-        write_payload(path, str(self.message_dir), body.encode("utf-8"))
         seq = self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER)
         command = build_submit_command(
             sim=self.sim,
             seq=seq,
-            payload_path=path,
             payload=payload,
             params=params,
             cmd_id=command_id,

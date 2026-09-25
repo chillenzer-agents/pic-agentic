@@ -14,6 +14,9 @@ import pytest
 
 from pic_agentic.protocol.simulation import (
     DEFAULT_SUBMIT_SYSTEM,
+    MAX_INLINE_PAYLOAD_BYTES,
+    PAYLOAD_KEY,
+    PayloadTooLargeError,
     SimulationPayload,
     SimulationState,
     SubmitParams,
@@ -21,6 +24,7 @@ from pic_agentic.protocol.simulation import (
     build_submit_ack,
     build_submit_command,
     build_submit_event,
+    payload_wire_bytes,
     provenance_mismatches,
     simulation_spec_from_runner_dump,
 )
@@ -129,18 +133,22 @@ def test_provenance_skips_unknown_local_values() -> None:
 
 def test_command_header_carries_provenance_and_hash() -> None:
     payload = _payload()
-    command = build_submit_command(sim="s", seq=1, payload_path="/shared/sim/x.json", payload=payload)
+    command = build_submit_command(sim="s", seq=1, payload=payload)
     header = command.payload["header"]
     assert header["payload_hash"] == hashlib.sha256(canonical_bytes(payload.simulation)).hexdigest()
     assert header["sim_id"] == payload.sim_id
     assert header["wire_format_version"] == WIRE_FORMAT_VERSION
     assert command.kind is Kind.COMMAND
     assert command.sender_role is SenderRole.MCP_SERVER
+    # The payload travels inline; no shared-FS path is involved.
+    assert PAYLOAD_KEY in command.payload
+    assert "payload_path" not in command.payload
+    assert set(command.payload[PAYLOAD_KEY]["simulation"]) == {"sim"}
 
 
 def test_params_round_trip_and_default_submit_system() -> None:
     params = SubmitParams(build_jobs=4)
-    command = build_submit_command(sim="s", seq=1, payload_path="/p", payload=_payload(), params=params)
+    command = build_submit_command(sim="s", seq=1, payload=_payload(), params=params)
     assert command.payload["params"]["submit_system"] == DEFAULT_SUBMIT_SYSTEM
     # picongpu_flags maps the design's build_* names to the aliases the pinned
     # PicBuildFlags/TBGFlags actually accept, and drops unset options (a False
@@ -166,6 +174,26 @@ def test_params_maps_every_field_to_its_picongpu_alias() -> None:
         "submit": "sbatch",
         "o": ["a=1"],
     }
+
+
+def test_payload_wire_bytes_excludes_computed_fields_and_round_trips() -> None:
+    payload = _payload()
+    raw = payload_wire_bytes(payload)
+    body = json.loads(raw)
+    assert "payload_hash" not in body
+    assert "sim_id" not in body
+    restored = SimulationPayload.model_validate(body)
+    assert restored.payload_hash == payload.payload_hash
+
+
+def test_payload_wire_bytes_rejects_oversized_simulation() -> None:
+    payload = SimulationPayload(
+        picongpu_version="0.9.0-dev",
+        schema_hash="x",
+        simulation={"sim": {"blob": "a" * (MAX_INLINE_PAYLOAD_BYTES + 1)}},
+    )
+    with pytest.raises(PayloadTooLargeError, match="inline limit"):
+        payload_wire_bytes(payload)
 
 
 def test_ack_and_event_shape() -> None:

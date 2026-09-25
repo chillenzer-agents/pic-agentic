@@ -167,15 +167,20 @@ def _server_env(state: dict) -> dict:
             "PIC_AGENTIC_ROOM_ID": state["room_id"],
             "PIC_AGENTIC_RCP_SECRET": state["rcp_secret"],
             "PIC_AGENTIC_SIM": state["sim"],
-            # Must be the CLUSTER path: the server builds it, the simclient
-            # writes and validates against its own message_dir.
+            # Used by the M1 hello path; the M2 payload travels inline, so this
+            # is only the simclient-side bookkeeping directory.
             "PIC_AGENTIC_MESSAGE_DIR": state["message_dir"],
             "PIC_AGENTIC_POLL_INTERVAL_S": "2",
             # The cluster side may wait in the SLURM queue; keep the ack wait
-            # generous and independent of the (fast) local message file write.
+            # generous.  The `accepted` ack is immediate, so this only bounds a
+            # missing/unreachable simclient.
             "PIC_AGENTIC_ACK_TIMEOUT_S": str(state.get("ack_timeout_s", 900)),
         }
     )
+    # picongpu_python/revision may come from the state file or the environment.
+    for key in ("PIC_AGENTIC_PICONGPU_PYTHON", "PIC_AGENTIC_PICONGPU_REVISION"):
+        if state.get(key):
+            env[key] = state[key]
     return env
 
 
@@ -271,6 +276,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         raise SystemExit(msg)
     state = json.loads(args.state.read_text())
     state["ack_timeout_s"] = args.ack_timeout_s
+    if args.picongpu_python:
+        state["PIC_AGENTIC_PICONGPU_PYTHON"] = args.picongpu_python
     try:
         result = asyncio.run(_call_submit(state, str(script.resolve())))
     except Exception as exc:  # ruff: ignore[blind-except] - the server reports failure as data normally
@@ -300,6 +307,14 @@ def main() -> None:
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
     parser.add_argument("--picmi-script", default="", help="PICMI script path for --submit")
+    parser.add_argument(
+        "--picongpu-python",
+        default="",
+        help=(
+            "Interpreter with the [sim] extra that builds the payload subprocess "
+            "(PIC_AGENTIC_PICONGPU_PYTHON); defaults to the server's interpreter."
+        ),
+    )
     parser.add_argument("--wait-s", type=float, default=1800.0, help="overall wait for an ack")
     parser.add_argument("--ack-timeout-s", type=float, default=900.0, help="per-attempt ack wait")
     parser.add_argument(

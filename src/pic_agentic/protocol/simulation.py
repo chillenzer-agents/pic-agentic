@@ -4,13 +4,18 @@
 
 """M2 ``submit_simulation`` RCP messages (design sections 4.1, 8.2).
 
-Wire format (decided before implementation): the payload carries a
-``pypicongpu.Runner`` *spec* -- only the ``sim`` field -- and never the runner's
-cluster-local directories.  The MCP server writes the payload to a
-server-generated path on the shared file system; the simclient re-validates the
-path, the provenance tuple and the payload hash *before* it imports PIConGPU or
-writes anything, then rebuilds a fresh ``Runner`` with cluster-local
-``setup_dir``/``run_dir``/``template_dir`` (design section 6.4, gap 3).
+Wire format: the signed command carries a ``pypicongpu.Runner`` *spec* inline
+-- only the ``sim`` field -- and never the runner's cluster-local directories.
+The simclient validates the provenance tuple and the payload hash, then rebuilds
+a fresh ``Runner`` with cluster-local ``setup_dir``/``run_dir``/``template_dir``
+(design section 6.4, gap 3).
+
+The payload travels *inside* the Matrix ``m.room.message`` (not as a shared-FS
+file), so the MCP server and the simclient need no common file system: the
+container/cluster split of the deployment is preserved.  The cost is that the
+command is bounded by the homeserver's event-size limit, hence
+:data:`MAX_INLINE_PAYLOAD_BYTES` (a realistic simulation is a few KiB; the
+largest stress case measured ~53 KiB).
 
 The payload itself contains no ``rc_params``: those are cluster-local (the
 ``picongpurc.toml``) and some of their fields are shell code (design section
@@ -23,6 +28,7 @@ is the simclient's job (the ``sim`` extra).
 from __future__ import annotations
 
 import hashlib
+import json
 from enum import StrEnum
 from typing import Any
 
@@ -36,6 +42,19 @@ ALLOWED_SIMULATION_KEYS = frozenset({"sim"})
 
 #: Default submit command; a payload asking for anything else is rejected.
 DEFAULT_SUBMIT_SYSTEM = "sbatch"
+
+#: Cap on the canonical simulation bytes carried in one Matrix command.  The
+#: homeserver rejects an oversized event (Synapse's default limit is 64 KiB for
+#: the whole content); 48 KiB leaves headroom for the envelope and the tool
+#: metadata.  A larger simulation needs out-of-band transport (future work).
+MAX_INLINE_PAYLOAD_BYTES = 48 * 1024
+
+#: Key of the embedded :class:`SimulationPayload` body inside the command.
+PAYLOAD_KEY = "payload"
+
+
+class PayloadTooLargeError(ValueError):
+    """Raised when a simulation is too large to send inline in one command."""
 
 
 class UnsupportedPayloadError(ValueError):
@@ -268,11 +287,39 @@ def provenance_mismatches(payload: SimulationPayload, local: dict[str, str]) -> 
     return mismatches
 
 
+def payload_wire_bytes(payload: SimulationPayload) -> bytes:
+    """Serialise a payload for inline transport, enforcing the size cap.
+
+    The computed fields (``payload_hash``/``sim_id``) are excluded: they are
+    recomputed on read and would otherwise be rejected by
+    ``extra="forbid"``.
+
+    Args:
+        payload: The payload to serialise.
+
+    Returns:
+        The canonical JSON bytes to embed in the command.
+
+    Raises:
+        PayloadTooLargeError: If the simulation exceeds
+            :data:`MAX_INLINE_PAYLOAD_BYTES`.
+
+    """
+    body = payload.model_dump_json(exclude_computed_fields=True).encode("utf-8")
+    size = len(canonical_bytes(payload.simulation))
+    if size > MAX_INLINE_PAYLOAD_BYTES:
+        msg = (
+            f"simulation is {size} bytes; the inline limit is {MAX_INLINE_PAYLOAD_BYTES} "
+            "(out-of-band payload transport is not implemented yet)"
+        )
+        raise PayloadTooLargeError(msg)
+    return body
+
+
 def build_submit_command(
     *,
     sim: str,
     seq: int,
-    payload_path: str,
     payload: SimulationPayload,
     params: SubmitParams | None = None,
     cmd_id: str | None = None,
@@ -280,19 +327,24 @@ def build_submit_command(
 ) -> RcpMessage:
     """Build the MCP-server-to-simclient ``submit_simulation`` command.
 
+    The payload travels inline in the signed envelope, so the command is
+    self-contained: the simclient needs no shared file system to read it.
+
     Args:
         sim: Simulation id.
         seq: Per-sender sequence number.
-        payload_path: Server-generated absolute path of the payload file.
-        payload: The payload written to ``payload_path``.
+        payload: The simulation payload to embed.
         params: Optional build/run flags.
         cmd_id: Optional command id (generated when omitted).
         in_reply_to: Optional transport event id being replied to.
 
     Returns:
-        The unsigned ``rcp.simulation_submit`` command.
+        The unsigned ``rcp.simulation_submit`` command.  A simulation larger
+        than :data:`MAX_INLINE_PAYLOAD_BYTES` is rejected by
+        :func:`payload_wire_bytes` with :class:`PayloadTooLargeError`.
 
     """
+    body = json.loads(payload_wire_bytes(payload))
     return RcpMessage(
         sim=sim,
         kind=Kind.COMMAND,
@@ -302,8 +354,8 @@ def build_submit_command(
         in_reply_to=in_reply_to,
         payload={
             "cmd_id": cmd_id or new_cmd_id(),
-            "payload_path": payload_path,
             "header": payload.counts(),
+            PAYLOAD_KEY: body,
             "params": (params or SubmitParams()).model_dump(mode="json"),
         },
     )

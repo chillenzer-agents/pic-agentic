@@ -166,10 +166,12 @@ raw callables; see `M2-SUBMIT-PLAN.md`).
    `Runner` dump into a `SimulationPayload`. The payload carries a provenance
    tuple — `wire_format_version`, `picongpu_version`, `picongpu_revision`,
    `schema_hash` (SHA-256 of the `Runner` JSON schema), plus a `payload_hash`
-   and 8-hex `sim_id` — and is written to the shared file system. Only its
-   **path** travels in the Matrix command.
-2. The simclient re-validates the path, the byte hash and the provenance tuple
-   against its own install **before** importing PIConGPU; all cluster
+   and 8-hex `sim_id` — and travels **inline inside the signed command**, so no
+   shared file system between the two sides is needed. Simulations larger than
+   `MAX_INLINE_PAYLOAD_BYTES` (48 KiB) are rejected; realistic simulations are a
+   few KiB.
+2. The simclient re-validates the embedded payload's byte hash and provenance
+   tuple against its own install **before** importing PIConGPU; all cluster
    locations (`setup_dir`, `run_dir`, `template_dir`) come from local config,
    never the payload. It rebuilds a fresh `Runner`, `generate()`s the setup and
    `run()`s the workflow (which invokes `sbatch`).
@@ -192,6 +194,9 @@ check:
 ```bash
 python scripts/local_mcp_check.py --submit --picmi-script ./my_simulation.py
 ```
+
+The MCP server needs the `[sim]` extra to build the payload (run the check in
+that venv, or point `--picongpu-python` at it).
 
 ## Security model (M1)
 
@@ -284,9 +289,11 @@ should be folded back into the design document.
   avg-per-step field has no outer `setw`. The regex is robust to both.
 - **M2 wire format**: the payload carries a `pypicongpu.Runner` *spec*, not the
   picmi `Simulation`, and `rc_params` are never transmitted. The payload travels
-  by shared-file-system path (so it is not bound by Matrix's `m.room.message`
-  size limit); the command carries only its path plus a provenance header and
-  the JSON build/run flags.
+  **inline** in the signed command (bounded by `MAX_INLINE_PAYLOAD_BYTES`),
+  alongside a provenance header and the JSON build/run flags. This keeps the
+  agent host and the cluster split without a shared file system; the earlier
+  shared-FS-path variant is available in the git history if larger payloads
+  ever need out-of-band transport.
 - **M2 acks**: coarse (`accepted`, then `simulation.submitted` /
   `results.ready` / `simulation.failed{stage}` events). Per-stage acks are
   deferred to upstream PR #55.

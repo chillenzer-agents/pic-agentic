@@ -5,16 +5,15 @@
 """Simulation-side execution of an M2 ``submit_simulation`` command.
 
 The handler is deliberately paranoid (design sections 6.4, 8.2): it re-validates
-the server-generated payload path, checks the payload hash and the provenance
-tuple against the local install, and only then imports PIConGPU.  All cluster
-locations come from local configuration, never from the payload.
+the inline payload, checks its byte hash and the provenance tuple against the
+local install, and only then imports PIConGPU.  All cluster locations come from
+local configuration, never from the payload.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -32,7 +31,6 @@ from pic_agentic.protocol.simulation import (
     provenance_mismatches,
 )
 from pic_agentic.rcp import canonical_bytes
-from pic_agentic.simclient.safety import UnsafePathError, validate_message_path
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +43,6 @@ class SimulationErrorCode(StrEnum):
     """Stable machine-readable error codes reported in acks and events."""
 
     PATH_UNSAFE = "path_unsafe"
-    PAYLOAD_UNREADABLE = "payload_unreadable"
     PAYLOAD_INVALID = "payload_invalid"
     UNSUPPORTED = "unsupported"
     HASH_MISMATCH = "hash_mismatch"
@@ -78,22 +75,20 @@ class SimulationExecutionError(RuntimeError):
 class SubmitConfig:
     """Cluster-local policy for executing a submitted simulation."""
 
-    message_dir: Path
     setup_root: Path
     template_dir: str = ""
     preset: int | None = None
 
     def __post_init__(self) -> None:
-        """Normalise the paths to absolute form."""
-        self.message_dir = Path(self.message_dir)
+        """Normalise the path to absolute form."""
         self.setup_root = Path(self.setup_root)
 
 
-def check_payload_hash(raw: bytes, header: dict[str, Any]) -> None:
-    """Verify the transmitted hash against the raw payload bytes.
+def check_payload_hash(body: dict[str, Any], header: dict[str, Any]) -> None:
+    """Verify the transmitted hash against the embedded payload.
 
     Args:
-        raw: The payload file contents.
+        body: The embedded ``SimulationPayload`` mapping from the command.
         header: The command's ``header`` mapping.
 
     Raises:
@@ -101,9 +96,8 @@ def check_payload_hash(raw: bytes, header: dict[str, Any]) -> None:
 
     """
     try:
-        data = json.loads(raw)
-        simulation = data["simulation"]
-    except (ValueError, KeyError, TypeError) as exc:
+        simulation = body["simulation"]
+    except (KeyError, TypeError) as exc:
         msg = f"cannot read simulation from payload: {exc}"
         raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_INVALID, msg) from exc
     actual = hashlib.sha256(canonical_bytes(simulation)).hexdigest()
@@ -227,7 +221,7 @@ class PreparedSubmit:
 
 def prepare_submit(
     *,
-    payload_path: str,
+    body: dict[str, Any],
     header: dict[str, Any],
     params: dict[str, Any] | None,
     config: SubmitConfig,
@@ -242,7 +236,7 @@ def prepare_submit(
     instead (see :func:`execute_submit`).
 
     Args:
-        payload_path: Server-generated path of the payload file.
+        body: The embedded payload mapping from the command.
         header: The command's provenance header.
         params: The command's build/run flags.
         config: Cluster-local submit policy.
@@ -256,19 +250,10 @@ def prepare_submit(
         SimulationExecutionError: On any validation failure.
 
     """
-    try:
-        resolved = validate_message_path(payload_path, str(config.message_dir))
-    except UnsafePathError as exc:
-        raise SimulationExecutionError(SimulationErrorCode.PATH_UNSAFE, str(exc)) from exc
-    try:
-        raw = Path(resolved).read_bytes()
-    except OSError as exc:
-        msg = f"cannot read payload: {exc}"
-        raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_UNREADABLE, msg) from exc
-    check_payload_hash(raw, header)
+    check_payload_hash(body, header)
 
     try:
-        payload = SimulationPayload.model_validate_json(raw)
+        payload = SimulationPayload.model_validate(body)
     except ValueError as exc:
         raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_INVALID, str(exc)) from exc
     if payload.payload_hash != str(header.get("payload_hash", "")):

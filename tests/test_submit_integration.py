@@ -116,7 +116,7 @@ def test_nested_unknown_field_is_rejected(tmp_path: Path) -> None:
         schema_hash=runner_schema_hash(),
         runner_dump=dump,
     )
-    config = SubmitConfig(message_dir=tmp_path, setup_root=tmp_path)
+    config = SubmitConfig(setup_root=tmp_path)
     with pytest.raises(SimulationExecutionError) as excinfo:
         runner_from_payload(payload, config, "deadbeef")
     assert excinfo.value.code is SimulationErrorCode.UNSUPPORTED

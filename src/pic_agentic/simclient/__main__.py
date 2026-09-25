@@ -45,7 +45,6 @@ async def run() -> None:
     submit_config = None
     if config.sim_setup_root:
         submit_config = SubmitConfig(
-            message_dir=message_dir,
             setup_root=Path(config.sim_setup_root).resolve(),
             template_dir=config.cluster_template_dir,
             preset=config.cluster_preset,
