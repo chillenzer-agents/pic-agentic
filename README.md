@@ -167,9 +167,11 @@ raw callables; see `M2-SUBMIT-PLAN.md`).
    tuple — `wire_format_version`, `picongpu_version`, `picongpu_revision`,
    `schema_hash` (SHA-256 of the `Runner` JSON schema), plus a `payload_hash`
    and 8-hex `sim_id` — and travels **inline inside the signed command**, so no
-   shared file system between the two sides is needed. Simulations larger than
-   `MAX_INLINE_PAYLOAD_BYTES` (48 KiB) are rejected; realistic simulations are a
-   few KiB.
+   shared file system between the two sides is needed. The payload is carried as
+   a JSON **string**, because Matrix's canonical JSON (Synapse) rejects floats
+   in event-content objects and a simulation is full of floats. Simulations
+   larger than `MAX_INLINE_PAYLOAD_BYTES` (48 KiB) are rejected; realistic
+   simulations are a few KiB.
 2. The simclient re-validates the embedded payload's byte hash and provenance
    tuple against its own install **before** importing PIConGPU; all cluster
    locations (`setup_dir`, `run_dir`, `template_dir`) come from local config,
@@ -289,11 +291,13 @@ should be folded back into the design document.
   avg-per-step field has no outer `setw`. The regex is robust to both.
 - **M2 wire format**: the payload carries a `pypicongpu.Runner` *spec*, not the
   picmi `Simulation`, and `rc_params` are never transmitted. The payload travels
-  **inline** in the signed command (bounded by `MAX_INLINE_PAYLOAD_BYTES`),
-  alongside a provenance header and the JSON build/run flags. This keeps the
-  agent host and the cluster split without a shared file system; the earlier
-  shared-FS-path variant is available in the git history if larger payloads
-  ever need out-of-band transport.
+  **inline** in the signed command as a JSON string (bounded by
+  `MAX_INLINE_PAYLOAD_BYTES`), alongside a provenance header and the JSON
+  build/run flags. This keeps the agent host and the cluster split without a
+  shared file system; the earlier shared-FS-path variant is available in the git
+  history if larger payloads ever need out-of-band transport. The string
+  encoding is required because Matrix's canonical JSON rejects floats in event
+  content.
 - **M2 acks**: coarse (`accepted`, then `simulation.submitted` /
   `results.ready` / `simulation.failed{stage}` events). Per-stage acks are
   deferred to upstream PR #55.

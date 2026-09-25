@@ -165,11 +165,14 @@ async def test_submit_payload_is_embedded_in_the_command(shared_dir, tmp_path, f
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
     _cmd_id, payload, command = await service.build_payload(script)
-    body = command.payload[PAYLOAD_KEY]
+    raw = command.payload[PAYLOAD_KEY]
+    # The payload is a JSON *string*: Synapse's canonical JSON rejects floats in
+    # event-content objects, and the simulation has many.
+    assert isinstance(raw, str)
+    body = json.loads(raw)
     assert set(body) == {"wire_format_version", "picongpu_version", "picongpu_revision", "schema_hash", "simulation"}
     assert set(body["simulation"]) == {"sim"}
     assert SimulationPayload.model_validate(body).sim_id == payload.sim_id
-    # No shared-FS path is involved any more.
     assert "payload_path" not in command.payload
 
 
@@ -245,7 +248,9 @@ async def test_submit_reports_hash_mismatch(shared_dir, tmp_path, fake_runner) -
     _cmd_id, _payload, command = await service.build_payload(script)
     # Corrupt the embedded simulation; the header hash still names the original,
     # so the hash check fires.  Re-sign so the signature is not the blocker.
-    command.payload[PAYLOAD_KEY]["simulation"]["sim"]["delta_t_si"] = 9.99e-15
+    tampered = json.loads(command.payload[PAYLOAD_KEY])
+    tampered["simulation"]["sim"]["delta_t_si"] = 9.99e-15
+    command.payload[PAYLOAD_KEY] = json.dumps(tampered)
     command.sign(SECRET)
 
     ack = await client.handle(command)
@@ -419,7 +424,7 @@ async def test_submit_rejects_unsupported_simulation_key(shared_dir, tmp_path, f
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
     cmd_id, _payload, command = await service.build_payload(script)
-    body = dict(command.payload[PAYLOAD_KEY])
+    body = json.loads(command.payload[PAYLOAD_KEY])
     body["simulation"] = {**body["simulation"], "run_dir": "/etc"}
     # Rebuild and re-sign the command; its header hash is recomputed from the
     # tampered simulation, so the allow-list check (not the hash check) fires.

@@ -28,7 +28,6 @@ is the simclient's job (the ``sim`` extra).
 from __future__ import annotations
 
 import hashlib
-import json
 from enum import StrEnum
 from typing import Any
 
@@ -49,7 +48,13 @@ DEFAULT_SUBMIT_SYSTEM = "sbatch"
 #: metadata.  A larger simulation needs out-of-band transport (future work).
 MAX_INLINE_PAYLOAD_BYTES = 48 * 1024
 
-#: Key of the embedded :class:`SimulationPayload` body inside the command.
+#: Key of the embedded :class:`SimulationPayload` inside the command.
+#:
+#: The value is the payload's canonical JSON as a *string*, not a nested
+#: object: Matrix's canonical JSON (Synapse) rejects any floating-point value
+#: in an event content object, and the simulation is full of floats (every
+#: length, density and timestep).  Floats inside a JSON string are fine, so the
+#: payload is serialised once and parsed on receipt.
 PAYLOAD_KEY = "payload"
 
 
@@ -344,7 +349,9 @@ def build_submit_command(
         :func:`payload_wire_bytes` with :class:`PayloadTooLargeError`.
 
     """
-    body = json.loads(payload_wire_bytes(payload))
+    # The payload is carried as a JSON string (see PAYLOAD_KEY): Synapse
+    # rejects floats in event-content objects, and the simulation has many.
+    body = payload_wire_bytes(payload).decode("utf-8")
     return RcpMessage(
         sim=sim,
         kind=Kind.COMMAND,

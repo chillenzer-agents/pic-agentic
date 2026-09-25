@@ -36,6 +36,7 @@ from pic_agentic.simclient.simulation import (
     SimulationExecutionError,
     SubmitConfig,
     execute_submit,
+    parse_payload,
     prepare_submit,
 )
 from pic_agentic.slurm import JobInfo, SlurmClient, SlurmError
@@ -414,10 +415,11 @@ class SimClient:
             The prepared submission, or the rejection ack that was sent.
 
         """
-        body = message.payload.get(PAYLOAD_KEY)
-        if not isinstance(body, dict):
+        raw = message.payload.get(PAYLOAD_KEY)
+        if not isinstance(raw, str):
             return await self._reject_submit(message, error="payload_missing", sim_id=sim_id, cmd_id=cmd_id)
         try:
+            body = parse_payload(raw)
             return prepare_submit(
                 body=body,
                 header=header,

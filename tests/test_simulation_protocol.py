@@ -140,10 +140,13 @@ def test_command_header_carries_provenance_and_hash() -> None:
     assert header["wire_format_version"] == WIRE_FORMAT_VERSION
     assert command.kind is Kind.COMMAND
     assert command.sender_role is SenderRole.MCP_SERVER
-    # The payload travels inline; no shared-FS path is involved.
-    assert PAYLOAD_KEY in command.payload
+    # The payload travels inline as a JSON string; no shared-FS path is
+    # involved.  A string (not a nested object) is required because Matrix's
+    # canonical JSON rejects floats in event content.
     assert "payload_path" not in command.payload
-    assert set(command.payload[PAYLOAD_KEY]["simulation"]) == {"sim"}
+    raw = command.payload[PAYLOAD_KEY]
+    assert isinstance(raw, str)
+    assert set(json.loads(raw)["simulation"]) == {"sim"}
 
 
 def test_params_round_trip_and_default_submit_system() -> None:

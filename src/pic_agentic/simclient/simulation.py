@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -82,6 +83,34 @@ class SubmitConfig:
     def __post_init__(self) -> None:
         """Normalise the path to absolute form."""
         self.setup_root = Path(self.setup_root)
+
+
+def parse_payload(raw: str) -> dict[str, Any]:
+    """Parse the inline payload JSON string into a mapping.
+
+    The payload is transported as a JSON *string* (see
+    :data:`~pic_agentic.protocol.simulation.PAYLOAD_KEY`): Matrix's canonical
+    JSON rejects floats in event-content objects, and the simulation has many.
+
+    Args:
+        raw: The JSON string from the command's payload.
+
+    Returns:
+        The decoded payload mapping.
+
+    Raises:
+        SimulationExecutionError: If the string is not a JSON object.
+
+    """
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        msg = f"inline payload is not JSON: {exc}"
+        raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_INVALID, msg) from exc
+    if not isinstance(body, dict):
+        msg = "inline payload is not a JSON object"
+        raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_INVALID, msg)
+    return body
 
 
 def check_payload_hash(body: dict[str, Any], header: dict[str, Any]) -> None:
