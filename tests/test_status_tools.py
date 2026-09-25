@@ -132,6 +132,27 @@ async def test_fetch_logs_rejects_unknown_stream() -> None:
         await service.fetch_logs(lambda _m: None, SIM_ID, stream="nope")  # type: ignore[arg-type]
 
 
+async def test_wrong_ack_type_does_not_resolve_a_pending_pull() -> None:
+    """A logs_ack carrying a status request's cmd_id must not resolve it (#6a)."""
+    service = _service(ack_timeout_s=0.05)
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    service._pending_pull["shared-cmd"] = future
+    service._pending_pull_kind["shared-cmd"] = SimulationType.STATUS_COMMAND
+    misrouted = build_logs_ack(
+        sim=SIM,
+        seq=1,
+        cmd_id="shared-cmd",
+        sim_id=SIM_ID,
+        in_reply_to=None,
+        stream="stdout",
+        lines=["nope"],
+        total_lines=1,
+    ).sign(SECRET)
+    service.on_message(misrouted)
+    assert not future.done()
+    assert not service._pending_pull["shared-cmd"].done()
+
+
 async def test_fetch_status_times_out_without_raising() -> None:
     mcp_t, _sim_t = MemoryTransport.create_pair()
     service = _service(ack_timeout_s=0.05)

@@ -16,6 +16,7 @@ lifecycle events (``simulation.submitted``/``workflow.finished``/
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
 from collections.abc import Awaitable, Callable, Iterable
@@ -38,6 +39,8 @@ from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd
 from pic_agentic.server.hello import AckTimeoutError, SendFn
 from pic_agentic.simulation_build import BuiltSimulation, SimulationBuildError, build_runner_dump
 
+log = logging.getLogger(__name__)
+
 #: Signature of the injectable runner-dump builder (test seam).
 RunnerDumpBuilder = Callable[..., Awaitable[BuiltSimulation]]
 
@@ -56,6 +59,13 @@ DEFAULT_EVENT_LOG_MAX = 1000
 
 #: Cap on rows returned by ``get_events``.
 MAX_EVENT_PAGE = 200
+
+#: The ack type each request/response pull expects, so ``on_message`` can match
+#: a pending pull by kind and not only by the (possibly colliding) cmd_id.
+_PULL_ACK_FOR_REQUEST: dict[SimulationType, SimulationType] = {
+    SimulationType.STATUS_COMMAND: SimulationType.STATUS_ACK,
+    SimulationType.LOGS_COMMAND: SimulationType.LOGS_ACK,
+}
 
 #: Fields projected from an event/ack payload into a :class:`SimRecord` when the
 #: payload actually carries a non-None value (a later event omitting the field
@@ -210,11 +220,14 @@ class SubmitService:
         self.event_log_max = event_log_max
         self.sequences = SequenceState()
         self._pending: dict[str, asyncio.Future[RcpMessage]] = {}
-        #: Pending status/logs pulls, keyed by cmd_id.
+        #: Pending status/logs pulls, keyed by cmd_id, and the ack type each
+        #: one expects (so a mis-routed ack cannot resolve the wrong future).
         self._pending_pull: dict[str, asyncio.Future[RcpMessage]] = {}
-        #: Lifecycle events observed so far, keyed by cmd_id (M2 reporting).
-        self.events: dict[str, list[RcpMessage]] = {}
-        #: Ordered retained event log (all sims) and its sim_id-keyed projection.
+        self._pending_pull_kind: dict[str, SimulationType] = {}
+        #: Ordered retained event log (all sims), capped *per sim_id* so one
+        #: busy simulation cannot evict another's history; its sim_id-keyed
+        #: projection is :attr:`registry`.  This is the single store
+        #: ``get_events``/``condense_events`` read from.
         self.event_log: list[RcpMessage] = []
         self.registry: dict[str, SimRecord] = {}
 
@@ -271,14 +284,25 @@ class SubmitService:
             return
         cmd_id = str(message.payload.get("cmd_id", ""))
         if message.kind is Kind.EVENT and message.type == SimulationType.EVENT:
-            self.events.setdefault(cmd_id, []).append(message)
             self._append_event_log(message)
             self._project_event(message)
             return
         if message.kind is Kind.ACK and message.type in {SimulationType.STATUS_ACK, SimulationType.LOGS_ACK}:
-            future = self._pending_pull.get(cmd_id)
-            if future is not None and not future.done():
-                future.set_result(message)
+            # Match the ack's *kind* to the pending request, not just its
+            # cmd_id: a mis-routed ``logs_ack`` carrying a status request's
+            # cmd_id must not resolve the status future.
+            expected = _PULL_ACK_FOR_REQUEST.get(self._pending_pull_kind.get(cmd_id))
+            if expected is not None and message.type == expected:
+                future = self._pending_pull.get(cmd_id)
+                if future is not None and not future.done():
+                    future.set_result(message)
+            else:
+                log.warning(
+                    "ignoring %s for pending %s request %s",
+                    message.type,
+                    self._pending_pull_kind.get(cmd_id),
+                    cmd_id,
+                )
             return
         if message.kind is Kind.ACK and message.type == SimulationType.ACK:
             self._project_ack(message)
@@ -304,14 +328,23 @@ class SubmitService:
     def _append_event_log(self, message: RcpMessage) -> None:
         """Append one event to the bounded, ordered event log.
 
+        The cap is applied *per sim_id*: at most :attr:`event_log_max` events
+        per simulation are retained, so a busy simulation cannot evict another
+        simulation's early lifecycle history.
+
         Args:
             message: The event to retain.
 
         """
         self.event_log.append(message)
-        overflow = len(self.event_log) - self.event_log_max
+        sim_id = str(message.payload.get("sim_id", ""))
+        matching = [
+            index for index, entry in enumerate(self.event_log) if str(entry.payload.get("sim_id", "")) == sim_id
+        ]
+        overflow = len(matching) - self.event_log_max
         if overflow > 0:
-            del self.event_log[:overflow]
+            for index in reversed(matching[:overflow]):
+                del self.event_log[index]
 
     def _project_event(self, message: RcpMessage) -> None:
         """Project one lifecycle event into the sim_id-keyed registry.
@@ -325,7 +358,18 @@ class SubmitService:
         if not sim_id:
             return
         state = str(payload.get("state", ""))
-        record = self._record_for(sim_id, cmd_id=str(payload.get("cmd_id", "")))
+        cmd_id = str(payload.get("cmd_id", ""))
+        record = self._record_for(sim_id, cmd_id=cmd_id, ts=message.ts)
+        # A replayed/old-run event (its cmd_id predates the latest run) must not
+        # touch the current record.
+        if cmd_id and cmd_id != record.cmd_id:
+            return
+        # Terminal is monotonic within a run: a replayed or out-of-order
+        # non-terminal event (e.g. a late ``step_finished``) must never flip a
+        # finished record back to active.  A genuinely new run under the same
+        # sim_id gets a fresh (non-terminal) record from :meth:`_record_for`.
+        if record.state in TERMINAL_STATES:
+            return
         for field in _RECORD_FIELDS:
             value = payload.get(field)
             if value is not None:
@@ -347,7 +391,11 @@ class SubmitService:
         sim_id = str(payload.get("sim_id", ""))
         if not sim_id:
             return
-        record = self._record_for(sim_id, cmd_id=str(payload.get("cmd_id", "")))
+        cmd_id = str(payload.get("cmd_id", ""))
+        record = self._record_for(sim_id, cmd_id=cmd_id, ts=message.ts)
+        # A replayed ack from an older run must not touch the latest record.
+        if cmd_id and cmd_id != record.cmd_id:
+            return
         # The ack seeds a fresh record only: a late or re-delivered ack must
         # never regress a state already projected from a later event.
         state = str(payload.get("state", ""))
@@ -361,12 +409,24 @@ class SubmitService:
             record.last_event_ts = message.ts
         self.registry[sim_id] = record
 
-    def _record_for(self, sim_id: str, *, cmd_id: str) -> SimRecord:
-        """Return the existing record for ``sim_id`` or a fresh one.
+    def _record_for(self, sim_id: str, *, cmd_id: str, ts: str | None = None) -> SimRecord:
+        """Return the record for the simulation's latest run.
+
+        A resubmission of an identical simulation yields the same ``sim_id``
+        but a fresh ``cmd_id``.  Such a message starts a *new run*: the record
+        is reset to the new run, rather than reporting the first run's
+        ``cmd_id`` alongside the second run's ``state``/``job_id``.  The
+        registry therefore keeps one (latest-run) record per ``sim_id`` and the
+        event log separates runs by ``cmd_id``.
+
+        A message from an *older* run (a backfill replay of run 1 after run 2
+        has started) must not create or switch records: a new ``cmd_id`` only
+        starts a run when its timestamp is not older than the record's.
 
         Args:
             sim_id: The simulation id.
-            cmd_id: The command id to seed a fresh record with.
+            cmd_id: The command id naming this run.
+            ts: The message timestamp (for the old-run guard), if known.
 
         Returns:
             The mutable record (also stored in :attr:`registry`).
@@ -376,8 +436,15 @@ class SubmitService:
         if record is None:
             record = SimRecord(sim_id=sim_id, cmd_id=cmd_id)
             self.registry[sim_id] = record
-        elif cmd_id and not record.cmd_id:
-            record.cmd_id = cmd_id
+        elif (
+            cmd_id
+            and cmd_id != record.cmd_id
+            and (ts is None or record.last_event_ts is None or ts >= record.last_event_ts)
+        ):
+            # New run under the same sim_id: reset the run-scoped projection
+            # (keep the sim_id) so it reflects the latest run only.
+            record = SimRecord(sim_id=sim_id, cmd_id=cmd_id)
+            self.registry[sim_id] = record
         return record
 
     def get(self, sim_id: str) -> SimRecord | None:
@@ -534,6 +601,7 @@ class SubmitService:
         command = build(cmd_id).sign(self.secret)
         future: asyncio.Future[RcpMessage] = asyncio.get_running_loop().create_future()
         self._pending_pull[cmd_id] = future
+        self._pending_pull_kind[cmd_id] = command.type
         try:
             await send(command)
             try:
@@ -542,6 +610,7 @@ class SubmitService:
                 return {"sim_id": sim_id, "error": "timeout"}
         finally:
             self._pending_pull.pop(cmd_id, None)
+            self._pending_pull_kind.pop(cmd_id, None)
         return dict(ack.payload)
 
 

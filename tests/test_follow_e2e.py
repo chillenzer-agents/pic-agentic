@@ -205,12 +205,16 @@ async def test_follow_events_and_status_logs(shared_dir, tmp_path, fake_runner) 
         assert outcome.ok, outcome.error
 
         await _wait_for(
-            lambda: any(
-                event.payload["state"] == SimulationState.RESULTS_READY.value
-                for event in service.events.get(outcome.cmd_id, [])
+            lambda: (
+                service.get(outcome.sim_id) is not None
+                and service.get(outcome.sim_id).state == SimulationState.RESULTS_READY.value
             ),
         )
-        events = service.events[outcome.cmd_id]
+        events = [
+            message
+            for message in service.event_log
+            if message.payload.get("sim_id") == outcome.sim_id and message.payload.get("cmd_id") == outcome.cmd_id
+        ]
         states = [event.payload["state"] for event in events]
 
         # Coarse transitions, each once, in order.
@@ -232,6 +236,9 @@ async def test_follow_events_and_status_logs(shared_dir, tmp_path, fake_runner) 
     finally:
         serve_task.cancel()
         pump_task.cancel()
+        # Await the cancelled tasks so ``serve``'s ``finally`` reaps the
+        # follower's in-flight ``scontrol`` subprocess before the loop closes.
+        await asyncio.gather(serve_task, pump_task, return_exceptions=True)
         await sim_t.close()
         await mcp_t.close()
 
@@ -255,6 +262,85 @@ async def _assert_pulls(mcp_t, received: list[RcpMessage], sim_id: str) -> None:
     assert logs_ack.payload["stream"] == "stdout"
     assert logs_ack.payload["total_lines"] == TOTAL_STDOUT_LINES
     assert logs_ack.payload["lines"][-1] == _progress_line(100, 1000)
+
+
+async def test_same_sim_id_resubmission_cancels_previous_follower(shared_dir, tmp_path, fake_runner) -> None:
+    """A second follower for one sim_id must cancel (and reap) the first (#1)."""
+    shared, state_dir = shared_dir
+    _mcp_t, sim_t, _service, client = _make_pair(shared)
+    # A job that never terminates: the follower parks after its first poll.
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "4711.state").write_text("RUNNING\n", encoding="utf-8")
+    client._serving = True
+    try:
+        await client._start_follower(
+            cmd_id="cmd-a",
+            sim_id="same1234",
+            job_id=4711,
+            run_dir=str(tmp_path),
+            stdout_path=None,
+            submit_system="sbatch",
+        )
+        first = client._follow_tasks["same1234"]
+        await client._start_follower(
+            cmd_id="cmd-b",
+            sim_id="same1234",
+            job_id=4711,
+            run_dir=str(tmp_path),
+            stdout_path=None,
+            submit_system="sbatch",
+        )
+        second = client._follow_tasks["same1234"]
+        assert second is not first
+        # The superseded watcher was cancelled and awaited, not merely dropped.
+        assert first.done()
+        assert not second.done()
+        assert [task for task in client._follow_tasks_all if not task.done()] == [second]
+    finally:
+        client._serving = False
+        await client._cancel_followers()
+        await sim_t.close()
+    assert not client._follow_tasks
+    assert not client._follow_tasks_all
+
+
+async def test_get_logs_reads_only_a_bounded_suffix(shared_dir, tmp_path, monkeypatch) -> None:
+    """``get_logs`` must not slurp the whole file (#4)."""
+    from pic_agentic.simclient import client as client_mod
+    from pic_agentic.simclient.follow import TrackedSim
+
+    monkeypatch.setattr(client_mod, "_MAX_LOG_READ_BYTES", 64)
+    monkeypatch.setattr(client_mod, "_ASSUMED_MAX_LINE_BYTES", 1024)
+    shared, _state_dir = shared_dir
+    _mcp_t, sim_t = MemoryTransport.create_pair()
+    client = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared,
+        submit_config=SubmitConfig(setup_root=shared / "sims"),
+    )
+    run = tmp_path / "run"
+    run.mkdir()
+    stdout = run / "stdout"
+    lines = [f"log-line-{index:03d}" for index in range(100)]
+    stdout.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    client._tracked["sim12345"] = TrackedSim(
+        sim_id="sim12345",
+        cmd_id="c",
+        job_id=1,
+        run_dir=str(run),
+        stdout_path=str(stdout),
+        submit_system="sbatch",
+    )
+    ack = await client.handle(
+        build_logs_command(sim=SIM, seq=1, sim_id="sim12345", stream="stdout", tail=3, cmd_id="l").sign(SECRET)
+    )
+    assert ack is not None
+    assert ack.payload["lines"] == lines[-3:]
+    # Only the bounded suffix was counted: a whole-file read would report 100.
+    assert ack.payload["total_lines"] < len(lines)
 
 
 async def test_status_unknown_sim_is_ack_error(shared_dir, tmp_path, fake_runner) -> None:

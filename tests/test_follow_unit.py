@@ -201,7 +201,11 @@ async def test_malformed_stdout_is_tolerated(tmp_path) -> None:
     events = await _run_to_terminal(follower)
     # The malformed bytes do not crash the loop and the terminal transition
     # still fires; a partial final line without a newline is not consumed.
-    assert [state for state, _ in events][-1] is SimulationState.RESULTS_READY
+    # The link cannot run (no ``link_results.sh``), so no RESULTS_READY is
+    # claimed: the run stops at job_finished with results_linked=False.
+    assert [state for state, _ in events][-1] is SimulationState.JOB_FINISHED
+    assert SimulationState.RESULTS_READY not in [state for state, _ in events]
+    assert events[-1][1]["results_linked"] is False
     assert SimulationState.STEP_FINISHED not in [state for state, _ in events]
 
 
@@ -215,7 +219,10 @@ async def test_missing_stdout_file_is_tolerated(tmp_path) -> None:
         max_interval_s=0.02,
     )
     events = await _run_to_terminal(follower)
-    assert [state for state, _ in events][-1] is SimulationState.RESULTS_READY
+    # No ``link_results.sh`` in ``tmp_path``: the link fails, so results are not
+    # claimed.
+    assert [state for state, _ in events][-1] is SimulationState.JOB_FINISHED
+    assert events[-1][1]["results_linked"] is False
 
 
 async def test_job_info_failure_is_tolerated(tmp_path) -> None:
@@ -238,7 +245,8 @@ async def test_job_info_failure_is_tolerated(tmp_path) -> None:
     )
     events = await _run_to_terminal(follower)
     assert calls["n"] >= 2
-    assert [state for state, _ in events][-1] is SimulationState.RESULTS_READY
+    # No link script here, so the terminal state is job_finished.
+    assert [state for state, _ in events][-1] is SimulationState.JOB_FINISHED
 
 
 async def test_no_job_id_stops_immediately(tmp_path) -> None:
@@ -253,6 +261,52 @@ async def test_no_job_id_stops_immediately(tmp_path) -> None:
     )
     await asyncio.wait_for(follower.run(), timeout=1.0)
     assert events == []
+
+
+async def test_failed_link_emits_job_finished_not_results_ready(tmp_path) -> None:
+    """A terminal job whose link is missing stays at job_finished (#2)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(run_dir, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.COMPLETED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    states = [state for state, _ in events]
+    assert SimulationState.RESULTS_READY not in states
+    assert states[-1] is SimulationState.JOB_FINISHED
+    # A second job_finished carries the explicit ``results_linked=False``.
+    finished = [fields for state, fields in events if state is SimulationState.JOB_FINISHED]
+    assert finished[-1]["results_linked"] is False
+
+
+async def test_missing_link_emits_results_ready_once_link_exists(tmp_path) -> None:
+    """A present link still yields results_ready (#2, positive branch)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output = run_dir / ".cwl_cache" / "x" / "simOutput"
+    output.mkdir(parents=True)
+    (run_dir / "link_results.sh").write_text(f'#!/bin/bash\nln -s "{output}" "$1"\n')
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(run_dir, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.COMPLETED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    states = [state for state, _ in events]
+    assert states[-2:] == [SimulationState.JOB_FINISHED, SimulationState.RESULTS_READY]
+    assert events[-1][1]["results_linked"] is True
 
 
 async def test_stop_ends_the_loop(tmp_path) -> None:

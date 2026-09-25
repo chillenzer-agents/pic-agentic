@@ -11,6 +11,14 @@ backoff cadence -- a few ``scontrol`` calls per hour on a long run, not a fixed
 high-frequency poll -- and tails the job's PIConGPU progress output to emit the
 bounded ``simulation.step_finished`` cadence.
 
+Deliberate simplification (documented in the plan): the backoff only widens
+(initial -> max) and resets to the initial cadence when the job starts running;
+it does not *tighten* as the expected walltime nears (the submit payload carries
+no expected walltime) and a status/logs pull does not reset it (the pull is a
+separate request/response path that answers live from ``scontrol``).  Both
+refinements are unnecessary for correctness: the coarse terminal transition is
+still observed within one ``max_interval_s`` tick.
+
 The watcher is deliberately transport-agnostic: it takes an async ``emit``
 callback and an async ``job_info`` callable, so it can be driven directly in
 unit tests without a cluster, a transport or a room.
@@ -323,11 +331,26 @@ class JobFollower:
                 exit_code=info.exit_code,
             )
             linked = await asyncio.to_thread(link_run_results, Path(self.tracked.run_dir))
-            await self.emit(
-                SimulationState.RESULTS_READY,
-                job_id=self.tracked.job_id,
-                results_linked=linked,
-            )
+            # ``results.ready`` is only claimed once ``run_dir/simOutput`` really
+            # exists (the plan's M2b contract).  A failed link emits a second,
+            # explicit ``job_finished`` carrying ``results_linked=False`` (the
+            # stored-terminal re-emission is idempotent and condenses to the
+            # latest payload); a later status pull promotes it via
+            # ``SimClient._state_for_info`` once the link appears.
+            if linked:
+                await self.emit(
+                    SimulationState.RESULTS_READY,
+                    job_id=self.tracked.job_id,
+                    results_linked=True,
+                )
+            else:
+                await self.emit(
+                    SimulationState.JOB_FINISHED,
+                    job_id=self.tracked.job_id,
+                    slurm_state=info.state.value,
+                    exit_code=info.exit_code,
+                    results_linked=False,
+                )
         else:
             await self.emit(
                 SimulationState.JOB_FAILED,

@@ -61,6 +61,23 @@ _M2_COMMANDS = frozenset(
     {SimulationType.COMMAND, SimulationType.STATUS_COMMAND, SimulationType.LOGS_COMMAND},
 )
 
+#: Default first (and reset) poll interval for the job-follow watcher, per the
+#: M2b plan (30 s -> 5 min adaptive backoff); overridable per instance and via
+#: ``PIC_AGENTIC_POLL_INTERVAL_S``.
+DEFAULT_POLL_INTERVAL_S = 30.0
+
+#: Default cap for the watcher's backing-off poll interval (the plan's 5 min).
+DEFAULT_POLL_MAX_INTERVAL_S = 300.0
+
+#: Assume a log line is at most this long when sizing the tail read window; a
+#: longer line is still returned in full once the window is aligned to a
+#: newline, but may cover fewer than ``tail`` lines.
+_ASSUMED_MAX_LINE_BYTES = 4096
+
+#: Hard cap on the bytes a single ``get_logs`` reads from the end of a stream,
+#: so an unbounded PIConGPU ``stdout`` cannot OOM the simclient.
+_MAX_LOG_READ_BYTES = 8 * 1024 * 1024
+
 
 class HelloResult(BaseModel):
     """Outcome of one ``hello`` command execution."""
@@ -155,7 +172,11 @@ class SimClient:
         self.seen = DedupStore()
         #: Per-sim follow-state and detached watcher tasks, keyed by ``sim_id``.
         self._tracked: dict[str, TrackedSim] = {}
+        #: Current watcher per ``sim_id`` (the latest run).
         self._follow_tasks: dict[str, asyncio.Task[None]] = {}
+        #: Every live watcher task, including a superseded one still winding
+        #: down, so shutdown reaps orphans the dict slot no longer points at.
+        self._follow_tasks_all: set[asyncio.Task[None]] = set()
         #: Detached watchers are started only while :meth:`serve` owns the event
         #: loop, so a direct ``handle`` call in a test does not leave a task
         #: (and its subprocesses) running past the test.
@@ -620,7 +641,7 @@ class SimClient:
                     state=str(result.get("state", SimulationState.WORKFLOW_FINISHED.value)),
                 )
             )
-        self._start_follower(
+        await self._start_follower(
             cmd_id=cmd_id,
             sim_id=str(result.get("sim_id", sim_id)),
             job_id=result.get("job_id"),
@@ -630,7 +651,7 @@ class SimClient:
         )
         return accepted
 
-    def _start_follower(
+    async def _start_follower(
         self,
         *,
         cmd_id: str,
@@ -656,8 +677,22 @@ class SimClient:
             stdout_path=stdout_path,
             submit_system=submit_system,
         )
+        # A resubmission of an identical simulation yields the same ``sim_id``
+        # (payload-hash prefix).  Cancel the previous watcher *before* replacing
+        # it, so it cannot keep polling and emitting under its stale ``cmd_id``;
+        # keep it in ``_follow_tasks_all`` until it has actually finished so
+        # shutdown reaps it even after the dict slot is reused.
+        previous = self._follow_tasks.pop(sim_id, None)
+        if previous is not None:
+            previous.cancel()
+            self._follow_tasks_all.add(previous)
+            previous.add_done_callback(self._follow_tasks_all.discard)
+            # Await it so the cancelled watcher's in-flight ``scontrol``
+            # subprocess is reaped before the replacement starts (the follower
+            # shields its poll for exactly this reason).
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await previous
         self._tracked[sim_id] = tracked
-        self._follow_tasks.pop(sim_id, None)
 
         async def emit(state: SimulationState, *, job_id: int | None = None, **fields: object) -> None:
             event = self._build_submit_event(cmd_id=cmd_id, sim_id=sim_id, state=state, job_id=job_id, **fields)
@@ -671,18 +706,27 @@ class SimClient:
             initial_interval_s=self.poll_interval_s,
             max_interval_s=self.poll_max_interval_s,
         )
-        self._follow_tasks[sim_id] = asyncio.create_task(follower.run())
+        task = asyncio.create_task(follower.run())
+        self._follow_tasks[sim_id] = task
+        self._follow_tasks_all.add(task)
+        task.add_done_callback(self._follow_tasks_all.discard)
 
     async def _cancel_followers(self) -> None:
-        """Stop and await every detached watcher task (idempotent)."""
-        for follower_task in list(self._follow_tasks.values()):
+        """Stop and await every detached watcher task (idempotent).
+
+        Cancels both the current per-``sim_id`` watchers and any superseded
+        (orphaned) watcher still winding down, then awaits them all.
+        """
+        tasks = set(self._follow_tasks.values()) | self._follow_tasks_all
+        for follower_task in tasks:
             follower_task.cancel()
-        for follower_task in list(self._follow_tasks.values()):
+        for follower_task in tasks:
             # A cancelled follower raises CancelledError; a follower that crashed
             # before cancellation may raise its stored exception.  Best-effort.
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await follower_task
         self._follow_tasks.clear()
+        self._follow_tasks_all.clear()
 
     @staticmethod
     def _state_for_info(info: JobInfo, run_dir: str) -> str:
@@ -784,6 +828,46 @@ class SimClient:
         discovered = find_stdout_path(run_dir)
         return Path(discovered) if discovered else None
 
+    @staticmethod
+    def _read_tail(path: Path, tail: int) -> tuple[list[str], int]:
+        """Read up to ``tail`` trailing lines without slurping the whole file.
+
+        The read window is bounded by :data:`_MAX_LOG_READ_BYTES`, so a
+        multi-hundred-MB PIConGPU ``stdout`` cannot OOM the simclient.  When
+        the window does not reach the start of the file the first (partial)
+        line is dropped, and ``total_lines`` then counts only the lines in the
+        window (the true total is unknowable without reading everything).
+
+        Args:
+            path: The log file to read.
+            tail: Maximum number of trailing lines to return.
+
+        Returns:
+            The ``(lines, total_lines)`` pair; ``([], 0)`` on an unreadable file.
+
+        """
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return [], 0
+        window = min(_MAX_LOG_READ_BYTES, max(tail, 1) * _ASSUMED_MAX_LINE_BYTES + 1)
+        start = max(0, size - window)
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                data = handle.read()
+        except OSError:
+            return [], 0
+        if start > 0:
+            newline = data.find(b"\n")
+            # No newline in the window means a single line longer than the
+            # whole window; report nothing rather than a bogus partial line.
+            if newline < 0:
+                return [], 0
+            data = data[newline + 1 :]
+        all_lines = data.decode("utf-8", errors="replace").splitlines()
+        return (all_lines[-tail:] if tail else []), len(all_lines)
+
     async def _handle_logs(self, message: RcpMessage) -> RcpMessage:
         """Answer a ``logs_request`` with up to ``tail`` lines of a stream.
 
@@ -817,17 +901,10 @@ class SimClient:
             await self.transport.send(ack)
             return ack
         lines: list[str] = []
+        total = 0
         path = self._log_path(tracked, stream)
         if path is not None:
-            try:
-                text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
-                all_lines = text.splitlines()
-                lines = all_lines[-tail:] if tail else []
-                total = len(all_lines)
-            except OSError:
-                total = 0
-        else:
-            total = 0
+            lines, total = await asyncio.to_thread(self._read_tail, path, tail)
         ack = self._build_logs_ack(
             message,
             cmd_id=cmd_id,

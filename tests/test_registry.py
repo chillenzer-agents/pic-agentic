@@ -223,6 +223,75 @@ def test_get_and_list_active_only() -> None:
     assert all(isinstance(record, SimRecord) for record in active)
 
 
+def test_new_cmd_id_same_sim_id_starts_a_fresh_run() -> None:
+    """A resubmission (same sim_id, new cmd_id) reflects the latest run only (#3)."""
+    service = _service()
+    service.on_message(_event(SimulationState.SUBMITTED, cmd_id="run1", job_id=1, seq=1))
+    service.on_message(_event(SimulationState.RESULTS_READY, cmd_id="run1", job_id=1, seq=2))
+    assert service.get(SIM_ID).active is False  # type: ignore[union-attr]
+
+    # Same simulation content -> same sim_id, but a fresh cmd_id is a new run.
+    service.on_message(_event(SimulationState.SUBMITTED, cmd_id="run2", job_id=2, seq=3))
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.cmd_id == "run2"
+    assert record.job_id == 2
+    assert record.state == SimulationState.SUBMITTED.value
+    assert record.active is True
+    # One latest-run record per sim_id, and both runs remain separable by
+    # cmd_id in the event log.
+    assert [row.sim_id for row in service.list()] == [SIM_ID]
+    assert {str(message.payload.get("cmd_id")) for message in service.event_log} == {"run1", "run2"}
+
+
+def test_replayed_old_run_event_does_not_clobber_the_latest_run() -> None:
+    """A backfilled run-1 event must not switch the record back to run 1 (#3)."""
+    service = _service()
+    service.on_message(_event(SimulationState.SUBMITTED, cmd_id="run1", job_id=1, seq=1, ts="2026-09-25T10:00:00Z"))
+    service.on_message(_event(SimulationState.RESULTS_READY, cmd_id="run1", job_id=1, seq=2, ts="2026-09-25T10:05:00Z"))
+    service.on_message(_event(SimulationState.SUBMITTED, cmd_id="run2", job_id=2, seq=3, ts="2026-09-25T11:00:00Z"))
+    assert service.get(SIM_ID).cmd_id == "run2"  # type: ignore[union-attr]
+
+    # A late replay of run 1's terminal event must be ignored.
+    service.on_message(
+        _event(SimulationState.RESULTS_READY, cmd_id="run1", job_id=1, seq=99, ts="2026-09-25T10:06:00Z")
+    )
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.cmd_id == "run2"
+    assert record.job_id == 2
+    assert record.active is True
+
+
+def test_terminal_record_is_not_flipped_back_to_active() -> None:
+    """A replayed/out-of-order non-terminal event cannot revive a finished run (#6)."""
+    service = _service()
+    service.on_message(_event(SimulationState.JOB_RUNNING, cmd_id="run1", seq=1, job_id=1))
+    service.on_message(_event(SimulationState.RESULTS_READY, cmd_id="run1", seq=3, job_id=1))
+    assert service.get(SIM_ID).state == SimulationState.RESULTS_READY.value  # type: ignore[union-attr]
+
+    # A late duplicate progress event must not regress the terminal record.
+    service.on_message(_event(SimulationState.STEP_FINISHED, cmd_id="run1", seq=2, percent=50))
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.state == SimulationState.RESULTS_READY.value
+    assert record.active is False
+
+
+def test_event_log_cap_is_per_sim() -> None:
+    """One busy sim must not evict another sim's retained events (#5)."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05, event_log_max=3)
+    service.on_message(_event(SimulationState.SUBMITTED, sim_id="zzzz9999", cmd_id="z1", seq=1, job_id=9))
+    for index in range(6):
+        service.on_message(_event(SimulationState.STEP_FINISHED, sim_id=SIM_ID, cmd_id="c1", seq=index + 2, step=index))
+    retained = [str(entry.payload.get("sim_id")) for entry in service.event_log]
+    # The quiet sim's single event survives; the busy sim is capped at 3.
+    assert retained.count("zzzz9999") == 1
+    assert retained.count(SIM_ID) == 3
+    steps = [entry.payload["step"] for entry in service.event_log if entry.payload["sim_id"] == SIM_ID]
+    assert steps == [3, 4, 5]
+
+
 def test_event_log_is_bounded(monkeypatch) -> None:
     service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05, event_log_max=3)
     for index in range(5):
