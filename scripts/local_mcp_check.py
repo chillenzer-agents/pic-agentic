@@ -22,7 +22,8 @@ Three modes:
   (``PIC_AGENTIC_PICONGPU_PYTHON`` may point at another interpreter).
 
 * ``--watch`` reads the RCP room and prints the lifecycle events
-  (``simulation.submitted``/``workflow.finished``/``simulation.failed``) as they
+  (``simulation.submitted``/``workflow.finished``/``simulation.job_*``/
+  ``results.ready``/``simulation.failed``) as they
   arrive, until ``--wait-s`` elapses.  Use it in a second terminal after
   ``--submit`` to follow the run.
 
@@ -293,7 +294,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print("\nFAILED: the submit command was not accepted.", file=sys.stderr)
         return 1
     print(f"\nSUBMIT ACCEPTED: sim_id={result.get('sim_id')} state={result.get('state')}")
-    print("Watch the room / run --run later for the simulation.submitted and workflow.finished events.")
+    print("Watch the room / run --watch to follow the run to results.ready.")
     return 0
 
 
@@ -301,7 +302,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
     Returns:
-        The process exit code (0 on ``workflow.finished``, 1 on failure/timeout).
+        The process exit code (0 on ``results.ready``, 1 on failure/timeout).
 
     Raises:
         SystemExit: If no setup state exists.
@@ -361,17 +362,25 @@ async def _watch(state: dict, wait_s: float) -> int:
 def _print_event(message) -> int | None:
     if not message.type.startswith("rcp.simulation"):
         return None
-    state = message.payload.get("state")
-    job_id = message.payload.get("job_id")
-    print(f"[{message.type}] state={state} job_id={job_id}", flush=True)
-    error = message.payload.get("error")
+    payload = message.payload
+    state = payload.get("state")
+    job_id = payload.get("job_id")
+    detail = ""
+    if state == "simulation.step_finished":
+        detail = f" step={payload.get('step')} percent={payload.get('percent')} eta_s={payload.get('eta_s')}"
+    elif state in {"simulation.job_finished", "simulation.job_failed"}:
+        detail = f" slurm_state={payload.get('slurm_state')} exit_code={payload.get('exit_code')}"
+    print(f"[{message.type}] state={state} job_id={job_id}{detail}", flush=True)
+    error = payload.get("error")
     if error:
         print(f"    error: {error}", flush=True)
-    if state == "workflow.finished":
-        linked = message.payload.get("results_linked")
-        print(f"\nWORKFLOW FINISHED (results linked: {linked}).", flush=True)
+    # M2b: `workflow.finished` is no longer terminal (the job may still run).
+    # Only `results.ready` (results linked) is success; job/sim failures are not.
+    if state == "results.ready":
+        linked = payload.get("results_linked")
+        print(f"\nRESULTS READY (results linked: {linked}).", flush=True)
         return 0
-    if state == "simulation.failed":
+    if state in {"simulation.failed", "simulation.job_failed"}:
         print("\nSIMULATION FAILED.", file=sys.stderr, flush=True)
         return 1
     return None
