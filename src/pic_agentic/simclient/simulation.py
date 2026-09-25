@@ -317,8 +317,13 @@ def prepare_submit(
     )
 
 
-#: Captured stderr of the last workflow execution.  A shared slot is acceptable
-#: because the simclient executes one submission at a time.
+#: Captured stderr of the last workflow execution.  Single process-global slot:
+#: safe only because the simclient executes one submission at a time (the
+#: single-threaded event loop serialises ``execute_submit``, and the only
+#: concurrent caller is that one submission's ``asyncio.to_thread``).  It is
+#: reset at the start of every ``_run_workflow`` and read immediately after via
+#: ``_workflow_failure_detail``; do not introduce concurrent workflow runs
+#: without replacing it with a per-run return value.
 _LAST_WORKFLOW_STDERR = ""
 
 #: Cap on the captured error text sent in a failure event.
@@ -349,6 +354,8 @@ def _run_workflow(runner: Any) -> None:
 
     """
     global _LAST_WORKFLOW_STDERR  # ruff: ignore[global-statement] - single-slot capture, one run at a time
+    # Reset the single-slot capture at the start of every run (see the module
+    # note on _LAST_WORKFLOW_STDERR); _workflow_failure_detail consumes it.
     _LAST_WORKFLOW_STDERR = ""
     saved = os.dup(2)
     read_fd, write_fd = os.pipe()
@@ -423,6 +430,32 @@ def _scan_retained_step_logs(run_dir: Path) -> str:
     return "\n".join(hits[-20:])
 
 
+def _normalise_workflow_vars(setup_dir: Path) -> None:
+    """Patch the generated ``input.yaml`` so CWL accepts ``run_overwrite_vars``.
+
+    The pinned ``Runner.generate()`` serialises its ``TBGFlags.overwrite_vars``
+    list straight into the workflow input as a YAML/JSON list, but the pinned
+    ``workflow.cwl`` declares ``run_overwrite_vars`` as ``type: string?`` (tbg
+    takes a single ``-o`` argument it word-splits itself).  Left as a list, CWL
+    validation fails with "value is a CommentedSeq, expected null or string",
+    so every submission using the flag would die as ``RUN_FAILED`` after
+    ``accepted``.  Join the (already validated, single-token) entries into the
+    one space-separated string the tool expects.
+
+    Args:
+        setup_dir: The runner's setup directory (holds ``workflow/input.yaml``).
+
+    """
+    input_path = Path(setup_dir) / "workflow" / "input.yaml"
+    if not input_path.is_file():
+        return
+    data = json.loads(input_path.read_text(encoding="utf-8"))
+    value = data.get("run_overwrite_vars")
+    if isinstance(value, list):
+        data["run_overwrite_vars"] = " ".join(str(entry) for entry in value)
+        input_path.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
 def link_run_results(run_dir: Path) -> bool:
     """Link the simulation output into ``run_dir`` via the generated script.
 
@@ -492,6 +525,10 @@ async def execute_submit(
     except Exception as exc:
         msg = f"generate failed: {exc}"
         raise SimulationExecutionError(SimulationErrorCode.GENERATE_FAILED, msg, SimulationStage.BUILD) from exc
+    # The pinned workflow.cwl types run_overwrite_vars as a single string while
+    # Runner.generate() writes the list through; patch the input so a
+    # submission using -o does not fail CWL validation (see the helper).
+    await asyncio.to_thread(_normalise_workflow_vars, runner.setup_dir)
 
     # Submit stage: run the workflow; job id from submission_information.txt.
     # cwltool raises a generic ``Completed permanentFail`` and logs the actual
@@ -509,6 +546,10 @@ async def execute_submit(
     job_id = job_id_reader(runner.run_dir, prepared.payload)
     if job_id is not None:
         await emit(SimulationState.SUBMITTED, job_id=job_id, submit_system=prepared.params.submit_system)
+    # A submit system without a scheduler job id (e.g. local ``bash`` execution,
+    # or a scheduler whose output has no parseable id) has nothing to report in
+    # ``simulation.submitted``; the ``workflow.finished`` event below still fires
+    # with ``job_id=None``, so the lifecycle is not silently truncated.
     link_ready = await asyncio.to_thread(link_run_results, runner.run_dir)
     await emit(SimulationState.WORKFLOW_FINISHED, job_id=job_id, results_linked=link_ready)
     return {"sim_id": prepared.payload.sim_id, "state": SimulationState.WORKFLOW_FINISHED.value, "job_id": job_id}

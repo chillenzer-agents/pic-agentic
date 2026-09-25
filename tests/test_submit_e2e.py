@@ -52,6 +52,9 @@ class _FakeRunner:
 
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = Path(run_dir)
+        # Mirrors Runner.setup_dir (base/input next to base/run); the simclient
+        # patches setup_dir/workflow/input.yaml after generate().
+        self.setup_dir = self.run_dir.parent / "input"
         self.generated = False
         self.ran = False
         self.flags: dict = {}
@@ -371,6 +374,33 @@ async def test_submit_bad_params_is_reported_not_crashed(shared_dir, tmp_path, f
     assert ack.payload["error_code"] == "payload_invalid"
 
 
+async def test_submit_rejects_shell_injection_params(shared_dir, tmp_path, fake_runner) -> None:
+    """A wire-supplied shell-injection attempt is rejected before generate()."""
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id, _payload, command = await service.build_payload(script)
+    command.payload["params"] = {"overwrite_vars": ["PARAM=$(touch /tmp/pwned)"]}
+    command.sign(SECRET)
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload["error_code"] == "payload_invalid"
+    # generate() never ran for the malicious payload.
+    assert not fake_runner or not fake_runner[0].generated
+
+
+async def test_submit_rejects_absolute_cfg_file(shared_dir, tmp_path, fake_runner) -> None:
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id, _payload, command = await service.build_payload(script)
+    command.payload["params"] = {"cfg_file": "/etc/passwd"}
+    command.sign(SECRET)
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload["error_code"] == "payload_invalid"
+
+
 def test_link_run_results_runs_the_generated_script(tmp_path) -> None:
     from pic_agentic.simclient.simulation import link_run_results
 
@@ -403,6 +433,7 @@ def test_per_command_token_must_be_safe_hex(shared_dir) -> None:
     )
 
     payload = SimulationPayload(
+        wire_format_version=1,
         picongpu_version="",
         schema_hash="",
         simulation={"sim": json.loads(FIXTURE.read_text())["sim"]},
@@ -469,6 +500,8 @@ async def test_submit_rejects_unsupported_simulation_key(shared_dir, tmp_path, f
 
 def test_allowlist_is_enforced_by_prepare_submit(shared_dir, tmp_path) -> None:
     # A simulation mapping carrying a cluster-local key must fail the allow-list.
-    payload = SimulationPayload(picongpu_version="", schema_hash="", simulation={"sim": {}, "run_dir": "/etc"})
+    payload = SimulationPayload(
+        wire_format_version=1, picongpu_version="", schema_hash="", simulation={"sim": {}, "run_dir": "/etc"}
+    )
     with pytest.raises(UnsupportedPayloadError):
         payload.check_allowlist()

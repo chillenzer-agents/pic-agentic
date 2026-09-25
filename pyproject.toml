@@ -135,6 +135,9 @@ author = "Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf"
   "DOC501",
   "INP001",
   "PLC0415",
+  # Tests intentionally exercise private helpers (env allow-list, wire
+  # normalisation, marker parsing) that have no public entry point.
+  "PLC2701",
   "PLR2004",
   "PT017",
   "RUF029",

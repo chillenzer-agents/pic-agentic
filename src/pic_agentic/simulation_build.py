@@ -10,6 +10,24 @@ file and handed to a fresh interpreter (``picongpu_python`` when configured,
 else the current one); the child imports ``picongpu`` and the script, converts
 the resulting ``picmi.Simulation`` to ``pypicongpu`` and prints one JSON line.
 
+Security scope (important): this child is **not a sandbox**.  It runs
+same-uid, so the LLM-supplied script can still read the parent's environment
+via ``/proc/<ppid>/environ``, and any redaction of its output is best-effort.
+What this module *does* provide is a **disposable interpreter with a minimal
+environment**: the RCP secret and MAS tokens are not passed in, ``HOME`` points
+at a fresh scratch directory (so the 0600 ``~/.config/pic-agentic/config.toml``
+is not reachable by ``~``), and the child's stderr is only echoed back as a
+bounded, clearly-labelled tail.  Full isolation (separate uid or a namespace)
+is a documented non-goal for this PoC; executing the PICMI script on the
+submission node is the design's premise (``M2-SUBMIT-PLAN.md``, design section
+6.5).
+
+The provenance tuple the child reports is a **drift/consistency check, not a
+trust boundary**: the script that builds the simulation is arbitrary code by
+design, so it is inherently untrusted and could in principle forge the tuple.
+The check catches accidental version/schema drift between the server and the
+cluster install, not a hostile script (see :func:`build_runner_dump`).
+
 Isolating this in a module of its own keeps the test seam small: the tests
 monkeypatch :func:`build_runner_dump` rather than the subprocess.
 """
@@ -19,6 +37,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -76,6 +96,12 @@ def _revision():
 schema_hash = hashlib.sha256(_canonical_bytes(_normalise(Runner.model_json_schema()))).hexdigest()
 
 path = sys.argv[1]
+# Marker injected by the server: the trusted harness emits exactly one line
+# prefixed with it *after* ``runpy`` returns, so a stray/forged line from the
+# script's ``atexit``/stdout games cannot be mistaken for the dump.  The nonce
+# is visible to the script (same process) and so is NOT an authentication
+# secret -- it is a line-selection aid, not a trust boundary (see module doc).
+marker = sys.argv[2] if len(sys.argv) > 2 else ""
 namespace = runpy.run_path(path)
 sims = [v for v in namespace.values() if isinstance(v, picmi.Simulation)]
 if not sims:
@@ -90,7 +116,7 @@ provenance = {
     "picongpu_revision": os.environ.get("PIC_AGENTIC_PICONGPU_REVISION", "") or _revision(),
     "schema_hash": schema_hash,
 }
-print(json.dumps({"runner": runner.model_dump(mode="json"), "provenance": provenance}))
+print(marker + json.dumps({"runner": runner.model_dump(mode="json"), "provenance": provenance}))
 """
 
 
@@ -100,11 +126,15 @@ _CHILD_RUNNER_KEY = "runner"
 #: Environment variables safe to pass into the untrusted PICMI child.  The
 #: child executes arbitrary LLM-supplied code, so it must NOT inherit the RCP
 #: secret or MAS tokens (which would otherwise be readable and printable back
-#: into the tool result).
+#: into the tool result).  ``HOME`` is intentionally absent: it is set to a
+#: fresh scratch directory by :func:`_safe_child_env` so ``~`` cannot reach the
+#: 0600 ``~/.config/pic-agentic/config.toml``.  ``PYTHONPATH``/``PYTHONHOME``/
+#: ``VIRTUAL_ENV`` are omitted too: the interpreter is invoked by absolute path
+#: (its own venv/``sys.executable`` resolves ``picongpu``), so they are not
+#: needed and only widen what the script can reach.
 _SAFE_ENV_KEYS = frozenset(
     {
         "PATH",
-        "HOME",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
@@ -112,9 +142,6 @@ _SAFE_ENV_KEYS = frozenset(
         "TZ",
         "USER",
         "LOGNAME",
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "VIRTUAL_ENV",
         "LD_LIBRARY_PATH",
         "CUDA_HOME",
         "CUDA_ROOT",
@@ -127,14 +154,19 @@ _SAFE_ENV_KEYS = frozenset(
 )
 
 
-def _safe_child_env() -> dict[str, str]:
+def _safe_child_env(home: str) -> dict[str, str]:
     """Return a minimal environment for the untrusted PICMI child.
 
+    Args:
+        home: Scratch directory to use as the child's ``HOME`` (so the 0600
+            config under the real ``~/.config`` is not reachable via ``~``).
+
     Returns:
-        The allow-listed environment plus ``PYTHONUNBUFFERED``.
+        The allow-listed environment plus ``HOME`` and ``PYTHONUNBUFFERED``.
 
     """
     env = {key: value for key, value in os.environ.items() if key in _SAFE_ENV_KEYS}
+    env["HOME"] = home
     env["PYTHONUNBUFFERED"] = "1"
     return env
 
@@ -153,6 +185,69 @@ class BuiltSimulation:
     schema_hash: str
 
 
+#: Maximum number of stderr characters echoed back in a build error.  The
+#: child is untrusted, so its stderr is treated as hostile input: only a
+#: bounded tail is kept, and the message labels it as untrusted.
+_MAX_STDERR_CHARS = 2000
+
+#: Prefix marking the harness-produced JSON line.  See ``_CHILD_SOURCE``.
+_OUTPUT_MARKER = "__pic_agentic_runner_dump__:"
+
+
+def _extract_payload(stdout: bytes, marker: str) -> dict[str, object] | None:
+    """Return the harness JSON object from the child's stdout, if present.
+
+    The trusted harness prints exactly one line prefixed with ``marker`` after
+    ``runpy`` returns.  Only the last such line is taken, so a script's own
+    ``atexit``/stdout output (which cannot know the server-injected nonce in
+    advance) cannot masquerade as the dump.  This is a *line-selection* aid,
+    not authentication: the script runs in the same process and can read the
+    nonce from ``sys.argv``.  Provenance is a drift check, not a trust boundary
+    (see the module docstring).
+
+    Args:
+        stdout: The child's raw stdout.
+        marker: The nonce prefix the server injected.
+
+    Returns:
+        The decoded JSON mapping, or ``None`` if no marked line parses.
+
+    """
+    prefix = marker.encode("utf-8") if marker else b""
+    for line in reversed(stdout.decode("utf-8", "replace").splitlines()):
+        candidate = line
+        if prefix:
+            if not candidate.startswith(marker):
+                continue
+            candidate = candidate[len(marker) :]
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and _CHILD_RUNNER_KEY in data:
+            return data
+    return None
+
+
+def _bounded_stderr(stderr: bytes, stdout: bytes) -> str:
+    """Return a labeled, bounded tail of the child's error output.
+
+    Args:
+        stderr: The child's stderr bytes (preferred).
+        stdout: The child's stdout bytes (fallback when stderr is empty).
+
+    Returns:
+        The last :data:`_MAX_STDERR_CHARS` characters, prefixed to make clear
+        the text is untrusted child output.
+
+    """
+    detail = (stderr or stdout).decode("utf-8", "replace").strip()
+    if not detail:
+        return ""
+    tail = detail[-_MAX_STDERR_CHARS:]
+    return f"<untrusted child stderr, tail> {tail}"
+
+
 async def build_runner_dump(
     *,
     script_path: Path,
@@ -162,7 +257,14 @@ async def build_runner_dump(
     """Run ``script_path`` in a child interpreter and return its build result.
 
     The child executes untrusted, LLM-supplied code, so it gets a minimal
-    allow-listed environment and never the RCP secret or MAS tokens.
+    allow-listed environment (no RCP secret/MAS tokens, a scratch ``HOME``) and
+    its error output is only echoed back as a bounded, labeled tail.  This is a
+    disposable interpreter, **not** a security sandbox: the child runs same-uid
+    and can still read ``/proc/<ppid>/environ`` (see the module docstring).
+
+    The provenance tuple is a drift/consistency check, not a trust boundary;
+    the harness prints it on a nonce-marked line after ``runpy`` returns so
+    stray script output is not mistaken for it.
 
     Args:
         script_path: Path to the (already written) PICMI script.
@@ -180,12 +282,16 @@ async def build_runner_dump(
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as child:
         child.write(_CHILD_SOURCE)
         child_path = child.name
-    argv = [interpreter or sys.executable, child_path, str(script_path)]
+    # A fresh scratch HOME per invocation: ``~`` in the child cannot reach the
+    # real 0600 config.toml, and the directory is removed with the child.
+    scratch_home = tempfile.mkdtemp(prefix="pic-agentic-home-")
+    marker = f"{_OUTPUT_MARKER}{secrets.token_hex(16)}"
+    argv = [interpreter or sys.executable, child_path, str(script_path), marker]
     process = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=_safe_child_env(),
+        env=_safe_child_env(scratch_home),
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_s)
@@ -196,21 +302,16 @@ async def build_runner_dump(
         raise SimulationBuildError(msg) from None
     finally:
         Path(child_path).unlink(missing_ok=True)
+        shutil.rmtree(scratch_home, ignore_errors=True)
     if process.returncode != 0:
-        detail = (stderr or stdout).decode("utf-8", "replace").strip()
-        msg = f"PICMI script failed (rc={process.returncode}): {detail[-2000:]}"
+        detail = _bounded_stderr(stderr, stdout)
+        msg = f"PICMI script failed (rc={process.returncode})"
+        if detail:
+            msg = f"{msg}: {detail}"
         raise SimulationBuildError(msg)
-    text = stdout.decode("utf-8", "replace").strip().splitlines()
-    if not text:
-        msg = "PICMI script produced no output"
-        raise SimulationBuildError(msg)
-    try:
-        data = json.loads(text[-1])
-    except ValueError as exc:
-        msg = f"PICMI script output was not JSON: {exc}"
-        raise SimulationBuildError(msg) from exc
-    if not isinstance(data, dict) or _CHILD_RUNNER_KEY not in data:
-        msg = "PICMI script output has no runner dump"
+    data = _extract_payload(stdout, marker)
+    if data is None:
+        msg = "PICMI script produced no runner dump"
         raise SimulationBuildError(msg)
     runner = data[_CHILD_RUNNER_KEY]
     provenance = data.get("provenance", {})

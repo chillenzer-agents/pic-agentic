@@ -12,11 +12,6 @@ from pathlib import Path
 SAFE_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
 #: Hard cap on the LLM-supplied message written to the shared file system.
 MAX_MESSAGE_BYTES = 4096
-#: Hard cap on a serialised simulation payload.  It is written to the shared
-#: file system (the Matrix command only carries its path), so the Matrix
-#: ``m.room.message`` size limit does not apply; this is a sanity bound on a
-#: hostile sender.
-MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 
 class UnsafePathError(ValueError):
@@ -85,35 +80,6 @@ def safe_write_message(path: str, base_dir: str, *, default: str = "") -> Path:
     if len(data) > MAX_MESSAGE_BYTES:
         msg = f"message exceeds {MAX_MESSAGE_BYTES} bytes"
         raise UnsafePathError(msg)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(target)
-    return target
-
-
-def write_payload(path: str, base_dir: str, data: bytes) -> Path:
-    """Validate ``path`` then write a serialised simulation payload atomically.
-
-    Used on the MCP-server side to place a payload on the shared file system;
-    the simclient only ever *reads* it (after re-validating the path).
-
-    Args:
-        path: The server-generated target path.
-        base_dir: Directory the path must stay inside.
-        data: The payload bytes to write.
-
-    Returns:
-        The path that was written.
-
-    Raises:
-        UnsafePathError: If the path is unsafe or the payload is too large.
-
-    """
-    target = validate_message_path(path, base_dir)
-    if len(data) > MAX_PAYLOAD_BYTES:
-        msg = f"payload exceeds {MAX_PAYLOAD_BYTES} bytes"
-        raise UnsafePathError(msg)
-    target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_bytes(data)
     tmp.replace(target)

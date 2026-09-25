@@ -28,10 +28,12 @@ is the simclient's job (the ``sim`` extra).
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, computed_field, field_validator
 
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, canonical_bytes, new_cmd_id
 from pic_agentic.version import WIRE_FORMAT_VERSION
@@ -42,11 +44,32 @@ ALLOWED_SIMULATION_KEYS = frozenset({"sim"})
 #: Default submit command; a payload asking for anything else is rejected.
 DEFAULT_SUBMIT_SYSTEM = "sbatch"
 
-#: Cap on the canonical simulation bytes carried in one Matrix command.  The
-#: homeserver rejects an oversized event (Synapse's default limit is 64 KiB for
-#: the whole content); 48 KiB leaves headroom for the envelope and the tool
-#: metadata.  A larger simulation needs out-of-band transport (future work).
+#: Cap on the *encoded* event content carried in one Matrix command.  Synapse's
+#: default limit is 64 KiB for the whole event content, so 48 KiB leaves headroom
+#: for the envelope, the human-readable body and the params.  The size check
+#: counts the **escaped** payload (it is embedded as a JSON string, so its
+#: quotes/backslashes are doubled) plus :data:`_ENVELOPE_ALLOWANCE_BYTES`, i.e.
+#: what actually goes on the wire -- not the inner simulation object.
 MAX_INLINE_PAYLOAD_BYTES = 48 * 1024
+
+#: Reserved budget for the signed envelope, the room body line, the copy of the
+#: provenance header and the params that travel alongside the payload in the
+#: same event content.
+_ENVELOPE_ALLOWANCE_BYTES = 4 * 1024
+
+#: ``cfg_file``: a relative path to a ``.cfg`` inside the generated setup.
+#: Absolute paths, ``..`` and shell metacharacters are rejected outright so the
+#: value can never be interpreted as shell code by the cluster's ``tbg`` (which
+#: ``eval``\\s the configuration file name).
+_CFG_FILE_RE = re.compile(r"^[A-Za-z0-9._/-]+\.cfg$")
+
+#: One ``NAME=value`` overwrite entry.  The strict charset excludes every shell
+#: metacharacter (spaces, ``$``, backticks, ``;``, quotes, ``(``/``)``, ``<``,
+#: ``>``, ``|``, ``&``, ``\\``, ``*``, ``?``, ``~``, ``%``); ``tbg`` applies
+#: these with ``eval``/``for word in $extra_op``, so only inert ``name=value``
+#: data may pass.
+_OVERWRITE_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._:/+-]*$")
+
 
 #: Key of the embedded :class:`SimulationPayload` inside the command.
 #:
@@ -127,6 +150,55 @@ class SubmitParams(BaseModel):
     submit_system: str = DEFAULT_SUBMIT_SYSTEM
     overwrite_vars: list[str] | None = None
 
+    @field_validator("cfg_file")
+    @classmethod
+    def _validate_cfg_file(cls, value: str | None) -> str | None:
+        r"""Reject a ``cfg_file`` that is not a relative, inert ``.cfg`` path.
+
+        The cluster's ``tbg`` ``eval``\s the configuration file name, so an
+        arbitrary path or any shell metacharacter would be wire-supplied shell
+        code -- forbidden by the design (sections 5/9).
+
+        Returns:
+            The validated path, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the path is absolute, escapes upward, or contains
+                characters outside the safe set.
+
+        """
+        if value is None:
+            return None
+        if not _CFG_FILE_RE.fullmatch(value) or ".." in value.split("/") or value.startswith("/"):
+            msg = f"cfg_file must be a relative path matching {_CFG_FILE_RE.pattern!r}, got {value!r}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("overwrite_vars")
+    @classmethod
+    def _validate_overwrite_vars(cls, value: list[str] | None) -> list[str] | None:
+        """Reject any ``overwrite_vars`` entry that is not inert ``NAME=value``.
+
+        ``tbg`` expands each entry with ``eval``/``for word in $extra_op``, so a
+        value such as ``PARAM=$(cmd)`` or one containing whitespace/backticks
+        would be remote code execution on the submission node.
+
+        Returns:
+            The validated list, or ``None`` when unset.
+
+        Raises:
+            ValueError: If any entry contains shell metacharacters or does not
+                match ``NAME=value``.
+
+        """
+        if value is None:
+            return None
+        for entry in value:
+            if not _OVERWRITE_VAR_RE.fullmatch(entry):
+                msg = f"overwrite_vars entries must match {_OVERWRITE_VAR_RE.pattern!r}, got {entry!r}"
+                raise ValueError(msg)
+        return value
+
     def picongpu_flags(self) -> dict[str, Any]:
         """Map to the aliases ``Runner.generate(**flags)`` forwards to picongpu.
 
@@ -185,7 +257,10 @@ class SimulationPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    wire_format_version: int = WIRE_FORMAT_VERSION
+    #: Required: a payload that omits the version is rejected rather than
+    #: silently treated as the current version (design section 2.2).  The
+    #: sender always supplies it via :meth:`build`.
+    wire_format_version: int
     picongpu_version: str
     picongpu_revision: str = ""
     schema_hash: str
@@ -302,6 +377,12 @@ def provenance_mismatches(payload: SimulationPayload, local: dict[str, str]) -> 
 def payload_wire_bytes(payload: SimulationPayload) -> bytes:
     """Serialise a payload for inline transport, enforcing the size cap.
 
+    The cap is checked against the size the payload actually occupies on the
+    wire: the payload body is a JSON *string* embedded in the event content, so
+    its quotes/backslashes are escaped once more.  Measuring the inner
+    simulation object (as an earlier version did) undercounted by up to 2x and
+    let an "under-cap" payload produce an over-64-KiB Matrix event.
+
     The computed fields (``payload_hash``/``sim_id``) are excluded: they are
     recomputed on read and would otherwise be rejected by
     ``extra="forbid"``.
@@ -313,16 +394,21 @@ def payload_wire_bytes(payload: SimulationPayload) -> bytes:
         The canonical JSON bytes to embed in the command.
 
     Raises:
-        PayloadTooLargeError: If the simulation exceeds
+        PayloadTooLargeError: If the encoded payload plus
+            :data:`_ENVELOPE_ALLOWANCE_BYTES` exceeds
             :data:`MAX_INLINE_PAYLOAD_BYTES`.
 
     """
     body = payload.model_dump_json(exclude_computed_fields=True).encode("utf-8")
-    size = len(canonical_bytes(payload.simulation))
+    # The body is carried as a JSON string inside the event content, so measure
+    # the escaped form (json.dumps doubles every quote/backslash) plus the
+    # envelope budget -- that is what the homeserver's 64 KiB event limit sees.
+    encoded = len(json.dumps(body.decode("utf-8"), ensure_ascii=True).encode("ascii"))
+    size = encoded + _ENVELOPE_ALLOWANCE_BYTES
     if size > MAX_INLINE_PAYLOAD_BYTES:
         msg = (
-            f"simulation is {size} bytes; the inline limit is {MAX_INLINE_PAYLOAD_BYTES} "
-            "(out-of-band payload transport is not implemented yet)"
+            f"encoded simulation payload is ~{size} bytes; the inline limit is "
+            f"{MAX_INLINE_PAYLOAD_BYTES} (out-of-band payload transport is not implemented yet)"
         )
         raise PayloadTooLargeError(msg)
     return body

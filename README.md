@@ -162,21 +162,40 @@ spec, not the picmi `Simulation`** (the picmi object does not serialise with
 raw callables; see `M2-SUBMIT-PLAN.md`).
 
 1. The MCP server writes the PICMI script to a temp file and runs it in a
-   **disposable subprocess** (never imports it in-process), then serialises the
-   `Runner` dump into a `SimulationPayload`. The payload carries a provenance
-   tuple — `wire_format_version`, `picongpu_version`, `picongpu_revision`,
-   `schema_hash` (SHA-256 of the `Runner` JSON schema), plus a `payload_hash`
-   and 8-hex `sim_id` — and travels **inline inside the signed command**, so no
-   shared file system between the two sides is needed. The payload is carried as
-   a JSON **string**, because Matrix's canonical JSON (Synapse) rejects floats
-   in event-content objects and a simulation is full of floats. Simulations
-   larger than `MAX_INLINE_PAYLOAD_BYTES` (48 KiB) are rejected; realistic
-   simulations are a few KiB.
+   **disposable interpreter with a minimal environment** (never imports it
+   in-process), then serialises the `Runner` dump into a `SimulationPayload`.
+   The payload carries a provenance tuple — `wire_format_version`,
+   `picongpu_version`, `picongpu_revision`, `schema_hash` (SHA-256 of the
+   `Runner` JSON schema), plus a `payload_hash` and 8-hex `sim_id` — and
+   travels **inline inside the signed command**, so no shared file system
+   between the two sides is needed. The payload is carried as a JSON **string**,
+   because Matrix's canonical JSON (Synapse) rejects floats in event-content
+   objects and a simulation is full of floats. The inline limit
+   (`MAX_INLINE_PAYLOAD_BYTES`, 48 KiB) is checked against the **escaped** wire
+   size plus an envelope allowance, so an accepted payload cannot produce an
+   over-64-KiB Matrix event; realistic simulations are a few KiB.
+
+   The child is **not a sandbox**: it runs same-uid and the PICMI script is
+   arbitrary LLM-supplied code executed on the submission node by design, so it
+   can still read the parent environment via `/proc/<ppid>/environ`. What the
+   builder does provide is a *disposable interpreter*: it drops the RCP secret
+   and MAS tokens from the child environment, points `HOME` at a fresh scratch
+   directory (so the 0600 `~/.config/pic-agentic/config.toml` is not reachable
+   via `~`), and only echoes a bounded, clearly-labelled tail of the child's
+   stderr. Redaction of tool output is best-effort (it strips verbatim secrets,
+   not encodings), and the provenance tuple is a drift/consistency check, not a
+   trust boundary. Full isolation (separate uid/namespace) is a documented
+   non-goal for this PoC.
 2. The simclient re-validates the embedded payload's byte hash and provenance
    tuple against its own install **before** importing PIConGPU; all cluster
    locations (`setup_dir`, `run_dir`, `template_dir`) come from local config,
-   never the payload. It rebuilds a fresh `Runner`, `generate()`s the setup and
-   `run()`s the workflow (which invokes `sbatch`).
+   never the payload. `cfg_file` must be a relative `*.cfg` path and every
+   `overwrite_vars` entry a strict `NAME=value` token (no shell metacharacters),
+   because the cluster's `tbg` `eval`s them; anything else is rejected with
+   `payload_invalid` before `generate()`. It rebuilds a fresh `Runner`,
+   `generate()`s the setup and `run()`s the workflow (which invokes `sbatch`).
+   The simclient also normalises the generated `input.yaml` so
+   `run_overwrite_vars` is the single string the pinned CWL workflow expects.
 3. Acknowledgements are deliberately coarse: the simclient acks `accepted`
    immediately, then emits `simulation.submitted` (with the SLURM `job_id`
    parsed from `submission_information.txt`) and `workflow.finished` once the
@@ -216,7 +235,9 @@ that venv, or point `--picongpu-python` at it).
   `(sim, sender_role, seq, type)` when the transport did not stamp one), and
   re-sent commands are idempotent per `cmd_id`.
 - Credentials come from the environment or a 0600 config file and are redacted
-  from all tool output.
+  from all tool output. Redaction is best-effort: it strips verbatim secret
+  strings, not base64/hex encodings, and the M2 PICMI child runs same-uid by
+  design (see the M2 section) so it is not treated as a trust boundary.
 
 ## Configuration
 

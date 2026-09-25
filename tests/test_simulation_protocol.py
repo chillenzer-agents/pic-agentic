@@ -86,6 +86,7 @@ def test_extra_top_level_field_is_rejected() -> None:
     with pytest.raises(ValueError, match="Extra inputs"):
         SimulationPayload.model_validate(
             {
+                "wire_format_version": WIRE_FORMAT_VERSION,
                 "picongpu_version": "0.9.0-dev",
                 "schema_hash": "x",
                 "simulation": {"sim": {}},
@@ -94,8 +95,21 @@ def test_extra_top_level_field_is_rejected() -> None:
         )
 
 
+def test_omitted_wire_format_version_is_rejected() -> None:
+    """An omitted version must not silently masquerade as the current one."""
+    with pytest.raises(ValueError, match="wire_format_version"):
+        SimulationPayload.model_validate(
+            {
+                "picongpu_version": "0.9.0-dev",
+                "schema_hash": "x",
+                "simulation": {"sim": {}},
+            }
+        )
+
+
 def test_allowlist_rejects_extra_simulation_key() -> None:
     payload = SimulationPayload(
+        wire_format_version=WIRE_FORMAT_VERSION,
         picongpu_version="0.9.0-dev",
         schema_hash="x",
         simulation={"sim": {}, "setup_dir": "/etc"},
@@ -105,7 +119,12 @@ def test_allowlist_rejects_extra_simulation_key() -> None:
 
 
 def test_allowlist_reports_missing_sim() -> None:
-    payload = SimulationPayload(picongpu_version="0.9.0-dev", schema_hash="x", simulation={})
+    payload = SimulationPayload(
+        wire_format_version=WIRE_FORMAT_VERSION,
+        picongpu_version="0.9.0-dev",
+        schema_hash="x",
+        simulation={},
+    )
     with pytest.raises(UnsupportedPayloadError, match="missing field"):
         payload.check_allowlist()
 
@@ -179,6 +198,44 @@ def test_params_maps_every_field_to_its_picongpu_alias() -> None:
     }
 
 
+def test_overwrite_vars_flags_are_joined_for_the_workflow(tmp_path: Path) -> None:
+    """input.yaml gets the string CWL's ``run_overwrite_vars`` requires.
+
+    The pinned workflow.cwl declares ``run_overwrite_vars`` as ``type: string?``
+    while ``Runner.generate`` writes the list through; the simclient joins it
+    before CWL validation (see ``_normalise_workflow_vars``).
+    """
+    from pic_agentic.simclient.simulation import _normalise_workflow_vars
+
+    workflow_dir = tmp_path / "workflow"
+    workflow_dir.mkdir()
+    (workflow_dir / "input.yaml").write_text(
+        json.dumps({"run_overwrite_vars": ["A=1", "B=2"], "run_cfg_file": "etc/N.cfg"}), encoding="utf-8"
+    )
+    _normalise_workflow_vars(tmp_path)
+    patched = json.loads((workflow_dir / "input.yaml").read_text(encoding="utf-8"))
+    assert patched["run_overwrite_vars"] == "A=1 B=2"
+    # Absent/None and string values are left untouched.
+    (workflow_dir / "input.yaml").write_text(json.dumps({"run_overwrite_vars": None}), encoding="utf-8")
+    _normalise_workflow_vars(tmp_path)
+    assert json.loads((workflow_dir / "input.yaml").read_text())["run_overwrite_vars"] is None
+
+
+def test_cfg_file_rejects_unsafe_values() -> None:
+    for bad in ("/etc/passwd", "../../x.cfg", "a/../../x.cfg", "x;rm -rf.cfg", "x$(id).cfg", "x.cfg\n"):
+        with pytest.raises(ValueError, match="cfg_file"):
+            SubmitParams(cfg_file=bad)
+    assert SubmitParams(cfg_file="etc/picongpu/N.cfg").cfg_file == "etc/picongpu/N.cfg"
+    assert SubmitParams(cfg_file="my.cfg").cfg_file == "my.cfg"
+
+
+def test_overwrite_vars_rejects_shell_metacharacters() -> None:
+    for bad in ("PARAM=$(touch /tmp/pwned)", "A=1 B=2", "A=1;id", "A=`id`", "1BAD=1", "A=a|b", ""):
+        with pytest.raises(ValueError, match="overwrite_vars"):
+            SubmitParams(overwrite_vars=[bad])
+    assert SubmitParams(overwrite_vars=["A=1", "PATH_X=/a/b-c.d:e"]).overwrite_vars == ["A=1", "PATH_X=/a/b-c.d:e"]
+
+
 def test_payload_wire_bytes_excludes_computed_fields_and_round_trips() -> None:
     payload = _payload()
     raw = payload_wire_bytes(payload)
@@ -189,14 +246,105 @@ def test_payload_wire_bytes_excludes_computed_fields_and_round_trips() -> None:
     assert restored.payload_hash == payload.payload_hash
 
 
-def test_payload_wire_bytes_rejects_oversized_simulation() -> None:
+def test_payload_wire_bytes_rejects_oversized_wire_encoding() -> None:
+    # A quote-dense blob doubles in size when embedded as a JSON string; the cap
+    # must measure the *escaped* payload, not the inner simulation object.
     payload = SimulationPayload(
+        wire_format_version=WIRE_FORMAT_VERSION,
         picongpu_version="0.9.0-dev",
         schema_hash="x",
-        simulation={"sim": {"blob": "a" * (MAX_INLINE_PAYLOAD_BYTES + 1)}},
+        simulation={"sim": {"blob": '"' * (MAX_INLINE_PAYLOAD_BYTES // 2)}},
     )
     with pytest.raises(PayloadTooLargeError, match="inline limit"):
         payload_wire_bytes(payload)
+
+
+def test_emitted_event_stays_under_synapse_limit() -> None:
+    """An accepted payload must not exceed Synapse's 64 KiB event content."""
+    from pic_agentic.rcp.crypto import new_secret_hex
+
+    # A payload comfortably under the cap, encoded: the whole event must fit
+    # 64 KiB.
+    payload = SimulationPayload(
+        wire_format_version=WIRE_FORMAT_VERSION,
+        picongpu_version="0.9.0-dev",
+        schema_hash="x",
+        simulation={"sim": {"blob": "a" * (MAX_INLINE_PAYLOAD_BYTES - 12 * 1024)}},
+    )
+    command = build_submit_command(sim="s", seq=1, payload=payload)
+    content = command.to_content(new_secret_hex())
+    encoded = json.dumps(content, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) < 64 * 1024, f"event content is {len(encoded)} bytes"
+
+
+def test_child_env_drops_secrets_and_points_home_at_scratch() -> None:
+    """The PICMI child must not inherit secrets or the real 0600 config HOME."""
+    import os
+
+    from pic_agentic.simulation_build import _safe_child_env
+
+    sentinel = "syt_access_secret"
+    monkey_env = {
+        "PIC_AGENTIC_RCP_SECRET": "deadbeefcafesecret",
+        "PIC_AGENTIC_ACCESS_TOKEN": sentinel,
+        "PIC_AGENTIC_REFRESH_TOKEN": "refresh_secret",
+        "HOME": "/home/real",
+        "PATH": "/usr/bin",
+        "PYTHONPATH": "/workspace/src",
+        "VIRTUAL_ENV": "/venv",
+        "PYTHONHOME": "/py",
+    }
+    old = {key: os.environ.get(key) for key in monkey_env}
+    os.environ.update(monkey_env)
+    try:
+        env = _safe_child_env("/scratch/home")
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert env["HOME"] == "/scratch/home"
+    assert env["PATH"] == "/usr/bin"
+    assert env["PYTHONUNBUFFERED"] == "1"
+    for key in ("PIC_AGENTIC_RCP_SECRET", "PIC_AGENTIC_ACCESS_TOKEN", "PIC_AGENTIC_REFRESH_TOKEN"):
+        assert key not in env
+    for key in ("PYTHONPATH", "VIRTUAL_ENV", "PYTHONHOME"):
+        assert key not in env
+
+
+def test_build_error_stderr_is_labelled_and_bounded() -> None:
+    from pic_agentic.simulation_build import _bounded_stderr
+
+    detail = _bounded_stderr(b"x" * 10_000, b"")
+    assert detail.startswith("<untrusted child stderr, tail>")
+    assert len(detail) < 10_000
+    assert not _bounded_stderr(b"", b"")
+
+
+def test_extract_payload_ignores_unmarked_and_forged_lines() -> None:
+    from pic_agentic.simulation_build import _OUTPUT_MARKER, _extract_payload
+
+    marker = _OUTPUT_MARKER + "nonce123"
+    forged = b'{"runner": {"forged": true}, "provenance": {}}'
+    good = (marker + '{"runner": {"ok": 1}, "provenance": {}}').encode()
+    stdout = forged + b"\n" + good + b"\n" + forged + b"\n"
+    assert _extract_payload(stdout, marker) == {"runner": {"ok": 1}, "provenance": {}}
+    assert _extract_payload(forged, marker) is None
+
+
+def test_submit_tool_errors_cover_protocol_and_build_failures() -> None:
+    """The tool's soft-error tuple must include the payload protocol errors.
+
+    Regression: ``PayloadTooLargeError`` escaped ``submit_simulation`` as an
+    unhandled exception because ``app.py`` only caught ack/build/path/OSError.
+    """
+    from pic_agentic.server.app import _SUBMIT_TOOL_ERRORS
+
+    assert issubclass(PayloadTooLargeError, _SUBMIT_TOOL_ERRORS)
+    assert issubclass(UnsupportedPayloadError, _SUBMIT_TOOL_ERRORS)
+    # ValueError also covers pydantic ValidationError (bad injection params).
+    assert issubclass(ValueError, _SUBMIT_TOOL_ERRORS)
 
 
 def test_ack_and_event_shape() -> None:

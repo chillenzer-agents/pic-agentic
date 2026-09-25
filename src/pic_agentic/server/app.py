@@ -17,7 +17,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
 from pic_agentic.auth import MasTokenStore
-from pic_agentic.protocol.simulation import SubmitParams
+from pic_agentic.protocol.simulation import PayloadTooLargeError, SubmitParams, UnsupportedPayloadError
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
 from pic_agentic.server.simulation import SubmitOutcome, SubmitService, resolve_script
 from pic_agentic.simclient.safety import UnsafePathError
@@ -31,6 +31,21 @@ if TYPE_CHECKING:
     from pic_agentic.rcp.envelope import RcpMessage
 
 log = logging.getLogger(__name__)
+
+#: Errors the ``submit_simulation`` tool turns into a soft ``{"ok": false}``
+#: result rather than letting them escape as an unhandled tool exception.
+#: Includes the protocol ``ValueError``s raised before/while sending
+#: (``PayloadTooLargeError``, ``UnsupportedPayloadError``) and pydantic's
+#: ``ValidationError`` for bad params; no ``ack`` reaches the LLM otherwise.
+_SUBMIT_TOOL_ERRORS: tuple[type[BaseException], ...] = (
+    AckTimeoutError,
+    SimulationBuildError,
+    UnsafePathError,
+    PayloadTooLargeError,
+    UnsupportedPayloadError,
+    OSError,
+    ValueError,
+)
 
 
 class HelloRuntime:
@@ -213,17 +228,17 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         cfg_file: str | None = None,
         overwrite_vars: list[str] | None = None,
     ) -> dict[str, Any]:
-        params = SubmitParams(
-            build_jobs=build_jobs,
-            build_cmake=build_cmake,
-            build_preset=build_preset,
-            build_force=build_force,
-            cfg_file=cfg_file,
-            overwrite_vars=overwrite_vars,
-        )
         try:
+            params = SubmitParams(
+                build_jobs=build_jobs,
+                build_cmake=build_cmake,
+                build_preset=build_preset,
+                build_force=build_force,
+                cfg_file=cfg_file,
+                overwrite_vars=overwrite_vars,
+            )
             outcome = await runtime.submit(picmi_script, params=params)
-        except (AckTimeoutError, SimulationBuildError, UnsafePathError, OSError) as exc:
+        except _SUBMIT_TOOL_ERRORS as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
         return _submit_outcome_dict(runtime, outcome)
 
