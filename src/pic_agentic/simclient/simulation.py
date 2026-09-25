@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import re
@@ -314,6 +315,85 @@ def prepare_submit(
     )
 
 
+#: Per-process buffer of the last workflow's cwltool ERROR output.  A shared
+#: buffer is acceptable because the simclient executes one submission at a time.
+_LAST_CWLT_ERROR = io.StringIO()
+
+#: Cap on the captured error text sent in a failure event.
+_MAX_ERROR_DETAIL = 4000
+#: Files above this size are skipped by the cache scan (compiled binaries).
+_MAX_SCAN_FILE_BYTES = 2_000_000
+#: Stop the cache scan after this many matching lines.
+_MAX_SCAN_HITS = 50
+
+
+def _run_workflow(runner: Any) -> None:
+    """Run the CWL workflow, capturing cwltool's own ERROR log.
+
+    cwltool's exception is only ``Completed permanentFail``; the step command
+    error (e.g. ``cmake: command not found``) is emitted on the ``cwltool``
+    logger at ERROR level.  Attach a temporary handler to retain it.
+
+    Args:
+        runner: The ``pypicongpu.Runner`` to run.
+
+    """
+    import logging  # ruff: ignore[import-outside-top-level] - only needed for this call
+
+    handler = logging.StreamHandler(_LAST_CWLT_ERROR)
+    handler.setLevel(logging.ERROR)
+    logger = logging.getLogger("cwltool")
+    logger.addHandler(handler)
+    try:
+        runner.run()
+    finally:
+        logger.removeHandler(handler)
+
+
+def _workflow_failure_detail(run_dir: Path) -> str:
+    """Return the captured cwltool error plus any retained step log.
+
+    Args:
+        run_dir: The run directory (for the .cwl_cache fallback scan).
+
+    Returns:
+        A truncated, redaction-ready error string (possibly empty).
+
+    """
+    captured = _LAST_CWLT_ERROR.getvalue()
+    _LAST_CWLT_ERROR.seek(0)
+    _LAST_CWLT_ERROR.truncate(0)
+    detail = captured.strip()
+    if not detail:
+        detail = _scan_retained_step_logs(run_dir)
+    return detail[-_MAX_ERROR_DETAIL:]
+
+
+def _scan_retained_step_logs(run_dir: Path) -> str:
+    """Best-effort scan of the retained cwltool cache for an error line.
+
+    Returns:
+        The most relevant-looking error line, or ``""``.
+
+    """
+    cache = Path(run_dir) / ".cwl_cache"
+    if not cache.is_dir():
+        return ""
+    pattern = re.compile(r"error|fatal|not found|No such file|command not found|exited with status", re.IGNORECASE)
+    hits: list[str] = []
+    for path in cache.rglob("*"):
+        if not path.is_file() or path.stat().st_size > _MAX_SCAN_FILE_BYTES:
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                hits.extend(line.rstrip() for line in handle if pattern.search(line))
+        except OSError:
+            continue
+        if len(hits) > _MAX_SCAN_HITS:
+            break
+    return "\n".join(hits[-20:])
+
+
 async def execute_submit(
     *,
     prepared: PreparedSubmit,
@@ -348,10 +428,16 @@ async def execute_submit(
         raise SimulationExecutionError(SimulationErrorCode.GENERATE_FAILED, msg, SimulationStage.BUILD) from exc
 
     # Submit stage: run the workflow; job id from submission_information.txt.
+    # cwltool raises a generic ``Completed permanentFail`` and logs the actual
+    # step error at ERROR level, so capture its log for the failure event;
+    # otherwise the event is undiagnosable from the room.
     try:
-        await asyncio.to_thread(runner.run)
+        await asyncio.to_thread(_run_workflow, runner)
     except Exception as exc:
+        detail = _workflow_failure_detail(runner.run_dir)
         msg = f"workflow failed: {exc}"
+        if detail:
+            msg = f"{msg}\n{detail}"
         raise SimulationExecutionError(SimulationErrorCode.RUN_FAILED, msg, SimulationStage.RUN) from exc
 
     job_id = job_id_reader(runner.run_dir, prepared.payload)
