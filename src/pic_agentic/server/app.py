@@ -500,6 +500,18 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
         return await _control_tool(runtime, sim_id, SimulationOp.CANCEL)
 
     @server.tool(
+        title="Checkpoint and stop a simulation",
+        description=(
+            "Ask a running simulation to write a checkpoint at the next step "
+            "and then stop cleanly (SIGALRM via scontrol signal) -- the atomic "
+            "'save state and finish' control."
+        ),
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    async def checkpoint_and_stop_simulation(sim_id: str) -> dict[str, Any]:
+        return await _control_tool(runtime, sim_id, SimulationOp.CHECKPOINT_AND_STOP)
+
+    @server.tool(
         title="Describe a simulation's results",
         description=(
             "Return the light manifest (files, formats, sizes, records) of a "

@@ -197,13 +197,19 @@ async def test_tool_registration_shape() -> None:
         "checkpoint_simulation",
         "stop_simulation",
         "cancel_simulation",
+        "checkpoint_and_stop_simulation",
         "describe_results",
         "get_result_slice",
         "read_result",
         "export_results",
     }
     assert expected <= set(tools)
-    for name in ("checkpoint_simulation", "stop_simulation", "cancel_simulation"):
+    for name in (
+        "checkpoint_simulation",
+        "stop_simulation",
+        "cancel_simulation",
+        "checkpoint_and_stop_simulation",
+    ):
         annotations = tools[name].annotations
         assert annotations is not None
         assert annotations.read_only_hint is False
