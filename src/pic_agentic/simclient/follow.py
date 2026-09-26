@@ -313,6 +313,33 @@ class JobFollower:
                 )
                 self._last_emitted_bucket = parsed.percent // PROGRESS_EVENT_STEP_PERCENT
 
+    def _scan_manifest(self) -> dict[str, object] | None:
+        """Build the light results manifest for ``results.ready``.
+
+        The results engine is imported lazily and guarded: a worktree that has
+        not yet merged it must not break following, so a missing engine (or any
+        scan failure) simply yields ``None`` and the event omits the manifest.
+
+        Returns:
+            The manifest dump, or None when the engine is unavailable.
+
+        """
+        try:
+            from pic_agentic.results import scan_output  # ruff: ignore[import-outside-top-level] - lazy seam
+        except ImportError:
+            return None
+        run_dir = Path(self.tracked.run_dir)
+        try:
+            manifest = scan_output(
+                run_dir / "simOutput",
+                sim_id=self.tracked.sim_id,
+                run_dir=str(run_dir),
+            )
+        except Exception:  # ruff: ignore[blind-except] - a manifest is best-effort event data
+            log.warning("results manifest scan failed for sim %s", self.tracked.sim_id)
+            return None
+        return manifest.model_dump()
+
     async def _emit_terminal(self, info: JobInfo) -> None:
         """Emit the terminal lifecycle events and stop following.
 
@@ -338,11 +365,11 @@ class JobFollower:
             # latest payload); a later status pull promotes it via
             # ``SimClient._state_for_info`` once the link appears.
             if linked:
-                await self.emit(
-                    SimulationState.RESULTS_READY,
-                    job_id=self.tracked.job_id,
-                    results_linked=True,
-                )
+                manifest = self._scan_manifest()
+                fields: dict[str, object] = {"job_id": self.tracked.job_id, "results_linked": True}
+                if manifest is not None:
+                    fields["manifest"] = manifest
+                await self.emit(SimulationState.RESULTS_READY, **fields)
             else:
                 await self.emit(
                     SimulationState.JOB_FINISHED,
@@ -352,8 +379,12 @@ class JobFollower:
                     results_linked=False,
                 )
         else:
+            # A user-requested cancel is reported as its own terminal state so
+            # callers can distinguish "I stopped it" from an actual job failure;
+            # every other non-clean terminal state stays ``job_failed``.
+            state = SimulationState.CANCELLED if info.state is SlurmJobState.CANCELLED else SimulationState.JOB_FAILED
             await self.emit(
-                SimulationState.JOB_FAILED,
+                state,
                 job_id=self.tracked.job_id,
                 slurm_state=info.state.value,
                 exit_code=info.exit_code,

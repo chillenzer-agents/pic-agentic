@@ -4,7 +4,7 @@
 
 """Local MCP-side driver for the real-cluster connectivity check.
 
-Three modes:
+Modes:
 
 * ``--setup`` creates a private room on the homeserver using the local account
   (see ``scripts/mas_login.py``), generates the shared RCP secret, and prints
@@ -27,6 +27,25 @@ Three modes:
   arrive, until ``--wait-s`` elapses.  Use it in a second terminal after
   ``--submit`` to follow the run.
 
+* ``--control {checkpoint,stop,checkpoint_and_stop,cancel} --sim-id <id>`` calls
+  the matching M3 control tool and prints the ack.  ``checkpoint``/``stop`` map
+  to ``checkpoint_simulation``/``stop_simulation``; ``checkpoint_and_stop`` has
+  no own server tool, so it is sent as a checkpoint followed by a stop.
+
+* ``--describe --sim-id <id>`` prints the M3 results manifest summary.
+
+* ``--read --sim-id <id> [--result-path <rel>] [--stream {stdout,stderr}]
+  [--tail N]`` prints the returned text lines.
+
+* ``--slice --sim-id <id> --record <name> [--component C] [--iteration N|last]
+  [--downsample N]`` prints ``n_points`` and a short data prefix.
+
+* ``--export --sim-id <id>`` prints the transfer ticket.
+
+* ``--wait-results --sim-id <id>`` polls ``describe_results`` until the manifest
+  appears or ``--wait-s`` elapses; use it to wait for a run before
+  ``--describe``.
+
 The MCP server and the cluster simclient use the same Matrix account but log in
 separately, so each gets its own MAS session/device and its own refresh chain
 (no rotation conflict).  RCP messages are role-tagged, so the self-echo works.
@@ -38,6 +57,12 @@ Usage::
     python scripts/local_mcp_check.py --run
     python scripts/local_mcp_check.py --submit --picmi-script ./my_sim.py
     python scripts/local_mcp_check.py --watch
+    python scripts/local_mcp_check.py --control checkpoint --sim-id <id>
+    python scripts/local_mcp_check.py --wait-results --sim-id <id>
+    python scripts/local_mcp_check.py --describe --sim-id <id>
+    python scripts/local_mcp_check.py --read --sim-id <id> --stream stdout --tail 50
+    python scripts/local_mcp_check.py --slice --sim-id <id> --record E --component z
+    python scripts/local_mcp_check.py --export --sim-id <id>
 """
 
 from __future__ import annotations
@@ -61,6 +86,7 @@ from pic_agentic.config import Config
 
 DEFAULT_STATE = Path("~/.config/pic-agentic/cluster-check.json").expanduser()
 DEFAULT_MESSAGE = "Hello from the MCP server to the cluster"
+SLICE_PREFIX = 8
 
 
 def api(homeserver: str, method: str, path: str, token: str, data: dict | None = None) -> dict:
@@ -354,6 +380,192 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return _call_report_tool(state, "get_logs", {"sim_id": args.sim_id, "stream": args.stream, "tail": args.tail})
 
 
+def _load_state(args: argparse.Namespace) -> dict:
+    """Load the setup state and validate a required ``--sim-id``.
+
+    Returns:
+        The parsed state dict.
+
+    Raises:
+        SystemExit: If no state exists or ``--sim-id`` is missing.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    if not args.sim_id:
+        mode = getattr(args, "control", None) or "results"
+        msg = f"the {mode} mode requires --sim-id <sim_id>"
+        raise SystemExit(msg)
+    return json.loads(args.state.read_text())
+
+
+def _result_tool_call(state: dict, tool: str, arguments: dict) -> dict:
+    """Drive the MCP server and call one M3 tool, returning the payload.
+
+    Returns:
+        The tool's structured content (or a soft-error dict).
+
+    """
+    try:
+        return asyncio.run(_call_tool(state, tool, arguments))
+    except Exception as exc:  # ruff: ignore[blind-except] - surfaced as data normally
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def cmd_control(args: argparse.Namespace) -> int:
+    """Call the M3 control tool matching ``--control``.
+
+    Each op maps to its own server tool, including the atomic
+    ``checkpoint_and_stop_simulation`` (a single SIGALRM).
+
+    Returns:
+        The process exit code (non-zero if ``ok`` is false).
+
+    """
+    state = _load_state(args)
+    tool_for = {
+        "checkpoint": "checkpoint_simulation",
+        "stop": "stop_simulation",
+        "cancel": "cancel_simulation",
+        "checkpoint_and_stop": "checkpoint_and_stop_simulation",
+    }
+    result = _result_tool_call(state, tool_for[args.control], {"sim_id": args.sim_id})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    if not result.get("ok"):
+        print("\nFAILED: the control command was not accepted.", file=sys.stderr)
+        return 1
+    print(f"\nCONTROL OK: op={args.control} sim_id={args.sim_id}")
+    return 0
+
+
+def cmd_describe(args: argparse.Namespace) -> int:
+    """Call ``describe_results`` and print the manifest summary.
+
+    Returns:
+        The process exit code (non-zero if ``ok`` is false).
+
+    """
+    state = _load_state(args)
+    result = _result_tool_call(state, "describe_results", {"sim_id": args.sim_id})
+    if not result.get("ok", True):
+        print(json.dumps(result, indent=2, default=str), flush=True)
+        print("\nFAILED: describe_results returned an error.", file=sys.stderr)
+        return 1
+    manifest = result.get("manifest") or {}
+    files = manifest.get("files") or []
+    print(f"sim_id        : {manifest.get('sim_id')}")
+    print(f"output_dir    : {manifest.get('output_dir')}")
+    print(f"total_bytes   : {manifest.get('total_bytes')}")
+    print(f"reader        : {manifest.get('reader')}")
+    print(f"readable_local: {manifest.get('readable_local')}")
+    print(f"files         : {len(files)}")
+    for ref in files:
+        print(f"  - {ref.get('path')}  format={ref.get('format')}  size={ref.get('size_bytes')}")
+    return 0
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    """Call ``read_result`` and print the returned lines.
+
+    Returns:
+        The process exit code (non-zero if ``ok`` is false).
+
+    """
+    state = _load_state(args)
+    if args.result_path:
+        arguments: dict = {"sim_id": args.sim_id, "path": args.result_path}
+    else:
+        arguments = {"sim_id": args.sim_id, "stream": args.stream or None}
+    if args.tail is not None:
+        arguments["tail"] = args.tail
+    result = _result_tool_call(state, "read_result", arguments)
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", True) else 1
+
+
+def cmd_slice(args: argparse.Namespace) -> int:
+    """Call ``get_result_slice`` and print ``n_points`` plus a data prefix.
+
+    Returns:
+        The process exit code (non-zero if ``ok`` is false).
+
+    Raises:
+        SystemExit: If no setup state exists, ``--sim-id`` is missing, or
+            ``--record`` is missing.
+
+    """
+    state = _load_state(args)
+    if not args.record:
+        msg = "--slice requires --record <name>"
+        raise SystemExit(msg)
+    arguments: dict = {"sim_id": args.sim_id, "record": args.record, "iteration": args.iteration}
+    if args.component:
+        arguments["component"] = args.component
+    if args.downsample is not None:
+        arguments["downsample"] = args.downsample
+    result = _result_tool_call(state, "get_result_slice", arguments)
+    if not result.get("ok", True):
+        print(json.dumps(result, indent=2, default=str), flush=True)
+        print("\nFAILED: get_result_slice returned an error.", file=sys.stderr)
+        return 1
+    data = result.get("data") or []
+    prefix = ", ".join(str(value) for value in data[:SLICE_PREFIX])
+    more = ", ..." if len(data) > SLICE_PREFIX else ""
+    print(f"n_points: {result.get('n_points', len(data))}")
+    print(f"data[:{SLICE_PREFIX}]: [{prefix}{more}]")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Call ``export_results`` and print the transfer ticket.
+
+    Returns:
+        The process exit code (non-zero if ``ok`` is false).
+
+    """
+    state = _load_state(args)
+    result = _result_tool_call(state, "export_results", {"sim_id": args.sim_id})
+    if not result.get("ok", True):
+        print(json.dumps(result, indent=2, default=str), flush=True)
+        print("\nFAILED: export_results returned an error.", file=sys.stderr)
+        return 1
+    ticket = result.get("result") or {}
+    print(f"ref       : {(ticket.get('ref') or {}).get('path')}")
+    print(f"transfer  : {ticket.get('transfer')}")
+    print(f"resolved  : {ticket.get('resolved')}")
+    print(f"local_path: {ticket.get('local_path')}")
+    return 0
+
+
+def cmd_wait_results(args: argparse.Namespace) -> int:
+    """Poll ``describe_results`` until a manifest appears or ``--wait-s`` runs out.
+
+    Returns:
+        The process exit code (0 once a manifest appears, 1 on timeout/error).
+
+    """
+    state = _load_state(args)
+    deadline = time.monotonic() + args.wait_s
+    interval = 15.0
+    attempt = 0
+    while True:
+        attempt += 1
+        result = _result_tool_call(state, "describe_results", {"sim_id": args.sim_id})
+        manifest = result.get("manifest") if isinstance(result, dict) else None
+        if manifest and manifest.get("output_dir"):
+            print(json.dumps(manifest, indent=2, default=str), flush=True)
+            print(f"\nRESULTS READY: sim_id={args.sim_id} files={len(manifest.get('files') or [])}")
+            return 0
+        if not result.get("ok", True):
+            print(json.dumps(result, indent=2, default=str), flush=True)
+        print(f"[attempt {attempt}] no result manifest yet; retrying in {interval:.0f}s ...", flush=True)
+        if time.monotonic() >= deadline:
+            print("\nFAILED: no result manifest before the wait expired.", file=sys.stderr)
+            return 1
+        time.sleep(interval)
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
@@ -442,11 +654,11 @@ def _print_event(message) -> int | None:
     return None
 
 
-def main() -> None:
-    """Parse arguments and dispatch to setup, run, submit, or watch.
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser with all mutually exclusive modes.
 
-    Raises:
-        SystemExit: With the chosen command's exit code.
+    Returns:
+        The configured parser.
 
     """
     parser = argparse.ArgumentParser(description=__doc__)
@@ -457,13 +669,29 @@ def main() -> None:
     mode.add_argument("--watch", action="store_true", help="follow lifecycle events in the RCP room")
     mode.add_argument("--status", action="store_true", help="call get_status / list_simulations / get_events")
     mode.add_argument("--logs", action="store_true", help="call get_logs for one sim")
+    mode.add_argument(
+        "--control",
+        choices=["checkpoint", "stop", "checkpoint_and_stop", "cancel"],
+        default="",
+        help="call an M3 control tool for --sim-id",
+    )
+    mode.add_argument("--describe", action="store_true", help="call describe_results and print the manifest summary")
+    mode.add_argument("--read", action="store_true", help="call read_result for one sim")
+    mode.add_argument("--slice", action="store_true", help="call get_result_slice for one sim")
+    mode.add_argument("--export", action="store_true", help="call export_results for one sim")
+    mode.add_argument("--wait-results", action="store_true", help="poll describe_results until results appear")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
-    parser.add_argument("--sim-id", default="", help="sim_id for --status/--logs")
+    parser.add_argument("--sim-id", default="", help="sim_id for the per-sim reporting/control/result modes")
     parser.add_argument("--events", action="store_true", help="with --status: return get_events instead")
-    parser.add_argument("--stream", default="stdout", help="log stream for --logs")
+    parser.add_argument("--stream", default="stdout", help="log stream for --logs/--read")
     parser.add_argument("--tail", type=int, default=100, help="log lines for --logs")
+    parser.add_argument("--result-path", default="", help="relative result path for --read")
+    parser.add_argument("--record", default="", help="openPMD record name for --slice")
+    parser.add_argument("--component", default="", help="openPMD component for --slice")
+    parser.add_argument("--iteration", default="last", help="iteration (int or 'last') for --slice")
+    parser.add_argument("--downsample", type=int, default=None, help="stride for --slice")
     parser.add_argument("--picmi-script", default="", help="PICMI script path for --submit")
     parser.add_argument(
         "--picongpu-python",
@@ -484,17 +712,33 @@ def main() -> None:
             "/scratch/<user>/pic-agentic/shared). Required for --setup."
         ),
     )
-    args = parser.parse_args()
-    if args.setup:
-        raise SystemExit(cmd_setup(args))
-    if args.submit:
-        raise SystemExit(cmd_submit(args))
-    if args.watch:
-        raise SystemExit(cmd_watch(args))
-    if args.status:
-        raise SystemExit(cmd_status(args))
-    if args.logs:
-        raise SystemExit(cmd_logs(args))
+    return parser
+
+
+def main() -> None:
+    """Parse arguments and dispatch to the selected mode.
+
+    Raises:
+        SystemExit: With the chosen command's exit code.
+
+    """
+    args = _build_parser().parse_args()
+    dispatch = (
+        (args.setup, cmd_setup),
+        (args.submit, cmd_submit),
+        (args.watch, cmd_watch),
+        (args.status, cmd_status),
+        (args.logs, cmd_logs),
+        (bool(args.control), cmd_control),
+        (args.describe, cmd_describe),
+        (args.read, cmd_read),
+        (args.slice, cmd_slice),
+        (args.export, cmd_export),
+        (args.wait_results, cmd_wait_results),
+    )
+    for selected, command in dispatch:
+        if selected:
+            raise SystemExit(command(args))
     raise SystemExit(cmd_run(args))
 
 

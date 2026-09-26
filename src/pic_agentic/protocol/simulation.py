@@ -101,6 +101,12 @@ class SimulationType(StrEnum):
     STATUS_ACK = "rcp.status_ack"
     LOGS_COMMAND = "rcp.logs_request"
     LOGS_ACK = "rcp.logs_ack"
+    #: M3 request/response: control verbs (checkpoint/stop/cancel) and
+    #: results access (describe/slice/read/export), both demand-driven pulls.
+    CONTROL_COMMAND = "rcp.control_request"
+    CONTROL_ACK = "rcp.control_ack"
+    RESULT_COMMAND = "rcp.result_request"
+    RESULT_ACK = "rcp.result_ack"
 
 
 class SimulationState(StrEnum):
@@ -126,6 +132,80 @@ class SimulationState(StrEnum):
     STEP_FINISHED = "simulation.step_finished"
     RESULTS_READY = "results.ready"
     FAILED = "simulation.failed"
+    #: M3 control outcomes: a checkpoint was requested (non-terminal; the
+    #: simulation keeps running) and a graceful stop/cancel ended the job.
+    CHECKPOINT = "simulation.checkpoint"
+    CANCELLED = "simulation.cancelled"
+
+
+class SimulationOp(StrEnum):
+    """M3 control verbs (``rcp.control_request``).
+
+    Mapped 1:1 onto PIConGPU's signal handler (``pmacc/simulationControl/
+    signal.cpp``) delivered to every MPI rank via ``scontrol signal``:
+    ``checkpoint``->``SIGUSR1`` (dump a checkpoint at the next common step and
+    keep running), ``stop``->``SIGTERM`` (clean stop at the next step),
+    ``checkpoint_and_stop``->``SIGALRM`` (checkpoint *then* stop) and
+    ``cancel``->``scontrol cancel`` (immediate job death).
+    """
+
+    CHECKPOINT = "checkpoint"
+    STOP = "stop"
+    CHECKPOINT_AND_STOP = "checkpoint_and_stop"
+    CANCEL = "cancel"
+
+
+#: Control op -> the signal delivered to the job's tasks; ``None`` means the op
+#: uses ``scontrol cancel`` instead of ``scontrol signal``.
+CONTROL_SIGNAL: dict[SimulationOp, str | None] = {
+    SimulationOp.CHECKPOINT: "USR1",
+    SimulationOp.STOP: "TERM",
+    SimulationOp.CHECKPOINT_AND_STOP: "ALRM",
+    SimulationOp.CANCEL: None,
+}
+
+#: Control ops that require the job to be ``RUNNING`` (a queued job has no
+#: process with the handlers installed).  ``CANCEL`` works pre-launch too.
+CONTROL_REQUIRES_RUNNING = frozenset(
+    {SimulationOp.CHECKPOINT, SimulationOp.STOP, SimulationOp.CHECKPOINT_AND_STOP},
+)
+
+
+class ResultOp(StrEnum):
+    """M3 results-access verbs (``rcp.result_request``).
+
+    ``describe`` scans the linked output directory (no openPMD needed);
+    ``slice``/``stats``/``image``/``read`` reduce on the cluster via the
+    optional openPMD reader; ``export`` returns a transfer ticket and never
+    moves the bulk data itself.
+    """
+
+    DESCRIBE = "describe"
+    SLICE = "slice"
+    STATS = "stats"
+    IMAGE = "image"
+    EXPORT = "export"
+    READ = "read"
+
+
+#: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
+#: text tails or a thumbnail).  Deliberately the same 48 KiB budget as
+#: :data:`MAX_INLINE_PAYLOAD_BYTES`: Synapse rejects event content above its
+#: (64 KiB default) limit, and a rejected ack would surface as a silent pull
+#: timeout rather than a clean error.  Results above this are answered with a
+#: ``RESULT_TOO_LARGE`` error instead of being sent.
+MAX_RESULT_BYTES = 48 * 1024
+
+#: Cap on the number of reduced points a ``slice`` may return.
+SLICE_MAX_POINTS = 4096
+
+#: Cap on the bytes of a single ``read`` (text) response.
+RESULT_TEXT_MAX_BYTES = 48 * 1024
+
+#: ``path`` argument of a result request: a relative path under ``simOutput``.
+#: The strict charset excludes absolute paths, ``..`` and shell
+#: metacharacters; the client additionally refuses escapes from its base.
+_RESULT_REL_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 
 class SimulationStage(StrEnum):
@@ -538,6 +618,7 @@ def build_submit_event(
     eta_s: int | None = None,
     slurm_state: str | None = None,
     exit_code: int | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> RcpMessage:
     """Build one M2 lifecycle event.
 
@@ -559,6 +640,8 @@ def build_submit_event(
         payload["error_code"] = error_code
     if results_linked is not None:
         payload["results_linked"] = results_linked
+    if manifest is not None:
+        payload["manifest"] = manifest
     payload.update(
         {
             key: value
@@ -731,6 +814,296 @@ def build_logs_ack(
         sim=sim,
         kind=Kind.ACK,
         type=SimulationType.LOGS_ACK,
+        seq=seq,
+        sender_role=SenderRole.SIMCLIENT,
+        in_reply_to=in_reply_to,
+        payload=payload,
+    )
+
+
+class ControlParams(BaseModel):
+    """One M3 control request (``rcp.control_request``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    op: SimulationOp
+
+
+class ResultParams(BaseModel):
+    """One M3 results request (``rcp.result_request``).
+
+    Only the knobs relevant to the selected :class:`ResultOp` are meaningful;
+    the rest stay unset.  ``path`` is a relative path under the run's linked
+    ``simOutput`` directory and is validated against a strict charset so it can
+    never escape that directory or reach a shell.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    op: ResultOp
+    path: str | None = None
+    record: str | None = None
+    component: str | None = None
+    iteration: int | str | None = None
+    axis: int | None = None
+    index: int | None = None
+    downsample: int | None = None
+    stream: str | None = None
+    tail: int | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str | None) -> str | None:
+        """Reject a ``path`` that is absolute, escaping, or unsafe.
+
+        Returns:
+            The validated relative path, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the path is unsafe.
+
+        """
+        if value is None:
+            return None
+        if value.startswith("/") or not _RESULT_REL_RE.match(value) or ".." in value.split("/"):
+            msg = f"unsafe result path: {value!r}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("stream")
+    @classmethod
+    def _validate_stream(cls, value: str | None) -> str | None:
+        """Restrict a text ``read`` to the two captured streams.
+
+        Returns:
+            The validated stream name, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the stream is not ``stdout``/``stderr``.
+
+        """
+        if value is None:
+            return None
+        if value not in {"stdout", "stderr"}:
+            msg = f"unknown result stream {value!r}; expected 'stdout' or 'stderr'"
+            raise ValueError(msg)
+        return value
+
+
+class ResultRef(BaseModel):
+    """A reference to one output file or directory (never its contents)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    uri: str
+    format: str
+    size_bytes: int
+    sha256: str | None = None
+    records: list[str] = []
+    iterations: list[int] = []
+    #: Whether the file is resolvable in the *server's* optional local mirror.
+    readable: bool = False
+
+
+class ResultManifest(BaseModel):
+    """The light, scandir-level description of a run's linked output.
+
+    Deliberately does not open the files: it is cheap enough to attach to the
+    ``results.ready`` event and fast enough to answer without the optional
+    openPMD reader.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    run_dir: str
+    output_dir: str | None = None
+    total_bytes: int = 0
+    #: ``"openpmd"`` when the optional reader is importable, else ``None``.
+    reader: str | None = None
+    readable_local: bool = False
+    files: list[ResultRef] = []
+    #: Set when ``files`` was shortened to fit the ack wire budget; the summary
+    #: fields remain exact.
+    truncated: bool = False
+
+
+def _outcome_payload(**fields: Any) -> dict[str, Any]:
+    """Drop ``None`` fields from a payload dict.
+
+    Returns:
+        The payload with only non-``None`` values.
+
+    """
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def build_control_command(
+    *,
+    sim: str,
+    seq: int,
+    params: ControlParams,
+    cmd_id: str | None = None,
+    in_reply_to: str | None = None,
+) -> RcpMessage:
+    """Build the MCP-server-to-simclient control request (M3).
+
+    Returns:
+        The unsigned ``rcp.control_request`` command.
+
+    """
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.COMMAND,
+        type=SimulationType.CONTROL_COMMAND,
+        seq=seq,
+        sender_role=SenderRole.MCP_SERVER,
+        in_reply_to=in_reply_to,
+        payload={"cmd_id": cmd_id or new_cmd_id(), "sim_id": params.sim_id, "op": params.op.value},
+    )
+
+
+def build_control_ack(
+    *,
+    sim: str,
+    seq: int,
+    cmd_id: str,
+    sim_id: str,
+    op: SimulationOp,
+    ok: bool,
+    in_reply_to: str | None,
+    job_id: int | None = None,
+    signal: str | None = None,
+    slurm_reason: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> RcpMessage:
+    """Build the simclient's control response (M3).
+
+    Returns:
+        The unsigned ``rcp.control_ack`` message.
+
+    """
+    payload: dict[str, Any] = {"cmd_id": cmd_id, "sim_id": sim_id, "op": op.value, "ok": ok}
+    payload.update(
+        _outcome_payload(
+            job_id=job_id,
+            signal=signal,
+            slurm_reason=slurm_reason,
+            state=state,
+            error=error,
+            error_code=error_code,
+        ),
+    )
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.ACK,
+        type=SimulationType.CONTROL_ACK,
+        seq=seq,
+        sender_role=SenderRole.SIMCLIENT,
+        in_reply_to=in_reply_to,
+        payload=payload,
+    )
+
+
+def build_result_command(
+    *,
+    sim: str,
+    seq: int,
+    params: ResultParams,
+    cmd_id: str | None = None,
+    in_reply_to: str | None = None,
+) -> RcpMessage:
+    """Build the MCP-server-to-simclient results request (M3).
+
+    Returns:
+        The unsigned ``rcp.result_request`` command.
+
+    """
+    payload: dict[str, Any] = {"cmd_id": cmd_id or new_cmd_id(), "sim_id": params.sim_id, "op": params.op.value}
+    payload.update(
+        _outcome_payload(
+            path=params.path,
+            record=params.record,
+            component=params.component,
+            iteration=params.iteration,
+            axis=params.axis,
+            index=params.index,
+            downsample=params.downsample,
+            stream=params.stream,
+            tail=params.tail,
+        ),
+    )
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.COMMAND,
+        type=SimulationType.RESULT_COMMAND,
+        seq=seq,
+        sender_role=SenderRole.MCP_SERVER,
+        in_reply_to=in_reply_to,
+        payload=payload,
+    )
+
+
+def build_result_ack(
+    *,
+    sim: str,
+    seq: int,
+    cmd_id: str,
+    sim_id: str,
+    op: ResultOp,
+    in_reply_to: str | None,
+    manifest: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    data: list[float] | str | None = None,
+    data_encoding: str | None = None,
+    n_points: int | None = None,
+    stats: dict[str, float | int] | None = None,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> RcpMessage:
+    """Build the simclient's results response (M3).
+
+    ``data`` is either a reduced numeric array (``data_encoding="float"``), a
+    base64 thumbnail (``"png"``) or a list of text lines (``"text"``); all are
+    bounded by :data:`MAX_RESULT_BYTES` at the client before building.
+
+    Returns:
+        The unsigned ``rcp.result_ack`` message.
+
+    """
+    payload: dict[str, Any] = {"cmd_id": cmd_id, "sim_id": sim_id, "op": op.value}
+    payload.update(
+        _outcome_payload(
+            manifest=manifest,
+            result=result,
+            data=data,
+            data_encoding=data_encoding,
+            n_points=n_points,
+            stats=stats,
+            error=error,
+            error_code=error_code,
+        ),
+    )
+    # Single chokepoint: a result ack must fit the homeserver event budget, so
+    # an over-budget encoding is replaced by a clean RESULT_TOO_LARGE error
+    # rather than being sent and rejected (which would look like a pull timeout).
+    if len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) > MAX_RESULT_BYTES:
+        payload = {
+            "cmd_id": cmd_id,
+            "sim_id": sim_id,
+            "op": op.value,
+            "error": "result exceeds the ack wire budget",
+            "error_code": "result_too_large",
+        }
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.ACK,
+        type=SimulationType.RESULT_ACK,
         seq=seq,
         sender_role=SenderRole.SIMCLIENT,
         in_reply_to=in_reply_to,

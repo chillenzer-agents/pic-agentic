@@ -50,7 +50,7 @@ async def test_parse_human_output_fallback() -> None:
 async def test_signal_requires_fixed_set(fake_env) -> None:
     client = SlurmClient(bin_dir=str(FAKE_BIN))
     with pytest.raises(SlurmError):
-        await client.signal(4701, "TERM")
+        await client.signal(4701, "INT")
     with pytest.raises(SlurmError):
         await client.signal(4701, "9; rm -rf /")
 

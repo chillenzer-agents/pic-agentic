@@ -56,6 +56,12 @@ class SimulationErrorCode(StrEnum):
     PICONGPU_UNAVAILABLE = "picongpu_unavailable"
     GENERATE_FAILED = "generate_failed"
     RUN_FAILED = "run_failed"
+    #: M3 control/results error codes.
+    NOT_SIGNALABLE = "not_signalable"
+    NOT_TERMINAL = "not_terminal"
+    READER_UNAVAILABLE = "reader_unavailable"
+    NO_RESULTS = "no_results"
+    RESULT_TOO_LARGE = "result_too_large"
 
 
 class SimulationExecutionError(RuntimeError):
