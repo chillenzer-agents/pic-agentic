@@ -22,11 +22,19 @@ from pydantic import BaseModel
 
 from pic_agentic.protocol.hello import HelloType, build_hello_ack
 from pic_agentic.protocol.simulation import (
+    CONTROL_REQUIRES_RUNNING,
+    CONTROL_SIGNAL,
     PAYLOAD_KEY,
+    ControlParams,
+    ResultOp,
+    ResultParams,
+    SimulationOp,
     SimulationStage,
     SimulationState,
     SimulationType,
+    build_control_ack,
     build_logs_ack,
+    build_result_ack,
     build_status_ack,
     build_submit_ack,
     build_submit_event,
@@ -48,6 +56,8 @@ from pic_agentic.slurm import JobInfo, SlurmClient, SlurmError, SlurmJobState
 from pic_agentic.version import local_provenance as _local_provenance
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from pic_agentic.transport.base import Transport
 
 log = logging.getLogger(__name__)
@@ -58,7 +68,13 @@ _MAX_PROCESSED = 4096
 
 #: M2 commands gated by the presence of a cluster-local ``submit_config``.
 _M2_COMMANDS = frozenset(
-    {SimulationType.COMMAND, SimulationType.STATUS_COMMAND, SimulationType.LOGS_COMMAND},
+    {
+        SimulationType.COMMAND,
+        SimulationType.STATUS_COMMAND,
+        SimulationType.LOGS_COMMAND,
+        SimulationType.CONTROL_COMMAND,
+        SimulationType.RESULT_COMMAND,
+    },
 )
 
 #: Default first (and reset) poll interval for the job-follow watcher, per the
@@ -140,6 +156,7 @@ class SimClient:
         poll_max_interval_s: float = 300.0,
         allowed_sender_user_id: str | None = None,
         submit_config: SubmitConfig | None = None,
+        control_fn: Callable[[SimulationOp, TrackedSim], Awaitable[str]] | None = None,
     ) -> None:
         """Create a simulation-side client.
 
@@ -156,6 +173,8 @@ class SimClient:
             allowed_sender_user_id: Optional expected MCP-server identity.
             submit_config: Cluster-local policy for ``submit_simulation``;
                 when omitted the M2 handler is disabled.
+            control_fn: Optional M3 control translation ``(op, tracked) -> str``
+                returning SLURM's output; ``None`` disables the control handler.
 
         """
         self.sim = sim
@@ -168,6 +187,7 @@ class SimClient:
         self.poll_max_interval_s = poll_max_interval_s
         self.allowed_sender_user_id = allowed_sender_user_id
         self.submit_config = submit_config
+        self.control_fn = control_fn
         self.sequences = SequenceState()
         self.seen = DedupStore()
         #: Per-sim follow-state and detached watcher tasks, keyed by ``sim_id``.
@@ -242,6 +262,10 @@ class SimClient:
             return await self._handle_submit(message)
         if message.type == SimulationType.STATUS_COMMAND:
             return await self._handle_status(message)
+        if message.type == SimulationType.CONTROL_COMMAND:
+            return await self._handle_control(message)
+        if message.type == SimulationType.RESULT_COMMAND:
+            return await self._handle_result(message)
         return await self._handle_logs(message)
 
     async def _reject_m2(self, message: RcpMessage, *, error: str) -> RcpMessage:
@@ -256,7 +280,7 @@ class SimClient:
         return await self._reject_pull(message, error=error)
 
     async def _reject_pull(self, message: RcpMessage, *, error: str) -> RcpMessage:
-        """Send a status/logs-shaped rejection.
+        """Send a status/logs/control-shaped rejection.
 
         Returns:
             The signed acknowledgement that was sent.
@@ -273,6 +297,10 @@ class SimClient:
                 error=error,
                 error_code=SimulationErrorCode.REJECTED,
             )
+        elif message.type == SimulationType.CONTROL_COMMAND:
+            ack = self._build_control_rejection(message, error=error)
+        elif message.type == SimulationType.RESULT_COMMAND:
+            ack = self._build_result_rejection(message, error=error)
         else:
             ack = self._build_status_ack(
                 message,
@@ -284,6 +312,55 @@ class SimClient:
             )
         await self.transport.send(ack)
         return ack
+
+    def _build_control_rejection(self, message: RcpMessage, *, error: str) -> RcpMessage:
+        """Build a control-shaped rejection from a (possibly invalid) payload.
+
+        The payload may not parse as :class:`ControlParams`; the fields are read
+        defensively so a malformed request still gets a control ack rather than a
+        hello ack.
+
+        Returns:
+            The signed ``control_ack``.
+
+        """
+        try:
+            op = SimulationOp(str(message.payload.get("op", "")))
+        except ValueError:
+            op = SimulationOp.CHECKPOINT
+        return self._build_control_ack(
+            message,
+            cmd_id=str(message.payload.get("cmd_id", "")),
+            sim_id=str(message.payload.get("sim_id", "")),
+            op=op,
+            ok=False,
+            error=error,
+            error_code=SimulationErrorCode.REJECTED,
+        )
+
+    def _build_result_rejection(self, message: RcpMessage, *, error: str) -> RcpMessage:
+        """Build a result-shaped rejection from a (possibly invalid) payload.
+
+        The payload may not parse as :class:`ResultParams`; the fields are read
+        defensively so a malformed request still gets a ``result_ack`` rather
+        than a hello ack.
+
+        Returns:
+            The signed ``result_ack``.
+
+        """
+        try:
+            op = ResultOp(str(message.payload.get("op", "")))
+        except ValueError:
+            op = ResultOp.DESCRIBE
+        return self._build_result_ack(
+            message,
+            cmd_id=str(message.payload.get("cmd_id", "")),
+            sim_id=str(message.payload.get("sim_id", "")),
+            op=op,
+            error=error,
+            error_code=SimulationErrorCode.REJECTED,
+        )
 
     async def _reject_submit(
         self,
@@ -752,6 +829,232 @@ class SimClient:
         }
         return mapping[info.state].value
 
+    async def _live_job_state(self, tracked: TrackedSim) -> SlurmJobState | None:
+        """Query the tracked simulation's current SLURM state.
+
+        Args:
+            tracked: The follow-state to query.
+
+        Returns:
+            The SLURM job state, or None when there is no job id or the query
+            failed (a transient failure is treated as "unknown", never raised).
+
+        """
+        if tracked.job_id is None:
+            return None
+        try:
+            info = await self.slurm.job_info(tracked.job_id)
+        except Exception as exc:  # ruff: ignore[blind-except] - a control failure is ack data
+            log.warning("control state query failed for sim %s: %s", tracked.sim_id, exc)
+            return None
+        return info.state
+
+    async def _handle_control(self, message: RcpMessage) -> RcpMessage:
+        """Answer a ``control_request`` (M3).
+
+        Guards run before the injected ``control_fn``: an unknown sim, a signal
+        op on a non-``RUNNING`` job and a cancel of an already-terminal job are
+        answered with a non-error-shaped ``ok=False`` ack.  Success emits a
+        ``simulation.checkpoint`` event for the checkpoint op only; the stop and
+        cancel transitions are observed by the watcher.
+
+        Returns:
+            The signed ``control_ack`` that was sent.
+
+        """
+        try:
+            params = ControlParams.model_validate(
+                {"sim_id": message.payload.get("sim_id"), "op": message.payload.get("op")},
+            )
+        except ValueError as exc:
+            ack = self._build_control_rejection(message, error=f"invalid_control_params:{exc}")
+            await self.transport.send(ack)
+            return ack
+        tracked = self._tracked.get(params.sim_id)
+        gate = await self._control_gate(message, params, tracked)
+        if gate is not None:
+            return gate
+        if self.control_fn is None:
+            ack = self._build_control_rejection(message, error="control_disabled")
+            await self.transport.send(ack)
+            return ack
+        assert tracked is not None  # narrowed by _control_gate
+        try:
+            slurm_reason = await self.control_fn(params.op, tracked)
+        except Exception as exc:  # ruff: ignore[blind-except] - a control failure is ack data
+            log.warning("control op %s failed for sim %s: %s", params.op.value, params.sim_id, exc)
+            return await self._send_control_ack(
+                message,
+                params=params,
+                tracked=tracked,
+                ok=False,
+                signal=CONTROL_SIGNAL[params.op],
+                error=f"control_failed:{exc}",
+                error_code=SimulationErrorCode.RUN_FAILED,
+            )
+        if params.op is SimulationOp.CHECKPOINT:
+            await self.transport.send(
+                self._build_submit_event(
+                    cmd_id=tracked.cmd_id,
+                    sim_id=tracked.sim_id,
+                    state=SimulationState.CHECKPOINT,
+                    job_id=tracked.job_id,
+                ),
+            )
+        return await self._send_control_ack(
+            message,
+            params=params,
+            tracked=tracked,
+            ok=True,
+            signal=CONTROL_SIGNAL[params.op],
+            slurm_reason=slurm_reason,
+            state=SimulationState.CHECKPOINT.value if params.op is SimulationOp.CHECKPOINT else None,
+        )
+
+    async def _control_gate(
+        self,
+        message: RcpMessage,
+        params: ControlParams,
+        tracked: TrackedSim | None,
+    ) -> RcpMessage | None:
+        """Apply the M3 control guards and answer a rejected request.
+
+        Args:
+            message: The inbound control command.
+            params: The parsed request.
+            tracked: The follow-state for ``params.sim_id``, or None.
+
+        Returns:
+            The ``ok=False`` ack that was sent, or None when the request passes
+            every gate and should be translated to SLURM.
+
+        """
+        if tracked is None:
+            return await self._send_control_ack(
+                message,
+                params=params,
+                tracked=None,
+                ok=False,
+                error="unknown_sim",
+                error_code=SimulationErrorCode.NO_RESULTS,
+            )
+        state = await self._live_job_state(tracked)
+        if params.op in CONTROL_REQUIRES_RUNNING and state is not SlurmJobState.RUNNING:
+            return await self._send_control_ack(
+                message,
+                params=params,
+                tracked=tracked,
+                ok=False,
+                state=state.value if state is not None else None,
+                error_code=SimulationErrorCode.NOT_SIGNALABLE,
+            )
+        if params.op is SimulationOp.CANCEL and state is not None and state.terminal:
+            return await self._send_control_ack(
+                message,
+                params=params,
+                tracked=tracked,
+                ok=False,
+                state=state.value,
+                error_code=SimulationErrorCode.NOT_TERMINAL,
+            )
+        return None
+
+    async def _send_control_ack(
+        self,
+        message: RcpMessage,
+        *,
+        params: ControlParams,
+        tracked: TrackedSim | None,
+        ok: bool,
+        signal: str | None = None,
+        slurm_reason: str | None = None,
+        state: str | None = None,
+        error: str | None = None,
+        error_code: SimulationErrorCode | None = None,
+    ) -> RcpMessage:
+        """Build, send and return one ``control_ack``.
+
+        Returns:
+            The signed acknowledgement that was sent.
+
+        """
+        ack = self._build_control_ack(
+            message,
+            cmd_id=str(message.payload.get("cmd_id", "")),
+            sim_id=params.sim_id,
+            op=params.op,
+            ok=ok,
+            job_id=tracked.job_id if tracked is not None else None,
+            signal=signal,
+            slurm_reason=slurm_reason,
+            state=state,
+            error=error,
+            error_code=error_code,
+        )
+        await self.transport.send(ack)
+        return ack
+
+    async def _handle_result(self, message: RcpMessage) -> RcpMessage:
+        """Answer a ``result_request`` (M3).
+
+        The heavy lifting lives in :mod:`pic_agentic.results`, which is imported
+        lazily so the control/reporting paths keep working when the results
+        engine is absent.  A missing engine degrades to a
+        ``reader_unavailable`` ack; the scan-only ``describe`` path does not
+        move any bulk data and never touches openPMD.
+
+        Returns:
+            The signed ``result_ack`` that was sent.
+
+        """
+        try:
+            params = ResultParams.model_validate(
+                {key: message.payload.get(key) for key in ResultParams.model_fields if key in message.payload},
+            )
+        except ValueError as exc:
+            ack = self._build_result_rejection(message, error=f"invalid_result_params:{exc}")
+            await self.transport.send(ack)
+            return ack
+        tracked = self._tracked.get(params.sim_id)
+        if tracked is None:
+            ack = self._build_result_ack(
+                message,
+                cmd_id=str(message.payload.get("cmd_id", "")),
+                sim_id=params.sim_id,
+                op=params.op,
+                error="unknown_sim",
+                error_code=SimulationErrorCode.NO_RESULTS,
+            )
+            await self.transport.send(ack)
+            return ack
+        try:
+            from pic_agentic import results  # ruff: ignore[import-outside-top-level] - lazy optional engine
+
+            payload = await asyncio.to_thread(
+                results.resolve_result,
+                params,
+                run_dir=Path(tracked.run_dir),
+                sim_id=params.sim_id,
+                local_root="",
+            )
+        except ImportError:
+            payload = {"error": "reader_unavailable", "error_code": SimulationErrorCode.READER_UNAVAILABLE}
+        except Exception as exc:  # ruff: ignore[blind-except] - a result failure is ack data
+            log.warning("result op %s failed for sim %s: %s", params.op.value, params.sim_id, exc)
+            payload = {"error": f"result_failed:{exc}", "error_code": SimulationErrorCode.RUN_FAILED}
+        ack = self._build_result_ack(
+            message,
+            cmd_id=str(message.payload.get("cmd_id", "")),
+            sim_id=params.sim_id,
+            op=params.op,
+            **{
+                key: payload.get(key)
+                for key in ("manifest", "result", "data", "data_encoding", "n_points", "stats", "error", "error_code")
+            },
+        )
+        await self.transport.send(ack)
+        return ack
+
     async def _handle_status(self, message: RcpMessage) -> RcpMessage:
         """Answer a ``status_request`` with a live or last-known snapshot.
 
@@ -1016,6 +1319,76 @@ class SimClient:
             error_code=error_code,
         ).sign(self.secret)
 
+    def _build_control_ack(
+        self,
+        message: RcpMessage,
+        *,
+        cmd_id: str,
+        sim_id: str,
+        op: SimulationOp,
+        ok: bool,
+        job_id: int | None = None,
+        signal: str | None = None,
+        slurm_reason: str | None = None,
+        state: str | None = None,
+        error: str | None = None,
+        error_code: SimulationErrorCode | None = None,
+    ) -> RcpMessage:
+        return build_control_ack(
+            sim=self.sim,
+            seq=self.sequences.next_seq(self.sim, SenderRole.SIMCLIENT),
+            cmd_id=cmd_id,
+            sim_id=sim_id,
+            op=op,
+            ok=ok,
+            in_reply_to=message.transport_event_id,
+            job_id=job_id,
+            signal=signal,
+            slurm_reason=slurm_reason,
+            state=state,
+            error=error,
+            error_code=str(error_code) if error_code is not None else None,
+        ).sign(self.secret)
+
+    def _build_result_ack(
+        self,
+        message: RcpMessage,
+        *,
+        cmd_id: str,
+        sim_id: str,
+        op: ResultOp,
+        manifest: dict[str, object] | None = None,
+        result: dict[str, object] | None = None,
+        data: list[float] | str | None = None,
+        data_encoding: str | None = None,
+        n_points: int | None = None,
+        stats: dict[str, float | int] | None = None,
+        error: str | None = None,
+        error_code: SimulationErrorCode | None = None,
+    ) -> RcpMessage:
+        """Build and sign one ``result_ack`` from a resolved payload.
+
+        Returns:
+            The signed ``result_ack``.
+
+        """
+        return build_result_ack(
+            sim=self.sim,
+            seq=self.sequences.next_seq(self.sim, SenderRole.SIMCLIENT),
+            cmd_id=cmd_id,
+            sim_id=sim_id,
+            op=op,
+            in_reply_to=message.transport_event_id,
+            manifest=manifest,
+            result=result,
+            data=data,
+            data_encoding=data_encoding,
+            n_points=n_points,
+            stats=stats,
+            error=error,
+            error_code=str(error_code) if error_code is not None else None,
+        ).sign(self.secret)
+
     def _build_submit_event(
         self,
         *,
@@ -1035,6 +1408,7 @@ class SimClient:
         eta_s: int | None = None,
         slurm_state: str | None = None,
         exit_code: int | None = None,
+        manifest: dict[str, object] | None = None,
     ) -> RcpMessage:
         return build_submit_event(
             sim=self.sim,
@@ -1055,6 +1429,7 @@ class SimClient:
             eta_s=eta_s,
             slurm_state=slurm_state,
             exit_code=exit_code,
+            manifest=manifest,
         ).sign(self.secret)
 
     async def _ack(self, message: RcpMessage, *, cmd_id: object, error: str) -> RcpMessage:
