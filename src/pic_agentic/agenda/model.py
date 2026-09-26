@@ -23,6 +23,7 @@ the execution layer.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -93,21 +94,51 @@ class AgendaSweep(BaseModel):
     values: list[float | int | str]
     unit: str | None = None
 
+    @field_validator("parameter")
+    @classmethod
+    def _validate_parameter(cls, parameter: str) -> str:
+        r"""Reject a sweep parameter that cannot form a legal entry name.
+
+        The generated leaf name is ``<base>__<parameter>=<value>``, so a
+        parameter containing ``/`` or a leading ``.`` would produce an illegal
+        name.  Rejecting it here yields a clear sweep-level error.
+
+        Returns:
+            The validated parameter.
+
+        Raises:
+            ValueError: If the parameter cannot form a legal entry name.
+
+        """
+        if not parameter or parameter.startswith(".") or "/" in parameter:
+            msg = f"sweep parameter must be a legal name component: {parameter!r}"
+            raise ValueError(msg)
+        return parameter
+
     @field_validator("values")
     @classmethod
     def _non_empty(cls, values: list[float | int | str]) -> list[float | int | str]:
-        """Reject an empty sweep.
+        """Reject an empty sweep and non-finite numeric values.
+
+        Non-finite values (``nan``/``inf``) cannot round-trip through JSON
+        (pydantic serialises them as ``null``, which fails to rehydrate), so
+        they are rejected at construction rather than corrupting a persisted
+        agenda.
 
         Returns:
             The non-empty value list.
 
         Raises:
-            ValueError: If no values are given.
+            ValueError: If no values are given or one is non-finite.
 
         """
         if not values:
             msg = "a sweep requires at least one value"
             raise ValueError(msg)
+        for value in values:
+            if isinstance(value, float) and not math.isfinite(value):
+                msg = f"sweep values must be finite, got {value!r}"
+                raise ValueError(msg)
         return values
 
     def assignment(self, value: float | str) -> dict[str, float | int | str]:
@@ -163,6 +194,30 @@ class AgendaSim(BaseModel):
 
         """
         return validate_entry_name(name)
+
+    @field_validator("point")
+    @classmethod
+    def _finite_point(
+        cls,
+        point: dict[str, float | int | str] | None,
+    ) -> dict[str, float | int | str] | None:
+        """Reject non-finite values in a sweep point (JSON round-trip safety).
+
+        Non-finite floats serialise to ``null`` and would make the persisted
+        agenda unloadable.
+
+        Returns:
+            The validated point, or None.
+
+        Raises:
+            ValueError: If any numeric value is non-finite.
+
+        """
+        for key, value in (point or {}).items():
+            if isinstance(value, float) and not math.isfinite(value):
+                msg = f"point value for {key!r} must be finite, got {value!r}"
+                raise ValueError(msg)
+        return point
 
     @field_validator("depends_on")
     @classmethod
@@ -291,12 +346,21 @@ class AgendaGroup(BaseModel):
             The expanded group (leaves merged into a copy of this group's
             entries).
 
+        Raises:
+            ValueError: If a generated leaf name is illegal or would overwrite
+                an existing entry.
+
         """
         base = base_name or self.name
+        validate_entry_name(base)
         expanded = self.model_copy(deep=True)
         for value in sweep.values:
             point = sweep.assignment(value)
             leaf_name = f"{base}__{sweep.label(value)}"
+            validate_entry_name(leaf_name)
+            if leaf_name in expanded.entries:
+                msg = f"expand would overwrite an existing entry: {leaf_name!r}"
+                raise ValueError(msg)
             expanded.entries[leaf_name] = AgendaSim(name=leaf_name, spec=synthesized(point), point=point)
         return expanded
 
@@ -319,9 +383,13 @@ def _coerce_entry(name: str, entry: AgendaSim | AgendaGroup | dict[str, Any]) ->
 
     """
     if isinstance(entry, (AgendaSim, AgendaGroup)):
-        if entry.name != name:
-            return entry.model_copy(update={"name": name})
-        return entry
+        # Deep-copy so the returned agenda shares no mutable state with the
+        # caller's entry (e.g. its ``spec``): mutating the argument afterwards
+        # must not corrupt the agenda.
+        copy = entry.model_copy(deep=True)
+        if copy.name != name:
+            copy = copy.model_copy(update={"name": name})
+        return copy
     # A plain dict: the discriminant decides the concrete model.
     kind = entry.get("kind", "sim")
     payload = {**entry, "name": name}

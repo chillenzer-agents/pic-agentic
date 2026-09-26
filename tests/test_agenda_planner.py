@@ -79,7 +79,10 @@ def test_dependency_makes_a_leaf_wait_until_done() -> None:
 def test_dependency_on_a_failed_leaf_never_submits_the_successor() -> None:
     agenda = AgendaGroup(name="study").add(first=_leaf("first"), second=_leaf("second", depends_on=["first"]))
     steps = next_actions(agenda, {"first": "simulation.job_failed"}, budget=Budget(), usage=BudgetUsage())
-    assert _actions(steps) == [("first", "failed"), ("second", "wait")]
+    # The successor is terminal (failed) with a distinct reason, not a
+    # perpetual wait: a failed dependency can never become done.
+    assert _actions(steps) == [("first", "failed"), ("second", "failed")]
+    assert "dependency failed" in steps[1].reason
 
 
 def test_dependency_as_a_nested_group_waits_for_all_leaves() -> None:
@@ -282,3 +285,33 @@ def test_full_sweep_plan_apply_account_cycle() -> None:
     assert summary.action == "wait"
     assert summary.reason is not None
     assert "job budget" in summary.reason
+
+
+def test_batch_plan_never_overcommits_the_budget() -> None:
+    """H2: a batch of ready leaves must not plan past the caps."""
+    agenda = AgendaGroup(name="r")
+    for i in range(5):
+        agenda = agenda.add_sim(name=f"j{i}", spec={"resources": {"est_core_hours": 1.0}})
+
+    steps = next_actions(agenda, {}, budget=Budget(max_core_hours=3.0), usage=BudgetUsage())
+    submits = [s for s in steps if s.action == "submit"]
+    waits = [s for s in steps if s.action == "wait"]
+    assert len(submits) == 3
+    assert len(waits) == 2
+    assert all("core-hour" in s.reason for s in waits)
+
+
+def test_batch_plan_respects_total_job_cap() -> None:
+    agenda = AgendaGroup(name="r")
+    for i in range(4):
+        agenda = agenda.add_sim(name=f"j{i}", spec={})
+    steps = next_actions(agenda, {}, budget=Budget(max_total_jobs=2), usage=BudgetUsage())
+    assert sum(s.action == "submit" for s in steps) == 2
+
+
+def test_batch_plan_accounts_gpu_hours() -> None:
+    agenda = AgendaGroup(name="r")
+    for i in range(3):
+        agenda = agenda.add_sim(name=f"g{i}", spec={"resources": {"est_gpu_hours": 2.0, "is_gpu": True}})
+    steps = next_actions(agenda, {}, budget=Budget(max_gpu_hours=5.0), usage=BudgetUsage())
+    assert sum(s.action == "submit" for s in steps) == 2

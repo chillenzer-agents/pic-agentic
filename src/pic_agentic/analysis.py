@@ -70,13 +70,39 @@ def _load_json_object(path: Path) -> dict[str, Any]:
     """
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError covers a null byte in the path / a UnicodeDecodeError.
         return {}
     try:
         data = json.loads(text)
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _derive_setup_dir(run_dir: Path) -> Path | None:
+    """Derive ``<base>/input`` from ``<base>/run`` with a containment check.
+
+    Mirrors :func:`pic_agentic.simclient.client.derive_setup_dir`: the derived
+    directory is accepted only when it resolves to a direct child of the run's
+    parent, so a symlinked ``input`` cannot escape the run base.
+
+    Args:
+        run_dir: The run directory (``<base>/run``).
+
+    Returns:
+        The resolved ``<base>/input`` path, or None when it is not a direct
+        sibling of the run directory.
+
+    """
+    try:
+        base = run_dir.parent.resolve()
+        setup = (run_dir.parent / "input").resolve()
+    except (OSError, ValueError):
+        return None
+    if setup.parent != base:
+        return None
+    return setup
 
 
 def _redact_secrets(value: Any) -> Any:
@@ -368,14 +394,15 @@ def analyze(
     """Compose the four analysis sections for one simulation.
 
     Missing or malformed inputs degrade to empty sections; this function never
-    raises.  ``run_dir`` is used only to derive ``setup_dir`` (its sibling
-    ``input``) when the caller does not pass one.
+    raises.  When ``setup_dir`` is omitted it is derived from ``run_dir`` as the
+    sibling ``input`` directory, but only when that path really is a direct
+    child of the run's parent: a symlinked ``input`` escaping the run base is
+    rejected, so analysis can never read outside the run directory.
 
     Args:
-        run_dir: The run directory (``<base>/run``), used as a fallback source
-            for ``setup_dir``.
-        setup_dir: The setup directory (``<base>/input``); when falsy it is
-            derived from ``run_dir``.
+        run_dir: The run directory (``<base>/run``); used only as a fallback
+            source for ``setup_dir`` when ``setup_dir`` is None.
+        setup_dir: The setup directory (``<base>/input``), or None to derive it.
         output_dir: The linked ``simOutput`` directory.
         query: Optional free-text question for the synthesized answer.
 
@@ -386,7 +413,7 @@ def analyze(
     run = _as_path(run_dir)
     setup = _as_path(setup_dir)
     if setup is None and run is not None:
-        setup = run.parent / "input"
+        setup = _derive_setup_dir(run)
     output = _as_path(output_dir)
 
     try:

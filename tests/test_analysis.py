@@ -131,3 +131,29 @@ def test_analyze_with_no_paths_is_empty_but_valid() -> None:
     sections = analysis.analyze(None, None, None)
     assert sections["rocrate"] == {}
     assert "No analysis metadata" in sections["answer"]
+
+
+def test_analyze_rejects_symlinked_setup_escape(tmp_path) -> None:
+    """A symlinked ``input`` must not let analysis read outside the run base."""
+    base = tmp_path / "base"
+    (base / "run").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "ro-crate-metadata.json").write_text(
+        '{"@graph": [{"@id": "./", "name": "SECRET CRATE"}]}',
+        encoding="utf-8",
+    )
+    (base / "input").symlink_to(outside)
+    sections = analysis.analyze(base / "run", None, None)
+    assert sections["rocrate"] == {}
+
+
+def test_readers_never_raise_on_bad_bytes(tmp_path) -> None:
+    setup = tmp_path / "input"
+    (setup / "metadata").mkdir(parents=True)
+    (setup / "ro-crate-metadata.json").write_bytes(b"\xff\xfe not utf-8")
+    (setup / "metadata" / "rc_params.json").write_bytes(b"\x00null byte")
+    assert analysis.read_rocrate(setup) == {}
+    assert analysis.read_pypicongpu_metadata(setup)["rc_params"] == {}
+    # A null byte in the path itself must not raise either.
+    assert analysis.read_rocrate("bad\x00path") == {}

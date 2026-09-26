@@ -123,3 +123,42 @@ def test_spec_is_opaque_and_json_serialisable() -> None:
     group = AgendaGroup(name="g").add(a=_leaf("a"))
     payload = json.loads(group.model_dump_json())
     assert payload["entries"]["a"]["spec"] == {"sim": {"time_steps": 10}}
+
+
+def test_non_finite_point_is_rejected() -> None:
+    """nan/inf cannot round-trip through JSON, so they are refused up front."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError, match="finite"):
+            AgendaSim(name="s", spec={}, point={"p": bad})
+
+
+def test_non_finite_sweep_value_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="finite"):
+        AgendaSweep(parameter="p", values=[float("inf")])
+
+
+def test_illegal_sweep_parameter_is_rejected() -> None:
+    for bad in ("", ".p", "a/b"):
+        with pytest.raises(ValidationError, match="legal name component"):
+            AgendaSweep(parameter=bad, values=[1])
+
+
+def test_add_deep_copies_the_caller_entry() -> None:
+    """Mutating a caller's entry after add must not corrupt the agenda."""
+    entry = AgendaSim(name="x", spec={"nested": {"v": 1}})
+    group = AgendaGroup(name="r").add(x=entry)
+    entry.spec["nested"]["v"] = 999
+    assert group.entries["x"].spec == {"nested": {"v": 1}}
+
+
+def test_expand_rejects_colliding_leaf_name() -> None:
+    base = AgendaGroup(name="scan").add(**{"scan__i=1": _leaf("scan__i=1")})
+    with pytest.raises(ValueError, match="overwrite"):
+        base.expand(AgendaSweep(parameter="i", values=[1]), lambda point: {"sim": point})
+
+
+def test_expand_rejects_illegal_leaf_name() -> None:
+    base = AgendaGroup(name="scan")
+    # A base name that yields an illegal leaf segment is rejected.
+    with pytest.raises(ValueError, match="must not start with"):
+        base.expand(AgendaSweep(parameter="i", values=[1]), lambda point: {"sim": point}, base_name=".bad")

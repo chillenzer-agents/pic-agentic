@@ -83,8 +83,11 @@ class PlanStep(BaseModel):
 
     ``action`` is the next thing to do: ``submit`` the job, ``wait`` for it (or
     for a dependency, or for budget headroom), or record that the leaf is
-    already ``done``/``failed``.  ``reason`` explains a non-obvious decision
-    (currently only populates ``wait``) and is ``None`` otherwise.
+    already ``done``/``failed``.  A leaf whose *dependency* failed is reported
+    as ``failed`` with a ``reason`` naming the dependency (a failed dependency
+    can never become done, so the successor is terminal rather than waiting
+    forever).  ``reason`` explains a non-obvious decision and is ``None``
+    otherwise.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -154,6 +157,21 @@ def _subtree_done(entry: AgendaSim | AgendaGroup) -> bool:
     if isinstance(entry, AgendaGroup):
         return all(_subtree_done(child) for child in entry.entries.values())
     return entry.status == "done"
+
+
+def _subtree_failed(entry: AgendaSim | AgendaGroup) -> bool:
+    """Whether a dependency subtree contains a failed leaf.
+
+    A dependency containing any failed leaf can never become done, so its
+    successors are blocked rather than perpetually "waiting".
+
+    Returns:
+        True when the entry or any descendant is a failed leaf.
+
+    """
+    if isinstance(entry, AgendaGroup):
+        return any(_subtree_failed(child) for child in entry.entries.values())
+    return entry.status == "failed"
 
 
 def _resolve_dependency(
@@ -241,8 +259,22 @@ def next_actions(
     effective = apply_states(agenda, states)
     paths, parents = _index_entries(effective)
     steps: list[PlanStep] = []
+    # Thread a *running* usage through the plan: each emitted ``submit``
+    # consumes its estimated budget immediately, so a batch can never plan more
+    # concurrent work than the caps allow (per-leaf checks alone would).
+    running = usage
     for path, sim in effective.simulations():
-        steps.append(_plan_leaf(sim, path, parents.get(path), paths, budget=budget, usage=usage))
+        step = _plan_leaf(sim, path, parents.get(path), paths, budget=budget, usage=running)
+        if step.action == "submit":
+            request = resource_request_from_spec(sim.spec)
+            running = account(
+                running,
+                step,
+                core_hours=request.est_core_hours,
+                gpu_hours=request.est_gpu_hours,
+                is_gpu=request.is_gpu,
+            )
+        steps.append(step)
     return steps
 
 
@@ -267,10 +299,19 @@ def _plan_leaf(
     if sim.status in {"submitted", "running"}:
         return base.model_copy(update={"reason": f"already {sim.status}"})
     unmet: list[str] = []
+    blocked: list[str] = []
     for dep in sim.depends_on:
         resolved = _resolve_dependency(dep, parent, paths)
-        if resolved is None or not _subtree_done(resolved):
+        if resolved is None:
             unmet.append(dep)
+        elif _subtree_failed(resolved):
+            # A failed dependency will never become done: propagate the failure
+            # distinctly so the engine can branch instead of waiting forever.
+            blocked.append(dep)
+        elif not _subtree_done(resolved):
+            unmet.append(dep)
+    if blocked:
+        return base.model_copy(update={"action": "failed", "reason": f"dependency failed: {', '.join(blocked)}"})
     if unmet:
         return base.model_copy(update={"action": "wait", "reason": f"dependency not done: {', '.join(unmet)}"})
     try:
