@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.agenda.budget import Budget, BudgetUsage
-from pic_agentic.agenda.campaign import Campaign
+from pic_agentic.agenda.campaign import Callback, Campaign, utc_now_iso
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.planner import (
     PlanStep,
@@ -101,6 +101,8 @@ class TickResult(BaseModel):
     failed: list[str] = Field(default_factory=list)
     complete: bool = False
     usage: BudgetUsage = BudgetUsage()
+    #: Decision-point callbacks emitted this tick (newly done/failed leaves).
+    callbacks: list[Callback] = Field(default_factory=list)
 
 
 class AgendaEngine:
@@ -147,6 +149,9 @@ class AgendaEngine:
 
         """
         campaign = self.store.load(Campaign).with_created_ts()
+        # Edge-triggered callbacks: capture the pre-tick statuses (persisted by
+        # the last tick) so only genuine transitions to done/failed emit.
+        before = {path: sim.status for path, sim in campaign.agenda.simulations()}
         budget = self.budget_override or campaign.budget
         campaign, steps = self._plan(campaign, budget)
         # Persist the folded observation before submitting anything: progress
@@ -180,10 +185,34 @@ class AgendaEngine:
             self.store.save(campaign)
             result.submitted.append(path)
             in_flight += 1
+        campaign, result.callbacks = self._emit_callbacks(campaign, before)
         result.complete = _is_complete(campaign.agenda)
         result.usage = campaign.usage
         self.store.save(campaign)
         return result
+
+    @staticmethod
+    def _emit_callbacks(campaign: Campaign, before: Mapping[str, str]) -> tuple[Campaign, list[Callback]]:
+        """Append a callback for every leaf that newly reached done/failed.
+
+        Edge-triggered against the *persisted* pre-tick statuses, so a restart
+        between a transition and the agent's poll never re-emits: once the leaf
+        is terminal on disk, a later tick sees no transition.  The callbacks are
+        accumulated on the campaign (and drained by ``take_agenda_callbacks``),
+        so they survive the restart that follows the transition.
+
+        Returns:
+            The campaign with the new callbacks appended, and the new callbacks.
+
+        """
+        emitted: list[Callback] = []
+        for path, sim in campaign.agenda.simulations():
+            if sim.status not in {"done", "failed"} or before.get(path) == sim.status:
+                continue
+            emitted.append(Callback(path=path, kind=sim.status, sim_id=sim.sim_id, ts=utc_now_iso()))
+        if not emitted:
+            return campaign, emitted
+        return campaign.model_copy(update={"callbacks": [*campaign.callbacks, *emitted]}), emitted
 
     @staticmethod
     def _persist_terminal(campaign: Campaign, path: str, action: str) -> Campaign:

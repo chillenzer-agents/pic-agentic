@@ -865,6 +865,58 @@ def cmd_campaign_provenance(args: argparse.Namespace) -> int:
     return 0 if result.get("ok", "error" not in result) else 1
 
 
+def cmd_agenda_callbacks(args: argparse.Namespace) -> int:
+    """Call ``take_agenda_callbacks`` and print (and drain) the pending list.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, "take_agenda_callbacks", {})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
+def cmd_agenda_add_leaf(args: argparse.Namespace) -> int:
+    """Add one refinement leaf to the campaign's root group.
+
+    The spec is the fixture (or ``--agenda-script``) patched at ``--agenda-patch``
+    with the first ``--agenda-values`` entry, so a refinement point is one
+    command.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists or no leaf name was given.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    if not args.agenda_leaf:
+        msg = "--agenda-add-leaf requires --agenda-leaf NAME"
+        raise SystemExit(msg)
+    spec_source = args.agenda_script or str(_AGENDA_SPEC_FIXTURE)
+    spec = _agenda_spec(spec_source)
+    if args.agenda_patch and args.agenda_values:
+        value = _parse_agenda_values(args.agenda_values)[0]
+        spec = _patch_spec(spec, args.agenda_patch, value)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, "add_agenda_leaf", {"name": args.agenda_leaf, "spec": spec})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
@@ -990,6 +1042,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="call campaign_provenance and print the RO-Crate",
     )
+    mode.add_argument("--agenda-callbacks", action="store_true", help="drain and print pending agenda callbacks")
+    mode.add_argument(
+        "--agenda-add-leaf",
+        action="store_true",
+        help="add one refinement leaf (--agenda-leaf NAME; spec patched by --agenda-patch/--agenda-values)",
+    )
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
@@ -1071,6 +1129,8 @@ def main() -> None:
         (args.agenda_approve, cmd_agenda_approve),
         (args.fleet_status, cmd_fleet_status),
         (args.campaign_provenance, cmd_campaign_provenance),
+        (args.agenda_callbacks, cmd_agenda_callbacks),
+        (args.agenda_add_leaf, cmd_agenda_add_leaf),
     )
     for selected, command in dispatch:
         if selected:

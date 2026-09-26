@@ -14,14 +14,15 @@ holds no authoritative state of its own.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.agenda.budget import Budget, BudgetUsage
 from pic_agentic.agenda.model import AgendaGroup  # ruff: ignore[typing-only-first-party-import] - runtime
 
 
-def _now_iso() -> str:
+def utc_now_iso() -> str:
     """Return the current UTC time as an ISO-8601 ``Z`` string.
 
     Returns:
@@ -29,6 +30,24 @@ def _now_iso() -> str:
 
     """
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Callback(BaseModel):
+    """A durable decision-point record the agent drains (poll-based callback).
+
+    An MCP server cannot call the LLM, so a callback is a pollable record: the
+    engine appends one when a leaf reaches a terminal status, the agent drains
+    them with ``take_agenda_callbacks`` and decides what to do (analyse, refine
+    the agenda, stop).  Keeping them in the persisted campaign means a restart
+    between the transition and the poll does not lose a decision point.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    kind: Literal["done", "failed"]
+    sim_id: str | None = None
+    ts: str | None = None
 
 
 class Campaign(BaseModel):
@@ -42,6 +61,8 @@ class Campaign(BaseModel):
     usage: BudgetUsage = BudgetUsage()
     #: ISO-8601 creation timestamp, set on the first save.
     created_ts: str | None = None
+    #: Pending (undrained) decision-point callbacks, in emission order.
+    callbacks: list[Callback] = Field(default_factory=list)
 
     def with_created_ts(self) -> Campaign:
         """Return a copy with ``created_ts`` set when it is not already.
@@ -52,7 +73,7 @@ class Campaign(BaseModel):
         """
         if self.created_ts:
             return self
-        return self.model_copy(update={"created_ts": _now_iso()})
+        return self.model_copy(update={"created_ts": utc_now_iso()})
 
 
-__all__ = ["Campaign"]
+__all__ = ["Callback", "Campaign", "utc_now_iso"]

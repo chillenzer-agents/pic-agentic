@@ -298,6 +298,31 @@ class HelloRuntime:
         """
         return self.agenda_service.approve(path)
 
+    def take_agenda_callbacks(self) -> dict[str, Any]:
+        """Drain the pending decision-point callbacks.
+
+        Returns:
+            ``{"ok": True, "callbacks": [...]}``, or a soft error.
+
+        """
+        return self.agenda_service.take_callbacks()
+
+    def add_agenda_leaf(
+        self,
+        name: str,
+        spec: dict[str, Any],
+        *,
+        point: dict[str, float | int | str] | None = None,
+        depends_on: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Add one leaf to the campaign's root group (agent expansion).
+
+        Returns:
+            ``{"ok": True, "path": name}``, or a soft error.
+
+        """
+        return self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
+
     def fleet_status(self) -> dict[str, Any]:
         """Return the aggregate fleet view (summary + alerts).
 
@@ -719,6 +744,38 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     )
     def approve_agenda_leaf(path: str) -> dict[str, Any]:
         return _redact_dict(runtime, runtime.approve_agenda_leaf(path))
+
+    @server.tool(
+        title="Drain the campaign decision-point callbacks",
+        description=(
+            "Return and clear the pending callbacks for newly finished or failed "
+            "campaign leaves. An MCP server cannot call the agent, so these are "
+            "pollable records: drain them, analyse the run or refine the agenda, "
+            "then advance_agenda again. Draining persists, so a repeat call "
+            "returns an empty list."
+        ),
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    def take_agenda_callbacks() -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.take_agenda_callbacks())
+
+    @server.tool(
+        title="Add a simulation leaf to the campaign",
+        description=(
+            "Add one simulation leaf to the persisted campaign's root group, so "
+            "the next advance_agenda tick can submit it. Used by the agent to "
+            "refine a sweep (e.g. add points around an optimum)."
+        ),
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    def add_agenda_leaf(
+        name: str,
+        spec: dict[str, Any],
+        point: dict[str, Any] | None = None,
+        depends_on: list[str] | None = None,
+    ) -> dict[str, Any]:
+        result = runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on)
+        return _redact_dict(runtime, result)
 
     @server.tool(
         title="Get the aggregate fleet status",

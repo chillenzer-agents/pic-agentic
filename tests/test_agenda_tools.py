@@ -91,7 +91,13 @@ async def _call(config: Config, name: str, arguments: dict[str, object]):
 async def test_tool_registration_and_annotations() -> None:
     server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
     tools = {tool.name: tool for tool in await server.list_tools()}
-    assert {"advance_agenda", "agenda_status", "approve_agenda_leaf"} <= set(tools)
+    assert {
+        "advance_agenda",
+        "agenda_status",
+        "approve_agenda_leaf",
+        "take_agenda_callbacks",
+        "add_agenda_leaf",
+    } <= set(tools)
 
     advance = tools["advance_agenda"].annotations
     assert advance is not None
@@ -107,6 +113,10 @@ async def test_tool_registration_and_annotations() -> None:
     assert approve is not None
     assert approve.read_only_hint is False
     assert approve.destructive_hint is False
+
+    callbacks = tools["take_agenda_callbacks"].annotations
+    assert callbacks is not None
+    assert callbacks.read_only_hint is False
 
 
 async def test_advance_agenda_submits_and_returns_a_tick(tmp_path) -> None:
@@ -228,3 +238,54 @@ async def test_concurrent_advance_does_not_duplicate_submissions(tmp_path) -> No
             task.cancel()
         await mcp_t.close()
         await sim_t.close()
+
+
+async def test_take_callbacks_drains_durably(tmp_path) -> None:
+    """Callbacks emitted by a tick are returned once, then cleared on disk."""
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+    tasks = [await _serve(sim_t), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        await server.call_tool("advance_agenda", {})
+        # The fake responder acked sim0001; drive it terminal so the next tick
+        # folds a done transition and emits a callback.
+        sim_id = next(iter(runtime.submit_service.registry))
+        runtime.submit_service.registry[sim_id].state = "results.ready"
+        runtime.submit_service.registry[sim_id].active = False
+
+        tick = (await server.call_tool("advance_agenda", {})).structured_content
+        assert [c["path"] for c in tick["callbacks"]] == ["leaf0"]
+
+        drained = (await server.call_tool("take_agenda_callbacks", {})).structured_content
+        assert [c["path"] for c in drained["callbacks"]] == ["leaf0"]
+        # A second call is empty: the clear persisted.
+        again = (await server.call_tool("take_agenda_callbacks", {})).structured_content
+        assert again == {"ok": True, "callbacks": []}
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_add_leaf_is_submitted_by_the_next_tick(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    added = await _call(config, "add_agenda_leaf", {"name": "refined", "spec": {"sim": {"replica": 9}}})
+    assert added == {"ok": True, "path": "refined"}
+    tick = await _call(config, "advance_agenda", {})
+    assert "refined" in tick["submitted"]
+
+
+async def test_add_duplicate_leaf_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(config, "add_agenda_leaf", {"name": "leaf0", "spec": {"sim": {"replica": 1}}})
+    assert result["ok"] is False
+    assert result["error"] == "duplicate_leaf"
+
+
+async def test_add_leaf_without_campaign_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
+    result = await _call(config, "add_agenda_leaf", {"name": "x", "spec": {"sim": {"replica": 0}}})
+    assert result == {"ok": False, "error": "no_campaign"}
