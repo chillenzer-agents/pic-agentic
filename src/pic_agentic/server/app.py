@@ -27,6 +27,7 @@ from pic_agentic.protocol.simulation import (
     SubmitParams,
     UnsupportedPayloadError,
 )
+from pic_agentic.server.agenda import AgendaService
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
 from pic_agentic.server.simulation import (
     SimRecord,
@@ -108,6 +109,7 @@ class HelloRuntime:
             ack_timeout_s=config.ack_timeout_s,
             results_root=config.results_root,
         )
+        self.agenda_service = AgendaService(config, self.submit_service)
         self._transport: MatrixTransport | None = None
         self._pump: asyncio.Task | None = None
 
@@ -263,6 +265,36 @@ class HelloRuntime:
             return {}
         return await self.submit_service.fetch_result(self._transport.send, params)
 
+    async def advance_agenda(self) -> dict[str, Any]:
+        """Advance the persisted campaign by one engine tick, if started.
+
+        Returns:
+            The tick result, or ``{"ok": False, "error": "unavailable"}`` when
+            the transport has not been started.
+
+        """
+        if self._transport is None:
+            return {"ok": False, "error": "unavailable"}
+        return await self.agenda_service.advance(self._transport.send)
+
+    def agenda_status(self) -> dict[str, Any]:
+        """Return the aggregate campaign status.
+
+        Returns:
+            The status dict, or ``{"ok": False, "error": ...}``.
+
+        """
+        return self.agenda_service.status()
+
+    def approve_agenda_leaf(self, path: str) -> dict[str, Any]:
+        """Approve one gated campaign leaf so a later tick may submit it.
+
+        Returns:
+            ``{"ok": True, "path": ..., "approved": True}``, or a soft error.
+
+        """
+        return self.agenda_service.approve(path)
+
     def condensed_events(
         self,
         sim_id: str,
@@ -368,6 +400,7 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
 
     _register_reporting_tools(server, runtime)
     _register_control_result_tools(server, runtime)
+    _register_agenda_tools(server, runtime)
     return server, runtime
 
 
@@ -595,6 +628,64 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
     )
     async def analyze_output(sim_id: str, *, query: str | None = None) -> dict[str, Any]:
         return await _analyze_tool(runtime, sim_id, query=query)
+
+
+def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
+    """Register the campaign-agenda tools on ``server``.
+
+    ``advance_agenda`` is a write-tier call (it may submit new simulations, so
+    not read-only and not idempotent, but it is not destructive); it returns the
+    :class:`~pic_agentic.agenda.engine.TickResult` dict.  ``agenda_status`` is a
+    read-tier view of the aggregate campaign.  Both degrade to a soft
+    ``{"ok": False, ...}`` dict rather than raising.
+
+    Args:
+        server: The MCP server to add the tools to.
+        runtime: The runtime the tools delegate to.
+
+    """
+
+    @server.tool(
+        title="Advance the simulation campaign",
+        description=(
+            "Run one durable tick of the campaign engine stored on the server: "
+            "observe the known simulations, plan the next actions and submit "
+            "what the budget and the policy allow. Returns the tick result "
+            "(submitted/waiting/done/failed paths and usage)."
+        ),
+        # write/resource tier: a tick may submit new cluster jobs, so it is not
+        # read-only and not idempotent, but it is not destructive.
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    async def advance_agenda() -> dict[str, Any]:
+        result = await runtime.advance_agenda()
+        return _redact_dict(runtime, result)
+
+    @server.tool(
+        title="Get the simulation campaign status",
+        description=(
+            "Report the aggregate status of the persisted campaign: its name, "
+            "completion flag, per-status counts, accumulated usage and the "
+            "per-leaf view (path, status, sim_id, sweep point)."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def agenda_status() -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.agenda_status())
+
+    @server.tool(
+        title="Approve a gated campaign leaf",
+        description=(
+            "Mark one leaf of the persisted campaign as approved, so the next "
+            "advance_agenda tick may submit it despite an approval gate. The "
+            "flag is persisted, so approval survives a server restart."
+        ),
+        # write/resource tier: it changes persisted campaign state but starts no
+        # work itself; it is not destructive.
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    def approve_agenda_leaf(path: str) -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.approve_agenda_leaf(path))
 
 
 async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None = None) -> dict[str, Any]:

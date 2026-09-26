@@ -216,6 +216,46 @@ async def test_submit_is_idempotent_on_replay(shared_dir, tmp_path, fake_runner)
     assert len(fake_runner) == 1
 
 
+async def test_submit_spec_stable_cmd_id_replays_without_duplicate(shared_dir, tmp_path, fake_runner) -> None:
+    """A stable idempotency key makes a retried spec submission exactly-once.
+
+    The agenda engine derives a deterministic cmd_id per leaf; after a crash a
+    fresh engine re-uses it, and the simclient must replay its recorded ack
+    rather than run a second job.
+    """
+    _mcp_t, sim_t, service, client = _make_pair(shared_dir)
+    key = "a" * 32
+    cmd_id, _payload, command = service._build_spec_payload({"sim": {"time_steps": 4}}, cmd_id=key)
+    assert cmd_id == key
+
+    first = await client.handle(command)
+    assert first is not None
+    assert first.payload["cmd_id"] == key
+    assert len(fake_runner) == 1
+
+    # New process, same shared dir: the durable record re-acks the same job.
+    fresh = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        submit_config=SubmitConfig(setup_root=shared_dir / "sims"),
+        poll_interval_s=0.05,
+    )
+    command.transport_event_id = "$backfill"
+    replayed = await fresh.handle(command)
+    assert replayed is not None
+    assert replayed.payload["sim_id"] == first.payload["sim_id"]
+    assert len(fake_runner) == 1
+
+
+async def test_submit_spec_without_cmd_id_generates_one(shared_dir, tmp_path, fake_runner) -> None:
+    _mcp_t, _sim_t, service, _client = _make_pair(shared_dir)
+    cmd_id, _payload, _command = service._build_spec_payload({"sim": {"time_steps": 4}})
+    assert len(cmd_id) == 32
+
+
 async def test_submit_replay_after_restart_reacks_without_rebuilding(shared_dir, tmp_path, fake_runner) -> None:
     _mcp_t, sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"

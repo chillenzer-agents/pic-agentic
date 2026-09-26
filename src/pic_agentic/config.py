@@ -46,6 +46,9 @@ ENV_MAP = {
     "cluster_preset": "PIC_AGENTIC_CLUSTER_PRESET",
     "sim_setup_root": "PIC_AGENTIC_SIM_SETUP_ROOT",
     "results_root": "PIC_AGENTIC_RESULTS_ROOT",
+    "agenda_file": "PIC_AGENTIC_AGENDA_FILE",
+    "agenda_require_approval": "PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL",
+    "agenda_approve_over_est_core_hours": "PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS",
 }
 
 REDACTED = "[REDACTED]"
@@ -104,6 +107,14 @@ class Config(BaseModel):
     #: ``readable``/``readable_local`` iff ``<results_root>/<sim_id>/simOutput``
     #: resolves there.  The server never moves data (design section 4).
     results_root: str = ""
+    #: Path to the persisted campaign file the agenda tools advance.  Empty
+    #: means the default ``campaign.json`` under the message directory.
+    agenda_file: str = ""
+    #: Gate every agenda submission behind explicit approval (the engine holds
+    #: ``planned`` leaves as ``pending_approval`` until approved).
+    agenda_require_approval: bool = False
+    #: Gate agenda submissions whose estimated core-hours exceed this threshold.
+    agenda_approve_over_est_core_hours: float | None = None
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

@@ -99,3 +99,13 @@ def test_m2_submit_fields_from_toml_and_defaults(tmp_path) -> None:
     assert not cfg.picongpu_python
     assert not cfg.cluster_template_dir
     assert not cfg.cluster_preset
+
+
+def test_agenda_policy_fields_from_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PIC_AGENTIC_AGENDA_FILE", "/shared/campaign.json")
+    monkeypatch.setenv("PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL", "true")
+    monkeypatch.setenv("PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS", "120.5")
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.agenda_file == "/shared/campaign.json"
+    assert cfg.agenda_require_approval is True
+    assert cfg.agenda_approve_over_est_core_hours == pytest.approx(120.5)
