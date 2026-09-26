@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from pic_agentic.protocol.simulation import ResultOp, ResultParams
+from pic_agentic.protocol.simulation import ResultOp, ResultParams, SimulationOp
 from pic_agentic.rcp import new_secret_hex
 from pic_agentic.server.simulation import SubmitService
 from pic_agentic.simclient import SimClient
@@ -78,3 +78,66 @@ async def test_server_result_pull_resolves_against_real_client(tmp_path) -> None
         await asyncio.gather(*tasks, return_exceptions=True)
         await sim_t.close()
         await mcp_t.close()
+
+
+async def test_server_control_pull_resolves_against_real_client(tmp_path) -> None:
+    """The server's control pull is resolved by the real client's CONTROL_ACK."""
+    state_dir = tmp_path / "fake-slurm"
+    state_dir.mkdir()
+    job_id = 700777
+    (state_dir / f"{job_id}.state").write_text("RUNNING\n", encoding="utf-8")
+    monkey = __import__("os").environ
+    monkey["FAKE_SLURM_STATE"] = str(state_dir)
+    try:
+        mcp_t, sim_t = MemoryTransport.create_pair()
+        service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=5.0)
+        client = SimClient(
+            sim=SIM,
+            secret=SECRET,
+            transport=sim_t,
+            slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+            message_dir=tmp_path,
+            submit_config=SubmitConfig(setup_root=tmp_path / "sims"),
+            control_fn=_real_control_fn,
+        )
+        client._tracked["ctl12345"] = TrackedSim(
+            sim_id="ctl12345",
+            cmd_id="c",
+            job_id=job_id,
+            run_dir=str(tmp_path),
+            stdout_path=None,
+            submit_system="sbatch",
+        )
+
+        async def pump_client() -> None:
+            async for msg in sim_t.receive():
+                await client.handle(msg)
+
+        async def pump_server() -> None:
+            async for msg in mcp_t.receive():
+                service.on_message(msg)
+
+        tasks = [asyncio.create_task(pump_client()), asyncio.create_task(pump_server())]
+        try:
+            payload = await service.control(mcp_t.send, "ctl12345", SimulationOp.CHECKPOINT)
+            assert payload["ok"] is True
+            assert payload["signal"] == "USR1"
+            assert "Signal USR1 sent" in payload["slurm_reason"]
+            assert (state_dir / f"{job_id}.signals").read_text(encoding="utf-8").splitlines() == ["USR1"]
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await sim_t.close()
+            await mcp_t.close()
+    finally:
+        monkey.pop("FAKE_SLURM_STATE", None)
+
+
+async def _real_control_fn(op: SimulationOp, tracked: TrackedSim) -> str:
+    slurm = SlurmClient(bin_dir=str(FAKE_BIN))
+    if op is SimulationOp.CANCEL:
+        return await slurm.cancel_job(tracked.job_id or 0)
+    from pic_agentic.protocol.simulation import CONTROL_SIGNAL
+
+    return await slurm.signal_job(tracked.job_id or 0, CONTROL_SIGNAL[op] or "")

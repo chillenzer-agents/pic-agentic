@@ -212,6 +212,14 @@ class SimClient:
         self._processed: dict[str, ProcessedCommand] = {}
         self._processed_path = message_dir / "processed-cmds.jsonl"
         self._load_processed()
+        #: Bounded replay cache of control acks, keyed by
+        #: ``(cmd_id, sim_id, op)``.  A control command must not be re-executed
+        #: (re-signal/re-cancel) when the transport redelivers it with a fresh
+        #: event id inside one process; the original ack is re-sent instead.
+        #: The full key (not just cmd_id) prevents a reused id for a different
+        #: simulation/op from replaying the wrong ack.  Results are read-only
+        #: and therefore not cached.
+        self._control_acks: dict[tuple[str, str, str], RcpMessage] = {}
 
     def _accepts(self, message: RcpMessage) -> bool:
         if message.sim != self.sim or message.kind is not Kind.COMMAND:
@@ -823,7 +831,7 @@ class SimClient:
             SlurmJobState.COMPLETING: SimulationState.JOB_RUNNING,
             SlurmJobState.COMPLETED: SimulationState.JOB_FINISHED,
             SlurmJobState.FAILED: SimulationState.JOB_FAILED,
-            SlurmJobState.CANCELLED: SimulationState.JOB_FAILED,
+            SlurmJobState.CANCELLED: SimulationState.CANCELLED,
             SlurmJobState.TIMEOUT: SimulationState.JOB_FAILED,
             SlurmJobState.UNKNOWN: SimulationState.WORKFLOW_FINISHED,
         }
@@ -870,6 +878,14 @@ class SimClient:
             ack = self._build_control_rejection(message, error=f"invalid_control_params:{exc}")
             await self.transport.send(ack)
             return ack
+        cmd_id = str(message.payload.get("cmd_id", ""))
+        cache_key = (cmd_id, params.sim_id, params.op.value)
+        cached = self._control_acks.get(cache_key) if cmd_id else None
+        if cached is not None:
+            # A redelivered control command: re-send the original ack instead of
+            # signalling/cancelling twice.
+            await self.transport.send(cached)
+            return cached
         tracked = self._tracked.get(params.sim_id)
         gate = await self._control_gate(message, params, tracked)
         if gate is not None:
@@ -938,6 +954,19 @@ class SimClient:
                 error="unknown_sim",
                 error_code=SimulationErrorCode.NO_RESULTS,
             )
+        if tracked.job_id is None:
+            # No scheduler job id (a local ``bash`` run, or an unparseable id):
+            # there is nothing signalable, and ``scontrol`` must never see a
+            # placeholder like ``0`` (some SLURM versions treat it as "all my
+            # jobs").  Applies to cancel too, not only the signal ops.
+            return await self._send_control_ack(
+                message,
+                params=params,
+                tracked=tracked,
+                ok=False,
+                error="no_job_id",
+                error_code=SimulationErrorCode.NOT_SIGNALABLE,
+            )
         state = await self._live_job_state(tracked)
         if params.op in CONTROL_REQUIRES_RUNNING and state is not SlurmJobState.RUNNING:
             return await self._send_control_ack(
@@ -992,6 +1021,13 @@ class SimClient:
             error_code=error_code,
         )
         await self.transport.send(ack)
+        cmd_id = ack.payload.get("cmd_id", "")
+        sim_id = ack.payload.get("sim_id", "")
+        if cmd_id:
+            self._control_acks[cmd_id, sim_id, params.op.value] = ack
+            if len(self._control_acks) > _MAX_PROCESSED:
+                for stale in list(self._control_acks)[:-_MAX_PROCESSED]:
+                    self._control_acks.pop(stale, None)
         return ack
 
     async def _handle_result(self, message: RcpMessage) -> RcpMessage:

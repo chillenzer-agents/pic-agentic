@@ -262,11 +262,10 @@ async def test_cancel_e2e_flips_state(shared_dir, tmp_path) -> None:
         assert cancel_ack.payload["slurm_reason"] == f"cancel: JobId={job_id} cancelled"
         assert (state_dir / f"{job_id}.state").read_text(encoding="utf-8").strip() == "CANCELLED"
         assert control.calls == [(SimulationOp.CANCEL, job_id)]
-        # The watcher observes CANCELLED and reports a failed/terminal event.
+        # The watcher observes CANCELLED and reports its own terminal state.
         await _wait_for(
             lambda: any(
-                message.type == SimulationType.EVENT
-                and message.payload.get("state") == SimulationState.JOB_FAILED.value
+                message.type == SimulationType.EVENT and message.payload.get("state") == SimulationState.CANCELLED.value
                 for message in received
             ),
         )
@@ -345,3 +344,57 @@ async def test_control_rejected_when_submit_disabled(shared_dir) -> None:
     assert ack.payload["ok"] is False
     assert ack.payload["error"] == "rejected_by_policy"
     assert ack.payload["error_code"] == "rejected_by_policy"
+
+
+async def test_cancel_without_job_id_never_reaches_slurm(shared_dir, tmp_path) -> None:
+    """A tracked sim with no job id must not yield ``scontrol cancel 0``."""
+    shared, _state_dir = shared_dir
+    _mcp_t, sim_t, _service, client, control = _make_pair(shared)
+    run = tmp_path / "run"
+    run.mkdir()
+    client._tracked["nojob123"] = TrackedSim(
+        sim_id="nojob123",
+        cmd_id="c",
+        job_id=None,
+        run_dir=str(run),
+        stdout_path=None,
+        submit_system="bash",
+    )
+    try:
+        ack = await client.handle(_control("nojob123", SimulationOp.CANCEL, seq=900))
+        assert ack is not None
+        assert ack.payload["ok"] is False
+        assert ack.payload["error"] == "no_job_id"
+        assert ack.payload["error_code"] == "not_signalable"
+        assert control.calls == []
+    finally:
+        await sim_t.close()
+
+
+async def test_control_redelivery_is_idempotent(shared_dir, tmp_path) -> None:
+    """A redelivered control command re-acks instead of signalling twice."""
+    shared, state_dir = shared_dir
+    _mcp_t, sim_t, _service, client, control = _make_pair(shared)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    job_id = 910001
+    (state_dir / f"{job_id}.state").write_text("RUNNING\n", encoding="utf-8")
+    client._tracked["redel123"] = TrackedSim(
+        sim_id="redel123",
+        cmd_id="c",
+        job_id=job_id,
+        run_dir=str(tmp_path),
+        stdout_path=None,
+        submit_system="sbatch",
+    )
+    try:
+        first = await client.handle(_control("redel123", SimulationOp.CHECKPOINT, seq=901))
+        # A redelivery arrives with a fresh envelope (new seq) but the same
+        # cmd_id; it must re-ack, not signal again.
+        second = await client.handle(_control("redel123", SimulationOp.CHECKPOINT, seq=902))
+        assert first is not None
+        assert second is not None
+        assert first.payload["slurm_reason"] == second.payload["slurm_reason"]
+        assert len(control.calls) == 1
+        assert (state_dir / f"{job_id}.signals").read_text(encoding="utf-8").splitlines() == ["USR1"]
+    finally:
+        await sim_t.close()

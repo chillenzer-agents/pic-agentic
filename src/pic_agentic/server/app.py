@@ -73,11 +73,6 @@ _READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempoten
 #: idempotent in the MCP sense).
 _CONTROL_ANNOTATIONS = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
 
-#: Errors the M3 control/result tools turn into a soft ``{"ok": false}`` result.
-#: pydantic's ``ValidationError`` is a ``ValueError``, so a bad argument is
-#: covered by ``ValueError`` alongside the pull timeout and I/O failures.
-_CONTROL_RESULT_TOOL_ERRORS: tuple[type[BaseException], ...] = (ValueError, AckTimeoutError, OSError)
-
 #: Cap on the number of log lines a single ``get_logs`` call may return.
 _MAX_LOG_TAIL = 10_000
 
@@ -557,7 +552,7 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
     )
     async def read_result(
         sim_id: str,
-        path: str,
+        path: str | None = None,
         *,
         stream: str | None = None,
         tail: int | None = None,
@@ -587,7 +582,7 @@ async def _control_tool(runtime: HelloRuntime, sim_id: str, op: SimulationOp) ->
     op = SimulationOp(op)
     try:
         payload = await runtime.control(sim_id, op)
-    except _CONTROL_RESULT_TOOL_ERRORS as exc:
+    except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
         return _soft_error(runtime, sim_id, op.value, exc)
     if not payload:
         return {"ok": False, "sim_id": sim_id, "op": op.value, "error": "unavailable"}
@@ -614,7 +609,7 @@ async def _result_tool(
     try:
         params = ResultParams(sim_id=sim_id, op=op, **knobs)
         payload = await runtime.fetch_result(params)
-    except _CONTROL_RESULT_TOOL_ERRORS as exc:
+    except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
         return _soft_error(runtime, sim_id, op.value, exc)
     if not payload:
         return {"ok": False, "sim_id": sim_id, "op": op.value, "error": "unavailable"}

@@ -379,8 +379,12 @@ class JobFollower:
                     results_linked=False,
                 )
         else:
+            # A user-requested cancel is reported as its own terminal state so
+            # callers can distinguish "I stopped it" from an actual job failure;
+            # every other non-clean terminal state stays ``job_failed``.
+            state = SimulationState.CANCELLED if info.state is SlurmJobState.CANCELLED else SimulationState.JOB_FAILED
             await self.emit(
-                SimulationState.JOB_FAILED,
+                state,
                 job_id=self.tracked.job_id,
                 slurm_state=info.state.value,
                 exit_code=info.exit_code,

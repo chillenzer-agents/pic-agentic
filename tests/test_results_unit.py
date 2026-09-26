@@ -440,3 +440,54 @@ async def test_follower_hook_is_guarded_when_engine_missing(monkeypatch, tmp_pat
     info = JobInfo(job_id=1, state=SlurmJobState.COMPLETED, exit_code=0)
     await follower._emit_terminal(info)
     assert "manifest" not in events[-1][1]
+
+
+def test_read_stream_stdout_without_openpmd(tmp_path) -> None:
+    """The captured stdout stream has no suffix but must still read as text."""
+    out, _ = _tree(tmp_path)
+    run = out.parent
+    (run / "stdout").write_text("SIGNAL: received.\nSIGNAL: Activate checkpointing for step 42\n", encoding="utf-8")
+    payload = results.resolve_result(
+        _params(op=ResultOp.READ, stream="stdout"),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert payload.get("data_encoding") == "text"
+    assert "Activate checkpointing" in "\n".join(payload["data"])
+
+
+def test_describe_truncates_huge_manifests(tmp_path) -> None:
+    """A directory with many files must not overflow the ack wire budget."""
+    out = tmp_path / "simOutput"
+    out.mkdir(parents=True)
+    for i in range(4000):
+        (out / f"f{i:05d}.txt").write_text("x", encoding="utf-8")
+    payload = results.resolve_result(
+        _params(op=ResultOp.DESCRIBE),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert "manifest" in payload
+    dump = payload["manifest"]
+    assert dump["truncated"] is True
+    assert len(dump["files"]) < 4000
+    assert results._escaped_size(dump) <= results.MAX_RESULT_BYTES
+
+
+def test_result_ack_builder_enforces_wire_budget() -> None:
+    """The ack builder is the last line of defence against a Synapse rejection."""
+    from pic_agentic.protocol.simulation import ResultOp as _Op
+    from pic_agentic.protocol.simulation import build_result_ack
+
+    ack = build_result_ack(
+        sim="s",
+        seq=1,
+        cmd_id="c",
+        sim_id=SIM_ID,
+        op=_Op.SLICE,
+        in_reply_to=None,
+        data=[1.0] * 1_000_000,
+        data_encoding="float",
+    )
+    assert ack.payload.get("error_code") == "result_too_large"
+    assert "data" not in ack.payload

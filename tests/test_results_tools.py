@@ -461,3 +461,51 @@ async def test_control_and_result_acks_are_not_projected_into_the_registry() -> 
     service.on_message(result)
     assert service.registry == {}
     assert service.event_log == []
+
+
+def test_local_mirror_rejects_sim_id_traversal() -> None:
+    """A ``../`` sim_id must not turn the mirror flag into an existence oracle."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "mirror"
+        victim = Path(tmp) / "victim" / "simOutput"
+        victim.mkdir(parents=True)
+        (victim / "secret.h5").write_text("data")
+        service = _service(results_root=str(root))
+        payload = {
+            "manifest": {
+                "sim_id": "../../victim",
+                "readable_local": False,
+                "files": [{"path": "secret.h5", "readable": False}],
+            },
+            "result": {"path": "secret.h5", "readable": False},
+        }
+        service._mark_readable("../../victim", payload)
+
+    assert payload["manifest"]["readable_local"] is False
+    assert payload["manifest"]["files"][0]["readable"] is False
+    assert payload["result"]["readable"] is False
+
+
+def test_mirror_has_rejects_path_escape() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / SIM_ID / "simOutput"
+        base.mkdir(parents=True)
+        (Path(tmp) / "outside").write_text("x")
+        assert SubmitService._mirror_has(base, "../../outside") is False
+
+
+async def test_transport_failure_is_a_soft_error() -> None:
+    """A transport error must never escape the tool as an exception."""
+    server, runtime = build_server(Config(rcp_secret=SECRET), SIM)
+
+    class _Boom:
+        @staticmethod
+        async def send(_message: object) -> str:
+            msg = "transport down"
+            raise RuntimeError(msg)
+
+    runtime._transport = _Boom()
+    control = await server.call_tool("checkpoint_simulation", {"sim_id": SIM_ID})
+    assert control.structured_content["ok"] is False
+    result = await server.call_tool("describe_results", {"sim_id": SIM_ID})
+    assert result.structured_content["ok"] is False

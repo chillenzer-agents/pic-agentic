@@ -189,16 +189,18 @@ class ResultOp(StrEnum):
 
 
 #: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
-#: text tails or a thumbnail).  Larger results are answered with a clean
-#: ``RESULT_TOO_LARGE`` error instead of being sent, mirroring the M2a inline
-#: payload cap.
-MAX_RESULT_BYTES = 256 * 1024
+#: text tails or a thumbnail).  Deliberately the same 48 KiB budget as
+#: :data:`MAX_INLINE_PAYLOAD_BYTES`: Synapse rejects event content above its
+#: (64 KiB default) limit, and a rejected ack would surface as a silent pull
+#: timeout rather than a clean error.  Results above this are answered with a
+#: ``RESULT_TOO_LARGE`` error instead of being sent.
+MAX_RESULT_BYTES = 48 * 1024
 
 #: Cap on the number of reduced points a ``slice`` may return.
 SLICE_MAX_POINTS = 4096
 
 #: Cap on the bytes of a single ``read`` (text) response.
-RESULT_TEXT_MAX_BYTES = 256 * 1024
+RESULT_TEXT_MAX_BYTES = 48 * 1024
 
 #: ``path`` argument of a result request: a relative path under ``simOutput``.
 #: The strict charset excludes absolute paths, ``..`` and shell
@@ -924,6 +926,9 @@ class ResultManifest(BaseModel):
     reader: str | None = None
     readable_local: bool = False
     files: list[ResultRef] = []
+    #: Set when ``files`` was shortened to fit the ack wire budget; the summary
+    #: fields remain exact.
+    truncated: bool = False
 
 
 def _outcome_payload(**fields: Any) -> dict[str, Any]:
@@ -1084,6 +1089,17 @@ def build_result_ack(
             error_code=error_code,
         ),
     )
+    # Single chokepoint: a result ack must fit the homeserver event budget, so
+    # an over-budget encoding is replaced by a clean RESULT_TOO_LARGE error
+    # rather than being sent and rejected (which would look like a pull timeout).
+    if len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) > MAX_RESULT_BYTES:
+        payload = {
+            "cmd_id": cmd_id,
+            "sim_id": sim_id,
+            "op": op.value,
+            "error": "result exceeds the ack wire budget",
+            "error_code": "result_too_large",
+        }
     return RcpMessage(
         sim=sim,
         kind=Kind.ACK,

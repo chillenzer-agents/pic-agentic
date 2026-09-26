@@ -56,6 +56,7 @@ TERMINAL_STATES = frozenset(
         SimulationState.RESULTS_READY.value,
         SimulationState.FAILED.value,
         SimulationState.JOB_FAILED.value,
+        SimulationState.CANCELLED.value,
     },
 )
 
@@ -683,7 +684,13 @@ class SubmitService:
         """
         if not self.results_root:
             return
-        base = Path(self.results_root).expanduser() / sim_id / "simOutput"
+        root = Path(self.results_root).expanduser().resolve()
+        base = (root / sim_id / "simOutput").resolve()
+        # ``sim_id`` is LLM-supplied: refuse anything that escapes the mirror
+        # root, so the readability flag cannot become an existence oracle for
+        # arbitrary paths.
+        if base != root and root not in base.parents:
+            return
         manifest = payload.get("manifest")
         if isinstance(manifest, dict):
             manifest["readable_local"] = base.is_dir()
@@ -691,12 +698,25 @@ class SubmitService:
             if isinstance(files, list):
                 for ref in files:
                     if isinstance(ref, dict) and isinstance(ref.get("path"), str):
-                        ref["readable"] = (base / ref["path"]).exists()
+                        ref["readable"] = self._mirror_has(base, ref["path"])
         result = payload.get("result")
         if isinstance(result, dict):
             for ref in (result, result.get("ref")):
                 if isinstance(ref, dict) and isinstance(ref.get("path"), str):
-                    ref["readable"] = (base / ref["path"]).exists()
+                    ref["readable"] = self._mirror_has(base, ref["path"])
+
+    @staticmethod
+    def _mirror_has(base: Path, relpath: str) -> bool:
+        """Whether ``relpath`` exists inside ``base`` without escaping it.
+
+        Returns:
+            True when the contained path exists.
+
+        """
+        candidate = (base / relpath).resolve()
+        if candidate != base and base not in candidate.parents:
+            return False
+        return candidate.exists()
 
     async def _fetch(self, send: SendFn, sim_id: str, build: Callable[[str], RcpMessage]) -> dict[str, Any]:
         """Sign, send and await one request/response pull.

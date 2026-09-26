@@ -43,14 +43,20 @@ def _make_control_fn(
     """
 
     async def control_fn(op: SimulationOp, tracked: TrackedSim) -> str:
+        job_id = tracked.job_id
+        if job_id is None:
+            # Defensive: the client's gate already rejects this, but never pass
+            # a placeholder id to scontrol (``cancel 0`` can mean "all jobs").
+            msg = "no scheduler job id for this simulation"
+            raise ValueError(msg)
         if op is SimulationOp.CANCEL:
-            return await slurm.cancel_job(tracked.job_id or 0)
+            return await slurm.cancel_job(job_id)
         signal = {
             SimulationOp.CHECKPOINT: "USR1",
             SimulationOp.STOP: "TERM",
             SimulationOp.CHECKPOINT_AND_STOP: "ALRM",
         }[op]
-        return await slurm.signal_job(tracked.job_id or 0, signal)
+        return await slurm.signal_job(job_id, signal)
 
     return control_fn
 

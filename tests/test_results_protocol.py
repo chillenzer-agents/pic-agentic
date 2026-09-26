@@ -178,6 +178,8 @@ def test_result_manifest_defaults() -> None:
 
 
 def test_result_caps_are_frozen() -> None:
-    assert MAX_RESULT_BYTES == 256 * 1024
-    assert RESULT_TEXT_MAX_BYTES == 256 * 1024
+    # The ack cap matches the M2a inline budget (48 KiB) so a result ack can
+    # never exceed the homeserver's event-size limit and look like a timeout.
+    assert MAX_RESULT_BYTES == 48 * 1024
+    assert RESULT_TEXT_MAX_BYTES == 48 * 1024
     assert SLICE_MAX_POINTS == 4096

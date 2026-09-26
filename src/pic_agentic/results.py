@@ -329,7 +329,11 @@ def _load_dataset(path: Path, record: str | None, component: str | None, iterati
 
     """
     series = _open_series(path)
-    step = series.iterations[_select_iteration(series, iteration)]
+    try:
+        step = series.iterations[_select_iteration(series, iteration)]
+    except KeyError as exc:
+        msg = f"iteration {iteration!r} not found in the series"
+        raise ResultsReaderError(msg) from exc
     names = list(step.meshes)
     if not names:
         msg = "openPMD iteration has no meshes"
@@ -343,6 +347,9 @@ def _load_dataset(path: Path, record: str | None, component: str | None, iterati
     if selected is None:
         components = list(mesh.components)
         selected = components[0] if components else None
+    if selected is not None and selected not in mesh.components:
+        msg = f"component {selected!r} not found; available: {', '.join(mesh.components)}"
+        raise ResultsReaderError(msg)
     dataset = mesh[selected] if selected is not None else mesh
     try:
         chunk = dataset.load_chunk()
@@ -577,12 +584,24 @@ def _escaped_size(value: Any) -> int:
 def _describe(output: Path, *, sim_id: str, run_dir: Path, local_root: str) -> dict[str, Any]:
     """Answer ``describe``: the scandir-only manifest.
 
+    The file list is truncated (``truncated=True``) and the escaped payload is
+    size-checked so a directory with many files cannot overflow the homeserver's
+    event-size limit.
+
     Returns:
-        ``{"manifest": <manifest dump>}``.
+        ``{"manifest": <manifest dump>}`` or a ``RESULT_TOO_LARGE`` error.
 
     """
     manifest = scan_output(output, sim_id=sim_id, run_dir=str(run_dir), local_root=local_root)
-    return {"manifest": manifest.model_dump()}
+    dump = manifest.model_dump()
+    # Keep the manifest under the wire budget by dropping the (sorted) tail of
+    # the file list; the summary fields stay exact.
+    while dump["files"] and _escaped_size(dump) > MAX_RESULT_BYTES:
+        dump["files"] = dump["files"][: len(dump["files"]) // 2]
+        dump["truncated"] = True
+    if _escaped_size(dump) > MAX_RESULT_BYTES:
+        return _error(SimulationErrorCode.RESULT_TOO_LARGE, "manifest exceeds the wire budget")
+    return {"manifest": dump}
 
 
 def _read_target(params: ResultParams, run_dir: Path, output: Path) -> Path | None:
@@ -621,7 +640,10 @@ def _read(params: ResultParams, *, run_dir: Path, output: Path) -> dict[str, Any
         return _error(SimulationErrorCode.PATH_UNSAFE, "unsafe or missing result path")
     if target is None or not target.is_file():
         return _error(SimulationErrorCode.NO_RESULTS, "no such result file")
-    if _sniff_format(target.name) != "text":
+    # The captured stdout/stderr streams have no filename suffix; treat the
+    # known capture paths as text so the advertised stream read works.
+    from_stream = params.path is None and params.stream in {"stdout", "stderr"}
+    if not from_stream and _sniff_format(target.name) != "text":
         return _error(SimulationErrorCode.READER_UNAVAILABLE, "not a text result; use an openPMD operation")
     if _entry_size(target) > RESULT_TEXT_MAX_BYTES:
         return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"text result exceeds {RESULT_TEXT_MAX_BYTES} bytes")
@@ -681,6 +703,13 @@ def _reader_op(  # ruff: ignore[too-many-return-statements]
     """
     if _reader_name() is None:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, "the optional openpmd_api reader is not installed")
+    if params.op is ResultOp.SLICE and (params.index is not None or (params.axis not in {None, 0})):
+        # The reader currently returns a flattened chunk; refuse a spatial
+        # selection it cannot honour rather than silently returning all data.
+        return _error(
+            SimulationErrorCode.UNSUPPORTED,
+            "axis/index selection is not supported yet; omit them or use downsample",
+        )
     if not output.is_dir():
         return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
     target = output
@@ -693,7 +722,7 @@ def _reader_op(  # ruff: ignore[too-many-return-statements]
         result = _dispatch_reader(params, target)
     except ResultsUnavailable as exc:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
-    except (ResultsReaderError, OSError, ValueError) as exc:
+    except (ResultsReaderError, KeyError, OSError, ValueError) as exc:
         return _error(SimulationErrorCode.NO_RESULTS, str(exc))
     if params.op is ResultOp.SLICE:
         return _cap_slice(result, params.downsample)
@@ -742,6 +771,8 @@ def _export(output: Path, *, sim_id: str, run_dir: Path, local_root: str) -> dic
         "resolved": resolved,
         "local_path": str(mirror) if resolved else None,
     }
+    if _escaped_size(ticket) > MAX_RESULT_BYTES:
+        return _error(SimulationErrorCode.RESULT_TOO_LARGE, "export ticket exceeds the wire budget")
     return {"result": ticket}
 
 
