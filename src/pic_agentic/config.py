@@ -49,6 +49,7 @@ ENV_MAP = {
     "agenda_file": "PIC_AGENTIC_AGENDA_FILE",
     "agenda_require_approval": "PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL",
     "agenda_approve_over_est_core_hours": "PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS",
+    "fleet_stall_after_s": "PIC_AGENTIC_FLEET_STALL_AFTER_S",
 }
 
 REDACTED = "[REDACTED]"
@@ -115,6 +116,9 @@ class Config(BaseModel):
     agenda_require_approval: bool = False
     #: Gate agenda submissions whose estimated core-hours exceed this threshold.
     agenda_approve_over_est_core_hours: float | None = None
+    #: How long an active simulation may go without a lifecycle event before the
+    #: fleet view reports it as stalled.
+    fleet_stall_after_s: float = 900.0
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

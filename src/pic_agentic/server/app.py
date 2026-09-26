@@ -17,7 +17,10 @@ from typing import TYPE_CHECKING, Any
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
+from pic_agentic.agenda.campaign import Campaign
+from pic_agentic.agenda.provenance import campaign_rocrate
 from pic_agentic.auth import MasTokenStore
+from pic_agentic.fleet import fleet_view
 from pic_agentic.protocol.simulation import (
     LOG_STREAMS,
     PayloadTooLargeError,
@@ -294,6 +297,36 @@ class HelloRuntime:
 
         """
         return self.agenda_service.approve(path)
+
+    def fleet_status(self) -> dict[str, Any]:
+        """Return the aggregate fleet view (summary + alerts).
+
+        Returns:
+            ``{"summary": {...}, "alerts": [...]}``; never raises.
+
+        """
+        return fleet_view(
+            self.submit_service.list(),
+            now=datetime.now(UTC),
+            stall_after_s=self.config.fleet_stall_after_s,
+        )
+
+    def campaign_provenance(self) -> dict[str, Any]:
+        """Return the campaign's RO-Crate provenance document.
+
+        Returns:
+            The ``ro-crate-metadata.json`` dict, or ``{"ok": False, "error":
+            "no_campaign"}`` when no campaign is persisted.
+
+        """
+        if not self.agenda_service.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        try:
+            campaign = self.agenda_service.store.load(Campaign)
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            return {"ok": False, "error": self.config.redact(str(exc))}
+        crate = campaign_rocrate(campaign, revision=self.config.picongpu_revision or None)
+        return {"ok": True, **crate}
 
     def condensed_events(
         self,
@@ -687,6 +720,30 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     def approve_agenda_leaf(path: str) -> dict[str, Any]:
         return _redact_dict(runtime, runtime.approve_agenda_leaf(path))
 
+    @server.tool(
+        title="Get the aggregate fleet status",
+        description=(
+            "Report the whole fleet at a glance: total/active/terminal counts, "
+            "per-state counts, a mean progress percentage, and actionable "
+            "alerts (failed, cancelled, non-zero exit, stalled)."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def fleet_status() -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.fleet_status())
+
+    @server.tool(
+        title="Export the campaign provenance (RO-Crate)",
+        description=(
+            "Render the persisted campaign's lineage as a minimal RO-Crate "
+            "JSON-LD document: one entity per simulation linked to the "
+            "PIConGPU software entity at a pinned revision, plus its runs."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def campaign_provenance() -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.campaign_provenance())
+
 
 async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None = None) -> dict[str, Any]:
     """Run one ``analyze`` pull and shape it into the design's section dict.
@@ -876,7 +933,10 @@ def _redact_dict(runtime: HelloRuntime, payload: Any, _depth: int = 0) -> Any:
     if isinstance(payload, str):
         return redact(payload)
     if isinstance(payload, dict):
-        return {key: _redact_dict(runtime, value, _depth + 1) for key, value in payload.items()}
+        # Redact keys as well: a state string can itself be a dict key (e.g.
+        # ``fleet_status``'s ``by_state``), so a secret embedded in a key must
+        # not slip through.
+        return {redact(str(key)): _redact_dict(runtime, value, _depth + 1) for key, value in payload.items()}
     if isinstance(payload, list):
         return [_redact_dict(runtime, value, _depth + 1) for value in payload]
     return payload

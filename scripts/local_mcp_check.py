@@ -826,6 +826,45 @@ def cmd_agenda_approve(args: argparse.Namespace) -> int:
     return 0 if result.get("ok", "error" not in result) else 1
 
 
+def cmd_fleet_status(args: argparse.Namespace) -> int:
+    """Call the ``fleet_status`` server tool and print the aggregate view.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    result = _result_tool_call(state, "fleet_status", {})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
+def cmd_campaign_provenance(args: argparse.Namespace) -> int:
+    """Call the ``campaign_provenance`` server tool and print the RO-Crate.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, "campaign_provenance", {})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
@@ -945,6 +984,12 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--agenda-advance", action="store_true", help="call advance_agenda (one engine tick)")
     mode.add_argument("--agenda-status", action="store_true", help="call agenda_status and print the campaign view")
     mode.add_argument("--agenda-approve", action="store_true", help="approve one gated leaf (--agenda-leaf PATH)")
+    mode.add_argument("--fleet-status", action="store_true", help="call fleet_status and print summary + alerts")
+    mode.add_argument(
+        "--campaign-provenance",
+        action="store_true",
+        help="call campaign_provenance and print the RO-Crate",
+    )
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
@@ -1024,6 +1069,8 @@ def main() -> None:
         (args.agenda_advance, cmd_agenda_advance),
         (args.agenda_status, cmd_agenda_status),
         (args.agenda_approve, cmd_agenda_approve),
+        (args.fleet_status, cmd_fleet_status),
+        (args.campaign_provenance, cmd_campaign_provenance),
     )
     for selected, command in dispatch:
         if selected:
