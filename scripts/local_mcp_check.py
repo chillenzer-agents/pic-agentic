@@ -49,6 +49,18 @@ Modes:
   appears or ``--wait-s`` elapses; use it to wait for a run before
   ``--describe``.
 
+* ``--agenda-init --agenda-file F [--agenda-script S] [--agenda-replicas N]
+  [--agenda-patch sim.time_steps --agenda-values 4,8,16]`` builds a campaign
+  file for the agenda tools: N replicated leaves of the Runner spec (defaulting
+  to the ``tests/fixtures/pypicongpu_runner.json`` fixture) or one leaf per
+  patched value.  This is pure local state; it does not talk to the server.
+
+* ``--agenda-advance --agenda-file F`` calls the ``advance_agenda`` tool (one
+  engine tick) and prints the tick result.
+
+* ``--agenda-status --agenda-file F`` calls ``agenda_status`` and prints the
+  aggregate campaign view.
+
 The MCP server and the cluster simclient use the same Matrix account but log in
 separately, so each gets its own MAS session/device and its own refresh chain
 (no rotation conflict).  RCP messages are role-tagged, so the self-echo works.
@@ -67,6 +79,10 @@ Usage::
     python scripts/local_mcp_check.py --read --sim-id <id> --stream stdout --tail 50
     python scripts/local_mcp_check.py --slice --sim-id <id> --record E --component z
     python scripts/local_mcp_check.py --export --sim-id <id>
+    python scripts/local_mcp_check.py --agenda-init --agenda-file ./campaign.json --agenda-replicas 3
+    python scripts/local_mcp_check.py --agenda-init --agenda-patch sim.time_steps --agenda-values 4,8
+    python scripts/local_mcp_check.py --agenda-advance --agenda-file ./campaign.json
+    python scripts/local_mcp_check.py --agenda-status --agenda-file ./campaign.json
 """
 
 from __future__ import annotations
@@ -85,6 +101,9 @@ from pathlib import Path
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from pic_agentic.agenda.campaign import Campaign
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim
+from pic_agentic.agenda.store import AgendaStore
 from pic_agentic.auth import MasTokenStore
 from pic_agentic.config import Config
 
@@ -218,6 +237,9 @@ def _server_env(state: dict) -> dict:
     for key in ("PIC_AGENTIC_PICONGPU_PYTHON", "PIC_AGENTIC_PICONGPU_REVISION"):
         if state.get(key):
             env[key] = state[key]
+    # The server-side agenda store must be the same file the driver wrote.
+    if state.get("agenda_file"):
+        env["PIC_AGENTIC_AGENDA_FILE"] = state["agenda_file"]
     return env
 
 
@@ -593,6 +615,162 @@ def cmd_wait_results(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+#: Default Runner-spec fixture used by ``--agenda-init`` when no script is given.
+_AGENDA_SPEC_FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "pypicongpu_runner.json"
+
+
+def _agenda_spec(path: str) -> dict:
+    """Load a Runner spec (a full runner dump or a bare ``{"sim": ...}``).
+
+    Returns:
+        The parsed spec dict.
+
+    Raises:
+        SystemExit: If the file does not exist or is not a JSON object.
+
+    """
+    spec_path = Path(path).expanduser()
+    if not spec_path.is_file():
+        msg = f"agenda spec not found: {spec_path}"
+        raise SystemExit(msg)
+    try:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        msg = f"agenda spec {spec_path} is not valid JSON: {exc}"
+        raise SystemExit(msg) from exc
+    if not isinstance(spec, dict):
+        msg = f"agenda spec {spec_path} must be a JSON object"
+        raise SystemExit(msg)
+    return spec
+
+
+def _patch_spec(spec: dict, dotted: str, value: object) -> dict:
+    """Return a copy of ``spec`` with the dotted JSON path set to ``value``.
+
+    Args:
+        spec: The base Runner spec (mutated in a deep copy).
+        dotted: A dotted path such as ``sim.time_steps``.
+        value: The JSON value to set.
+
+    Returns:
+        The patched deep copy.
+
+    Raises:
+        SystemExit: If any intermediate path segment is missing.
+
+    """
+    patched = json.loads(json.dumps(spec))
+    node: dict = patched
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            msg = f"agenda patch path {dotted!r} has no object at {part!r}"
+            raise SystemExit(msg)
+        node = child
+    node[parts[-1]] = value
+    return patched
+
+
+def _parse_agenda_values(values: str) -> list[object]:
+    """Parse a comma-separated value list, JSON-decoding each entry.
+
+    Bare tokens are decoded with :func:`json.loads` so ``4`` becomes an int and
+    ``1e18`` a float; an undecodable token is kept as a string.
+
+    Returns:
+        The parsed values.
+
+    Raises:
+        SystemExit: If the list is empty.
+
+    """
+    raw = [token.strip() for token in values.split(",") if token.strip()]
+    if not raw:
+        msg = "--agenda-values must list at least one value"
+        raise SystemExit(msg)
+    parsed: list[object] = []
+    for token in raw:
+        try:
+            parsed.append(json.loads(token))
+        except ValueError:
+            parsed.append(token)
+    return parsed
+
+
+def cmd_agenda_init(args: argparse.Namespace) -> int:
+    """Build and save a campaign file from a Runner-spec fixture or script.
+
+    With ``--agenda-patch``/``--agenda-values`` one leaf per value is created
+    (the dotted JSON path in the spec is set to each value); otherwise
+    ``--agenda-replicas`` identical leaves are created.  The campaign is written
+    with :class:`~pic_agentic.agenda.store.AgendaStore` so the server-side
+    agenda tools load it from ``PIC_AGENTIC_AGENDA_FILE``.
+
+    Returns:
+        The process exit code.
+
+    """
+    spec_source = args.agenda_script or str(_AGENDA_SPEC_FIXTURE)
+    base_spec = _agenda_spec(spec_source)
+    if args.agenda_patch:
+        specs = [_patch_spec(base_spec, args.agenda_patch, value) for value in _parse_agenda_values(args.agenda_values)]
+    else:
+        specs = [base_spec] * max(1, args.agenda_replicas)
+
+    agenda = AgendaGroup(name="campaign")
+    for index, spec in enumerate(specs):
+        name = f"leaf{index:03d}"
+        agenda = agenda.add(**{name: AgendaSim(name=name, spec=spec)})
+    campaign = Campaign(name=args.agenda_name, agenda=agenda).with_created_ts()
+
+    file_path = Path(args.agenda_file).expanduser()
+    store = AgendaStore(file_path.parent, filename=file_path.name)
+    store.save(campaign)
+    print(json.dumps({"ok": True, "agenda_file": str(file_path), "leaves": len(specs)}, indent=2), flush=True)
+    return 0
+
+
+def cmd_agenda_advance(args: argparse.Namespace) -> int:
+    """Call the ``advance_agenda`` server tool for the configured campaign.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, "advance_agenda", {})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
+def cmd_agenda_status(args: argparse.Namespace) -> int:
+    """Call the ``agenda_status`` server tool and print the campaign view.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, "agenda_status", {})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
@@ -708,6 +886,9 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--slice", action="store_true", help="call get_result_slice for one sim")
     mode.add_argument("--export", action="store_true", help="call export_results for one sim")
     mode.add_argument("--wait-results", action="store_true", help="poll describe_results until results appear")
+    mode.add_argument("--agenda-init", action="store_true", help="build and save a campaign file for the agenda tools")
+    mode.add_argument("--agenda-advance", action="store_true", help="call advance_agenda (one engine tick)")
+    mode.add_argument("--agenda-status", action="store_true", help="call agenda_status and print the campaign view")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
@@ -741,6 +922,23 @@ def _build_parser() -> argparse.ArgumentParser:
             "/scratch/<user>/pic-agentic/shared). Required for --setup."
         ),
     )
+    parser.add_argument(
+        "--agenda-file",
+        default="campaign.json",
+        help=(
+            "campaign file for the --agenda-* modes; for the server tools it is "
+            "exported as PIC_AGENTIC_AGENDA_FILE and must match the server's."
+        ),
+    )
+    parser.add_argument(
+        "--agenda-script",
+        default="",
+        help="Runner-spec JSON for --agenda-init (defaults to the tests/fixtures runner).",
+    )
+    parser.add_argument("--agenda-name", default="campaign", help="campaign name written by --agenda-init")
+    parser.add_argument("--agenda-replicas", type=int, default=1, help="number of identical leaves for --agenda-init")
+    parser.add_argument("--agenda-patch", default="", help="dotted Runner-spec path to sweep, e.g. sim.time_steps")
+    parser.add_argument("--agenda-values", default="", help="comma-separated values for --agenda-patch")
     return parser
 
 
@@ -765,6 +963,9 @@ def main() -> None:
         (args.slice, cmd_slice),
         (args.export, cmd_export),
         (args.wait_results, cmd_wait_results),
+        (args.agenda_init, cmd_agenda_init),
+        (args.agenda_advance, cmd_agenda_advance),
+        (args.agenda_status, cmd_agenda_status),
     )
     for selected, command in dispatch:
         if selected:

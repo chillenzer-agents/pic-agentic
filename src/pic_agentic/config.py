@@ -46,6 +46,7 @@ ENV_MAP = {
     "cluster_preset": "PIC_AGENTIC_CLUSTER_PRESET",
     "sim_setup_root": "PIC_AGENTIC_SIM_SETUP_ROOT",
     "results_root": "PIC_AGENTIC_RESULTS_ROOT",
+    "agenda_file": "PIC_AGENTIC_AGENDA_FILE",
 }
 
 REDACTED = "[REDACTED]"
@@ -104,6 +105,9 @@ class Config(BaseModel):
     #: ``readable``/``readable_local`` iff ``<results_root>/<sim_id>/simOutput``
     #: resolves there.  The server never moves data (design section 4).
     results_root: str = ""
+    #: Path to the persisted campaign file the agenda tools advance.  Empty
+    #: means the default ``campaign.json`` under the message directory.
+    agenda_file: str = ""
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

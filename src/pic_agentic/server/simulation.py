@@ -44,6 +44,7 @@ from pic_agentic.protocol.simulation import (
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 from pic_agentic.server.hello import AckTimeoutError, SendFn
 from pic_agentic.simulation_build import BuiltSimulation, SimulationBuildError, build_runner_dump
+from pic_agentic.version import local_provenance
 
 log = logging.getLogger(__name__)
 
@@ -518,13 +519,91 @@ class SubmitService:
 
         Returns:
             The outcome; ``state`` is the simclient's first ack state (normally
-            ``accepted``).
+            ``accepted``).  A missing ack surfaces as the
+            :class:`~pic_agentic.server.hello.AckTimeoutError` raised by
+            :meth:`_dispatch`.
+
+        """
+        cmd_id, _payload, command = await self.build_payload(script_path, params=params)
+        return await self._dispatch(send, cmd_id, command)
+
+    async def submit_spec(
+        self,
+        send: SendFn,
+        runner_dump: dict[str, Any],
+        *,
+        params: SubmitParams | None = None,
+    ) -> SubmitOutcome:
+        """Build, send and await one ``submit_simulation`` from a Runner spec.
+
+        Unlike :meth:`submit`, the payload is built directly from an
+        already-produced ``Runner.model_dump(mode="json")`` (an agenda leaf
+        holds such a spec), skipping the PICMI-to-Runner subprocess builder.
+        The provenance tuple is taken from this install via
+        :func:`~pic_agentic.version.local_provenance` (falling back to the
+        configured ``picongpu_revision``), and the payload is still validated by
+        :meth:`~pic_agentic.protocol.simulation.SimulationPayload.check_allowlist`.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            runner_dump: A full runner dump (or a wire spec carrying ``sim``).
+            params: Optional build/run flags.
+
+        Returns:
+            The outcome; ``state`` is the simclient's first ack state.
+
+        """
+        cmd_id, _payload, command = self._build_spec_payload(runner_dump, params=params)
+        return await self._dispatch(send, cmd_id, command)
+
+    def _build_spec_payload(
+        self,
+        runner_dump: dict[str, Any],
+        *,
+        params: SubmitParams | None = None,
+        cmd_id: str | None = None,
+    ) -> tuple[str, SimulationPayload, RcpMessage]:
+        """Wrap a Runner spec directly in a signed submit command.
+
+        Mirrors :meth:`build_payload` but skips the ``runner_dump_builder`` (the
+        spec already exists), so it is synchronous.
+
+        Returns:
+            The ``(cmd_id, payload, command)`` triple, the command signed.
+
+        """
+        command_id = cmd_id or new_cmd_id()
+        provenance = local_provenance()
+        payload = SimulationPayload.build(
+            picongpu_version=provenance["picongpu_version"],
+            picongpu_revision=self.picongpu_revision or provenance["picongpu_revision"],
+            schema_hash=provenance["schema_hash"],
+            runner_dump=runner_dump,
+        )
+        payload.check_allowlist()
+        seq = self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER)
+        command = build_submit_command(
+            sim=self.sim,
+            seq=seq,
+            payload=payload,
+            params=params,
+            cmd_id=command_id,
+        ).sign(self.secret)
+        return command_id, payload, command
+
+    async def _dispatch(self, send: SendFn, cmd_id: str, command: RcpMessage) -> SubmitOutcome:
+        """Send one signed submit command and await its ack.
+
+        Shared by :meth:`submit` and :meth:`submit_spec` so the pending-future
+        bookkeeping lives in one place.
+
+        Returns:
+            The outcome built from the ack.
 
         Raises:
             AckTimeoutError: If no ack arrives within the configured wait.
 
         """
-        cmd_id, _payload, command = await self.build_payload(script_path, params=params)
         future: asyncio.Future[RcpMessage] = asyncio.get_running_loop().create_future()
         self._pending[cmd_id] = future
         try:
