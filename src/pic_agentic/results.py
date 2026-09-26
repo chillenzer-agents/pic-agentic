@@ -58,6 +58,10 @@ _OPENPMD_SUFFIXES = {".bp": "openpmd-adios2", ".h5": "openpmd-hdf5", ".hdf5": "o
 #: Iteration selectors that mean "the newest available iteration".
 _LAST_ITERATIONS = frozenset({None, "last"})
 
+#: The sentinel component name openPMD reports for a scalar (componentless)
+#: mesh record; it must not be presented as a selectable component.
+_SCALAR_COMPONENT = "\x0bScalar"
+
 #: Directory (relative to ``run_dir``) the workflow links the results into.
 _SIM_OUTPUT = "simOutput"
 
@@ -265,8 +269,11 @@ def _open_series(path: Path) -> Any:
 
     """
     api = _import_openpmd()
+    # openPMD >= 0.14 exposes the access modes as attributes on ``Access``
+    # (``api.Access.read_only``); older builds used an ``Access_Type`` enum.
+    access = getattr(api.Access, "read_only", None) or api.Access_Type.READ_ONLY
     try:
-        return api.Series(str(path), api.Access_Type.READ_ONLY)
+        return api.Series(str(path), access)
     except Exception as exc:
         msg = f"cannot open openPMD series at {path}: {exc}"
         raise ResultsReaderError(msg) from exc
@@ -312,6 +319,27 @@ def _flatten(data: Any) -> list[float]:
     return [float(value) for value in flat]
 
 
+def _record_components(mesh: Any) -> list[str]:
+    r"""List a mesh record's component names (openPMD-API version safe).
+
+    ``openpmd_api`` >= 0.15 has no ``mesh.components`` attribute: component
+    names are the record's iteration keys.  A scalar mesh exposes a single
+    sentinel component ``"\x0bScalar"`` which callers should treat as "no
+    explicit component".
+
+    Args:
+        mesh: An openPMD mesh record.
+
+    Returns:
+        The component names (possibly empty).
+
+    """
+    try:
+        return [str(name) for name in mesh]
+    except TypeError:  # pragma: no cover - very old readers expose .components instead
+        return [str(name) for name in getattr(mesh, "components", [])]
+
+
 def _load_dataset(path: Path, record: str | None, component: str | None, iteration: int | str | None) -> list[float]:
     """Load the requested mesh component's raw chunk.
 
@@ -331,7 +359,9 @@ def _load_dataset(path: Path, record: str | None, component: str | None, iterati
     series = _open_series(path)
     try:
         step = series.iterations[_select_iteration(series, iteration)]
-    except KeyError as exc:
+    except (KeyError, IndexError) as exc:
+        # openpmd_api raises IndexError for an unknown iteration number and
+        # KeyError for some backends; both mean "no such iteration".
         msg = f"iteration {iteration!r} not found in the series"
         raise ResultsReaderError(msg) from exc
     names = list(step.meshes)
@@ -343,14 +373,16 @@ def _load_dataset(path: Path, record: str | None, component: str | None, iterati
         msg = f"record {name!r} not found; available: {', '.join(names)}"
         raise ResultsReaderError(msg)
     mesh = step.meshes[name]
+    components = [c for c in _record_components(mesh) if c != _SCALAR_COMPONENT]
     selected = component
     if selected is None:
-        components = list(mesh.components)
         selected = components[0] if components else None
-    if selected is not None and selected not in mesh.components:
-        msg = f"component {selected!r} not found; available: {', '.join(mesh.components)}"
+    if selected is not None and components and selected not in components:
+        msg = f"component {selected!r} not found; available: {', '.join(components)}"
         raise ResultsReaderError(msg)
-    dataset = mesh[selected] if selected is not None else mesh
+    # ``mesh[name]`` yields a Record_Component; a componentless scalar mesh
+    # loads straight from the record.
+    dataset = mesh[selected] if selected is not None and components else mesh
     try:
         chunk = dataset.load_chunk()
         series.flush()

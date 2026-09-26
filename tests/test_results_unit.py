@@ -191,6 +191,8 @@ def test_resolve_slice_reader_unavailable_without_openpmd(tmp_path, monkeypatch)
 
 def test_resolve_slice_prereader_reports_unavailable(tmp_path) -> None:
     """On the reader-absent host even a missing output is reader_unavailable."""
+    if results._reader_name() is not None:
+        pytest.skip("openpmd_api is installed in this environment")
     payload = results.resolve_result(_params(op=ResultOp.SLICE), run_dir=tmp_path, sim_id=SIM_ID)
     assert payload["error_code"] == "reader_unavailable"
 
@@ -210,12 +212,13 @@ class _FakeValues:
 
 
 class _FakeMesh:
+    """Models the openPMD >= 0.15 record API: components via iteration."""
+
     def __init__(self, comps: dict[str, object]) -> None:
         self._comps = comps
 
-    @property
-    def components(self) -> list[str]:
-        return list(self._comps)
+    def __iter__(self) -> object:
+        return iter(self._comps)
 
     def __getitem__(self, key: str) -> object:
         return self._comps[key]
@@ -257,7 +260,7 @@ class _FakeDataset:
 
 
 class _FakeApi:
-    Access_Type = type("Access_Type", (), {"READ_ONLY": "READ_ONLY"})
+    Access = type("Access", (), {"read_only": "read_only"})
 
     def __init__(self, values: list[float]) -> None:
         self._dataset = _FakeDataset(values)
@@ -491,3 +494,42 @@ def test_result_ack_builder_enforces_wire_budget() -> None:
     )
     assert ack.payload.get("error_code") == "result_too_large"
     assert "data" not in ack.payload
+
+
+@pytest.mark.skipif(importlib.util.find_spec("openpmd_api") is None, reason="openpmd_api not installed")
+def test_real_openpmd_series_roundtrip(tmp_path) -> None:
+    """Read a real openPMD series (guards against reader-API drift).
+
+    The optional reader is only importable in the ``[sim]`` environment, so
+    this is skipped offline.  It pins the component/iteration access that the
+    mocked unit tests cannot: 0.17 exposes components via record iteration
+    (not ``mesh.components``), a scalar mesh via a sentinel component, and an
+    unknown iteration as ``IndexError``.
+    """
+    import numpy as np
+    import openpmd_api as api
+
+    out = tmp_path / "simOutput"
+    out.mkdir()
+    series = api.Series(str(out / "fields.h5"), api.Access.create)
+    mesh = series.iterations[0].meshes["E"]
+    mesh["x"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [4]))
+    mesh["x"].store_chunk(np.array([1.0, 2.0, 3.0, 4.0]))
+    rho = series.iterations[0].meshes["rho"]
+    rho.reset_dataset(api.Dataset(api.Datatype.DOUBLE, [2]))
+    rho.store_chunk(np.array([5.0, 7.0]))
+    series.flush()
+    del series
+
+    def show(op, **kw: object):
+        return results.resolve_result(ResultParams(sim_id=SIM_ID, op=op, **kw), run_dir=tmp_path, sim_id=SIM_ID)
+
+    assert show(ResultOp.SLICE, path="fields.h5", record="E", component="x")["data"] == [1.0, 2.0, 3.0, 4.0]
+    # Component-less selection resolves the first component.
+    assert show(ResultOp.SLICE, path="fields.h5", record="E")["n_points"] == 4
+    # A scalar (componentless) mesh loads straight from the record.
+    assert show(ResultOp.STATS, path="fields.h5", record="rho")["stats"]["mean"] == pytest.approx(6.0)
+    # Unknown record/component/iteration are clean errors, not exceptions.
+    assert show(ResultOp.STATS, path="fields.h5", record="nope")["error_code"] == "no_results"
+    assert show(ResultOp.STATS, path="fields.h5", record="E", component="nope")["error_code"] == "no_results"
+    assert show(ResultOp.STATS, path="fields.h5", record="E", iteration=999)["error_code"] == "no_results"

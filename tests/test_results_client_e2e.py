@@ -88,8 +88,14 @@ async def test_describe_and_read_without_openpmd(tmp_path) -> None:
             _request("res12345", ResultOp.SLICE, seq=3, path="openPMD/sim_0000.bp", record="E"),
         )
         assert mesh is not None
-        # openPMD is not installed in the offline test env: clean degradation.
-        assert mesh.payload.get("error_code") in {"reader_unavailable", "result_failed:ResultsUnavailable"}
+        # The 4-byte fake is not a valid openPMD series: without the reader this
+        # is reader_unavailable, with it a clean no_results/reader error.  Never
+        # a crash.
+        assert mesh.payload.get("error_code") in {
+            "reader_unavailable",
+            "no_results",
+            "result_failed:ResultsUnavailable",
+        }
     finally:
         await sim_t.close()
 
