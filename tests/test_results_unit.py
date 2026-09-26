@@ -1,0 +1,442 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the results engine (:mod:`pic_agentic.results`).
+
+A fake ``simOutput`` tree is scanned directly; no cluster, transport or reader
+is required.  The optional openPMD dependency is monkeypatched where a code
+path must be exercised, so the suite passes with ``openpmd_api`` ABSENT.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+
+import pytest
+
+from pic_agentic import results
+from pic_agentic.protocol.simulation import SLICE_MAX_POINTS, ResultOp, ResultParams
+from pic_agentic.results import (
+    ResultsReaderError,
+    read_stats,
+    scan_output,
+)
+
+SIM_ID = "abcd1234"
+
+
+def _tree(tmp_path):
+    """Build a small fake output tree and return (simOutput, sizes)."""
+    out = tmp_path / "simOutput"
+    (out / "openPMD").mkdir(parents=True)
+    (out / "openPMD" / "fields.bp").write_bytes(b"b" * 100)
+    (out / "foo.txt").write_text("first\nsecond\nthird\nfourth\n")
+    (out / "bar.csv").write_text("a,b\n1,2\n")
+    (out / "adir").mkdir()
+    (out / "noext").write_bytes(b"z" * 7)
+    sizes = {
+        "openPMD/fields.bp": 100,
+        "foo.txt": (out / "foo.txt").stat().st_size,
+        "bar.csv": (out / "bar.csv").stat().st_size,
+        "noext": 7,
+    }
+    return out, sizes
+
+
+def _scan(out, local_root=""):
+    return scan_output(out, sim_id=SIM_ID, run_dir=str(out.parent), local_root=local_root)
+
+
+def test_scan_output_never_needs_reader_but_reports_it(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    manifest = _scan(out)
+    assert manifest.reader == results._reader_name()
+    if importlib.util.find_spec("openpmd_api") is None:
+        assert manifest.reader is None
+
+
+def test_scan_output_is_sorted_and_total_bytes_matches(tmp_path) -> None:
+    out, sizes = _tree(tmp_path)
+    manifest = _scan(out)
+    by_path = {ref.path: ref for ref in manifest.files}
+    assert set(by_path) == {*sizes, "adir", "openPMD"}
+    assert [ref.path for ref in manifest.files] == sorted(by_path)
+    assert manifest.total_bytes == sum(sizes.values())
+    assert by_path["adir"].size_bytes == 0
+    assert by_path["adir"].format == "dir"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("fields.bp", "openpmd-adios2"),
+        ("fields.h5", "openpmd-hdf5"),
+        ("fields.hdf5", "openpmd-hdf5"),
+        ("foo.txt", "text"),
+        ("bar.csv", "text"),
+        ("run.log", "text"),
+        ("noext", "binary"),
+        ("lib.so", "binary"),
+    ],
+)
+def test_scan_output_format_sniffing(tmp_path, name: str, expected: str) -> None:
+    out = tmp_path / "simOutput"
+    out.mkdir()
+    (out / name).write_bytes(b"x")
+    manifest = _scan(out)
+    assert manifest.files[0].format == expected
+
+
+def test_scan_output_uri_is_real_absolute(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    manifest = _scan(out)
+    ref = next(ref for ref in manifest.files if ref.path == "foo.txt")
+    assert ref.uri == (out / "foo.txt").resolve().as_uri()
+    assert ref.uri.startswith("file://")
+
+
+def test_scan_output_missing_dir_is_empty_manifest(tmp_path) -> None:
+    missing = tmp_path / "nope" / "simOutput"
+    manifest = scan_output(missing, sim_id=SIM_ID, run_dir=str(tmp_path))
+    assert manifest.output_dir is None
+    assert manifest.total_bytes == 0
+    assert manifest.files == []
+    assert manifest.readable_local is False
+
+
+def test_scan_output_readable_without_local_root(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    manifest = _scan(out)
+    assert manifest.readable_local is False
+    assert all(ref.readable is False for ref in manifest.files)
+
+
+def test_scan_output_readable_with_local_root(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    mirror = tmp_path / "mirror"
+    (mirror / SIM_ID / "simOutput").mkdir(parents=True)
+    (mirror / SIM_ID / "simOutput" / "foo.txt").write_text("mirrored\n")
+    manifest = _scan(out, local_root=str(mirror))
+    by_path = {ref.path: ref for ref in manifest.files}
+    assert manifest.readable_local is True
+    assert by_path["foo.txt"].readable is True
+    assert by_path["bar.csv"].readable is False
+    assert by_path["adir"].readable is False
+
+
+def _params(**kwargs: object) -> ResultParams:
+    return ResultParams(sim_id=SIM_ID, **kwargs)
+
+
+def test_resolve_read_tail_without_openpmd(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    payload = results.resolve_result(
+        _params(op=ResultOp.READ, path="foo.txt", tail=2),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["data"] == ["third", "fourth"]
+    assert payload["data_encoding"] == "text"
+    assert payload["n_points"] == 2
+    assert "error_code" not in payload
+
+
+def test_resolve_read_default_tail(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    payload = results.resolve_result(_params(op=ResultOp.READ, path="foo.txt"), run_dir=out.parent, sim_id=SIM_ID)
+    assert payload["data"] == ["first", "second", "third", "fourth"]
+
+
+def test_resolve_read_csv_is_text(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    payload = results.resolve_result(_params(op=ResultOp.READ, path="bar.csv"), run_dir=out.parent, sim_id=SIM_ID)
+    assert payload["data"] == ["a,b", "1,2"]
+
+
+def test_resolve_read_bp_is_reader_unavailable(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    payload = results.resolve_result(
+        _params(op=ResultOp.READ, path="openPMD/fields.bp"),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["error_code"] == "reader_unavailable"
+    assert "data" not in payload
+
+
+def test_resolve_read_missing_file_is_no_results(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    payload = results.resolve_result(_params(op=ResultOp.READ, path="absent.txt"), run_dir=out.parent, sim_id=SIM_ID)
+    assert payload["error_code"] == "no_results"
+
+
+def test_resolve_describe_returns_manifest(tmp_path) -> None:
+    out, sizes = _tree(tmp_path)
+    payload = results.resolve_result(_params(op=ResultOp.DESCRIBE), run_dir=out.parent, sim_id=SIM_ID)
+    assert payload["manifest"]["sim_id"] == SIM_ID
+    assert payload["manifest"]["total_bytes"] == sum(sizes.values())
+
+
+def test_resolve_slice_reader_unavailable_without_openpmd(tmp_path, monkeypatch) -> None:
+    out, _ = _tree(tmp_path)
+    monkeypatch.setattr(results, "_reader_name", lambda: None)
+    payload = results.resolve_result(
+        _params(op=ResultOp.SLICE, path="openPMD/fields.bp", record="E"),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["error_code"] == "reader_unavailable"
+
+
+def test_resolve_slice_prereader_reports_unavailable(tmp_path) -> None:
+    """On the reader-absent host even a missing output is reader_unavailable."""
+    payload = results.resolve_result(_params(op=ResultOp.SLICE), run_dir=tmp_path, sim_id=SIM_ID)
+    assert payload["error_code"] == "reader_unavailable"
+
+
+def test_resolve_slice_no_output_is_no_results(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    payload = results.resolve_result(_params(op=ResultOp.SLICE), run_dir=tmp_path, sim_id=SIM_ID)
+    assert payload["error_code"] == "no_results"
+
+
+class _FakeValues:
+    def __init__(self, values: list[float]) -> None:
+        self._values = values
+
+    def reshape(self, *_shape: object) -> list[float]:
+        return self._values
+
+
+class _FakeMesh:
+    def __init__(self, comps: dict[str, object]) -> None:
+        self._comps = comps
+
+    @property
+    def components(self) -> list[str]:
+        return list(self._comps)
+
+    def __getitem__(self, key: str) -> object:
+        return self._comps[key]
+
+
+class _FakeStep:
+    def __init__(self, meshes: dict[str, object]) -> None:
+        self.meshes = meshes
+
+    def __getitem__(self, key: str) -> object:
+        return self.meshes[key]
+
+
+class _FakeIterations:
+    def __init__(self, steps: dict[int, object]) -> None:
+        self._steps = steps
+
+    def __iter__(self) -> object:
+        return iter(self._steps)
+
+    def __getitem__(self, key: int) -> object:
+        return self._steps[key]
+
+
+class _FakeSeries:
+    def __init__(self, steps: dict[int, object]) -> None:
+        self.iterations = _FakeIterations(steps)
+
+    def flush(self) -> None:
+        pass
+
+
+class _FakeDataset:
+    def __init__(self, values: list[float]) -> None:
+        self._values = values
+
+    def load_chunk(self) -> _FakeValues:
+        return _FakeValues(self._values)
+
+
+class _FakeApi:
+    Access_Type = type("Access_Type", (), {"READ_ONLY": "READ_ONLY"})
+
+    def __init__(self, values: list[float]) -> None:
+        self._dataset = _FakeDataset(values)
+
+    def Series(self, path: object, access: object) -> _FakeSeries:  # ruff: ignore[invalid-function-name]
+        _ = (path, access)
+        return _FakeSeries({0: _FakeStep({}), 10: _FakeStep({"E": _FakeMesh({"x": self._dataset})})})
+
+
+def _fake_api(values: list[float]) -> _FakeApi:
+    return _FakeApi(values)
+
+
+def test_resolve_slice_hard_caps_points(tmp_path, monkeypatch) -> None:
+    out, _ = _tree(tmp_path)
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    monkeypatch.setattr(results, "_import_openpmd", lambda: _fake_api(list(range(SLICE_MAX_POINTS * 2 + 5))))
+    payload = results.resolve_result(
+        _params(op=ResultOp.SLICE, path="openPMD/fields.bp", record="E", component="x"),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["n_points"] == SLICE_MAX_POINTS
+    assert len(payload["data"]) == SLICE_MAX_POINTS
+
+
+def test_resolve_slice_downsample_applied(tmp_path, monkeypatch) -> None:
+    out, _ = _tree(tmp_path)
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    monkeypatch.setattr(results, "_import_openpmd", lambda: _fake_api(list(range(20))))
+    payload = results.resolve_result(
+        _params(op=ResultOp.SLICE, path="openPMD/fields.bp", record="E", component="x", downsample=5),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["data"] == [0.0, 5.0, 10.0, 15.0]
+    assert payload["n_points"] == 4
+
+
+def test_resolve_slice_too_large_budget(tmp_path, monkeypatch) -> None:
+    out, _ = _tree(tmp_path)
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    monkeypatch.setattr(results, "_import_openpmd", lambda: _fake_api(list(range(1000))))
+    monkeypatch.setattr(results, "MAX_RESULT_BYTES", 32)
+    payload = results.resolve_result(
+        _params(op=ResultOp.SLICE, path="openPMD/fields.bp", record="E", component="x"),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["error_code"] == "result_too_large"
+    assert "data" not in payload
+
+
+def test_resolve_stats_with_fake_reader(tmp_path, monkeypatch) -> None:
+    out, _ = _tree(tmp_path)
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    monkeypatch.setattr(results, "_import_openpmd", lambda: _fake_api([1.0, 2.0, 3.0]))
+    payload = results.resolve_result(
+        _params(op=ResultOp.STATS, path="openPMD/fields.bp", record="E", component="x"),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["stats"]["min"] == pytest.approx(1.0)
+    assert payload["stats"]["max"] == pytest.approx(3.0)
+    assert payload["stats"]["mean"] == pytest.approx(2.0)
+
+
+def test_read_stats_unknown_record_raises(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    monkeypatch.setattr(results, "_import_openpmd", lambda: _fake_api([1.0]))
+    with pytest.raises(ResultsReaderError):
+        read_stats(tmp_path / "fields.bp", record="missing")
+
+
+@pytest.mark.skipif(importlib.util.find_spec("PIL") is not None, reason="Pillow installed")
+def test_resolve_image_without_pillow_is_clean_error(tmp_path, monkeypatch) -> None:
+    out, _ = _tree(tmp_path)
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    monkeypatch.setattr(results, "_import_openpmd", lambda: _fake_api([1.0, 2.0]))
+    payload = results.resolve_result(
+        _params(op=ResultOp.IMAGE, path="openPMD/fields.bp", record="E", component="x"),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+    )
+    assert payload["error_code"] == "reader_unavailable"
+
+
+def test_resolve_export_unresolved_is_ticket_with_rsync(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    payload = results.resolve_result(_params(op=ResultOp.EXPORT), run_dir=out.parent, sim_id=SIM_ID)
+    ticket = payload["result"]
+    assert ticket["resolved"] is False
+    assert ticket["local_path"] is None
+    assert ticket["transfer"].startswith("rsync -a ")
+    assert str(out.resolve()) in ticket["transfer"]
+    assert ticket["ref"]["path"] == "adir"  # dirs sort before files, first entry
+
+
+def test_resolve_export_resolved_with_local_root(tmp_path) -> None:
+    out, _ = _tree(tmp_path)
+    mirror = tmp_path / "mirror"
+    (mirror / SIM_ID / "simOutput").mkdir(parents=True)
+    payload = results.resolve_result(
+        _params(op=ResultOp.EXPORT),
+        run_dir=out.parent,
+        sim_id=SIM_ID,
+        local_root=str(mirror),
+    )
+    ticket = payload["result"]
+    assert ticket["resolved"] is True
+    assert ticket["local_path"] == str(mirror / SIM_ID / "simOutput")
+
+
+def test_resolve_export_empty_output_has_no_ref(tmp_path) -> None:
+    payload = results.resolve_result(_params(op=ResultOp.EXPORT), run_dir=tmp_path, sim_id=SIM_ID)
+    assert payload["result"]["ref"] is None
+
+
+async def test_follower_results_ready_carries_manifest(tmp_path) -> None:
+    """The follow hook attaches the light manifest to ``results.ready``."""
+    from pic_agentic.simclient.follow import JobFollower, TrackedSim
+    from pic_agentic.slurm import JobInfo, SlurmJobState
+
+    run_dir = tmp_path / "run"
+    (run_dir / "simOutput").mkdir(parents=True)
+    (run_dir / "simOutput" / "foo.txt").write_text("hello\n")
+    events: list[tuple[object, dict]] = []
+
+    async def emit(state: object, *, job_id: int | None = None, **fields: object) -> None:
+        events.append((state, {"job_id": job_id, **fields}))
+
+    follower = JobFollower(
+        sim=SIM_ID,
+        emit=emit,
+        tracked=TrackedSim(
+            sim_id=SIM_ID, cmd_id="c", job_id=1, run_dir=str(run_dir), stdout_path=None, submit_system="sbatch"
+        ),
+        job_info=None,  # type: ignore[arg-type]
+    )
+    info = JobInfo(job_id=1, state=SlurmJobState.COMPLETED, exit_code=0)
+    await follower._emit_terminal(info)
+
+    ready = next(fields for state, fields in events if fields.get("manifest") is not None)
+    manifest = ready["manifest"]
+    assert manifest["sim_id"] == SIM_ID
+    assert any(ref["path"] == "foo.txt" for ref in manifest["files"])
+
+
+async def test_follower_hook_is_guarded_when_engine_missing(monkeypatch, tmp_path) -> None:
+    """A scan failure is swallowed: following still emits the plain event."""
+    import builtins
+
+    from pic_agentic.simclient.follow import JobFollower, TrackedSim
+    from pic_agentic.slurm import JobInfo, SlurmJobState
+
+    run_dir = tmp_path / "run"
+    (run_dir / "simOutput").mkdir(parents=True)
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pic_agentic.results":
+            msg = "engine not merged"
+            raise ImportError(msg)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    events: list[tuple[object, dict]] = []
+
+    async def emit(state: object, *, job_id: int | None = None, **fields: object) -> None:
+        events.append((state, {"job_id": job_id, **fields}))
+
+    follower = JobFollower(
+        sim=SIM_ID,
+        emit=emit,
+        tracked=TrackedSim(
+            sim_id=SIM_ID, cmd_id="c", job_id=1, run_dir=str(run_dir), stdout_path=None, submit_system="sbatch"
+        ),
+        job_info=None,  # type: ignore[arg-type]
+    )
+    info = JobInfo(job_id=1, state=SlurmJobState.COMPLETED, exit_code=0)
+    await follower._emit_terminal(info)
+    assert "manifest" not in events[-1][1]
