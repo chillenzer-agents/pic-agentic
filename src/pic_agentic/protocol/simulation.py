@@ -186,6 +186,9 @@ class ResultOp(StrEnum):
     IMAGE = "image"
     EXPORT = "export"
     READ = "read"
+    #: Milestone A: compose the RO-Crate + pypicongpu metadata + a deterministic
+    #: ``answer`` summary (no LLM call) for one run.
+    ANALYZE = "analyze"
 
 
 #: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
