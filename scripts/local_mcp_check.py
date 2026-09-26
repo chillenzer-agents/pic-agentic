@@ -34,6 +34,9 @@ Modes:
 
 * ``--describe --sim-id <id>`` prints the M3 results manifest summary.
 
+* ``--analyze --sim-id <id> [--query <text>]`` prints the milestone-A analysis
+  sections (RO-Crate, redacted metadata, openPMD summary, deterministic answer).
+
 * ``--read --sim-id <id> [--result-path <rel>] [--stream {stdout,stderr}]
   [--tail N]`` prints the returned text lines.
 
@@ -60,6 +63,7 @@ Usage::
     python scripts/local_mcp_check.py --control checkpoint --sim-id <id>
     python scripts/local_mcp_check.py --wait-results --sim-id <id>
     python scripts/local_mcp_check.py --describe --sim-id <id>
+    python scripts/local_mcp_check.py --analyze --sim-id <id> --query spect
     python scripts/local_mcp_check.py --read --sim-id <id> --stream stdout --tail 50
     python scripts/local_mcp_check.py --slice --sim-id <id> --record E --component z
     python scripts/local_mcp_check.py --export --sim-id <id>
@@ -439,6 +443,29 @@ def cmd_control(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Call ``analyze_output`` and print the composed analysis sections.
+
+    Milestone A live test: exercises the RO-Crate / pypicongpu-metadata /
+    openPMD-summary readers on the cluster side and the deterministic answer.
+
+    Returns:
+        The process exit code (non-zero if ``ok`` is false).
+
+    """
+    state = _load_state(args)
+    arguments: dict = {"sim_id": args.sim_id}
+    if args.query:
+        arguments["query"] = args.query
+    result = _result_tool_call(state, "analyze_output", arguments)
+    if not result.get("ok", True):
+        print(json.dumps(result, indent=2, default=str), flush=True)
+        print("\nFAILED: analyze_output returned an error.", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0
+
+
 def cmd_describe(args: argparse.Namespace) -> int:
     """Call ``describe_results`` and print the manifest summary.
 
@@ -676,6 +703,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="call an M3 control tool for --sim-id",
     )
     mode.add_argument("--describe", action="store_true", help="call describe_results and print the manifest summary")
+    mode.add_argument("--analyze", action="store_true", help="call analyze_output and print the analysis sections")
     mode.add_argument("--read", action="store_true", help="call read_result for one sim")
     mode.add_argument("--slice", action="store_true", help="call get_result_slice for one sim")
     mode.add_argument("--export", action="store_true", help="call export_results for one sim")
@@ -686,6 +714,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sim-id", default="", help="sim_id for the per-sim reporting/control/result modes")
     parser.add_argument("--events", action="store_true", help="with --status: return get_events instead")
     parser.add_argument("--stream", default="stdout", help="log stream for --logs/--read")
+    parser.add_argument("--query", default="", help="free-text query for --analyze")
     parser.add_argument("--tail", type=int, default=100, help="log lines for --logs")
     parser.add_argument("--result-path", default="", help="relative result path for --read")
     parser.add_argument("--record", default="", help="openPMD record name for --slice")
@@ -731,6 +760,7 @@ def main() -> None:
         (args.logs, cmd_logs),
         (bool(args.control), cmd_control),
         (args.describe, cmd_describe),
+        (args.analyze, cmd_analyze),
         (args.read, cmd_read),
         (args.slice, cmd_slice),
         (args.export, cmd_export),
