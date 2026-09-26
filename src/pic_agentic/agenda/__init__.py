@@ -18,6 +18,7 @@ from pic_agentic.agenda.budget import (
 )
 from pic_agentic.agenda.cwl import dump_cwl_workflow, to_cwl_workflow
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim, AgendaSweep, validate_entry_name
+from pic_agentic.agenda.planner import PlanStep, account, apply_states, next_actions
 from pic_agentic.agenda.store import AgendaStore
 
 __all__ = [
@@ -28,9 +29,13 @@ __all__ = [
     "Budget",
     "BudgetExceededError",
     "BudgetUsage",
+    "PlanStep",
     "ResourceRequest",
+    "account",
+    "apply_states",
     "check_admission",
     "dump_cwl_workflow",
+    "next_actions",
     "to_cwl_workflow",
     "validate_entry_name",
 ]
