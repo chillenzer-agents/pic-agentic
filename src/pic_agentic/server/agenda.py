@@ -184,6 +184,87 @@ class AgendaService:
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": path, "approved": True}
 
+    def take_callbacks(self) -> dict[str, Any]:
+        """Return and durably clear the pending decision-point callbacks.
+
+        An MCP server cannot call the LLM, so "callbacks" are pollable records:
+        the agent drains them here and decides what to do next.  Draining is
+        idempotent in effect -- a second call returns an empty list, and the
+        clear is persisted atomically so a restart cannot resurrect them.
+
+        Returns:
+            ``{"ok": True, "callbacks": [...]}``, or a soft error.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        try:
+            campaign = self.store.load(Campaign)
+            drained = list(campaign.callbacks)
+            if drained:
+                self.store.save(campaign.model_copy(update={"callbacks": []}))
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            log.warning("agenda take_callbacks failed: %s", exc)
+            return {"ok": False, "error": self.config.redact(str(exc))}
+        return {"ok": True, "callbacks": [callback.model_dump() for callback in drained]}
+
+    def add_leaf(
+        self,
+        name: str,
+        spec: dict[str, Any],
+        *,
+        point: dict[str, float | int | str] | None = None,
+        depends_on: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Add one leaf to the persisted campaign's root group (agent expansion).
+
+        This is the agent's refinement primitive: after draining a ``done``
+        callback it may add a new simulation (e.g. a refined sweep point) that
+        the next tick will submit.  A duplicate name is a soft error.
+
+        Args:
+            name: The new leaf's entry name.
+            spec: The leaf's Runner spec.
+            point: Optional sweep point recorded on the leaf.
+            depends_on: Optional sibling dependencies.
+
+        Returns:
+            ``{"ok": True, "path": name}``, or a soft error.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        try:
+            return self._add_leaf(name, spec, point=point, depends_on=depends_on)
+        except ValueError as exc:
+            # A duplicate/illegal name is a model-level ValueError: report it as
+            # data, not a tool exception.
+            return {"ok": False, "error": "duplicate_leaf", "detail": self.config.redact(str(exc)), "path": name}
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            log.warning("agenda add_leaf failed: %s", exc)
+            return {"ok": False, "error": self.config.redact(str(exc))}
+
+    def _add_leaf(
+        self,
+        name: str,
+        spec: dict[str, Any],
+        *,
+        point: dict[str, float | int | str] | None,
+        depends_on: list[str] | None,
+    ) -> dict[str, Any]:
+        """Load, add the leaf and save (may raise).
+
+        Returns:
+            ``{"ok": True, "path": name}``.
+
+        """
+        campaign = self.store.load(Campaign)
+        agenda = campaign.agenda.add_sim(name=name, spec=spec, point=point)
+        if depends_on:
+            agenda.entries[name].depends_on = list(depends_on)
+        self.store.save(campaign.model_copy(update={"agenda": agenda}))
+        return {"ok": True, "path": name}
+
 
 def _policy_from_config(config: Config) -> EnginePolicy:
     """Derive the engine policy from the server configuration.
