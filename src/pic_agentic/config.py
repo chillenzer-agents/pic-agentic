@@ -45,6 +45,7 @@ ENV_MAP = {
     "cluster_template_dir": "PIC_AGENTIC_CLUSTER_TEMPLATE_DIR",
     "cluster_preset": "PIC_AGENTIC_CLUSTER_PRESET",
     "sim_setup_root": "PIC_AGENTIC_SIM_SETUP_ROOT",
+    "results_root": "PIC_AGENTIC_RESULTS_ROOT",
 }
 
 REDACTED = "[REDACTED]"
@@ -98,6 +99,11 @@ class Config(BaseModel):
     #: Base directory on the shared file system under which the simclient
     #: creates per-simulation ``input``/``run`` directories.
     sim_setup_root: str = ""
+    #: Optional local mirror of a run's ``simOutput`` on the server host.  When
+    #: set, the result tools mark a ``ResultRef``/``ResultManifest`` as
+    #: ``readable``/``readable_local`` iff ``<results_root>/<sim_id>/simOutput``
+    #: resolves there.  The server never moves data (design section 4).
+    results_root: str = ""
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

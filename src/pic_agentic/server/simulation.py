@@ -27,11 +27,17 @@ from pydantic import BaseModel, ConfigDict, computed_field
 
 from pic_agentic.protocol.simulation import (
     LOG_STREAMS,
+    ControlParams,
+    ResultOp,
+    ResultParams,
+    SimulationOp,
     SimulationPayload,
     SimulationState,
     SimulationType,
     SubmitParams,
+    build_control_command,
     build_logs_command,
+    build_result_command,
     build_status_command,
     build_submit_command,
 )
@@ -65,6 +71,8 @@ MAX_EVENT_PAGE = 200
 _PULL_ACK_FOR_REQUEST: dict[SimulationType, SimulationType] = {
     SimulationType.STATUS_COMMAND: SimulationType.STATUS_ACK,
     SimulationType.LOGS_COMMAND: SimulationType.LOGS_ACK,
+    SimulationType.CONTROL_COMMAND: SimulationType.CONTROL_ACK,
+    SimulationType.RESULT_COMMAND: SimulationType.RESULT_ACK,
 }
 
 #: Fields projected from an event/ack payload into a :class:`SimRecord` when the
@@ -198,6 +206,7 @@ class SubmitService:
         ack_timeout_s: float = 90.0,
         runner_dump_builder: RunnerDumpBuilder = build_runner_dump,
         event_log_max: int = DEFAULT_EVENT_LOG_MAX,
+        results_root: str = "",
     ) -> None:
         """Create a service for one simulation.
 
@@ -209,6 +218,8 @@ class SubmitService:
             ack_timeout_s: Maximum wait for an ack (submit and pull).
             runner_dump_builder: Subprocess runner-dump builder (test seam).
             event_log_max: Maximum retained lifecycle events.
+            results_root: Optional local mirror of a run's ``simOutput`` used
+                for the contract-4 ``readable`` check; never moved from.
 
         """
         self.sim = sim
@@ -218,6 +229,7 @@ class SubmitService:
         self.ack_timeout_s = ack_timeout_s
         self.runner_dump_builder = runner_dump_builder
         self.event_log_max = event_log_max
+        self.results_root = results_root
         self.sequences = SequenceState()
         self._pending: dict[str, asyncio.Future[RcpMessage]] = {}
         #: Pending status/logs pulls, keyed by cmd_id, and the ack type each
@@ -287,7 +299,12 @@ class SubmitService:
             self._append_event_log(message)
             self._project_event(message)
             return
-        if message.kind is Kind.ACK and message.type in {SimulationType.STATUS_ACK, SimulationType.LOGS_ACK}:
+        if message.kind is Kind.ACK and message.type in {
+            SimulationType.STATUS_ACK,
+            SimulationType.LOGS_ACK,
+            SimulationType.CONTROL_ACK,
+            SimulationType.RESULT_ACK,
+        }:
             # Match the ack's *kind* to the pending request, not just its
             # cmd_id: a mis-routed ``logs_ack`` carrying a status request's
             # cmd_id must not resolve the status future.
@@ -584,6 +601,102 @@ class SubmitService:
                 cmd_id=cmd_id,
             ),
         )
+
+    async def control(self, send: SendFn, sim_id: str, op: SimulationOp) -> dict[str, Any]:
+        """Send a control request and await its ack.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            sim_id: The simulation to control.
+            op: The control verb (checkpoint/stop/cancel).
+
+        Returns:
+            The ``control_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
+
+        """
+        params = ControlParams(sim_id=sim_id, op=op)
+        return await self._fetch(
+            send,
+            sim_id,
+            lambda cmd_id: build_control_command(
+                sim=self.sim,
+                seq=self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER),
+                params=params,
+                cmd_id=cmd_id,
+            ),
+        )
+
+    async def fetch_result(self, send: SendFn, params: ResultParams) -> dict[str, Any]:
+        """Send a results request and await its ack.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            params: The validated result request (op plus its knobs).
+
+        Returns:
+            The ``result_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
+
+        """
+        sim_id = params.sim_id
+        payload = await self._fetch(
+            send,
+            sim_id,
+            lambda cmd_id: build_result_command(
+                sim=self.sim,
+                seq=self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER),
+                params=params,
+                cmd_id=cmd_id,
+            ),
+        )
+        self._mark_readable(sim_id, payload)
+        return payload
+
+    async def fetch_manifest(self, send: SendFn, sim_id: str) -> dict[str, Any]:
+        """Send a ``describe`` result request and await its ack.
+
+        Convenience wrapper over :meth:`fetch_result` for the common manifest
+        pull.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            sim_id: The simulation to describe.
+
+        Returns:
+            The ``result_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
+
+        """
+        return await self.fetch_result(send, ResultParams(sim_id=sim_id, op=ResultOp.DESCRIBE))
+
+    def _mark_readable(self, sim_id: str, payload: dict[str, Any]) -> None:
+        """Annotate a result ack with the contract-4 local-mirror readability.
+
+        When ``results_root`` is configured and
+        ``results_root/<sim_id>/simOutput/<path>`` exists, the corresponding
+        ``ResultRef.readable`` (and ``ResultManifest.readable_local``) are set.
+        This is a pure existence check: no data is moved and nothing outside
+        the mirror is touched.
+
+        Args:
+            sim_id: The simulation the ack belongs to.
+            payload: The ``result_ack`` payload, updated in place.
+
+        """
+        if not self.results_root:
+            return
+        base = Path(self.results_root).expanduser() / sim_id / "simOutput"
+        manifest = payload.get("manifest")
+        if isinstance(manifest, dict):
+            manifest["readable_local"] = base.is_dir()
+            files = manifest.get("files")
+            if isinstance(files, list):
+                for ref in files:
+                    if isinstance(ref, dict) and isinstance(ref.get("path"), str):
+                        ref["readable"] = (base / ref["path"]).exists()
+        result = payload.get("result")
+        if isinstance(result, dict):
+            for ref in (result, result.get("ref")):
+                if isinstance(ref, dict) and isinstance(ref.get("path"), str):
+                    ref["readable"] = (base / ref["path"]).exists()
 
     async def _fetch(self, send: SendFn, sim_id: str, build: Callable[[str], RcpMessage]) -> dict[str, Any]:
         """Sign, send and await one request/response pull.
