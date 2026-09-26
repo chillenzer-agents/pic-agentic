@@ -188,6 +188,8 @@ class AgendaSim(BaseModel):
     sim_id: str | None = None
     #: Whether this leaf must be approved before the engine submits it.
     requires_approval: bool = False
+    #: Whether a human has pre-approved this leaf (set by the approval tool).
+    approved: bool = False
 
     @field_validator("name")
     @classmethod

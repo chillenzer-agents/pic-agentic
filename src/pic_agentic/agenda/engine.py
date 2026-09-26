@@ -12,6 +12,13 @@ therefore resumes exactly where the last tick stopped -- that is what lets a
 campaign survive MCP-server restarts, and what makes a tick idempotent (a leaf
 that already carries a ``sim_id`` is never submitted again).
 
+Submission is **exactly-once even across a lost acknowledgement**: each leaf is
+submitted under a deterministic idempotency key derived from the campaign name,
+the leaf path and a hash of its spec, so a retry after a crash re-uses the same
+cluster-side command id and the simclient replays the original ack instead of
+running a second job.  The campaign is also saved *incrementally* (right after
+each submission), so a crash mid-tick never loses the leaves already accepted.
+
 This module is transport- and protocol-agnostic: submission and observation are
 injected callables.  It imports only the agenda model/budget/planner/campaign
 layers plus stdlib and pydantic.
@@ -29,14 +36,22 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.agenda.budget import Budget, BudgetUsage
 from pic_agentic.agenda.campaign import Campaign
-from pic_agentic.agenda.planner import PlanStep, account, apply_states, next_actions
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim
+from pic_agentic.agenda.planner import (
+    PlanStep,
+    account,
+    apply_states,
+    next_actions,
+    resource_request_from_spec,
+)
 
 if TYPE_CHECKING:
-    from pic_agentic.agenda.model import AgendaGroup
     from pic_agentic.agenda.store import AgendaStore
 
-#: Async ``spec -> sim_id`` submission callable.
-SubmitFn = Callable[[dict[str, Any]], Awaitable[str]]
+#: Async ``(spec, idempotency_key) -> sim_id`` submission callable.  The key is
+#: stable across retries so a lost ack re-uses the same cluster-side command id
+#: (exactly-once at the cluster, not merely at-most-once here).
+SubmitFn = Callable[[dict[str, Any], str], Awaitable[str]]
 
 #: ``() -> {sim_id: state}`` observation callable.
 ObserveFn = Callable[[], Mapping[str, str]]
@@ -45,6 +60,20 @@ log = logging.getLogger(__name__)
 
 #: A leaf status that still requires engine action.
 _ACTIVE_STATUSES = frozenset({"planned", "submitted", "running"})
+
+#: Leaf statuses that count as an in-flight job for the concurrency cap.
+_RUNNING_STATUSES = frozenset({"submitted", "running"})
+
+
+class DuplicateSpecError(RuntimeError):
+    """Raised when two leaves carry identical specs (they would collide).
+
+    A simulation's ``sim_id`` is derived from the payload hash, so two leaves
+    with byte-identical specs collapse into one cluster job and one registry
+    record -- the observation of the second silently drives the first.  Replicas
+    must therefore be made distinct (the driver injects a per-replica tag);
+    submitting an identical spec is refused loudly instead.
+    """
 
 
 class EnginePolicy(BaseModel):
@@ -97,7 +126,7 @@ class AgendaEngine:
                 file; callers use :data:`~pic_agentic.agenda.store.
                 DEFAULT_CAMPAIGN_FILE`).
             budget: Hard caps overriding the campaign's stored budget.
-            submit: Async ``spec -> sim_id`` submission callable.
+            submit: Async ``(spec, idempotency_key) -> sim_id`` callable.
             observe: ``() -> {sim_id: state}`` observation callable.
             policy: Engine limits/gates.
             approve: Optional ``path -> bool`` pre-approval predicate.
@@ -120,22 +149,37 @@ class AgendaEngine:
         campaign = self.store.load(Campaign).with_created_ts()
         budget = self.budget_override or campaign.budget
         campaign, steps = self._plan(campaign, budget)
-        attempted = 0
+        # Persist the folded observation before submitting anything: progress
+        # observed in this tick survives a crash before the first submission,
+        # and the incremental saves below lock in each accepted leaf.
+        self.store.save(campaign)
         result = TickResult()
+        in_flight = campaign.usage.jobs_running
+        concurrency_cap = budget.max_concurrent_jobs
         for path, step in steps:
-            if step.action == "submit":
-                if attempted >= self.policy.max_submits_per_tick:
-                    result.waiting.append(path)
-                    continue
-                if not self._may_submit(step):
-                    result.pending_approval.append(path)
-                    continue
-                campaign = await self._do_submit(campaign, path, step)
-                result.submitted.append(path)
-                attempted += 1
-            else:
+            if step.action != "submit":
                 campaign = self._persist_terminal(campaign, path, step.action)
                 _bucket(result, path, step.action)
+                continue
+            if len(result.submitted) >= self.policy.max_submits_per_tick:
+                result.waiting.append(path)
+                continue
+            if concurrency_cap is not None and in_flight >= concurrency_cap:
+                # The planner threads a *running* usage through the batch, but
+                # it does not accrue jobs_running per emitted submit; enforce
+                # the concurrency headroom here so one tick cannot over-fill.
+                result.waiting.append(path)
+                continue
+            leaf = leaf_at(campaign.agenda, path)
+            if not self._may_submit(leaf, step):
+                result.pending_approval.append(path)
+                continue
+            campaign = await self._do_submit(campaign, path, step)
+            # Incremental persistence: a crash after this point must not
+            # resubmit the leaf (the next tick sees its recorded sim_id).
+            self.store.save(campaign)
+            result.submitted.append(path)
+            in_flight += 1
         result.complete = _is_complete(campaign.agenda)
         result.usage = campaign.usage
         self.store.save(campaign)
@@ -157,7 +201,7 @@ class AgendaEngine:
         if action not in {"failed", "done"}:
             return campaign
         agenda = campaign.agenda.model_copy(deep=True)
-        leaf = _leaf_by_path(agenda, path)
+        leaf = leaf_at(agenda, path)
         if leaf is None or leaf.status in {"failed", "done"}:
             return campaign
         leaf.status = action
@@ -168,7 +212,9 @@ class AgendaEngine:
 
         The folded agenda is written back into the returned campaign so that a
         tick persists observed progress (not only new submissions); otherwise
-        ``complete``/``done`` could never be reached.
+        ``complete``/``done`` could never be reached.  ``jobs_running`` is
+        recomputed from the observed in-flight leaves so the concurrency cap
+        reflects reality across ticks.
 
         Returns:
             The campaign with the folded agenda, and ``(path, step)`` pairs in
@@ -179,11 +225,18 @@ class AgendaEngine:
         by_sim = {sim.sim_id: path for path, sim in campaign.agenda.simulations() if sim.sim_id}
         path_states = {by_sim[sim_id]: state for sim_id, state in observed.items() if sim_id in by_sim}
         agenda = apply_states(campaign.agenda, path_states)
-        steps = next_actions(agenda, {}, budget=budget, usage=campaign.usage)
-        return campaign.model_copy(update={"agenda": agenda}), [(s.path, s) for s in steps]
+        in_flight = sum(1 for _, sim in agenda.simulations() if sim.status in _RUNNING_STATUSES)
+        usage = campaign.usage.model_copy(update={"jobs_running": in_flight})
+        steps = next_actions(agenda, {}, budget=budget, usage=usage)
+        return campaign.model_copy(update={"agenda": agenda, "usage": usage}), [(s.path, s) for s in steps]
 
-    def _may_submit(self, step: PlanStep) -> bool:
+    def _may_submit(self, leaf: AgendaSim | None, step: PlanStep) -> bool:
         """Whether the policy gates allow submitting ``step`` right now.
+
+        A leaf pre-approved either through the injected predicate or through its
+        persisted ``approved`` flag (set by the ``approve_agenda_leaf`` tool) is
+        always allowed; otherwise ``require_approval``, a per-leaf
+        ``requires_approval`` and the estimated-core-hours threshold each gate.
 
         Returns:
             True when the step may be submitted.
@@ -191,36 +244,44 @@ class AgendaEngine:
         """
         if self.approve is not None and self.approve(step.path):
             return True
-        if self.policy.require_approval:
+        if leaf is not None and leaf.approved:
+            return True
+        if (leaf is not None and leaf.requires_approval) or self.policy.require_approval:
             return False
         threshold = self.policy.approve_over_est_core_hours
-        if threshold is not None:
-            est = float(step.spec.get("resources", {}).get("est_core_hours", 0.0)) if step.spec else 0.0
-            if est > threshold:
-                return False
-        return True
+        return threshold is None or resource_request_from_spec(step.spec).est_core_hours <= threshold
 
     async def _do_submit(self, campaign: Campaign, path: str, step: PlanStep) -> Campaign:
         """Submit one leaf, record its sim_id and accrue usage.
+
+        The submission carries a deterministic idempotency key so a retried
+        submit after a lost ack re-uses the same cluster-side command id and the
+        simclient replays the original ack (exactly-once).
 
         Returns:
             The updated campaign (a new object; the input is not mutated).
 
         """
-        sim_id = await self.submit(step.spec)
+        _reject_duplicate_spec(campaign, path, step)
+        key = _idempotency_key(campaign, path, step)
+        sim_id = await self.submit(step.spec, key)
         agenda = campaign.agenda.model_copy(deep=True)
-        leaf = _leaf_by_path(agenda, path)
+        leaf = leaf_at(agenda, path)
         if leaf is not None:
             leaf.sim_id = sim_id
             leaf.status = "submitted"
-        resources = step.spec.get("resources", {}) if step.spec else {}
+        request = resource_request_from_spec(step.spec)
         usage = account(
             campaign.usage,
             step,
-            core_hours=float(resources.get("est_core_hours", 0.0)),
-            gpu_hours=float(resources.get("est_gpu_hours", 0.0)),
-            is_gpu=bool(resources.get("is_gpu", False)),
+            core_hours=request.est_core_hours,
+            gpu_hours=request.est_gpu_hours,
+            is_gpu=request.is_gpu,
         )
+        # A freshly accepted job is in flight until an observation says
+        # otherwise; the next tick recomputes jobs_running from the registry
+        # (the authoritative source), so this is only the between-ticks view.
+        usage = usage.model_copy(update={"jobs_running": usage.jobs_running + 1})
         return campaign.model_copy(update={"agenda": agenda, "usage": usage})
 
     def status(self) -> dict[str, Any]:
@@ -236,7 +297,14 @@ class AgendaEngine:
         for path, sim in campaign.agenda.simulations():
             counts[sim.status] = counts.get(sim.status, 0) + 1
             leaves.append(
-                {"path": path, "status": sim.status, "sim_id": sim.sim_id, "point": sim.point},
+                {
+                    "path": path,
+                    "status": sim.status,
+                    "sim_id": sim.sim_id,
+                    "point": sim.point,
+                    "requires_approval": sim.requires_approval,
+                    "approved": sim.approved,
+                },
             )
         return {
             "name": campaign.name,
@@ -269,9 +337,28 @@ class AgendaEngine:
             "name": campaign.name,
             "created_ts": campaign.created_ts,
             "complete": _is_complete(campaign.agenda),
+            "revision": _revision(campaign),
             "usage": campaign.usage.model_dump(),
             "leaves": leaves,
         }
+
+
+def leaf_at(agenda: AgendaGroup, path: str) -> AgendaSim | None:
+    """Return the leaf at ``path`` (``a/b/c``), or None.
+
+    Returns:
+        The :class:`~pic_agentic.agenda.model.AgendaSim`, or None when absent
+        (or when ``path`` names a group).
+
+    """
+    node: Any = agenda
+    parts = path.split("/")
+    for name in parts[:-1]:
+        node = getattr(node, "entries", {}).get(name)
+        if not isinstance(node, AgendaGroup):
+            return None
+    leaf = node.entries.get(parts[-1]) if isinstance(node, AgendaGroup) else None
+    return leaf if isinstance(leaf, AgendaSim) else None
 
 
 def _bucket(result: TickResult, path: str, action: str) -> None:
@@ -298,20 +385,40 @@ def _is_complete(agenda: AgendaGroup) -> bool:
     return all(sim.status not in _ACTIVE_STATUSES for _, sim in agenda.simulations())
 
 
-def _leaf_by_path(agenda: AgendaGroup, path: str) -> Any:
-    """Return the leaf at ``path`` (``a/b/c``), or None.
+def _reject_duplicate_spec(campaign: Campaign, path: str, step: PlanStep) -> None:
+    """Refuse an already-submitted identical spec (sim_id collision).
 
-    Returns:
-        The :class:`~pic_agentic.agenda.model.AgendaSim`, or None when absent.
+    Raises:
+        DuplicateSpecError: If ``step``'s spec matches an already-submitted
+            leaf's spec.
 
     """
-    node: Any = agenda
-    parts = path.split("/")
-    for name in parts[:-1]:
-        node = node.entries.get(name)
-        if node is None:
-            return None
-    return node.entries.get(parts[-1])
+    digest = _spec_hash(step.spec)
+    for other_path, sim in campaign.agenda.simulations():
+        if other_path == path or not sim.sim_id:
+            continue
+        if _spec_hash(sim.spec) == digest:
+            msg = (
+                f"duplicate spec at {path!r} and {other_path!r}: identical payloads map to the same "
+                "sim_id and would collapse into one job; make replicas distinct (e.g. per-replica tag)"
+            )
+            raise DuplicateSpecError(msg)
+
+
+def _idempotency_key(campaign: Campaign, path: str, step: PlanStep) -> str:
+    """Return the stable, collision-free command id for one leaf submission.
+
+    The key is a pure function of the persisted campaign data, so a fresh engine
+    after a restart derives the same key and the simclient replays its recorded
+    ack.  The spec hash is folded in so a *changed* spec is a genuinely new
+    command (and therefore a new job), while a retry of the same spec is not.
+
+    Returns:
+        A 32-character lowercase hex command id.
+
+    """
+    seed = f"{campaign.name}\x00{path}\x00{_spec_hash(step.spec)}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
 def _spec_hash(spec: Mapping[str, Any]) -> str:
@@ -325,4 +432,31 @@ def _spec_hash(spec: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-__all__ = ["AgendaEngine", "EnginePolicy", "ObserveFn", "SubmitFn", "TickResult"]
+def _revision(campaign: Campaign) -> str | None:
+    """Return the pinned revision carried by the campaign's specs, if uniform.
+
+    A spec may carry a ``provenance`` mapping (the server injects it into the
+    wire payload); the campaign report surfaces a single revision when every
+    leaf agrees on one, so the lineage record names the revision of the runs.
+
+    Returns:
+        The shared ``picongpu_revision``, or None when absent or mixed.
+
+    """
+    revisions = {
+        str(sim.spec["provenance"]["picongpu_revision"])
+        for _, sim in campaign.agenda.simulations()
+        if isinstance(sim.spec.get("provenance"), Mapping) and sim.spec["provenance"].get("picongpu_revision")
+    }
+    return next(iter(revisions)) if len(revisions) == 1 else None
+
+
+__all__ = [
+    "AgendaEngine",
+    "DuplicateSpecError",
+    "EnginePolicy",
+    "ObserveFn",
+    "SubmitFn",
+    "TickResult",
+    "leaf_at",
+]

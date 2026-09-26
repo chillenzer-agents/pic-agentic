@@ -286,6 +286,15 @@ class HelloRuntime:
         """
         return self.agenda_service.status()
 
+    def approve_agenda_leaf(self, path: str) -> dict[str, Any]:
+        """Approve one gated campaign leaf so a later tick may submit it.
+
+        Returns:
+            ``{"ok": True, "path": ..., "approved": True}``, or a soft error.
+
+        """
+        return self.agenda_service.approve(path)
+
     def condensed_events(
         self,
         sim_id: str,
@@ -663,6 +672,20 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     )
     def agenda_status() -> dict[str, Any]:
         return _redact_dict(runtime, runtime.agenda_status())
+
+    @server.tool(
+        title="Approve a gated campaign leaf",
+        description=(
+            "Mark one leaf of the persisted campaign as approved, so the next "
+            "advance_agenda tick may submit it despite an approval gate. The "
+            "flag is persisted, so approval survives a server restart."
+        ),
+        # write/resource tier: it changes persisted campaign state but starts no
+        # work itself; it is not destructive.
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    def approve_agenda_leaf(path: str) -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.approve_agenda_leaf(path))
 
 
 async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None = None) -> dict[str, Any]:

@@ -672,6 +672,38 @@ def _patch_spec(spec: dict, dotted: str, value: object) -> dict:
     return patched
 
 
+def _tag_replica(spec: dict, index: int) -> dict:
+    """Return a copy of ``spec`` tagged with a distinct per-replica marker.
+
+    A simulation's ``sim_id`` is the prefix of its payload hash, so identical
+    replica specs would collapse into one cluster job and one observation.  The
+    marker rides in the pypicongpu ``customuserinput`` rendering context (a
+    legitimate, round-trip-safe field), making each replica's payload distinct
+    without changing the physics.
+
+    Args:
+        spec: The base Runner spec.
+        index: The replica index (also the number of extra time steps).
+
+    Returns:
+        The tagged deep copy.
+
+    """
+    tagged = json.loads(json.dumps(spec))
+    sim = tagged.get("sim")
+    if not isinstance(sim, dict):
+        return tagged
+    existing = sim.get("customuserinput")
+    context = dict(existing) if isinstance(existing, dict) else {}
+    tags = list(context.pop("tags", [])) if context.get("tags") else []
+    if "pic_agentic_replica" not in tags:
+        tags.append("pic_agentic_replica")
+    context["tags"] = tags
+    context["pic_agentic_replica"] = index
+    sim["customuserinput"] = context
+    return tagged
+
+
 def _parse_agenda_values(values: str) -> list[object]:
     """Parse a comma-separated value list, JSON-decoding each entry.
 
@@ -716,7 +748,7 @@ def cmd_agenda_init(args: argparse.Namespace) -> int:
     if args.agenda_patch:
         specs = [_patch_spec(base_spec, args.agenda_patch, value) for value in _parse_agenda_values(args.agenda_values)]
     else:
-        specs = [base_spec] * max(1, args.agenda_replicas)
+        specs = [_tag_replica(base_spec, index) for index in range(max(1, args.agenda_replicas))]
 
     agenda = AgendaGroup(name="campaign")
     for index, spec in enumerate(specs):
@@ -767,6 +799,29 @@ def cmd_agenda_status(args: argparse.Namespace) -> int:
     state = json.loads(args.state.read_text())
     state["agenda_file"] = str(Path(args.agenda_file).expanduser())
     result = _result_tool_call(state, "agenda_status", {})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
+def cmd_agenda_approve(args: argparse.Namespace) -> int:
+    """Call ``approve_agenda_leaf`` for one gated campaign leaf.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists or no leaf path was given.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    if not args.agenda_leaf:
+        msg = "--agenda-approve requires --agenda-leaf PATH"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, "approve_agenda_leaf", {"path": args.agenda_leaf})
     print(json.dumps(result, indent=2, default=str), flush=True)
     return 0 if result.get("ok", "error" not in result) else 1
 
@@ -889,6 +944,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--agenda-init", action="store_true", help="build and save a campaign file for the agenda tools")
     mode.add_argument("--agenda-advance", action="store_true", help="call advance_agenda (one engine tick)")
     mode.add_argument("--agenda-status", action="store_true", help="call agenda_status and print the campaign view")
+    mode.add_argument("--agenda-approve", action="store_true", help="approve one gated leaf (--agenda-leaf PATH)")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
@@ -939,6 +995,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agenda-replicas", type=int, default=1, help="number of identical leaves for --agenda-init")
     parser.add_argument("--agenda-patch", default="", help="dotted Runner-spec path to sweep, e.g. sim.time_steps")
     parser.add_argument("--agenda-values", default="", help="comma-separated values for --agenda-patch")
+    parser.add_argument("--agenda-leaf", default="", help="leaf path for --agenda-approve, e.g. leaf000")
     return parser
 
 
@@ -966,6 +1023,7 @@ def main() -> None:
         (args.agenda_init, cmd_agenda_init),
         (args.agenda_advance, cmd_agenda_advance),
         (args.agenda_status, cmd_agenda_status),
+        (args.agenda_approve, cmd_agenda_approve),
     )
     for selected, command in dispatch:
         if selected:

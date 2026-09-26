@@ -36,7 +36,9 @@ def _campaign_file(tmp_path: Path, *, name: str = "campaign", leaves: int = 1) -
     agenda = AgendaGroup(name="group")
     for index in range(leaves):
         leaf = f"leaf{index}"
-        agenda = agenda.add(**{leaf: AgendaSim(name=leaf, spec=_SPEC)})
+        # Distinct specs: identical payloads map to the same sim_id.
+        spec = {"sim": {**_SPEC["sim"], "replica": index}}
+        agenda = agenda.add(**{leaf: AgendaSim(name=leaf, spec=spec)})
     path = tmp_path / "campaign.json"
     AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name=name, agenda=agenda))
     return str(path)
@@ -89,7 +91,7 @@ async def _call(config: Config, name: str, arguments: dict[str, object]):
 async def test_tool_registration_and_annotations() -> None:
     server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
     tools = {tool.name: tool for tool in await server.list_tools()}
-    assert {"advance_agenda", "agenda_status"} <= set(tools)
+    assert {"advance_agenda", "agenda_status", "approve_agenda_leaf"} <= set(tools)
 
     advance = tools["advance_agenda"].annotations
     assert advance is not None
@@ -100,6 +102,11 @@ async def test_tool_registration_and_annotations() -> None:
     status = tools["agenda_status"].annotations
     assert status is not None
     assert status.read_only_hint is True
+
+    approve = tools["approve_agenda_leaf"].annotations
+    assert approve is not None
+    assert approve.read_only_hint is False
+    assert approve.destructive_hint is False
 
 
 async def test_advance_agenda_submits_and_returns_a_tick(tmp_path) -> None:
@@ -157,3 +164,67 @@ async def test_status_works_without_a_transport(tmp_path) -> None:
     payload = (await server.call_tool("agenda_status", {})).structured_content
     assert payload["name"] == "campaign"
     assert payload["counts"]["planned"] == 1
+
+
+async def test_require_approval_gate_is_wired_from_config(tmp_path) -> None:
+    """``agenda_require_approval`` holds leaves until ``approve_agenda_leaf``."""
+    config = Config(
+        rcp_secret=SECRET,
+        agenda_file=_campaign_file(tmp_path, leaves=1),
+        agenda_require_approval=True,
+    )
+    gated = await _call(config, "advance_agenda", {})
+    assert gated["submitted"] == []
+    assert gated["pending_approval"] == ["leaf0"]
+
+    approved = await _call(config, "approve_agenda_leaf", {"path": "leaf0"})
+    assert approved == {"ok": True, "path": "leaf0", "approved": True}
+
+    released = await _call(config, "advance_agenda", {})
+    assert released["submitted"] == ["leaf0"]
+
+
+async def test_approve_unknown_leaf_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(config, "approve_agenda_leaf", {"path": "nope"})
+    assert result == {"ok": False, "error": "no_such_leaf", "path": "nope"}
+
+
+async def test_approve_without_campaign_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
+    result = await _call(config, "approve_agenda_leaf", {"path": "leaf0"})
+    assert result == {"ok": False, "error": "no_campaign"}
+
+
+async def test_agenda_status_reports_approval_flags(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    await _call(config, "approve_agenda_leaf", {"path": "leaf0"})
+    status = await _call(config, "agenda_status", {})
+    leaf = status["leaves"][0]
+    assert leaf["approved"] is True
+    assert leaf["requires_approval"] is False
+
+
+async def test_concurrent_advance_does_not_duplicate_submissions(tmp_path) -> None:
+    """Two overlapping ticks must not both submit the same planned leaves.
+
+    ``AgendaService.advance`` serialises on a lock: without it, two ticks could
+    load the same campaign and each submit every planned leaf.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path, leaves=2))
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+    tasks = [await _serve(sim_t), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        first, second = await asyncio.gather(
+            server.call_tool("advance_agenda", {}),
+            server.call_tool("advance_agenda", {}),
+        )
+        submitted = first.structured_content["submitted"] + second.structured_content["submitted"]
+        assert len(submitted) == 2  # each leaf exactly once, not four
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
