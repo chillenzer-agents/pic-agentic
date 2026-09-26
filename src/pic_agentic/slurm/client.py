@@ -24,6 +24,11 @@ SAFE_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
 SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 STATE_RE = re.compile(r"JobState=(\w+)")
 
+#: Signals the client will deliver.  A fixed set, so a wire string can never be
+#: interpolated into ``scontrol``/``scancel``.  ``TERM``/``ALRM`` are the M3
+#: stop paths (PIConGPU's ``SIGTERM``/``SIGALRM`` handlers).
+ALLOWED_SIGNALS = frozenset({"USR1", "USR2", "KILL", "TERM", "ALRM"})
+
 
 class SlurmError(RuntimeError):
     """Raised when a SLURM command fails or its output cannot be parsed."""
@@ -229,14 +234,14 @@ class SlurmClient:
 
         Args:
             job_id: The SLURM job id.
-            signal: One of ``USR1``, ``USR2``, ``KILL``.
+            signal: One of :data:`ALLOWED_SIGNALS`.
             batch: Whether to target the batch step (``--batch``).
 
         Raises:
             SlurmError: If the signal is not allowed or ``scancel`` fails.
 
         """
-        if signal not in {"USR1", "USR2", "KILL"}:
+        if signal not in ALLOWED_SIGNALS:
             msg = f"unsupported signal: {signal}"
             raise SlurmError(msg)
         argv = [self._exe("scancel"), f"--signal={signal}"]
@@ -266,3 +271,52 @@ class SlurmClient:
         else:
             msg = f"unknown cancel mode: {mode}"
             raise SlurmError(msg)
+
+    async def signal_job(self, job_id: int, signal: str) -> str:
+        """Deliver a signal to *all* of a job's tasks via ``scontrol signal``.
+
+        This is the M3 control path: PIConGPU installs its handlers in every MPI
+        rank and each rank must receive the signal, which ``scontrol signal``
+        (unlike ``scancel --signal``) does.  ``signal`` is checked against the
+        fixed allow-list, so a wire value never reaches the command.
+
+        Args:
+            job_id: The SLURM job id.
+            signal: One of :data:`ALLOWED_SIGNALS`.
+
+        Returns:
+            The combined stdout and stderr of ``scontrol``.
+
+        Raises:
+            SlurmError: If the signal is not allowed or ``scontrol`` fails.
+
+        """
+        if signal not in ALLOWED_SIGNALS:
+            msg = f"unsupported signal: {signal}"
+            raise SlurmError(msg)
+        argv = [self._exe("scontrol"), "signal", signal, str(job_id)]
+        rc, stdout, stderr = await self._run(argv)
+        if rc != 0:
+            msg = f"scontrol signal failed ({rc}): {stderr.strip() or stdout.strip()}"
+            raise SlurmError(msg)
+        return (stdout + stderr).strip()
+
+    async def cancel_job(self, job_id: int) -> str:
+        """Hard-cancel a job via ``scontrol cancel``.
+
+        Args:
+            job_id: The SLURM job id.
+
+        Returns:
+            The combined stdout and stderr of ``scontrol``.
+
+        Raises:
+            SlurmError: If ``scontrol`` fails.
+
+        """
+        argv = [self._exe("scontrol"), "cancel", str(job_id)]
+        rc, stdout, stderr = await self._run(argv)
+        if rc != 0:
+            msg = f"scontrol cancel failed ({rc}): {stderr.strip() or stdout.strip()}"
+            raise SlurmError(msg)
+        return (stdout + stderr).strip()
