@@ -842,6 +842,10 @@ def resolve_result(
         return _read(params, run_dir=run, output=output)
     if params.op is ResultOp.EXPORT:
         return _export(output, sim_id=sim_id, run_dir=run, local_root=local_root)
+    if params.op is ResultOp.ANALYZE:
+        # ANALYZE is handled by the simclient's analysis engine, not here; a
+        # direct caller must not silently fall through to the openPMD reader.
+        return _error(SimulationErrorCode.UNSUPPORTED, "analyze is served by the analysis engine, not the reader")
     return _reader_op(params, output=output)
 
 

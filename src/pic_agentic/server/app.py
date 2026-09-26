@@ -583,6 +583,67 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
     async def export_results(sim_id: str) -> dict[str, Any]:
         return await _result_tool(runtime, ResultOp.EXPORT, sim_id=sim_id)
 
+    @server.tool(
+        title="Analyze a simulation's output",
+        description=(
+            "Compose the RO-Crate experiment metadata, the (redacted) pypicongpu "
+            "run metadata, an openPMD output summary and a deterministic "
+            "natural-language answer. Optionally filter the answer with `query`. "
+            "No LLM is called; missing inputs degrade to empty sections."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def analyze_output(sim_id: str, *, query: str | None = None) -> dict[str, Any]:
+        return await _analyze_tool(runtime, sim_id, query=query)
+
+
+async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None = None) -> dict[str, Any]:
+    """Run one ``analyze`` pull and shape it into the design's section dict.
+
+    The simclient composes the RO-Crate / metadata / openPMD sections and a
+    default answer.  The frozen result command carries no query field, so when
+    a query is given the answer is re-synthesized here -- ``synthesize_answer``
+    is a pure function of the sections, so this is exact.
+
+    Returns:
+        ``{"ok": True, rocrate, metadata, openpmd, answer}``, else
+        ``{"ok": False, "sim_id", "op", "error"}``.
+
+    """
+    op = ResultOp.ANALYZE
+    try:
+        params = ResultParams(sim_id=sim_id, op=op)
+        payload = await runtime.fetch_result(params)
+    except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+        return _soft_error(runtime, sim_id, op.value, exc)
+    if not payload:
+        return {"ok": False, "sim_id": sim_id, "op": op.value, "error": "unavailable"}
+    if payload.get("error"):
+        return {"ok": False, **_redact_dict(runtime, payload)}
+    sections = payload.get("result")
+    if not isinstance(sections, dict):
+        return {"ok": False, "sim_id": sim_id, "op": op.value, "error": "unavailable"}
+    rocrate = sections.get("rocrate") or {}
+    metadata = sections.get("metadata") or {}
+    openpmd = sections.get("openpmd") or {}
+    answer = sections.get("answer")
+    if query:
+        try:
+            from pic_agentic import analysis  # ruff: ignore[import-outside-top-level] - lazy optional engine
+
+            answer = analysis.synthesize_answer(query, rocrate, metadata, openpmd)
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            return _soft_error(runtime, sim_id, op.value, exc)
+    result = {
+        "ok": True,
+        "sim_id": sim_id,
+        "rocrate": rocrate,
+        "metadata": metadata,
+        "openpmd": openpmd,
+        "answer": answer,
+    }
+    return _redact_dict(runtime, result)
+
 
 async def _control_tool(runtime: HelloRuntime, sim_id: str, op: SimulationOp) -> dict[str, Any]:
     """Run one control pull and shape it into a redacted outcome dict.

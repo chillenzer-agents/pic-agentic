@@ -35,6 +35,8 @@ dependencies = [
   # Used directly by the MAS token-refresh client (also a matrix-nio dependency,
   # but we import it ourselves, so it is declared explicitly).
   "aiohttp>=3.9",
+  # The agenda model serialises/emits CWL, which is YAML.
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

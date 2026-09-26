@@ -95,6 +95,34 @@ _ASSUMED_MAX_LINE_BYTES = 4096
 _MAX_LOG_READ_BYTES = 8 * 1024 * 1024
 
 
+def derive_setup_dir(run_dir: Path | str) -> Path | None:
+    """Derive a tracked sim's ``setup_dir`` from its ``run_dir``.
+
+    ``Runner.generate`` lays a run out as ``<base>/input`` (setup) and
+    ``<base>/run`` (run), so the setup directory is the run directory's sibling
+    ``input``.  The derived path is only accepted when it resolves to a direct
+    child of the run's parent, i.e. it can never escape ``<base>`` via a crafted
+    or symlinked ``run_dir``.
+
+    Args:
+        run_dir: The tracked run directory (``<base>/run``).
+
+    Returns:
+        The resolved ``<base>/input`` path, or None when it is not a direct
+        sibling of the run directory.
+
+    """
+    run = Path(run_dir)
+    try:
+        base = run.parent.resolve()
+        setup = (run.parent / "input").resolve()
+    except OSError:
+        return None
+    if setup.parent != base:
+        return None
+    return setup
+
+
 class HelloResult(BaseModel):
     """Outcome of one ``hello`` command execution."""
 
@@ -1064,15 +1092,18 @@ class SimClient:
             await self.transport.send(ack)
             return ack
         try:
-            from pic_agentic import results  # ruff: ignore[import-outside-top-level] - lazy optional engine
+            if params.op is ResultOp.ANALYZE:
+                payload = await asyncio.to_thread(self._analyze, tracked)
+            else:
+                from pic_agentic import results  # ruff: ignore[import-outside-top-level] - lazy optional engine
 
-            payload = await asyncio.to_thread(
-                results.resolve_result,
-                params,
-                run_dir=Path(tracked.run_dir),
-                sim_id=params.sim_id,
-                local_root="",
-            )
+                payload = await asyncio.to_thread(
+                    results.resolve_result,
+                    params,
+                    run_dir=Path(tracked.run_dir),
+                    sim_id=params.sim_id,
+                    local_root="",
+                )
         except ImportError:
             payload = {"error": "reader_unavailable", "error_code": SimulationErrorCode.READER_UNAVAILABLE}
         except Exception as exc:  # ruff: ignore[blind-except] - a result failure is ack data
@@ -1254,6 +1285,30 @@ class SimClient:
         )
         await self.transport.send(ack)
         return ack
+
+    @staticmethod
+    def _analyze(tracked: TrackedSim) -> dict[str, object]:
+        """Compose the milestone-A analysis sections for a tracked simulation.
+
+        The analysis engine is imported lazily (it is stdlib-only but kept off
+        the control/reporting import path).  ``setup_dir`` is derived from the
+        tracked ``run_dir``; a missing setup simply yields empty sections.  The
+        sections ride in the ack's ``result`` field (the frozen result schema
+        has no dedicated ``analysis`` field).
+
+        Returns:
+            ``{"result": <rocrate, metadata, openpmd, answer>}``.
+
+        """
+        from pic_agentic import analysis  # ruff: ignore[import-outside-top-level] - lazy optional engine
+
+        run_dir = Path(tracked.run_dir)
+        sections = analysis.analyze(
+            run_dir=run_dir,
+            setup_dir=derive_setup_dir(run_dir),
+            output_dir=run_dir / "simOutput",
+        )
+        return {"result": sections}
 
     @staticmethod
     def _read_submission_job_id(run_dir: Path, _payload: object) -> int | None:
