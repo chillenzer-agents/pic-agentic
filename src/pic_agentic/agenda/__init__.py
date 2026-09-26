@@ -16,12 +16,17 @@ from pic_agentic.agenda.budget import (
     ResourceRequest,
     check_admission,
 )
+from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.cwl import dump_cwl_workflow, to_cwl_workflow
+from pic_agentic.agenda.engine import AgendaEngine, EnginePolicy, TickResult
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim, AgendaSweep, validate_entry_name
 from pic_agentic.agenda.planner import PlanStep, account, apply_states, next_actions
-from pic_agentic.agenda.store import AgendaStore
+from pic_agentic.agenda.store import DEFAULT_AGENDA_FILE, DEFAULT_CAMPAIGN_FILE, AgendaStore
 
 __all__ = [
+    "DEFAULT_AGENDA_FILE",
+    "DEFAULT_CAMPAIGN_FILE",
+    "AgendaEngine",
     "AgendaGroup",
     "AgendaSim",
     "AgendaStore",
@@ -29,8 +34,11 @@ __all__ = [
     "Budget",
     "BudgetExceededError",
     "BudgetUsage",
+    "Campaign",
+    "EnginePolicy",
     "PlanStep",
     "ResourceRequest",
+    "TickResult",
     "account",
     "apply_states",
     "check_admission",

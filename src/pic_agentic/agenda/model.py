@@ -183,6 +183,11 @@ class AgendaSim(BaseModel):
     point: dict[str, float | int | str] | None = None
     status: Literal["planned", "submitted", "running", "done", "failed"] = "planned"
     depends_on: list[str] = Field(default_factory=list)
+    #: The RCP simulation id once this leaf has been submitted (the engine's
+    #: idempotency key: a leaf with a sim_id is never submitted twice).
+    sim_id: str | None = None
+    #: Whether this leaf must be approved before the engine submits it.
+    requires_approval: bool = False
 
     @field_validator("name")
     @classmethod
