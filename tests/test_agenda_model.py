@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for the agenda model (round-trip, expansion, validation)."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from pydantic import ValidationError
+
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim, AgendaSweep, validate_entry_name
+
+
+def _leaf(name: str, **kw: object) -> AgendaSim:
+    return AgendaSim(name=name, spec={"sim": {"time_steps": 10}}, **kw)
+
+
+def test_recursive_round_trip_is_byte_stable() -> None:
+    group = AgendaGroup(name="study")
+    group = group.add(single=_leaf("single"))
+    group = group.add(scan=AgendaGroup(name="scan", sweep=AgendaSweep(parameter="intensity", values=[1e18, 2e18])))
+    group = group.add(diag=_leaf("diag", depends_on=["scan"], point={"intensity": 1e18}))
+
+    dumped = group.model_dump_json()
+    reloaded = AgendaGroup.model_validate_json(dumped)
+    assert reloaded.model_dump_json() == dumped
+    # A second generation is stable too.
+    assert AgendaGroup.model_validate_json(reloaded.model_dump_json()).model_dump_json() == dumped
+
+
+def test_discriminated_union_rehydrates_nested_types() -> None:
+    group = AgendaGroup(name="g")
+    group = group.add(sub=AgendaGroup(name="sub"))
+    group = group.add(leaf=_leaf("leaf"))
+    reloaded = AgendaGroup.model_validate_json(group.model_dump_json())
+    assert isinstance(reloaded.entries["sub"], AgendaGroup)
+    assert isinstance(reloaded.entries["leaf"], AgendaSim)
+
+
+def test_add_returns_new_group_and_does_not_mutate() -> None:
+    base = AgendaGroup(name="g")
+    expanded = base.add(a=_leaf("a"))
+    assert "a" not in base.entries
+    assert "a" in expanded.entries
+
+
+def test_add_rejects_duplicate_and_bad_names() -> None:
+    group = AgendaGroup(name="g").add(a=_leaf("a"))
+    with pytest.raises(ValueError, match="already exists"):
+        group.add(a=_leaf("a"))
+    with pytest.raises(ValueError, match="non-empty"):
+        group.add(**{"": _leaf("x")})
+    with pytest.raises(ValueError, match="must not start with"):
+        group.add(**{".hidden": _leaf("x")})
+    with pytest.raises(ValueError, match="must not contain"):
+        group.add(**{"has/slash": _leaf("x")})
+
+
+def test_validate_entry_name_rules() -> None:
+    assert validate_entry_name("ok-name_1") == "ok-name_1"
+    for bad, match in (("", "non-empty"), (".x", "must not start with"), ("a/b", "must not contain")):
+        with pytest.raises(ValueError, match=match):
+            validate_entry_name(bad)
+
+
+def test_depends_on_rejects_duplicates() -> None:
+    with pytest.raises(ValidationError):
+        _leaf("x", depends_on=["a", "a"])
+
+
+def test_simulations_are_flattened_depth_first_in_order() -> None:
+    group = AgendaGroup(name="g")
+    group = group.add(z=_leaf("z"))
+    group = group.add(inner=AgendaGroup(name="inner").add(m=_leaf("m"), n=_leaf("n")))
+    group = group.add(a=_leaf("a"))
+    assert [path for path, _ in group.simulations()] == ["z", "inner/m", "inner/n", "a"]
+
+
+def test_expand_is_pure_and_assigns_points() -> None:
+    base = AgendaGroup(name="scan").add(seed=_leaf("seed"))
+    sweep = AgendaSweep(parameter="intensity", values=[1e18, 2e18, 3e18])
+    expanded = base.expand(sweep, lambda point: {"sim": {"intensity": point["intensity"]}})
+
+    leaves = expanded.simulations()
+    generated = [(p, s) for p, s in leaves if p != "seed"]
+    assert len(generated) == 3
+    for _path, sim in generated:
+        assert sim.spec["sim"]["intensity"] in {1e18, 2e18, 3e18}
+        assert sim.point == {"intensity": sim.spec["sim"]["intensity"]}
+    # Source untouched.
+    assert [p for p, _ in base.simulations()] == ["seed"]
+
+
+def test_expand_names_are_distinct_for_int_vs_float() -> None:
+    sweep = AgendaSweep(parameter="n", values=[1, 1.0])
+    # repr() distinguishes the values, so the child names never collide.
+    assert sweep.label(1) != sweep.label(1.0)
+
+
+def test_expand_rejects_empty_sweep() -> None:
+    with pytest.raises(ValidationError):
+        AgendaSweep(parameter="x", values=[])
+
+
+def test_add_sim_convenience() -> None:
+    group = AgendaGroup(name="g").add_sim(name="only", spec={"sim": {}})
+    assert isinstance(group.entries["only"], AgendaSim)
+
+
+def test_plain_dict_coercion_uses_kind_discriminator() -> None:
+    group = AgendaGroup(name="g").add(
+        leaf={"kind": "sim", "spec": {"sim": {}}},
+        sub={"kind": "group"},
+    )
+    assert isinstance(group.entries["leaf"], AgendaSim)
+    assert isinstance(group.entries["sub"], AgendaGroup)
+
+
+def test_spec_is_opaque_and_json_serialisable() -> None:
+    group = AgendaGroup(name="g").add(a=_leaf("a"))
+    payload = json.loads(group.model_dump_json())
+    assert payload["entries"]["a"]["spec"] == {"sim": {"time_steps": 10}}
