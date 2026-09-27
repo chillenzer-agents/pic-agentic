@@ -54,6 +54,7 @@ def to_cwl_workflow(
     group: AgendaGroup,
     *,
     leaf_workflow: Callable[[str, AgendaSim], str] | None = None,
+    group_workflow: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """Build the CWL ``Workflow`` dict for ``group``.
 
@@ -62,18 +63,21 @@ def to_cwl_workflow(
         leaf_workflow: Maps ``(name, sim)`` to the leaf's workflow reference
             (relative to the group directory).  Defaults to the per-leaf
             ``../<name>/workflow/workflow.cwl``.
+        group_workflow: Maps a nested group's name to its workflow reference.
+            Defaults to ``../<name>/workflow/group_workflow.cwl``.
 
     Returns:
         The CWL workflow as a plain dictionary.
 
     """
     reference = leaf_workflow or (lambda name, _sim: f"../{name}/{_LEAF_WORKFLOW}")
+    nested_reference = group_workflow or (lambda name: f"../{name}/{_GROUP_WORKFLOW}")
     steps: dict[str, Any] = {}
     outputs: dict[str, Any] = {}
     for name, entry in group.entries.items():
         if isinstance(entry, AgendaGroup):
             step = {
-                "run": f"../{name}/{_GROUP_WORKFLOW}",
+                "run": nested_reference(name),
                 "in": {},
                 "out": list(_GROUP_OUTPUT_DEFS),
             }

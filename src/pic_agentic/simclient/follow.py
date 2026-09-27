@@ -45,7 +45,7 @@ from pic_agentic.slurm import SlurmJobState
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from pic_agentic.slurm import JobInfo
+    from pic_agentic.slurm import JobAccounting, JobInfo
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +117,7 @@ class JobFollower:
         job_info: Callable[[int], Awaitable[JobInfo]],
         initial_interval_s: float = 30.0,
         max_interval_s: float = 300.0,
+        job_accounting: Callable[[int], Awaitable[JobAccounting | None]] | None = None,
     ) -> None:
         """Create a follower.
 
@@ -127,6 +128,9 @@ class JobFollower:
             job_info: Async callable returning a :class:`~pic_agentic.slurm.JobInfo`.
             initial_interval_s: First (and reset) poll interval in seconds.
             max_interval_s: Cap for the backing-off poll interval in seconds.
+            job_accounting: Optional async callable returning the actual
+                resource usage of a finished job (gap 4); when given, the
+                terminal event carries ``core_hours``/``gpu_hours``.
 
         """
         self.sim = sim
@@ -135,6 +139,7 @@ class JobFollower:
         self.job_info = job_info
         self.initial_interval_s = initial_interval_s
         self.max_interval_s = max_interval_s
+        self.job_accounting = job_accounting
         self._stopped = False
         #: Last emitted ``percent // PROGRESS_EVENT_STEP_PERCENT`` bucket; 0 so
         #: the pre-first-boundary (0-24 %) range never emits on its own.
@@ -350,12 +355,14 @@ class JobFollower:
         if self.tracked.terminal_emitted:
             return
         self.tracked.terminal_emitted = True
+        accounting = await self._accounting_fields()
         if info.state is SlurmJobState.COMPLETED and info.exit_code in {None, 0}:
             await self.emit(
                 SimulationState.JOB_FINISHED,
                 job_id=self.tracked.job_id,
                 slurm_state=info.state.value,
                 exit_code=info.exit_code,
+                **accounting,
             )
             linked = await asyncio.to_thread(link_run_results, Path(self.tracked.run_dir))
             # ``results.ready`` is only claimed once ``run_dir/simOutput`` really
@@ -366,7 +373,7 @@ class JobFollower:
             # ``SimClient._state_for_info`` once the link appears.
             if linked:
                 manifest = self._scan_manifest()
-                fields: dict[str, object] = {"job_id": self.tracked.job_id, "results_linked": True}
+                fields: dict[str, object] = {"job_id": self.tracked.job_id, "results_linked": True, **accounting}
                 if manifest is not None:
                     fields["manifest"] = manifest
                 await self.emit(SimulationState.RESULTS_READY, **fields)
@@ -377,6 +384,7 @@ class JobFollower:
                     slurm_state=info.state.value,
                     exit_code=info.exit_code,
                     results_linked=False,
+                    **accounting,
                 )
         else:
             # A user-requested cancel is reported as its own terminal state so
@@ -388,7 +396,28 @@ class JobFollower:
                 job_id=self.tracked.job_id,
                 slurm_state=info.state.value,
                 exit_code=info.exit_code,
+                **accounting,
             )
+
+    async def _accounting_fields(self) -> dict[str, float]:
+        """Return the actual-cost event fields for the terminal event.
+
+        Returns:
+            ``{"core_hours", "gpu_hours"}`` when the accounting lookup succeeds,
+            else an empty dict (best-effort; never raises).
+
+        """
+        job_id = self.tracked.job_id
+        if self.job_accounting is None or job_id is None:
+            return {}
+        try:
+            accounting = await self.job_accounting(job_id)
+        except Exception:  # ruff: ignore[blind-except] - accounting is best-effort event data
+            log.warning("sacct accounting failed for sim %s job %s", self.sim, job_id)
+            return {}
+        if accounting is None:
+            return {}
+        return {"core_hours": accounting.core_hours, "gpu_hours": accounting.gpu_hours}
 
 
 __all__ = ["JobFollower", "TrackedSim"]

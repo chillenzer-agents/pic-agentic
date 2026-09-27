@@ -364,6 +364,50 @@ def account(
     )
 
 
+def reconcile(
+    usage: BudgetUsage,
+    *,
+    estimated_core_hours: float,
+    actual_core_hours: float | None,
+    estimated_gpu_hours: float = 0.0,
+    actual_gpu_hours: float | None = None,
+    is_gpu: bool = False,
+) -> BudgetUsage:
+    """Return ``usage`` with one leaf's *estimate* replaced by its *actual*.
+
+    Usage accrues at submission from the estimated cost; when the cluster
+    reports actual usage the estimate is corrected so the budget reflects what
+    was really spent.  Pure: the input usage is not mutated.  When an actual is
+    ``None`` (unknown) the estimate is left in place.
+
+    Args:
+        usage: Resources consumed so far (including the estimate).
+        estimated_core_hours: The core-hours reserved at submission.
+        actual_core_hours: The actual core-hours, or None to leave the estimate.
+        estimated_gpu_hours: The GPU-hours reserved at submission.
+        actual_gpu_hours: The actual GPU-hours, or None to leave the estimate.
+        is_gpu: Whether the leaf ran on a GPU.
+
+    Returns:
+        A new usage with the corresponding estimate replaced by the actual.
+
+    """
+    core_hours = usage.core_hours
+    if actual_core_hours is not None:
+        core_hours += actual_core_hours - estimated_core_hours
+    gpu_hours = usage.gpu_hours
+    if is_gpu and actual_gpu_hours is not None:
+        gpu_hours += actual_gpu_hours - estimated_gpu_hours
+    # Clamp tiny negative drift from float arithmetic, so a corrected usage can
+    # never read as a negative consumption.
+    return usage.model_copy(
+        update={
+            "core_hours": max(0.0, core_hours),
+            "gpu_hours": max(0.0, gpu_hours),
+        },
+    )
+
+
 __all__ = [
     "SIMULATION_STATE_STATUS",
     "PlanAction",
@@ -371,5 +415,6 @@ __all__ = [
     "account",
     "apply_states",
     "next_actions",
+    "reconcile",
     "resource_request_from_spec",
 ]

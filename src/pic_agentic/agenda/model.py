@@ -190,6 +190,16 @@ class AgendaSim(BaseModel):
     requires_approval: bool = False
     #: Whether a human has pre-approved this leaf (set by the approval tool).
     approved: bool = False
+    #: Core-hours the engine reserved for this leaf at submission time.
+    estimated_core_hours: float = 0.0
+    #: GPU-hours the engine reserved for this leaf at submission time.
+    estimated_gpu_hours: float = 0.0
+    #: Actual core-hours reported by the cluster on completion (gap 4).
+    actual_core_hours: float | None = None
+    #: Actual GPU-hours reported by the cluster on completion (gap 4).
+    actual_gpu_hours: float | None = None
+    #: Whether the leaf ran on a GPU (so actual GPU-hours are counted).
+    is_gpu: bool = False
 
     @field_validator("name")
     @classmethod

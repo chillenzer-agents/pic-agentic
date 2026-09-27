@@ -98,21 +98,40 @@ def _approve_all(store: AgendaStore) -> None:
 
 
 def _drain_and_refine(store: AgendaStore) -> None:
-    """Drain the done callbacks and add a refined sweep point.
+    """Drain the done callbacks, analyse the finished leaf and refine it.
 
-    A real campaign would analyse the finished run's spectrum here; the fake
-    refinement stands in for that decision.
+    The "analysis" records a score per finished leaf; the deterministic
+    :func:`pic_agentic.agenda.refine.summary` then names the best point and the
+    refinement to add, which is what a real campaign would do from the
+    spectrum.
     """
+    from pic_agentic.agenda.refine import summary
+
     campaign = store.load(Campaign)
     drained = [c for c in campaign.callbacks if c.kind == "done"]
     assert drained, "the finished leaf must have raised a done callback"
+    # Record a score for each finished leaf (stand-in for a real analysis).
+    analyses = dict(campaign.analyses)
+    for callback in drained:
+        analyses[callback.path] = {"score": 1.0}
+    refinement = summary({path: entry.get("score") for path, entry in analyses.items()})
+    assert refinement["best"] is not None
     agenda = campaign.agenda.add_sim(name="refine_2.5e18", spec={"sim": {"laser_intensity": 2.5e18}})
-    store.save(campaign.model_copy(update={"agenda": agenda, "callbacks": []}))
+    store.save(
+        campaign.model_copy(
+            update={
+                "agenda": agenda,
+                "callbacks": [],
+                "analyses": analyses,
+                "conclusion": "refined around the optimum",
+            },
+        ),
+    )
 
 
 def _assert_provenance(campaign: Campaign) -> None:
     """Assert the campaign RO-Crate links every leaf and the software entity."""
-    crate = campaign_rocrate(campaign)
+    crate = campaign_rocrate(campaign, analyses=campaign.analyses)
     ids = {entity["@id"] for entity in crate["@graph"]}
     assert RO_CRATE_METADATA_FILE in ids
     assert "./" in ids
@@ -120,6 +139,9 @@ def _assert_provenance(campaign: Campaign) -> None:
     assert "#picongpu" in ids
     root = next(entity for entity in crate["@graph"] if entity["@id"] == "./")
     assert len(root["hasPart"]) == len(INTENSITIES) + 1  # the sweep + the refinement
+    # The lineage now reaches the analyses and the conclusion.
+    assert any(entity_id.endswith("/analysis") for entity_id in ids)
+    assert campaign.conclusion == "refined around the optimum"
 
 
 async def _run_to_completion(store: AgendaStore, cluster: FakeCluster) -> object:

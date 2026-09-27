@@ -47,6 +47,11 @@ class MemoryTransport:
         self.inbox: asyncio.Queue[RcpMessage] = inbox if inbox is not None else asyncio.Queue()
         self.peer_inbox = peer_inbox
         self.state = state if state is not None else _ChannelState()
+        #: Human-facing messages (text/image) sent by this end, in order.
+        self.sent_text: list[tuple[str, str]] = []
+        self.sent_images: list[tuple[str, bytes, str]] = []
+        #: Inbound human room messages for :meth:`drain` (test-only).
+        self.human_inbox: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
 
     @classmethod
     def create_pair(cls) -> tuple[MemoryTransport, MemoryTransport]:
@@ -108,6 +113,54 @@ class MemoryTransport:
             except TimeoutError:
                 continue
             yield message
+
+    async def send_text(self, room_id: str, text: str) -> str:
+        """Record a human-facing text message (test double).
+
+        Returns:
+            A synthetic transport event id.
+
+        """
+        self.state.counter += 1
+        self.sent_text.append((room_id, text))
+        return f"$memory-text{self.state.counter}"
+
+    async def send_image(
+        self,
+        room_id: str,
+        png: bytes,
+        *,
+        body: str = "image",
+        filename: str = "plot.png",
+        mimetype: str = "image/png",
+    ) -> str:
+        """Record a human-facing image message (test double).
+
+        Returns:
+            A synthetic transport event id.
+
+        """
+        _ = filename, mimetype
+        self.state.counter += 1
+        self.sent_images.append((room_id, png, body))
+        return f"$memory-image{self.state.counter}"
+
+    async def drain(self) -> tuple[list[RcpMessage], list[tuple[str, str, str]]]:
+        """Non-blocking drain of the inbox (test double for the human pump).
+
+        Returns:
+            A ``(rcp_messages, human_messages)`` pair; ``human_messages`` are
+            read from a companion :attr:`human_inbox` if one is set.
+
+        """
+        rcp: list[RcpMessage] = []
+        while not self.inbox.empty():
+            rcp.append(self.inbox.get_nowait())
+        human: list[tuple[str, str, str]] = []
+        while not self.human_inbox.empty():
+            human.append(self.human_inbox.get_nowait())
+        await asyncio.sleep(0)  # yield so a pump loop can be driven in tests
+        return rcp, human
 
     async def close(self) -> None:
         """Close the channel for both ends."""

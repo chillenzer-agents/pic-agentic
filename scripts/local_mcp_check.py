@@ -917,6 +917,93 @@ def cmd_agenda_add_leaf(args: argparse.Namespace) -> int:
     return 0 if result.get("ok", "error" not in result) else 1
 
 
+def _agenda_campaign_tool(args: argparse.Namespace, tool: str, arguments: dict) -> int:
+    """Call one campaign tool with the agenda file exported.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, tool, arguments)
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
+def cmd_agenda_refinement(args: argparse.Namespace) -> int:
+    """Call ``suggest_agenda_refinement`` and print the summary.
+
+    Returns:
+        The process exit code.
+
+    """
+    return _agenda_campaign_tool(args, "suggest_agenda_refinement", {"rel_tol": args.rel_tol})
+
+
+def cmd_agenda_conclude(args: argparse.Namespace) -> int:
+    """Call ``conclude_agenda`` with the given text.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists or no conclusion was given.
+
+    """
+    if not args.conclusion:
+        msg = "--agenda-conclude requires --conclusion TEXT"
+        raise SystemExit(msg)
+    return _agenda_campaign_tool(args, "conclude_agenda", {"conclusion": args.conclusion})
+
+
+def cmd_agenda_cwl(args: argparse.Namespace) -> int:
+    """Call ``export_agenda_cwl`` and print the workflow document.
+
+    Returns:
+        The process exit code.
+
+    """
+    return _agenda_campaign_tool(args, "export_agenda_cwl", {})
+
+
+def cmd_agenda_record_analysis(args: argparse.Namespace) -> int:
+    """Analyse one sim and record its analysis on a campaign leaf.
+
+    Calls ``analyze_output`` for ``--sim-id`` and attaches the returned sections
+    to ``--agenda-leaf`` via ``record_agenda_analysis``, so the campaign
+    provenance links the run to its finding.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists, or no sim/leaf was given.
+
+    """
+    if not args.sim_id or not args.agenda_leaf:
+        msg = "--agenda-record-analysis requires --sim-id and --agenda-leaf"
+        raise SystemExit(msg)
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    analysis = _result_tool_call(state, "analyze_output", {"sim_id": args.sim_id})
+    if not analysis.get("ok", "error" not in analysis):
+        print(json.dumps(analysis, indent=2, default=str), flush=True)
+        return 1
+    result = _result_tool_call(state, "record_agenda_analysis", {"path": args.agenda_leaf, "analysis": analysis})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
 def cmd_agenda_pause(args: argparse.Namespace) -> int:
     """Call ``pause_agenda`` and print the new lifecycle state.
 
@@ -1071,6 +1158,18 @@ def _add_agenda_callback_args(mode: argparse._MutuallyExclusiveGroup) -> None:
     mode.add_argument("--agenda-pause", action="store_true", help="pause the campaign (hold submissions)")
     mode.add_argument("--agenda-resume", action="store_true", help="resume a paused campaign")
     mode.add_argument("--agenda-stop", action="store_true", help="kill-switch: stop and cancel in-flight jobs")
+    mode.add_argument(
+        "--agenda-refinement",
+        action="store_true",
+        help="call suggest_agenda_refinement (best point / convergence / next points)",
+    )
+    mode.add_argument("--agenda-conclude", action="store_true", help="call conclude_agenda (--conclusion TEXT)")
+    mode.add_argument("--agenda-cwl", action="store_true", help="call export_agenda_cwl and print the workflow")
+    mode.add_argument(
+        "--agenda-record-analysis",
+        action="store_true",
+        help="analyze --sim-id and record it on --agenda-leaf",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1162,6 +1261,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agenda-patch", default="", help="dotted Runner-spec path to sweep, e.g. sim.time_steps")
     parser.add_argument("--agenda-values", default="", help="comma-separated values for --agenda-patch")
     parser.add_argument("--agenda-leaf", default="", help="leaf path for --agenda-approve, e.g. leaf000")
+    parser.add_argument("--conclusion", default="", help="conclusion text for --agenda-conclude")
+    parser.add_argument("--rel-tol", type=float, default=0.05, help="relative tolerance for --agenda-refinement")
     return parser
 
 
@@ -1197,6 +1298,10 @@ def main() -> None:
         (args.agenda_pause, cmd_agenda_pause),
         (args.agenda_resume, cmd_agenda_resume),
         (args.agenda_stop, cmd_agenda_stop),
+        (args.agenda_refinement, cmd_agenda_refinement),
+        (args.agenda_conclude, cmd_agenda_conclude),
+        (args.agenda_cwl, cmd_agenda_cwl),
+        (args.agenda_record_analysis, cmd_agenda_record_analysis),
     )
     for selected, command in dispatch:
         if selected:

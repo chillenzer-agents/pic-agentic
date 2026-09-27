@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+"""Server-tool tests for the research-loop closure (analysis/conclusion/CWL)."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from pic_agentic.agenda.campaign import Campaign
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim
+from pic_agentic.agenda.store import AgendaStore
+from pic_agentic.config import Config
+from pic_agentic.protocol.simulation import SimulationState, SimulationType, build_submit_ack
+from pic_agentic.rcp import new_secret_hex
+from pic_agentic.server.app import build_server
+from pic_agentic.transport.memory import MemoryTransport
+
+SECRET = new_secret_hex()
+SIM = "7f3a2b1c"
+
+
+def _campaign_file(tmp_path: Path) -> str:
+    agenda = AgendaGroup(name="group")
+    agenda = agenda.add(leaf0=AgendaSim(name="leaf0", spec={"sim": {"replica": 0}}, point={"i": 2.0}))
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="study", agenda=agenda))
+    return str(tmp_path / "campaign.json")
+
+
+async def _serve(sim_transport: MemoryTransport) -> asyncio.Task:
+    async def responder() -> None:
+        counter = 0
+        async for command in sim_transport.receive():
+            if command.type != SimulationType.COMMAND:
+                continue
+            counter += 1
+            ack = build_submit_ack(
+                sim=SIM,
+                seq=counter,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id=f"sim{counter:04d}",
+                state=SimulationState.ACCEPTED,
+                in_reply_to=command.transport_event_id,
+            ).sign(SECRET)
+            await sim_transport.send(ack)
+
+    return asyncio.create_task(responder())
+
+
+async def _call(config: Config, name: str, arguments: dict):
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+    tasks = [await _serve(sim_t)]
+    try:
+        return (await server.call_tool(name, arguments)).structured_content
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_record_analysis_and_conclusion(tmp_path: Path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    assert await _call(config, "record_agenda_analysis", {"path": "leaf0", "analysis": {"score": 9.0}}) == {
+        "ok": True,
+        "path": "leaf0",
+    }
+    assert await _call(config, "conclude_agenda", {"conclusion": "optimum at 9"}) == {
+        "ok": True,
+        "conclusion": "optimum at 9",
+    }
+    # Persisted.
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.analyses["leaf0"]["score"] == pytest.approx(9.0)
+    assert campaign.conclusion == "optimum at 9"
+
+
+async def test_record_analysis_unknown_leaf(tmp_path: Path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(config, "record_agenda_analysis", {"path": "nope", "analysis": {}})
+    assert result["ok"] is False
+    assert result["error"] == "no_such_leaf"
+
+
+async def test_conclude_rejects_empty(tmp_path: Path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(config, "conclude_agenda", {"conclusion": "   "})
+    assert result == {"ok": False, "error": "empty_conclusion"}
+
+
+async def test_suggest_refinement_uses_recorded_scores(tmp_path: Path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    await _call(config, "record_agenda_analysis", {"path": "leaf0", "analysis": {"score": 9.0}})
+    result = await _call(config, "suggest_agenda_refinement", {"rel_tol": 0.05})
+    assert result["ok"] is True
+    assert result["best"]["value"] == pytest.approx(9.0)
+    assert result["converged"] is False  # a single sample
+
+
+async def test_export_agenda_cwl(tmp_path: Path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(config, "export_agenda_cwl", {})
+    assert result["ok"] is True
+    assert "class: Workflow" in result["workflow"]
+    assert "leaf0" in result["workflow"]
+    assert result["leaves"] == ["leaf0"]
+
+
+async def test_campaign_provenance_includes_recorded_analysis(tmp_path: Path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    await _call(config, "record_agenda_analysis", {"path": "leaf0", "analysis": {"score": 1.0}})
+    crate = await _call(config, "campaign_provenance", {})
+    ids = {entity["@id"] for entity in crate["@graph"]}
+    assert "#leaf0/analysis" in ids

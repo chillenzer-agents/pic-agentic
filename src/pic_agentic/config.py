@@ -50,6 +50,8 @@ ENV_MAP = {
     "agenda_require_approval": "PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL",
     "agenda_approve_over_est_core_hours": "PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS",
     "fleet_stall_after_s": "PIC_AGENTIC_FLEET_STALL_AFTER_S",
+    "human_room_id": "PIC_AGENTIC_HUMAN_ROOM_ID",
+    "notify": "PIC_AGENTIC_NOTIFY",
 }
 
 REDACTED = "[REDACTED]"
@@ -119,6 +121,11 @@ class Config(BaseModel):
     #: How long an active simulation may go without a lifecycle event before the
     #: fleet view reports it as stalled.
     fleet_stall_after_s: float = 900.0
+    #: Matrix room id for human chat (``!status``, ``!fleet``, ``!png ...``).
+    #: Empty disables the human-command handler.
+    human_room_id: str = ""
+    #: Whether to push a one-line notification to the human room after a tick.
+    notify: bool = False
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

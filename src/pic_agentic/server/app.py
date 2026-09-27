@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import tempfile
 from contextlib import asynccontextmanager
@@ -18,9 +19,21 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
+from pic_agentic.agenda.cwl_exec import manifest_for
 from pic_agentic.agenda.provenance import campaign_rocrate
 from pic_agentic.auth import MasTokenStore
 from pic_agentic.fleet import fleet_view
+from pic_agentic.human import (
+    HumanAction,
+    HumanCommand,
+    format_fleet,
+    format_leaves,
+    format_png_caption,
+    format_status,
+    help_text,
+    notification_text,
+    parse_command,
+)
 from pic_agentic.protocol.simulation import (
     LOG_STREAMS,
     PayloadTooLargeError,
@@ -139,7 +152,11 @@ class HelloRuntime:
         for message in backfilled:
             self.service.on_message(message)
         self.submit_service.ingest_backfill(backfilled)
-        self._pump = asyncio.create_task(self._pump_forever())
+        # With a human room configured, one pump loop serves both the signed RCP
+        # room and the human chat (they share the sync position); otherwise the
+        # plain RCP pump is enough.
+        pump = self._pump_with_human if self.config.human_room_id else self._pump_forever
+        self._pump = asyncio.create_task(pump())
 
     def _route(self, message: RcpMessage) -> None:
         # Both services filter by envelope kind/type/sim/signature, so feeding
@@ -153,6 +170,163 @@ class HelloRuntime:
             raise RuntimeError(msg)
         async for message in self._transport.receive():
             self._route(message)
+
+    async def _pump_with_human(self) -> None:
+        """Pump RCP messages and answer human chat in one sync loop.
+
+        Raises:
+            RuntimeError: If the runtime has not been started.
+
+        """
+        if self._transport is None:
+            msg = "runtime is not started"
+            raise RuntimeError(msg)
+        while True:
+            rcp, human = await self._transport.drain()
+            for message in rcp:
+                self._route(message)
+            for room_id, sender, body in human:
+                await self._handle_human(room_id, sender, body)
+
+    async def _handle_human(self, room_id: str, sender: str, body: str) -> None:
+        """Answer one human room message (best-effort; never raises).
+
+        Only messages in the configured human room from a sender that is not
+        the bot itself are acted on.
+
+        Args:
+            room_id: The room the message arrived in.
+            sender: The sender's Matrix id.
+            body: The message body.
+
+        """
+        if self._transport is None:
+            return
+        if not self.config.human_room_id or room_id != self.config.human_room_id:
+            return
+        if sender == self.config.user_id:
+            return  # never answer ourselves
+        try:
+            action = await self.dispatch_human(body)
+            await self._send_human_action(room_id, action)
+        except Exception as exc:  # ruff: ignore[blind-except] - a bot must never crash the pump
+            log.warning("human command failed: %s", exc)
+
+    async def _send_human_action(self, room_id: str, action: HumanAction) -> None:
+        """Send a :class:`HumanAction` (text or PNG) to ``room_id``.
+
+        Args:
+            room_id: The target room.
+            action: The action produced by :meth:`dispatch_human`.
+
+        """
+        if self._transport is None:
+            return
+        if action.kind == "image" and action.png_base64:
+            await self._transport.send_image(room_id, base64.b64decode(action.png_base64), body=action.text)
+        else:
+            await self._transport.send_text(room_id, action.text)
+
+    async def dispatch_human(self, body: str) -> HumanAction:
+        """Map one human message to the reply the agent should send.
+
+        Args:
+            body: The raw message body.
+
+        Returns:
+            The text or image action; never raises (an unexpected failure is
+            returned as help text).
+
+        """
+        command = parse_command(body)
+        try:
+            return await self._dispatch_command(command)
+        except Exception as exc:  # ruff: ignore[blind-except] - a reply must never raise
+            return HumanAction(text=f"Could not handle {command.verb}: {self.config.redact(str(exc))}")
+
+    async def _dispatch_command(self, command: HumanCommand) -> HumanAction:
+        """Handle a parsed command (may raise; wrapped by :meth:`dispatch_human`).
+
+        Returns:
+            The reply action.
+
+        """
+        simple = {
+            "help": lambda: HumanAction(text=help_text()),
+            "status": lambda: HumanAction(text=format_status(self.agenda_status(), self.fleet_status())),
+            "fleet": lambda: HumanAction(text=format_fleet(self.fleet_status())),
+            "leaves": lambda: HumanAction(text=format_leaves(self.agenda_status())),
+        }
+        if command.verb in simple:
+            return simple[command.verb]()
+        if command.verb == "pause":
+            return await self._lifecycle_action("paused")
+        if command.verb == "resume":
+            return await self._lifecycle_action("running")
+        if command.verb == "stop":
+            result = await self.stop_agenda()
+            return HumanAction(
+                text=f"Stopped: {len(result.get('cancelled', []))} cancelled, {len(result.get('errors', []))} errors.",
+            )
+        if command.verb == "png":
+            return await self._human_png(command)
+        return HumanAction(text=help_text())
+
+    async def _lifecycle_action(self, state: CampaignState) -> HumanAction:
+        """Set the campaign state and phrase the reply.
+
+        Returns:
+            The reply action.
+
+        """
+        result = await self.set_agenda_state(state)
+        return HumanAction(text=f"Campaign {result.get('state', result.get('error'))}.")
+
+    async def _human_png(self, command: HumanCommand) -> HumanAction:
+        """Render ``!png <sim_id> [record] [component]`` as an image reply.
+
+        Returns:
+            The image action, or a text error when unavailable.
+
+        """
+        sim_id = command.arg
+        if not sim_id:
+            return HumanAction(text="Usage: !png <sim_id> [record] [component]")
+        if self._transport is None:
+            return HumanAction(text="Transport is not started.")
+        record = command.extras[0] if command.extras else None
+        component = command.extras[1] if len(command.extras) > 1 else None
+        params = ResultParams(sim_id=sim_id, op=ResultOp.IMAGE, record=record, component=component)
+        payload = await self.submit_service.fetch_result(self._transport.send, params)
+        if not payload or payload.get("error"):
+            error = self.config.redact(str(payload.get("error", "unavailable")))
+            return HumanAction(text=f"No image for {sim_id}: {error}")
+        data = payload.get("data")
+        if not isinstance(data, str):
+            return HumanAction(text=f"No image data for {sim_id}.")
+        return HumanAction(
+            kind="image",
+            text=format_png_caption(sim_id, record, component),
+            png_base64=data,
+        )
+
+    async def notify_human(self, callbacks: list[dict[str, Any]], alerts: list[dict[str, Any]]) -> None:
+        """Push a one-line notification to the human room (best-effort).
+
+        Args:
+            callbacks: Callbacks emitted by the last tick.
+            alerts: Fleet alerts at that point.
+
+        """
+        if self._transport is None or not self.config.human_room_id or not self.config.notify:
+            return
+        text = notification_text(callbacks, alerts)
+        if text is None:
+            return
+        try:
+            await self._transport.send_text(self.config.human_room_id, text)
+        except Exception as exc:  # ruff: ignore[blind-except] - notifications are best-effort
+            log.warning("human notification failed: %s", exc)
 
     async def hello(self, message: str) -> HelloOutcome:
         """Run one ``hello`` exchange.
@@ -278,7 +452,11 @@ class HelloRuntime:
         """
         if self._transport is None:
             return {"ok": False, "error": "unavailable"}
-        return await self.agenda_service.advance(self._transport.send)
+        result = await self.agenda_service.advance(self._transport.send)
+        # Best-effort human notification when a tick produced decision points; a
+        # notification failure must never fail the tick.
+        await self.notify_human(result.get("callbacks", []), self.fleet_status().get("alerts", []))
+        return result
 
     def agenda_status(self) -> dict[str, Any]:
         """Return the aggregate campaign status.
@@ -322,6 +500,53 @@ class HelloRuntime:
 
         """
         return await self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
+
+    async def record_analysis(self, path: str, analysis: dict[str, Any]) -> dict[str, Any]:
+        """Record one leaf's analysis on the campaign.
+
+        Returns:
+            ``{"ok": True, "path": path}``, or a soft error.
+
+        """
+        return await self.agenda_service.record_analysis(path, analysis)
+
+    async def record_conclusion(self, conclusion: str) -> dict[str, Any]:
+        """Record the campaign's declared conclusion.
+
+        Returns:
+            ``{"ok": True, "conclusion": conclusion}``, or a soft error.
+
+        """
+        return await self.agenda_service.record_conclusion(conclusion)
+
+    def suggest_refinement(self, *, rel_tol: float = 0.05) -> dict[str, Any]:
+        """Suggest refinement points from the recorded analyses.
+
+        Returns:
+            The refinement summary, or a soft error.
+
+        """
+        return self.agenda_service.suggest_refinement(rel_tol=rel_tol)
+
+    def export_agenda_cwl(self) -> dict[str, Any]:
+        """Return the campaign agenda as a CWL workflow document.
+
+        Makes the emitted CWL reachable (it is the execution substrate the
+        queue-based engine stands in for): the workflow YAML plus the leaf
+        paths, or a soft error when there is no campaign.
+
+        Returns:
+            ``{"ok": True, "workflow": <yaml>, "leaves": [...]}`` or a soft
+            error.
+
+        """
+        if not self.agenda_service.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        try:
+            campaign = self.agenda_service.store.load(Campaign)
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            return {"ok": False, "error": self.config.redact(str(exc))}
+        return {"ok": True, **manifest_for(campaign.agenda)}
 
     async def set_agenda_state(self, state: CampaignState) -> dict[str, Any]:
         """Persist the campaign lifecycle state.
@@ -371,7 +596,11 @@ class HelloRuntime:
             campaign = self.agenda_service.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
             return {"ok": False, "error": self.config.redact(str(exc))}
-        crate = campaign_rocrate(campaign, revision=self.config.picongpu_revision or None)
+        crate = campaign_rocrate(
+            campaign,
+            analyses=campaign.analyses,
+            revision=self.config.picongpu_revision or None,
+        )
         return {"ok": True, **crate}
 
     def condensed_events(
@@ -814,6 +1043,64 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     ) -> dict[str, Any]:
         result = await runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on)
         return _redact_dict(runtime, result)
+
+    _register_research_tools(server, runtime)
+
+
+def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
+    """Register the research-loop tools (analysis, refinement, conclusion, CWL).
+
+    Args:
+        server: The MCP server to add the tools to.
+        runtime: The runtime the tools delegate to.
+
+    """
+
+    @server.tool(
+        title="Record an analysis on the campaign",
+        description=(
+            "Attach one leaf's analysis (e.g. the analyze_output sections) to the "
+            "campaign, so the provenance record links inputs -> runs -> analyses."
+        ),
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    async def record_agenda_analysis(path: str, analysis: dict[str, Any]) -> dict[str, Any]:
+        return _redact_dict(runtime, await runtime.record_analysis(path, analysis))
+
+    @server.tool(
+        title="Suggest a refinement from the recorded analyses",
+        description=(
+            "Score the recorded analyses and report the best point, whether the "
+            "sweep has converged, and deterministic refinement points to add "
+            "around the optimum."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def suggest_agenda_refinement(rel_tol: float = 0.05) -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.suggest_refinement(rel_tol=rel_tol))
+
+    @server.tool(
+        title="Declare the campaign conclusion",
+        description=(
+            "Record the campaign's conclusion text; it is emitted in the campaign "
+            "provenance report, closing the lineage."
+        ),
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    async def conclude_agenda(conclusion: str) -> dict[str, Any]:
+        return _redact_dict(runtime, await runtime.record_conclusion(conclusion))
+
+    @server.tool(
+        title="Export the campaign agenda as CWL",
+        description=(
+            "Render the campaign's agenda as a CWL Workflow document (the "
+            "execution substrate): the workflow YAML plus the leaf paths. "
+            "Inspect it, or hand it to cwltool."
+        ),
+        annotations=_READ_ONLY,
+    )
+    def export_agenda_cwl() -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.export_agenda_cwl())
 
     @server.tool(
         title="Get the aggregate fleet status",

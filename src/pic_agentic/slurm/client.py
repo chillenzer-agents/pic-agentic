@@ -24,6 +24,13 @@ SAFE_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
 SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 STATE_RE = re.compile(r"JobState=(\w+)")
 
+#: ``sacct --parsable2`` accounting columns (fixed ``--format`` order):
+#: ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot``.
+_MIN_ACCOUNTING_FIELDS = 3
+_COL_ELAPSED_RAW = 1
+_COL_ALLOC_CPUS = 2
+_COL_TRES = 3
+
 #: Signals the client will deliver.  A fixed set, so a wire string can never be
 #: interpolated into ``scontrol``/``scancel``.  ``TERM``/``ALRM`` are the M3
 #: stop paths (PIConGPU's ``SIGTERM``/``SIGALRM`` handlers).
@@ -63,6 +70,84 @@ class JobInfo(BaseModel):
     job_id: int
     state: SlurmJobState
     exit_code: int | None = None
+
+
+class JobAccounting(BaseModel):
+    """Actual resource usage reported by ``sacct`` for one finished job."""
+
+    job_id: int
+    core_hours: float = 0.0
+    gpu_hours: float = 0.0
+    is_gpu: bool = False
+
+
+def parse_accounting(output: str) -> dict[int, JobAccounting]:
+    """Parse ``sacct --parsable2`` output into per-job actual usage.
+
+    The expected columns are ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot`` (or a
+    ``--format`` subset in the same order); ``ElapsedRaw`` is seconds and
+    ``AllocCPUS`` is the allocated CPU count, so
+    ``core_hours = ElapsedRaw * AllocCPUS / 3600``.  A ``gres/gpu=N`` in the TRES
+    usage contributes ``gpu_hours = elapsed_hours * N``.  A malformed row is
+    skipped, never raised.
+
+    Args:
+        output: The raw ``sacct --parsable2`` stdout.
+
+    Returns:
+        ``{job_id: JobAccounting}`` for the base jobs that parsed.
+
+    """
+    accounting: dict[int, JobAccounting] = {}
+    lines = output.splitlines()
+    if not lines:
+        return accounting
+    # Column positions in the fixed ``--format=JobID,ElapsedRaw,AllocCPUS,
+    # TRESUsageInTot`` order; ``|`` is the ``--parsable2`` delimiter.
+    for line in lines[1:]:  # the first line is the header
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < _MIN_ACCOUNTING_FIELDS:
+            continue
+        try:
+            job_id = int(fields[0].split(".")[0])
+        except ValueError:
+            continue
+        elapsed_raw = _int_or_none(fields[_COL_ELAPSED_RAW])
+        alloc_cpus = _int_or_none(fields[_COL_ALLOC_CPUS])
+        elapsed_hours = (elapsed_raw or 0) / 3600.0
+        tres = fields[_COL_TRES] if len(fields) > _COL_TRES else ""
+        gpu_count = _gpu_count(tres)
+        accounting[job_id] = JobAccounting(
+            job_id=job_id,
+            core_hours=elapsed_hours * (alloc_cpus or 0),
+            gpu_hours=elapsed_hours * gpu_count,
+            is_gpu=gpu_count > 0,
+        )
+    return accounting
+
+
+def _int_or_none(text: str) -> int | None:
+    """Parse an integer field, returning None when it is not one.
+
+    Returns:
+        The integer, or None.
+
+    """
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _gpu_count(tres: str) -> int:
+    """Extract ``N`` from a ``gres/gpu=N`` TRES usage field.
+
+    Returns:
+        The GPU count, or 0 when absent/malformed.
+
+    """
+    match = re.search(r"gres/gpu=(\d+)", tres)
+    return int(match.group(1)) if match else 0
 
 
 def validate_shared_path(path: str, base_dir: str) -> str:
@@ -206,6 +291,40 @@ class SlurmClient:
         if exit_match:
             exit_code = int(exit_match.group(1))
         return JobInfo(job_id=job_id, state=state, exit_code=exit_code)
+
+    async def job_accounting(self, job_id: int) -> JobAccounting | None:
+        """Query ``sacct`` for one finished job's actual resource usage.
+
+        Uses ``--parsable2`` with a fixed, argument-array command (never a
+        shell), so the job id is an integer and cannot be interpolated.  A
+        failure (``sacct`` missing, no accounting row, malformed output) is
+        returned as ``None`` rather than raised: actual-cost reconciliation is
+        best-effort and must never block a tick.
+
+        Args:
+            job_id: The SLURM job id.
+
+        Returns:
+            The parsed accounting, or None when unavailable.
+
+        """
+        argv = [
+            self._exe("sacct"),
+            "-j",
+            str(job_id),
+            "--parsable2",
+            "--noheader",
+            "--format=JobID,ElapsedRaw,AllocCPUS,TRESUsageInTot",
+        ]
+        try:
+            rc, stdout, _stderr = await self._run(argv)
+        except SlurmError:
+            return None
+        if rc != 0:
+            return None
+        # --noheader is requested, but accept a header line too (older sacct).
+        rows = parse_accounting("JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot\n" + stdout)
+        return rows.get(job_id)
 
     async def wait_for_job(self, job_id: int, *, timeout_s: float, interval_s: float = 5.0) -> JobInfo:
         """Poll a job until it reaches a terminal state or ``timeout_s`` passes.

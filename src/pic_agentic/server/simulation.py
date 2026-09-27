@@ -89,6 +89,8 @@ _RECORD_FIELDS = (
     "avg_per_step",
     "eta_s",
     "exit_code",
+    "core_hours",
+    "gpu_hours",
     "run_dir",
 )
 
@@ -114,6 +116,9 @@ class SimRecord(BaseModel):
     avg_per_step: str | None = None
     eta_s: int | None = None
     exit_code: int | None = None
+    #: Actual resource usage reported on the terminal lifecycle event (gap 4).
+    core_hours: float | None = None
+    gpu_hours: float | None = None
     run_dir: str | None = None
     last_event_type: str | None = None
     last_event_ts: str | None = None
