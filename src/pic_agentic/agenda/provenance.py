@@ -35,16 +35,20 @@ _RO_CRATE_PROFILE = "https://w3id.org/ro/crate/1.1"
 
 
 def sanitize_id(path: str) -> str:
-    """Return a fragment-safe ``@id`` for a leaf path.
+    """Return a fragment-safe, collision-free ``@id`` for a leaf path.
+
+    ``/`` is percent-encoded (along with ``%`` itself), so the map is injective:
+    distinct leaf paths always yield distinct ids (unlike a plain ``/`` -> ``_``
+    substitution, under which ``a/b`` and ``a_b`` would collide).
 
     Args:
         path: The agenda leaf path (``a/b/c``).
 
     Returns:
-        A ``#``-prefixed fragment with path separators replaced by ``_``.
+        A ``#``-prefixed fragment with separators percent-encoded.
 
     """
-    safe = path.replace("/", "_")
+    safe = path.replace("%", "%25").replace("/", "%2F")
     return f"#{safe}"
 
 

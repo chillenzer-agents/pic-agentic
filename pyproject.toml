@@ -110,6 +110,9 @@ ignore = [
   "S603",
   # Constructors legitimately take many keyword arguments.
   "PLR0913",
+  # HelloRuntime is a thin facade whose public methods are the MCP tool
+  # handlers; one method per tool is the intended shape, not an oversight.
+  "PLR0904",
   # CLI entry points print by design.
   "T201",
 ]

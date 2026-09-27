@@ -259,10 +259,15 @@ def next_actions(
     effective = apply_states(agenda, states)
     paths, parents = _index_entries(effective)
     steps: list[PlanStep] = []
-    # Thread a *running* usage through the plan: each emitted ``submit``
-    # consumes its estimated budget immediately, so a batch can never plan more
-    # concurrent work than the caps allow (per-leaf checks alone would).
-    running = usage
+    # Thread a *running* usage through the plan: each emitted ``submit`` both
+    # accrues its estimated cost and counts as an in-flight job immediately, so
+    # a batch can never plan more concurrent work than the caps allow (per-leaf
+    # checks against the initial usage alone would).
+    running = usage.model_copy(
+        update={
+            "jobs_running": sum(1 for _, sim in effective.simulations() if sim.status in {"submitted", "running"}),
+        },
+    )
     for path, sim in effective.simulations():
         step = _plan_leaf(sim, path, parents.get(path), paths, budget=budget, usage=running)
         if step.action == "submit":
@@ -274,6 +279,7 @@ def next_actions(
                 gpu_hours=request.est_gpu_hours,
                 is_gpu=request.is_gpu,
             )
+            running = running.model_copy(update={"jobs_running": running.jobs_running + 1})
         steps.append(step)
     return steps
 

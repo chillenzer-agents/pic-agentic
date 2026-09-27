@@ -89,9 +89,13 @@ def test_mixed_revisions_leave_the_pin_blank() -> None:
     assert not _by_id(campaign_rocrate(mixed), "#picongpu")["version"]
 
 
-def test_sanitize_id_replaces_separators() -> None:
-    assert sanitize_id("group/leaf") == "#group_leaf"
+def test_sanitize_id_percent_encodes_separators() -> None:
+    # ``/`` is percent-encoded, so the map is injective: ``a/b`` and ``a_b``
+    # yield distinct ids (a plain ``/``->``_`` substitution would collide).
+    assert sanitize_id("group/leaf") == "#group%2Fleaf"
     assert sanitize_id("leaf") == "#leaf"
+    assert sanitize_id("a/b") != sanitize_id("a_b")
+    assert sanitize_id("a%2Fb") != sanitize_id("a/b")
 
 
 def test_crate_is_json_serialisable() -> None:

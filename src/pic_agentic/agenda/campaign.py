@@ -21,6 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from pic_agentic.agenda.budget import Budget, BudgetUsage
 from pic_agentic.agenda.model import AgendaGroup  # ruff: ignore[typing-only-first-party-import] - runtime
 
+#: The campaign lifecycle state.  ``running`` executes; ``paused`` folds
+#: observations and emits callbacks but submits nothing (resumable);
+#: ``stopped`` is the kill-switch terminal state.
+CampaignState = Literal["running", "paused", "stopped"]
+
 
 def utc_now_iso() -> str:
     """Return the current UTC time as an ISO-8601 ``Z`` string.
@@ -63,6 +68,9 @@ class Campaign(BaseModel):
     created_ts: str | None = None
     #: Pending (undrained) decision-point callbacks, in emission order.
     callbacks: list[Callback] = Field(default_factory=list)
+    #: Lifecycle state: ``running`` executes, ``paused`` holds submissions
+    #: (resumable), ``stopped`` is the kill-switch terminal state.
+    state: CampaignState = "running"
 
     def with_created_ts(self) -> Campaign:
         """Return a copy with ``created_ts`` set when it is not already.
@@ -76,4 +84,4 @@ class Campaign(BaseModel):
         return self.model_copy(update={"created_ts": utc_now_iso()})
 
 
-__all__ = ["Callback", "Campaign", "utc_now_iso"]
+__all__ = ["Callback", "Campaign", "CampaignState", "utc_now_iso"]

@@ -207,7 +207,6 @@ async def test_tool_registration_shape() -> None:
     for name in (
         "checkpoint_simulation",
         "stop_simulation",
-        "cancel_simulation",
         "checkpoint_and_stop_simulation",
     ):
         annotations = tools[name].annotations
@@ -215,6 +214,12 @@ async def test_tool_registration_shape() -> None:
         assert annotations.read_only_hint is False
         assert annotations.destructive_hint is False
         assert annotations.idempotent_hint is False
+    # A hard cancel kills the job outright (no clean shutdown), so it is
+    # destructive, unlike the signal-delivering control verbs above.
+    cancel = tools["cancel_simulation"].annotations
+    assert cancel is not None
+    assert cancel.read_only_hint is False
+    assert cancel.destructive_hint is True
     for name in ("describe_results", "get_result_slice", "read_result", "export_results"):
         annotations = tools[name].annotations
         assert annotations is not None

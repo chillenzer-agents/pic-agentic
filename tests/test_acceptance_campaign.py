@@ -149,14 +149,16 @@ async def test_first_acceptance_test_offline(tmp_path: Path) -> None:
         Campaign(
             name="laser-intensity-study",
             agenda=_sweep_agenda(),
-            budget=Budget(max_total_jobs=5, max_concurrent_jobs=2),
+            budget=Budget(max_total_jobs=6, max_concurrent_jobs=2),
         ),
     )
 
     # ---- Phase 0: the approval gate holds the expensive sweep -------------
     gated = await _tick_fresh(store, cluster, require_approval=True)
     assert gated.submitted == []
-    assert sorted(gated.pending_approval) == sorted(f"i={intensity:g}" for intensity in INTENSITIES)
+    # The concurrency cap bounds the batch, so only the first two leaves reach
+    # the approval gate this tick; the rest are still waiting.
+    assert sorted(gated.pending_approval) == sorted(f"i={intensity:g}" for intensity in INTENSITIES)[:2]
 
     # Approve every leaf (the human gate), then advance.
     _approve_all(store)
@@ -183,6 +185,24 @@ async def test_first_acceptance_test_offline(tmp_path: Path) -> None:
 
     # ---- Phase 3: drain callbacks, analyse, refine around the optimum -----
     _drain_and_refine(store)
+
+    # ---- Phase 3b: pause holds the refined leaf, resume releases it --------
+    # Pause first, then finish the in-flight jobs: the pause still folds the
+    # progress, but the now-ready refined leaf is held rather than submitted.
+    paused = store.load(Campaign)
+    store.save(paused.model_copy(update={"state": "paused"}))
+    for sim_id, sim_state in list(cluster.states.items()):
+        if sim_state == "simulation.job_running":
+            cluster.finish(sim_id)
+    held_tick = await _tick_fresh(store, cluster)
+    assert held_tick.submitted == []
+    assert "refine_2.5e18" in held_tick.held
+    submits_before_resume = len(cluster.submits)
+    resumed = store.load(Campaign)
+    store.save(resumed.model_copy(update={"state": "running"}))
+    released = await _tick_fresh(store, cluster)
+    assert len(cluster.submits) > submits_before_resume
+    assert released.state == "running"
 
     # ---- Phase 4: a second restart, then run to completion ----------------
     tick = await _run_to_completion(store, cluster)

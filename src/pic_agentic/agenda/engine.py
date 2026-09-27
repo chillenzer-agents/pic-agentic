@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.agenda.budget import Budget, BudgetUsage
-from pic_agentic.agenda.campaign import Callback, Campaign, utc_now_iso
+from pic_agentic.agenda.campaign import Callback, Campaign, CampaignState, utc_now_iso
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.planner import (
     PlanStep,
@@ -76,6 +76,17 @@ class DuplicateSpecError(RuntimeError):
     """
 
 
+class TransientSubmitError(RuntimeError):
+    """A submission failure that may succeed on retry (e.g. a lost ack).
+
+    A lost acknowledgement does not mean the job failed -- it may be running --
+    and the engine's exactly-once idempotency key makes retrying it safe.  The
+    engine therefore leaves the leaf ``planned`` (to retry next tick) for a
+    transient error, but marks it ``failed`` for any other submission error (a
+    rejected payload, a build failure), which a retry would only repeat.
+    """
+
+
 class EnginePolicy(BaseModel):
     """Limits and gates the engine applies on top of the budget."""
 
@@ -103,6 +114,10 @@ class TickResult(BaseModel):
     usage: BudgetUsage = BudgetUsage()
     #: Decision-point callbacks emitted this tick (newly done/failed leaves).
     callbacks: list[Callback] = Field(default_factory=list)
+    #: The campaign's lifecycle state after this tick.
+    state: CampaignState = "running"
+    #: Leaves the planner would have submitted but the lifecycle held back.
+    held: list[str] = Field(default_factory=list)
 
 
 class AgendaEngine:
@@ -154,42 +169,104 @@ class AgendaEngine:
         before = {path: sim.status for path, sim in campaign.agenda.simulations()}
         budget = self.budget_override or campaign.budget
         campaign, steps = self._plan(campaign, budget)
-        # Persist the folded observation before submitting anything: progress
-        # observed in this tick survives a crash before the first submission,
-        # and the incremental saves below lock in each accepted leaf.
+        # Refuse a campaign whose submissions would collide *before* submitting
+        # anything: a duplicate payload maps two leaves to one sim_id, so a
+        # partial tick would leave a leaf running against a corrupted
+        # observation.  Raising up-front keeps the tick atomic and tells the
+        # agent to fix the campaign (tag the replicas distinctly).
+        _reject_duplicate_specs(campaign, [path for path, step in steps if step.action == "submit"])
+        # Persist the folded observation *together with its callbacks* before
+        # submitting anything.  Doing it in one save is what makes the
+        # transition durable: if a later submit raises or the process crashes,
+        # the callback is already on disk rather than lost (the next tick would
+        # see the leaf already terminal and emit nothing).
+        campaign, emitted = self._emit_callbacks(campaign, before)
+        result = TickResult(state=campaign.state, callbacks=list(emitted))
         self.store.save(campaign)
-        result = TickResult()
         in_flight = campaign.usage.jobs_running
         concurrency_cap = budget.max_concurrent_jobs
         for path, step in steps:
             if step.action != "submit":
-                campaign = self._persist_terminal(campaign, path, step.action)
+                campaign, terminal = self._persist_terminal(campaign, path, step.action)
+                if terminal is not None:
+                    result.callbacks.append(terminal)
                 _bucket(result, path, step.action)
+                continue
+            if campaign.state != "running":
+                # Paused/stopped: observe, fold and emit callbacks as usual, but
+                # hold every submission (no gate, no usage).  Resuming simply
+                # lets the next tick submit the still-planned leaves.
+                result.held.append(path)
                 continue
             if len(result.submitted) >= self.policy.max_submits_per_tick:
                 result.waiting.append(path)
                 continue
             if concurrency_cap is not None and in_flight >= concurrency_cap:
-                # The planner threads a *running* usage through the batch, but
-                # it does not accrue jobs_running per emitted submit; enforce
-                # the concurrency headroom here so one tick cannot over-fill.
+                # The concurrency headroom is enforced here so one tick cannot
+                # over-fill (the planner also caps, but the observed in-flight
+                # count is authoritative).
                 result.waiting.append(path)
                 continue
             leaf = leaf_at(campaign.agenda, path)
             if not self._may_submit(leaf, step):
                 result.pending_approval.append(path)
                 continue
-            campaign = await self._do_submit(campaign, path, step)
+            campaign, failure, deferred = await self._submit_one(campaign, path, step)
+            if deferred:
+                # A lost ack: the leaf stays planned and is retried next tick
+                # (under the same idempotency key); nothing to bucket.
+                result.waiting.append(path)
+            elif failure is not None:
+                # A single leaf's submission failure must not abort the whole
+                # tick (which would wedge every later leaf behind it): mark it
+                # failed, record the callback and carry on.
+                result.failed.append(path)
+                result.callbacks.append(failure)
+            else:
+                result.submitted.append(path)
+                in_flight += 1
             # Incremental persistence: a crash after this point must not
             # resubmit the leaf (the next tick sees its recorded sim_id).
             self.store.save(campaign)
-            result.submitted.append(path)
-            in_flight += 1
-        campaign, result.callbacks = self._emit_callbacks(campaign, before)
         result.complete = _is_complete(campaign.agenda)
         result.usage = campaign.usage
         self.store.save(campaign)
         return result
+
+    async def _submit_one(
+        self,
+        campaign: Campaign,
+        path: str,
+        step: PlanStep,
+    ) -> tuple[Campaign, Callback | None, bool]:
+        """Submit one leaf, classifying a failure as deferred or terminal.
+
+        A transient failure (a lost ack) leaves the leaf ``planned`` for a retry;
+        any other submission failure marks it ``failed`` and emits a ``failed``
+        callback.  Neither raises out of :meth:`tick`, so one bad leaf cannot
+        block every leaf after it.
+
+        Returns:
+            ``(campaign, callback, deferred)``: on success ``(campaign, None,
+            False)``; on a lost ack ``(campaign, None, True)``; on a terminal
+            failure ``(campaign, callback, False)``.
+
+        """
+        try:
+            return await self._do_submit(campaign, path, step), None, False
+        except TransientSubmitError as exc:
+            log.warning("agenda submit deferred for %s: %s", path, exc)
+            return campaign, None, True
+        except Exception as exc:  # ruff: ignore[blind-except] - a leaf failure is data, not a fault
+            log.warning("agenda submit failed for %s: %s", path, exc)
+            agenda = campaign.agenda.model_copy(deep=True)
+            leaf = leaf_at(agenda, path)
+            if leaf is None:
+                return campaign, None, False
+            leaf.status = "failed"
+            callback = Callback(path=path, kind="failed", sim_id=leaf.sim_id, ts=utc_now_iso())
+            updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
+            return updated, callback, False
 
     @staticmethod
     def _emit_callbacks(campaign: Campaign, before: Mapping[str, str]) -> tuple[Campaign, list[Callback]]:
@@ -215,26 +292,30 @@ class AgendaEngine:
         return campaign.model_copy(update={"callbacks": [*campaign.callbacks, *emitted]}), emitted
 
     @staticmethod
-    def _persist_terminal(campaign: Campaign, path: str, action: str) -> Campaign:
+    def _persist_terminal(campaign: Campaign, path: str, action: str) -> tuple[Campaign, Callback | None]:
         """Persist a planner-terminal decision the observation did not cover.
 
         A leaf blocked by a failed dependency is reported ``failed`` by the
         planner but has no observed state of its own, so its folded status would
         stay ``planned`` and the campaign could never be ``complete``.  Writing
-        the terminal status back closes that gap.
+        the terminal status back closes that gap, and a callback is emitted for
+        the transition (it is a decision point like any other).
 
         Returns:
-            The campaign, with the leaf's status updated when terminal.
+            The campaign (with the leaf's status updated when terminal) and the
+            emitted callback, if any.
 
         """
         if action not in {"failed", "done"}:
-            return campaign
+            return campaign, None
         agenda = campaign.agenda.model_copy(deep=True)
         leaf = leaf_at(agenda, path)
         if leaf is None or leaf.status in {"failed", "done"}:
-            return campaign
+            return campaign, None
         leaf.status = action
-        return campaign.model_copy(update={"agenda": agenda})
+        callback = Callback(path=path, kind=action, sim_id=leaf.sim_id, ts=utc_now_iso())
+        updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
+        return updated, callback
 
     def _plan(self, campaign: Campaign, budget: Budget) -> tuple[Campaign, list[tuple[str, PlanStep]]]:
         """Fold observed states into the campaign and compute next actions.
@@ -337,6 +418,7 @@ class AgendaEngine:
             )
         return {
             "name": campaign.name,
+            "state": campaign.state,
             "complete": _is_complete(campaign.agenda),
             "counts": counts,
             "usage": campaign.usage.model_dump(),
@@ -414,21 +496,50 @@ def _is_complete(agenda: AgendaGroup) -> bool:
     return all(sim.status not in _ACTIVE_STATUSES for _, sim in agenda.simulations())
 
 
-def _reject_duplicate_spec(campaign: Campaign, path: str, step: PlanStep) -> None:
-    """Refuse an already-submitted identical spec (sim_id collision).
+def _reject_duplicate_specs(campaign: Campaign, submit_paths: list[str]) -> None:
+    """Refuse a tick whose *submitting* leaves would collide on ``sim_id``.
+
+    Checks the pending submissions against each other and against every
+    already-submitted leaf, using the wire payload (``spec["sim"]``) -- the same
+    bytes the cluster hashes into ``sim_id``.  Done up-front so a collision
+    aborts the tick before any job is launched.
 
     Raises:
-        DuplicateSpecError: If ``step``'s spec matches an already-submitted
-            leaf's spec.
+        DuplicateSpecError: On the first colliding pair (deterministic order).
 
     """
-    digest = _spec_hash(step.spec)
+    submitted = [(path, sim) for path, sim in campaign.agenda.simulations() if sim.sim_id]
+    by_path = dict(campaign.agenda.simulations())
+    pending = [(path, by_path[path]) for path in submit_paths if path in by_path]
+    for index, (path, sim) in enumerate(pending):
+        digest = _wire_hash(sim.spec)
+        for other_path, other in [*submitted, *pending[:index]]:
+            if _wire_hash(other.spec) == digest:
+                msg = (
+                    f"duplicate payload at {path!r} and {other_path!r}: identical simulations map to the same "
+                    "sim_id and would collapse into one job; make replicas distinct (e.g. per-replica tag)"
+                )
+                raise DuplicateSpecError(msg)
+
+
+def _reject_duplicate_spec(campaign: Campaign, path: str, step: PlanStep) -> None:
+    """Refuse a spec whose wire payload collides with an already-submitted leaf.
+
+    The per-submit guard, kept as a defensive check inside :meth:`_do_submit`;
+    the up-front :func:`_reject_duplicate_specs` does the authoritative scan.
+
+    Raises:
+        DuplicateSpecError: If ``step``'s wire payload matches an
+            already-submitted leaf's.
+
+    """
+    digest = _wire_hash(step.spec)
     for other_path, sim in campaign.agenda.simulations():
         if other_path == path or not sim.sim_id:
             continue
-        if _spec_hash(sim.spec) == digest:
+        if _wire_hash(sim.spec) == digest:
             msg = (
-                f"duplicate spec at {path!r} and {other_path!r}: identical payloads map to the same "
+                f"duplicate payload at {path!r} and {other_path!r}: identical simulations map to the same "
                 "sim_id and would collapse into one job; make replicas distinct (e.g. per-replica tag)"
             )
             raise DuplicateSpecError(msg)
@@ -459,6 +570,24 @@ def _spec_hash(spec: Mapping[str, Any]) -> str:
     """
     canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _wire_hash(spec: Mapping[str, Any]) -> str:
+    """Return the hash of the *wire payload* a leaf submission produces.
+
+    Mirrors :func:`pic_agentic.protocol.simulation.
+    simulation_spec_from_runner_dump`: the payload is ``{"sim": spec["sim"]}``,
+    and the cluster's ``sim_id`` is the payload-hash prefix.  Kept local (stdlib
+    only) so this module stays extraction-ready, and used so duplicate detection
+    matches exactly the bytes the ``sim_id`` uses.
+
+    Returns:
+        The sha256 hex digest of the canonical ``{"sim": ...}`` encoding.
+
+    """
+    sim = spec.get("sim")
+    payload = {"sim": sim} if sim is not None else dict(spec)
+    return _spec_hash(payload)
 
 
 def _revision(campaign: Campaign) -> str | None:

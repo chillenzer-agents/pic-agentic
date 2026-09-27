@@ -10,7 +10,7 @@ import pytest
 
 from pic_agentic.agenda.budget import Budget
 from pic_agentic.agenda.campaign import Campaign
-from pic_agentic.agenda.engine import AgendaEngine, DuplicateSpecError, EnginePolicy
+from pic_agentic.agenda.engine import AgendaEngine, DuplicateSpecError, EnginePolicy, TransientSubmitError
 from pic_agentic.agenda.model import AgendaGroup
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
 
@@ -99,28 +99,29 @@ async def test_idempotency_key_is_stable_across_restarts(tmp_path) -> None:
 
 
 async def test_lost_ack_does_not_duplicate_after_incremental_save(tmp_path) -> None:
-    """A crash after an accepted submit must not resubmit that leaf."""
+    """A lost ack leaves the leaf planned; the retry reuses its key."""
     store = _store(tmp_path)
     store.save(Campaign(name="c", agenda=_agenda(2)))
-
-    class _BoomError(Exception):
-        pass
 
     calls: list[str] = []
 
     async def submit(spec: dict, key: str) -> str:
         calls.append(key)
         if len(calls) == 2:
-            raise _BoomError
+            msg = "lost ack"
+            raise TransientSubmitError(msg)
         return "sim000"
 
     engine = AgendaEngine(store=store, submit=submit, observe=dict)
-    with pytest.raises(_BoomError):
-        await engine.tick()
-    # The first leaf was persisted incrementally and must not be resubmitted.
+    # A lost ack does not fail the tick: the first leaf is recorded, the second
+    # is deferred and stays planned.
+    first = await engine.tick()
+    assert first.submitted == ["a0"]
+    assert first.failed == []
     reloaded = store.load(Campaign)
     assert reloaded.agenda.entries["a0"].sim_id == "sim000"
-    assert reloaded.agenda.entries["a0"].status == "submitted"
+    assert reloaded.agenda.entries["a1"].status == "planned"
+    deferred_key = calls[1]
 
     resumed_calls: list[str] = []
 
@@ -132,14 +133,54 @@ async def test_lost_ack_does_not_duplicate_after_incremental_save(tmp_path) -> N
     result = await engine2.tick()
     assert result.submitted == ["a1"]
     assert len(resumed_calls) == 1
+    # The retry reuses the same idempotency key, so the cluster replays.
+    assert resumed_calls[0] == deferred_key
+
+
+async def test_permanent_submit_failure_marks_leaf_failed(tmp_path) -> None:
+    """A non-transient submit failure fails the leaf, not the whole tick."""
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(2)))
+    calls: list[str] = []
+
+    async def submit(spec: dict, key: str) -> str:
+        calls.append(key)
+        if len(calls) == 1:
+            msg = "payload rejected"
+            raise RuntimeError(msg)
+        return "sim001"
+
+    engine = AgendaEngine(store=store, submit=submit, observe=dict)
+    result = await engine.tick()
+    assert result.failed == ["a0"]
+    assert result.submitted == ["a1"]  # the later leaf is not blocked
+    assert [c.kind for c in result.callbacks] == ["failed"]
+    reloaded = store.load(Campaign)
+    assert reloaded.agenda.entries["a0"].status == "failed"
 
 
 async def test_duplicate_spec_is_refused(tmp_path) -> None:
-    """Identical specs would collide on sim_id; the engine refuses them."""
+    """Identical payloads would collide on sim_id; the engine refuses them."""
     store = _store(tmp_path)
     group = AgendaGroup(name="g")
     group = group.add_sim(name="a0", spec={"sim": {"time_steps": 4}})
     group = group.add_sim(name="a1", spec={"sim": {"time_steps": 4}})
+    store.save(Campaign(name="c", agenda=group))
+
+    async def submit(spec: dict, key: str) -> str:
+        return "sim000"
+
+    engine = AgendaEngine(store=store, submit=submit, observe=dict)
+    with pytest.raises(DuplicateSpecError):
+        await engine.tick()
+
+
+async def test_duplicate_payload_with_different_resources_is_refused(tmp_path) -> None:
+    """The guard hashes the wire payload (``sim``), like ``sim_id`` does."""
+    store = _store(tmp_path)
+    group = AgendaGroup(name="g")
+    group = group.add_sim(name="a0", spec={"sim": {"t": 4}, "resources": {"est_core_hours": 1.0}})
+    group = group.add_sim(name="a1", spec={"sim": {"t": 4}, "resources": {"est_core_hours": 2.0}})
     store.save(Campaign(name="c", agenda=group))
 
     async def submit(spec: dict, key: str) -> str:

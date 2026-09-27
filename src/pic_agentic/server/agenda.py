@@ -24,9 +24,12 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pic_agentic.agenda.campaign import Campaign
-from pic_agentic.agenda.engine import AgendaEngine, EnginePolicy, leaf_at
+from pic_agentic.agenda.campaign import Campaign, CampaignState
+from pic_agentic.agenda.engine import AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
+from pic_agentic.agenda.model import AgendaSim
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
+from pic_agentic.protocol.simulation import SimulationOp
+from pic_agentic.server.hello import AckTimeoutError
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -84,9 +87,11 @@ class AgendaService:
         self.submit_service = submit_service
         self.policy = policy or _policy_from_config(config)
         self.store = _store_for(config)
-        #: Serialise ticks: ``advance`` may be called concurrently (two tool
-        #: calls, or a tool call racing a reconnect); without this, two ticks
-        #: could load the same campaign and both submit its planned leaves.
+        #: Serialise every campaign read-modify-write (advance and the lifecycle
+        #: mutators) on one lock.  Without this, a tick's incremental save can
+        #: clobber a concurrent add_leaf/approve/drain, and -- worst -- a stop
+        #: issued mid-tick is overwritten by the tick's stale in-memory campaign,
+        #: resurrecting the campaign and letting it keep submitting.
         self._lock = asyncio.Lock()
 
     async def advance(self, send: SendFn) -> dict[str, Any]:
@@ -114,7 +119,13 @@ class AgendaService:
             return {sim_id: record.state for sim_id, record in registry.items()}
 
         async def submit(spec: dict[str, Any], key: str) -> str:
-            outcome = await self.submit_service.submit_spec(send, spec, cmd_id=key)
+            try:
+                outcome = await self.submit_service.submit_spec(send, spec, cmd_id=key)
+            except AckTimeoutError as exc:
+                # The ack was lost: the job may well be running.  Defer to the
+                # next tick (the stable cmd_id makes the retry exactly-once).
+                msg = f"lost ack: {exc}"
+                raise TransientSubmitError(msg) from exc
             if not outcome.ok or not outcome.sim_id:
                 msg = outcome.error or "submit failed"
                 raise RuntimeError(msg)
@@ -146,7 +157,7 @@ class AgendaService:
             log.warning("agenda status failed: %s", exc)
             return {"ok": False, "error": self.config.redact(str(exc))}
 
-    def approve(self, path: str) -> dict[str, Any]:
+    async def approve(self, path: str) -> dict[str, Any]:
         """Mark one campaign leaf as approved so the next tick may submit it.
 
         The leaf's persisted ``approved`` flag is what the engine's submission
@@ -162,11 +173,12 @@ class AgendaService:
         """
         if not self.store.exists():
             return {"ok": False, "error": "no_campaign"}
-        try:
-            return self._approve_leaf(path)
-        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
-            log.warning("agenda approve failed: %s", exc)
-            return {"ok": False, "error": self.config.redact(str(exc))}
+        async with self._lock:
+            try:
+                return self._approve_leaf(path)
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda approve failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
 
     def _approve_leaf(self, path: str) -> dict[str, Any]:
         """Load, set the approval flag on one leaf and save (may raise).
@@ -184,7 +196,80 @@ class AgendaService:
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": path, "approved": True}
 
-    def take_callbacks(self) -> dict[str, Any]:
+    async def set_state(self, state: CampaignState) -> dict[str, Any]:
+        """Persist the campaign lifecycle state (running/paused/stopped).
+
+        Args:
+            state: The new state.
+
+        Returns:
+            ``{"ok": True, "state": state}``, or a soft error.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        async with self._lock:
+            try:
+                campaign = self.store.load(Campaign)
+                # Re-validate the whole model: ``model_copy(update=...)`` does
+                # not validate, so an invalid state would otherwise be persisted
+                # and only fail on the next load.
+                updated = Campaign.model_validate({**campaign.model_dump(), "state": state})
+                self.store.save(updated)
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda set_state failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+        return {"ok": True, "state": state}
+
+    async def stop(self, send: SendFn) -> dict[str, Any]:
+        """Kill-switch: stop the campaign and cancel its in-flight jobs.
+
+        The lock is held for the whole operation, so a stop waits for any
+        in-flight tick to finish (whose final save would otherwise overwrite the
+        stop) and then blocks every later tick.  The state is set to ``stopped``
+        and persisted *before* any cancellation, so a crash mid-cancellation
+        still leaves the campaign stopped.  Only cancellations the simclient
+        confirmed (``ok`` and no error) are reported as ``cancelled``;
+        everything else -- a timeout, a rejection, an exception -- is collected
+        in ``errors`` and never raised.
+
+        Args:
+            send: Async RCP sender from the running transport.
+
+        Returns:
+            ``{"ok": True, "state": "stopped", "cancelled": [...],
+            "errors": [...]}``, or a soft error when no transport/campaign.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        async with self._lock:
+            try:
+                campaign = self.store.load(Campaign)
+                self.store.save(campaign.model_copy(update={"state": "stopped"}))
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda stop failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+            in_flight = [
+                sim.sim_id
+                for _, sim in campaign.agenda.simulations()
+                if sim.status in {"submitted", "running"} and sim.sim_id
+            ]
+            cancelled: list[str] = []
+            errors: list[dict[str, str]] = []
+            for sim_id in in_flight:
+                try:
+                    ack = await self.submit_service.control(send, sim_id, SimulationOp.CANCEL)
+                except Exception as exc:  # ruff: ignore[blind-except] - collect, never raise
+                    errors.append({"sim_id": sim_id, "error": self.config.redact(str(exc))})
+                    continue
+                if ack.get("ok") and not ack.get("error"):
+                    cancelled.append(sim_id)
+                else:
+                    errors.append({"sim_id": sim_id, "error": self.config.redact(str(ack.get("error", "rejected")))})
+        return {"ok": True, "state": "stopped", "cancelled": cancelled, "errors": errors}
+
+    async def take_callbacks(self) -> dict[str, Any]:
         """Return and durably clear the pending decision-point callbacks.
 
         An MCP server cannot call the LLM, so "callbacks" are pollable records:
@@ -198,17 +283,18 @@ class AgendaService:
         """
         if not self.store.exists():
             return {"ok": False, "error": "no_campaign"}
-        try:
-            campaign = self.store.load(Campaign)
-            drained = list(campaign.callbacks)
-            if drained:
-                self.store.save(campaign.model_copy(update={"callbacks": []}))
-        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
-            log.warning("agenda take_callbacks failed: %s", exc)
-            return {"ok": False, "error": self.config.redact(str(exc))}
+        async with self._lock:
+            try:
+                campaign = self.store.load(Campaign)
+                drained = list(campaign.callbacks)
+                if drained:
+                    self.store.save(campaign.model_copy(update={"callbacks": []}))
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda take_callbacks failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
         return {"ok": True, "callbacks": [callback.model_dump() for callback in drained]}
 
-    def add_leaf(
+    async def add_leaf(
         self,
         name: str,
         spec: dict[str, Any],
@@ -234,15 +320,31 @@ class AgendaService:
         """
         if not self.store.exists():
             return {"ok": False, "error": "no_campaign"}
+        async with self._lock:
+            try:
+                return self._add_leaf(name, spec, point=point, depends_on=depends_on)
+            except ValueError as exc:
+                # A duplicate/illegal name or an invalid dependency is a
+                # model-level ValueError: report it as data, not a tool
+                # exception, so a bad mutation is never persisted.
+                code = self._add_leaf_error_code(name)
+                return {"ok": False, "error": code, "detail": self.config.redact(str(exc)), "path": name}
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda add_leaf failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+
+    def _add_leaf_error_code(self, name: str) -> str:
+        """Classify a rejected ``add_leaf`` (duplicate name vs invalid leaf).
+
+        Returns:
+            ``duplicate_leaf`` when the name already exists, else
+            ``invalid_leaf``.
+
+        """
         try:
-            return self._add_leaf(name, spec, point=point, depends_on=depends_on)
-        except ValueError as exc:
-            # A duplicate/illegal name is a model-level ValueError: report it as
-            # data, not a tool exception.
-            return {"ok": False, "error": "duplicate_leaf", "detail": self.config.redact(str(exc)), "path": name}
-        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
-            log.warning("agenda add_leaf failed: %s", exc)
-            return {"ok": False, "error": self.config.redact(str(exc))}
+            return "duplicate_leaf" if name in self.store.load(Campaign).agenda.entries else "invalid_leaf"
+        except Exception:  # ruff: ignore[blind-except] - classification must never mask the error
+            return "invalid_leaf"
 
     def _add_leaf(
         self,
@@ -254,14 +356,18 @@ class AgendaService:
     ) -> dict[str, Any]:
         """Load, add the leaf and save (may raise).
 
+        The new leaf is built as an :class:`AgendaSim` and validated *before* it
+        is inserted, so its ``depends_on`` goes through the model validator
+        (a duplicate or path-style dependency is rejected rather than persisted
+        into an unloadable campaign).
+
         Returns:
             ``{"ok": True, "path": name}``.
 
         """
         campaign = self.store.load(Campaign)
-        agenda = campaign.agenda.add_sim(name=name, spec=spec, point=point)
-        if depends_on:
-            agenda.entries[name].depends_on = list(depends_on)
+        leaf = AgendaSim(name=name, spec=spec, point=point, depends_on=list(depends_on or []))
+        agenda = campaign.agenda.add(**{name: leaf})
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": name}
 
