@@ -42,6 +42,7 @@ from pic_agentic.agenda.planner import (
     account,
     apply_states,
     next_actions,
+    reconcile,
     resource_request_from_spec,
 )
 
@@ -56,7 +57,21 @@ SubmitFn = Callable[[dict[str, Any], str], Awaitable[str]]
 #: ``() -> {sim_id: state}`` observation callable.
 ObserveFn = Callable[[], Mapping[str, str]]
 
+#: ``() -> {sim_id: ActualUsage}`` actual-cost observation callable (gap 4).
+ActualsFn = Callable[[], Mapping[str, "ActualUsage"]]
+
 log = logging.getLogger(__name__)
+
+
+class ActualUsage(BaseModel):
+    """Actual resource usage the cluster reported for one finished run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    core_hours: float
+    gpu_hours: float = 0.0
+    is_gpu: bool = False
+
 
 #: A leaf status that still requires engine action.
 _ACTIVE_STATUSES = frozenset({"planned", "submitted", "running"})
@@ -135,6 +150,7 @@ class AgendaEngine:
         observe: ObserveFn,
         policy: EnginePolicy | None = None,
         approve: Callable[[str], bool] | None = None,
+        actuals: ActualsFn | None = None,
     ) -> None:
         """Create an engine.
 
@@ -147,6 +163,9 @@ class AgendaEngine:
             observe: ``() -> {sim_id: state}`` observation callable.
             policy: Engine limits/gates.
             approve: Optional ``path -> bool`` pre-approval predicate.
+            actuals: Optional ``() -> {sim_id: ActualUsage}`` callable supplying
+                the cluster's actual cost for finished runs (gap 4); when given,
+                a finished leaf's usage estimate is corrected to the actual.
 
         """
         self.store = store
@@ -155,6 +174,7 @@ class AgendaEngine:
         self.observe = observe
         self.policy = policy or EnginePolicy()
         self.approve = approve
+        self.actuals = actuals
 
     async def tick(self) -> TickResult:
         """Run one durable, idempotent engine tick.
@@ -335,10 +355,51 @@ class AgendaEngine:
         by_sim = {sim.sim_id: path for path, sim in campaign.agenda.simulations() if sim.sim_id}
         path_states = {by_sim[sim_id]: state for sim_id, state in observed.items() if sim_id in by_sim}
         agenda = apply_states(campaign.agenda, path_states)
-        in_flight = sum(1 for _, sim in agenda.simulations() if sim.status in _RUNNING_STATUSES)
-        usage = campaign.usage.model_copy(update={"jobs_running": in_flight})
+        usage = campaign.usage.model_copy(
+            update={"jobs_running": sum(1 for _, sim in agenda.simulations() if sim.status in _RUNNING_STATUSES)},
+        )
+        agenda, usage = self._reconcile_actuals(agenda, usage)
         steps = next_actions(agenda, {}, budget=budget, usage=usage)
         return campaign.model_copy(update={"agenda": agenda, "usage": usage}), [(s.path, s) for s in steps]
+
+    def _reconcile_actuals(self, agenda: AgendaGroup, usage: BudgetUsage) -> tuple[AgendaGroup, BudgetUsage]:
+        """Replace finished leaves' estimated usage with the cluster's actuals.
+
+        For every leaf that has finished and whose actual cost is known, the
+        estimate accrued at submission is corrected (once -- the actual is
+        stamped on the leaf, so a second tick does not re-apply it).  Pure: the
+        input agenda/usage are not mutated.
+
+        Returns:
+            The agenda with actuals stamped on reconciled leaves, and the
+            corrected usage.
+
+        """
+        if self.actuals is None:
+            return agenda, usage
+        try:
+            actuals = self.actuals()
+        except Exception as exc:  # ruff: ignore[blind-except] - reconciliation must never break a tick
+            log.warning("agenda actuals lookup failed: %s", exc)
+            return agenda, usage
+        updated = agenda.model_copy(deep=True)
+        for _, sim in updated.simulations():
+            if sim.status not in {"done", "failed"} or sim.actual_core_hours is not None or not sim.sim_id:
+                continue
+            actual = actuals.get(sim.sim_id)
+            if actual is None:
+                continue
+            usage = reconcile(
+                usage,
+                estimated_core_hours=sim.estimated_core_hours,
+                actual_core_hours=actual.core_hours,
+                estimated_gpu_hours=sim.estimated_gpu_hours,
+                actual_gpu_hours=actual.gpu_hours,
+                is_gpu=sim.is_gpu,
+            )
+            sim.actual_core_hours = actual.core_hours
+            sim.actual_gpu_hours = actual.gpu_hours
+        return updated, usage
 
     def _may_submit(self, leaf: AgendaSim | None, step: PlanStep) -> bool:
         """Whether the policy gates allow submitting ``step`` right now.
@@ -375,12 +436,16 @@ class AgendaEngine:
         _reject_duplicate_spec(campaign, path, step)
         key = _idempotency_key(campaign, path, step)
         sim_id = await self.submit(step.spec, key)
+        request = resource_request_from_spec(step.spec)
         agenda = campaign.agenda.model_copy(deep=True)
         leaf = leaf_at(agenda, path)
         if leaf is not None:
             leaf.sim_id = sim_id
             leaf.status = "submitted"
-        request = resource_request_from_spec(step.spec)
+            # Stamp what we reserved so a later reconciliation can correct it.
+            leaf.estimated_core_hours = request.est_core_hours
+            leaf.estimated_gpu_hours = request.est_gpu_hours
+            leaf.is_gpu = request.is_gpu
         usage = account(
             campaign.usage,
             step,
@@ -441,6 +506,9 @@ class AgendaEngine:
                 "status": sim.status,
                 "point": sim.point,
                 "spec_hash": _spec_hash(sim.spec),
+                "estimated_core_hours": sim.estimated_core_hours,
+                "actual_core_hours": sim.actual_core_hours,
+                "actual_gpu_hours": sim.actual_gpu_hours,
             }
             for path, sim in campaign.agenda.simulations()
         ]
@@ -449,6 +517,7 @@ class AgendaEngine:
             "created_ts": campaign.created_ts,
             "complete": _is_complete(campaign.agenda),
             "revision": _revision(campaign),
+            "conclusion": campaign.conclusion,
             "usage": campaign.usage.model_dump(),
             "leaves": leaves,
         }
@@ -610,6 +679,8 @@ def _revision(campaign: Campaign) -> str | None:
 
 
 __all__ = [
+    "ActualUsage",
+    "ActualsFn",
     "AgendaEngine",
     "DuplicateSpecError",
     "EnginePolicy",

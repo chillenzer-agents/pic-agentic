@@ -25,14 +25,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
-from pic_agentic.agenda.engine import AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
+from pic_agentic.agenda.engine import ActualUsage, AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
 from pic_agentic.agenda.model import AgendaSim
+from pic_agentic.agenda.refine import summary as refine_summary
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
 from pic_agentic.protocol.simulation import SimulationOp
 from pic_agentic.server.hello import AckTimeoutError
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from pic_agentic.config import Config
     from pic_agentic.server.hello import SendFn
@@ -118,6 +119,15 @@ class AgendaService:
         def observe() -> Mapping[str, str]:
             return {sim_id: record.state for sim_id, record in registry.items()}
 
+        def actuals() -> Mapping[str, ActualUsage]:
+            # The registry carries the actual cost reported on a run's terminal
+            # event (gap 4); only records that have it are offered.
+            return {
+                sim_id: ActualUsage(core_hours=record.core_hours, gpu_hours=record.gpu_hours or 0.0)
+                for sim_id, record in registry.items()
+                if record.core_hours is not None
+            }
+
         async def submit(spec: dict[str, Any], key: str) -> str:
             try:
                 outcome = await self.submit_service.submit_spec(send, spec, cmd_id=key)
@@ -131,7 +141,13 @@ class AgendaService:
                 raise RuntimeError(msg)
             return outcome.sim_id
 
-        engine = AgendaEngine(store=self.store, submit=submit, observe=observe, policy=self.policy)
+        engine = AgendaEngine(
+            store=self.store,
+            submit=submit,
+            observe=observe,
+            policy=self.policy,
+            actuals=actuals,
+        )
         async with self._lock:
             try:
                 result = await engine.tick()
@@ -195,6 +211,99 @@ class AgendaService:
         leaf.approved = True
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": path, "approved": True}
+
+    async def record_analysis(self, path: str, analysis: dict[str, Any]) -> dict[str, Any]:
+        """Record one leaf's analysis on the campaign (research-loop gap 2).
+
+        The recorded sections travel into the campaign RO-Crate, closing the
+        inputs -> runs -> analyses -> conclusion lineage.
+
+        Args:
+            path: The analysed leaf's path.
+            analysis: The ``analyze_output`` sections (or any JSON object).
+
+        Returns:
+            ``{"ok": True, "path": path}``, or a soft error.
+
+        """
+        return await self._mutate_campaign(lambda campaign: self._record_analysis(campaign, path, analysis))
+
+    def _record_analysis(self, campaign: Campaign, path: str, analysis: dict[str, Any]) -> dict[str, Any]:
+        """Set one analysis and return the success dict (may raise).
+
+        Returns:
+            ``{"ok": True, "path": path}``.
+
+        """
+        if leaf_at(campaign.agenda, path) is None:
+            return {"ok": False, "error": "no_such_leaf", "path": path}
+        analyses = {**campaign.analyses, path: analysis}
+        self.store.save(campaign.model_copy(update={"analyses": analyses}))
+        return {"ok": True, "path": path}
+
+    async def record_conclusion(self, conclusion: str) -> dict[str, Any]:
+        """Record the campaign's declared conclusion.
+
+        Args:
+            conclusion: The agent's conclusion text (must be non-empty).
+
+        Returns:
+            ``{"ok": True, "conclusion": conclusion}``, or a soft error.
+
+        """
+        return await self._mutate_campaign(lambda campaign: self._record_conclusion(campaign, conclusion))
+
+    def _record_conclusion(self, campaign: Campaign, conclusion: str) -> dict[str, Any]:
+        """Set the conclusion and return the success dict (may raise).
+
+        Returns:
+            ``{"ok": True, "conclusion": conclusion}``.
+
+        """
+        if not conclusion.strip():
+            return {"ok": False, "error": "empty_conclusion"}
+        self.store.save(campaign.model_copy(update={"conclusion": conclusion}))
+        return {"ok": True, "conclusion": conclusion}
+
+    def suggest_refinement(self, *, rel_tol: float = 0.05) -> dict[str, Any]:
+        """Suggest refinement points from the recorded analyses (gap 2).
+
+        Scores each leaf by its recorded analysis's numeric ``score`` (falling
+        back to the sweep point's single numeric value), then applies the
+        deterministic :mod:`pic_agentic.agenda.refine` helpers.
+
+        Args:
+            rel_tol: Relative tolerance for the convergence check.
+
+        Returns:
+            The refinement summary, or a soft error.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        try:
+            campaign = self.store.load(Campaign)
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            return {"ok": False, "error": self.config.redact(str(exc))}
+        points = _analysis_points(campaign)
+        return {"ok": True, **refine_summary(points, rel_tol=rel_tol)}
+
+    async def _mutate_campaign(self, mutate: Callable[[Campaign], dict[str, Any]]) -> dict[str, Any]:
+        """Run a locked load -> mutate -> save, degrading failures to data.
+
+        Returns:
+            The mutation's result dict, or a soft error.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        async with self._lock:
+            try:
+                campaign = self.store.load(Campaign)
+                return mutate(campaign)
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda mutation failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
 
     async def set_state(self, state: CampaignState) -> dict[str, Any]:
         """Persist the campaign lifecycle state (running/paused/stopped).
@@ -370,6 +479,43 @@ class AgendaService:
         agenda = campaign.agenda.add(**{name: leaf})
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": name}
+
+
+def _analysis_points(campaign: Campaign) -> dict[str, float | None]:
+    """Extract ``leaf path -> score`` from a campaign's recorded analyses.
+
+    A leaf's score is the numeric ``score`` field of its recorded analysis, or
+    its sweep point's single numeric value.  A leaf with neither (or with no
+    recorded analysis/point) maps to ``None``, which the refine helpers ignore.
+
+    Returns:
+        The ``path -> value`` sample map.
+
+    """
+    points: dict[str, float | None] = {}
+    for path, sim in campaign.agenda.simulations():
+        points[path] = _leaf_score(campaign.analyses.get(path), sim)
+    return points
+
+
+def _leaf_score(analysis: dict[str, Any] | None, sim: AgendaSim) -> float | None:
+    """Return a single numeric score for one leaf, or None.
+
+    Returns:
+        The analysis ``score`` (or ``value``/``peak``), else the sweep point's
+        single numeric value, else None.
+
+    """
+    for key in ("score", "value", "peak"):
+        if isinstance(analysis, dict):
+            candidate = analysis.get(key)
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                return float(candidate)
+    if isinstance(sim.point, dict) and len(sim.point) == 1:
+        value = next(iter(sim.point.values()))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
 
 
 def _policy_from_config(config: Config) -> EnginePolicy:

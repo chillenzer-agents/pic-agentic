@@ -88,7 +88,6 @@ class MatrixTransport:
 
         Raises:
             ValueError: If the message is not signed.
-            RuntimeError: If ``room_send`` reports a failure.
 
         """
         if message.sig is None:
@@ -96,8 +95,74 @@ class MatrixTransport:
             raise ValueError(msg)
         # to_content re-signs only when sig is None, which we have excluded.
         content: dict[str, Any] = message.to_content()
+        return await self._send_content(self._room_id, content)
+
+    async def send_text(self, room_id: str, text: str) -> str:
+        """Send a plain human-readable text message to a room.
+
+        Args:
+            room_id: The target room (the configured RCP room, or the human
+                room when different).
+            text: The message body.
+
+        Returns:
+            The Matrix event id.
+
+        """
+        content = {"msgtype": "m.text", "body": text}
+        return await self._send_content(room_id, content)
+
+    async def send_image(
+        self,
+        room_id: str,
+        png: bytes,
+        *,
+        body: str = "image",
+        filename: str = "plot.png",
+        mimetype: str = "image/png",
+    ) -> str:
+        """Upload a PNG and send it as an ``m.image`` message.
+
+        Args:
+            room_id: The target room.
+            png: The PNG bytes.
+            body: The message body / alt text.
+            filename: The uploaded file name.
+            mimetype: The content type.
+
+        Returns:
+            The Matrix event id.
+
+        Raises:
+            RuntimeError: If the upload or the send fails.
+
+        """
         await self._refresh_token()
-        response = await self._client.room_send(self._room_id, "m.room.message", content)
+        response, _ = await self._client.upload(png, content_type=mimetype, filename=filename)
+        content_uri = getattr(response, "content_uri", None)
+        if not content_uri:
+            msg = f"media upload failed: {getattr(response, 'message', response)}"
+            raise RuntimeError(msg)
+        content = {
+            "msgtype": "m.image",
+            "body": body,
+            "url": content_uri,
+            "info": {"mimetype": mimetype, "size": len(png)},
+        }
+        return await self._send_content(room_id, content)
+
+    async def _send_content(self, room_id: str, content: dict[str, Any]) -> str:
+        """Send one content object and return its event id.
+
+        Returns:
+            The Matrix event id.
+
+        Raises:
+            RuntimeError: If ``room_send`` reports a failure.
+
+        """
+        await self._refresh_token()
+        response = await self._client.room_send(room_id, "m.room.message", content)
         event_id = getattr(response, "event_id", None)
         if event_id is None:
             msg = f"room_send failed: {getattr(response, 'message', response)}"
@@ -120,6 +185,48 @@ class MatrixTransport:
         """
         response = await self._sync()
         return self._extract(response)
+
+    async def human_messages(self) -> list[tuple[str, str, str]]:
+        """Return plain (non-RCP) text messages since the last call.
+
+        A human room carries ordinary ``m.room.message`` events rather than
+        signed RCP envelopes.  Each returned tuple is
+        ``(room_id, sender, body)``; the caller applies the bot/room filters.
+        This shares the sync position with :meth:`receive`, so a caller must not
+        run both loops against the same transport instance -- use
+        :meth:`drain` to consume both in one loop.
+
+        Returns:
+            The ``(room_id, sender, body)`` tuples from joined rooms.
+
+        """
+        _rcp, human = await self.drain()
+        return human
+
+    async def drain(self) -> tuple[list[RcpMessage], list[tuple[str, str, str]]]:
+        """Run one sync and return both the RCP messages and the human chat.
+
+        Keeps a single sync position for both streams, so a server pump can
+        consume signed RCP envelopes and ordinary human messages in one loop.
+
+        Returns:
+            A ``(rcp_messages, human_messages)`` pair; human messages are
+            ``(room_id, sender, body)`` tuples from joined rooms.
+
+        """
+        response = await self._sync()
+        rcp = self._extract(response)
+        human: list[tuple[str, str, str]] = []
+        joined = getattr(response.rooms, "join", {}) or {}
+        for room_id, room in joined.items():
+            for event in room.timeline.events:
+                if not isinstance(event, RoomMessageText):
+                    continue
+                content = getattr(event, "source", {}).get("content")
+                if isinstance(content, dict) and RCP_NAMESPACE in content:
+                    continue  # an RCP message, not human chat
+                human.append((room_id, event.sender, event.body))
+        return rcp, human
 
     async def receive(self) -> AsyncIterator[RcpMessage]:
         """Yield RCP messages as they arrive.

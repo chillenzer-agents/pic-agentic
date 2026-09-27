@@ -621,6 +621,8 @@ def build_submit_event(
     eta_s: int | None = None,
     slurm_state: str | None = None,
     exit_code: int | None = None,
+    core_hours: float | None = None,
+    gpu_hours: float | None = None,
     manifest: dict[str, Any] | None = None,
 ) -> RcpMessage:
     """Build one M2 lifecycle event.
@@ -656,6 +658,8 @@ def build_submit_event(
                 ("eta_s", eta_s),
                 ("slurm_state", slurm_state),
                 ("exit_code", exit_code),
+                ("core_hours", core_hours),
+                ("gpu_hours", gpu_hours),
             )
             if value is not None
         },

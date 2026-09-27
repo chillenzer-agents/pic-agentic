@@ -14,7 +14,7 @@ holds no authoritative state of its own.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -71,6 +71,10 @@ class Campaign(BaseModel):
     #: Lifecycle state: ``running`` executes, ``paused`` holds submissions
     #: (resumable), ``stopped`` is the kill-switch terminal state.
     state: CampaignState = "running"
+    #: Recorded analyses, keyed by leaf path (the ``analyze_output`` sections).
+    analyses: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: The agent's declared conclusion for the campaign, if any.
+    conclusion: str | None = None
 
     def with_created_ts(self) -> Campaign:
         """Return a copy with ``created_ts`` set when it is not already.

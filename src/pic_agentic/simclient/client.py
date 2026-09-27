@@ -818,6 +818,7 @@ class SimClient:
             job_info=self.slurm.job_info,
             initial_interval_s=self.poll_interval_s,
             max_interval_s=self.poll_max_interval_s,
+            job_accounting=self.slurm.job_accounting,
         )
         task = asyncio.create_task(follower.run())
         self._follow_tasks[sim_id] = task
@@ -1499,6 +1500,8 @@ class SimClient:
         eta_s: int | None = None,
         slurm_state: str | None = None,
         exit_code: int | None = None,
+        core_hours: float | None = None,
+        gpu_hours: float | None = None,
         manifest: dict[str, object] | None = None,
     ) -> RcpMessage:
         return build_submit_event(
@@ -1520,6 +1523,8 @@ class SimClient:
             eta_s=eta_s,
             slurm_state=slurm_state,
             exit_code=exit_code,
+            core_hours=core_hours,
+            gpu_hours=gpu_hours,
             manifest=manifest,
         ).sign(self.secret)
 
