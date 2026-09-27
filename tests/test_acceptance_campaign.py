@@ -156,7 +156,9 @@ async def test_first_acceptance_test_offline(tmp_path: Path) -> None:
     # ---- Phase 0: the approval gate holds the expensive sweep -------------
     gated = await _tick_fresh(store, cluster, require_approval=True)
     assert gated.submitted == []
-    assert sorted(gated.pending_approval) == sorted(f"i={intensity:g}" for intensity in INTENSITIES)
+    # The concurrency cap bounds the batch, so only the first two leaves reach
+    # the approval gate this tick; the rest are still waiting.
+    assert sorted(gated.pending_approval) == sorted(f"i={intensity:g}" for intensity in INTENSITIES)[:2]
 
     # Approve every leaf (the human gate), then advance.
     _approve_all(store)

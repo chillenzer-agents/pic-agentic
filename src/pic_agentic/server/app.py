@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
-from pic_agentic.agenda.campaign import Campaign
+from pic_agentic.agenda.campaign import Campaign, CampaignState
 from pic_agentic.agenda.provenance import campaign_rocrate
 from pic_agentic.auth import MasTokenStore
 from pic_agentic.fleet import fleet_view
@@ -289,25 +289,25 @@ class HelloRuntime:
         """
         return self.agenda_service.status()
 
-    def approve_agenda_leaf(self, path: str) -> dict[str, Any]:
+    async def approve_agenda_leaf(self, path: str) -> dict[str, Any]:
         """Approve one gated campaign leaf so a later tick may submit it.
 
         Returns:
             ``{"ok": True, "path": ..., "approved": True}``, or a soft error.
 
         """
-        return self.agenda_service.approve(path)
+        return await self.agenda_service.approve(path)
 
-    def take_agenda_callbacks(self) -> dict[str, Any]:
+    async def take_agenda_callbacks(self) -> dict[str, Any]:
         """Drain the pending decision-point callbacks.
 
         Returns:
             ``{"ok": True, "callbacks": [...]}``, or a soft error.
 
         """
-        return self.agenda_service.take_callbacks()
+        return await self.agenda_service.take_callbacks()
 
-    def add_agenda_leaf(
+    async def add_agenda_leaf(
         self,
         name: str,
         spec: dict[str, Any],
@@ -321,16 +321,16 @@ class HelloRuntime:
             ``{"ok": True, "path": name}``, or a soft error.
 
         """
-        return self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
+        return await self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
 
-    def set_agenda_state(self, state: str) -> dict[str, Any]:
+    async def set_agenda_state(self, state: CampaignState) -> dict[str, Any]:
         """Persist the campaign lifecycle state.
 
         Returns:
             ``{"ok": True, "state": state}``, or a soft error.
 
         """
-        return self.agenda_service.set_state(state)  # type: ignore[arg-type]
+        return await self.agenda_service.set_state(state)
 
     async def stop_agenda(self) -> dict[str, Any]:
         """Kill-switch: stop the campaign and cancel its in-flight jobs.
@@ -437,7 +437,10 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
     )
     async def hello(message: str = "Hello World") -> dict[str, Any]:
-        outcome = await runtime.hello(message)
+        try:
+            outcome = await runtime.hello(message)
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
         return _outcome_dict(runtime, outcome)
 
     @server.tool(
@@ -504,15 +507,7 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         annotations=_READ_ONLY,
     )
     async def get_status(sim_id: str) -> dict[str, Any]:
-        record = runtime.get_sim(sim_id)
-        if record is None:
-            return {"sim_id": sim_id, "known": False, "error": "unknown_sim"}
-        projection = _status_dict(record)
-        if record.active:
-            live = await runtime.fetch_status(sim_id)
-            if live and not live.get("error"):
-                _merge_status(projection, live)
-        return _redact_dict(runtime, projection)
+        return await _status_tool(runtime, sim_id)
 
     @server.tool(
         title="List simulations",
@@ -559,13 +554,32 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         annotations=_READ_ONLY,
     )
     async def get_logs(sim_id: str, *, stream: str = "stdout", tail: int = 100) -> dict[str, Any]:
-        if stream not in LOG_STREAMS:
-            return {"sim_id": sim_id, "stream": stream, "error": "unknown_stream"}
-        tail = max(0, min(tail, _MAX_LOG_TAIL))
+        return await _logs_tool(runtime, sim_id, stream=stream, tail=tail)
+
+
+async def _logs_tool(runtime: HelloRuntime, sim_id: str, *, stream: str, tail: int) -> dict[str, Any]:
+    """Fetch a simulation's log tail, degrading every failure to data.
+
+    Returns:
+        The redacted log payload, or a soft ``error`` dict.
+
+    """
+    if stream not in LOG_STREAMS:
+        return {"sim_id": sim_id, "stream": stream, "error": "unknown_stream"}
+    tail = max(0, min(tail, _MAX_LOG_TAIL))
+    try:
         payload = await runtime.fetch_logs(sim_id, stream=stream, tail=tail)
-        if not payload:
-            return {"sim_id": sim_id, "stream": stream, "lines": [], "total_lines": 0, "error": "unavailable"}
-        return _redact_dict(runtime, payload)
+    except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+        return {
+            "sim_id": sim_id,
+            "stream": stream,
+            "lines": [],
+            "total_lines": 0,
+            "error": runtime.config.redact(str(exc)),
+        }
+    if not payload:
+        return {"sim_id": sim_id, "stream": stream, "lines": [], "total_lines": 0, "error": "unavailable"}
+    return _redact_dict(runtime, payload)
 
 
 def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> None:
@@ -607,7 +621,9 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
     @server.tool(
         title="Cancel a simulation",
         description="Cancel a simulation's SLURM job immediately (scontrol cancel).",
-        annotations=_CONTROL_ANNOTATIONS,
+        # destructive: it kills the job outright -- no clean shutdown, and any
+        # output since the last checkpoint is lost.
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
     )
     async def cancel_simulation(sim_id: str) -> dict[str, Any]:
         return await _control_tool(runtime, sim_id, SimulationOp.CANCEL)
@@ -764,8 +780,8 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         # work itself; it is not destructive.
         annotations=_CONTROL_ANNOTATIONS,
     )
-    def approve_agenda_leaf(path: str) -> dict[str, Any]:
-        return _redact_dict(runtime, runtime.approve_agenda_leaf(path))
+    async def approve_agenda_leaf(path: str) -> dict[str, Any]:
+        return _redact_dict(runtime, await runtime.approve_agenda_leaf(path))
 
     @server.tool(
         title="Drain the campaign decision-point callbacks",
@@ -778,8 +794,8 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
-    def take_agenda_callbacks() -> dict[str, Any]:
-        return _redact_dict(runtime, runtime.take_agenda_callbacks())
+    async def take_agenda_callbacks() -> dict[str, Any]:
+        return _redact_dict(runtime, await runtime.take_agenda_callbacks())
 
     @server.tool(
         title="Add a simulation leaf to the campaign",
@@ -790,13 +806,13 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
-    def add_agenda_leaf(
+    async def add_agenda_leaf(
         name: str,
         spec: dict[str, Any],
         point: dict[str, Any] | None = None,
         depends_on: list[str] | None = None,
     ) -> dict[str, Any]:
-        result = runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on)
+        result = await runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on)
         return _redact_dict(runtime, result)
 
     @server.tool(
@@ -847,16 +863,16 @@ def _register_lifecycle_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
-    def pause_agenda() -> dict[str, Any]:
-        return _redact_dict(runtime, runtime.set_agenda_state("paused"))
+    async def pause_agenda() -> dict[str, Any]:
+        return _redact_dict(runtime, await runtime.set_agenda_state("paused"))
 
     @server.tool(
         title="Resume the campaign",
         description="Resume a paused campaign so advance_agenda may submit again.",
         annotations=_CONTROL_ANNOTATIONS,
     )
-    def resume_agenda() -> dict[str, Any]:
-        return _redact_dict(runtime, runtime.set_agenda_state("running"))
+    async def resume_agenda() -> dict[str, Any]:
+        return _redact_dict(runtime, await runtime.set_agenda_state("running"))
 
     @server.tool(
         title="Stop the campaign (kill-switch)",
@@ -980,6 +996,28 @@ def _soft_error(runtime: HelloRuntime, sim_id: str, op: str, exc: str | BaseExce
     return {"ok": False, "sim_id": sim_id, "op": op, "error": runtime.config.redact(message)}
 
 
+async def _status_tool(runtime: HelloRuntime, sim_id: str) -> dict[str, Any]:
+    """Return one simulation's status, merging a live view when available.
+
+    Returns:
+        The redacted status dict; a live-fetch failure is captured as
+        ``live_error`` rather than raised.
+
+    """
+    record = runtime.get_sim(sim_id)
+    if record is None:
+        return {"sim_id": sim_id, "known": False, "error": "unknown_sim"}
+    projection = _status_dict(record)
+    if record.active:
+        try:
+            live = await runtime.fetch_status(sim_id)
+        except Exception as exc:  # ruff: ignore[blind-except] - fall back to the projection
+            return _redact_dict(runtime, {**projection, "live_error": str(exc)})
+        if live and not live.get("error"):
+            _merge_status(projection, live)
+    return _redact_dict(runtime, projection)
+
+
 def _status_dict(record: SimRecord) -> dict[str, Any]:
     """Build the registry projection of one simulation's status.
 
@@ -1054,11 +1092,17 @@ def _redact_dict(runtime: HelloRuntime, payload: Any, _depth: int = 0) -> Any:
         The payload with all strings redacted.
 
     """
-    if _depth > _REDACT_MAX_DEPTH:
-        return payload
     redact = runtime.config.redact
+    # Redact strings at *any* depth first: a deeply nested secret must never
+    # survive just because its container sits past the structural cap.
     if isinstance(payload, str):
         return redact(payload)
+    if _depth > _REDACT_MAX_DEPTH:
+        # Beyond the cap the shape is no longer trusted, so the subtree is
+        # dropped rather than passed through raw (a raw nested value could carry
+        # a secret the recursion never reached).  Dropping is safe; leaking is
+        # not.
+        return "[REDACTED: nesting too deep]"
     if isinstance(payload, dict):
         # Redact keys as well: a state string can itself be a dict key (e.g.
         # ``fleet_status``'s ``by_state``), so a secret embedded in a key must
