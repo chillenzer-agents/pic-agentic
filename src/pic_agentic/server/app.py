@@ -323,6 +323,27 @@ class HelloRuntime:
         """
         return self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
 
+    def set_agenda_state(self, state: str) -> dict[str, Any]:
+        """Persist the campaign lifecycle state.
+
+        Returns:
+            ``{"ok": True, "state": state}``, or a soft error.
+
+        """
+        return self.agenda_service.set_state(state)  # type: ignore[arg-type]
+
+    async def stop_agenda(self) -> dict[str, Any]:
+        """Kill-switch: stop the campaign and cancel its in-flight jobs.
+
+        Returns:
+            The stop result, or ``{"ok": False, "error": "unavailable"}`` when
+            the transport has not been started.
+
+        """
+        if self._transport is None:
+            return {"ok": False, "error": "unavailable"}
+        return await self.agenda_service.stop(self._transport.send)
+
     def fleet_status(self) -> dict[str, Any]:
         """Return the aggregate fleet view (summary + alerts).
 
@@ -459,6 +480,7 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
     _register_reporting_tools(server, runtime)
     _register_control_result_tools(server, runtime)
     _register_agenda_tools(server, runtime)
+    _register_lifecycle_tools(server, runtime)
     return server, runtime
 
 
@@ -800,6 +822,54 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     )
     def campaign_provenance() -> dict[str, Any]:
         return _redact_dict(runtime, runtime.campaign_provenance())
+
+
+def _register_lifecycle_tools(server: MCPServer, runtime: HelloRuntime) -> None:
+    """Register the campaign lifecycle tools (pause / resume / kill-switch).
+
+    These control whether ``advance_agenda`` may submit: ``pause_agenda`` holds
+    submissions (resumable), ``resume_agenda`` releases them, and ``stop_agenda``
+    is the destructive kill-switch that flips the state and cancels in-flight
+    jobs.  All degrade to a soft ``{"ok": False, ...}`` dict.
+
+    Args:
+        server: The MCP server to add the tools to.
+        runtime: The runtime the tools delegate to.
+
+    """
+
+    @server.tool(
+        title="Pause the campaign",
+        description=(
+            "Pause the campaign: advance_agenda still observes runs and records "
+            "callbacks, but submits nothing until it is resumed. Persisted, so "
+            "the pause survives a server restart."
+        ),
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    def pause_agenda() -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.set_agenda_state("paused"))
+
+    @server.tool(
+        title="Resume the campaign",
+        description="Resume a paused campaign so advance_agenda may submit again.",
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    def resume_agenda() -> dict[str, Any]:
+        return _redact_dict(runtime, runtime.set_agenda_state("running"))
+
+    @server.tool(
+        title="Stop the campaign (kill-switch)",
+        description=(
+            "Stop the campaign outright and cancel every in-flight job. The "
+            "state is flipped before cancellation, so no tick can submit after "
+            "the switch. This is terminal; it is not resumable."
+        ),
+        # destructive: it cancels running cluster jobs.
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+    )
+    async def stop_agenda() -> dict[str, Any]:
+        return _redact_dict(runtime, await runtime.stop_agenda())
 
 
 async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None = None) -> dict[str, Any]:

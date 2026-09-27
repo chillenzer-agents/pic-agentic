@@ -917,6 +917,56 @@ def cmd_agenda_add_leaf(args: argparse.Namespace) -> int:
     return 0 if result.get("ok", "error" not in result) else 1
 
 
+def cmd_agenda_pause(args: argparse.Namespace) -> int:
+    """Call ``pause_agenda`` and print the new lifecycle state.
+
+    Returns:
+        The process exit code.
+
+    """
+    return _agenda_lifecycle(args, "pause_agenda")
+
+
+def cmd_agenda_resume(args: argparse.Namespace) -> int:
+    """Call ``resume_agenda`` and print the new lifecycle state.
+
+    Returns:
+        The process exit code.
+
+    """
+    return _agenda_lifecycle(args, "resume_agenda")
+
+
+def cmd_agenda_stop(args: argparse.Namespace) -> int:
+    """Call the ``stop_agenda`` kill-switch and print the result.
+
+    Returns:
+        The process exit code.
+
+    """
+    return _agenda_lifecycle(args, "stop_agenda")
+
+
+def _agenda_lifecycle(args: argparse.Namespace, tool: str) -> int:
+    """Call one lifecycle tool with the campaign file exported.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    state["agenda_file"] = str(Path(args.agenda_file).expanduser())
+    result = _result_tool_call(state, tool, {})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
@@ -1005,6 +1055,24 @@ def _print_event(message) -> int | None:
     return None
 
 
+def _add_agenda_callback_args(mode: argparse._MutuallyExclusiveGroup) -> None:
+    """Add the callback/refinement/lifecycle agenda mode flags to ``mode``.
+
+    Args:
+        mode: The mutually exclusive mode group.
+
+    """
+    mode.add_argument("--agenda-callbacks", action="store_true", help="drain and print pending agenda callbacks")
+    mode.add_argument(
+        "--agenda-add-leaf",
+        action="store_true",
+        help="add one refinement leaf (--agenda-leaf NAME; spec patched by --agenda-patch/--agenda-values)",
+    )
+    mode.add_argument("--agenda-pause", action="store_true", help="pause the campaign (hold submissions)")
+    mode.add_argument("--agenda-resume", action="store_true", help="resume a paused campaign")
+    mode.add_argument("--agenda-stop", action="store_true", help="kill-switch: stop and cancel in-flight jobs")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all mutually exclusive modes.
 
@@ -1042,12 +1110,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="call campaign_provenance and print the RO-Crate",
     )
-    mode.add_argument("--agenda-callbacks", action="store_true", help="drain and print pending agenda callbacks")
-    mode.add_argument(
-        "--agenda-add-leaf",
-        action="store_true",
-        help="add one refinement leaf (--agenda-leaf NAME; spec patched by --agenda-patch/--agenda-values)",
-    )
+    _add_agenda_callback_args(mode)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
@@ -1131,6 +1194,9 @@ def main() -> None:
         (args.campaign_provenance, cmd_campaign_provenance),
         (args.agenda_callbacks, cmd_agenda_callbacks),
         (args.agenda_add_leaf, cmd_agenda_add_leaf),
+        (args.agenda_pause, cmd_agenda_pause),
+        (args.agenda_resume, cmd_agenda_resume),
+        (args.agenda_stop, cmd_agenda_stop),
     )
     for selected, command in dispatch:
         if selected:

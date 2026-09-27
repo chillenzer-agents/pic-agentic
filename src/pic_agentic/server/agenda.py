@@ -24,9 +24,10 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pic_agentic.agenda.campaign import Campaign
+from pic_agentic.agenda.campaign import Campaign, CampaignState
 from pic_agentic.agenda.engine import AgendaEngine, EnginePolicy, leaf_at
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
+from pic_agentic.protocol.simulation import SimulationOp
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -183,6 +184,70 @@ class AgendaService:
         leaf.approved = True
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": path, "approved": True}
+
+    def set_state(self, state: CampaignState) -> dict[str, Any]:
+        """Persist the campaign lifecycle state (running/paused/stopped).
+
+        Args:
+            state: The new state.
+
+        Returns:
+            ``{"ok": True, "state": state}``, or a soft error.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        try:
+            campaign = self.store.load(Campaign)
+            # Re-validate the whole model: ``model_copy(update=...)`` does not
+            # validate, so an invalid state would otherwise be persisted and
+            # only fail on the next load.
+            updated = Campaign.model_validate({**campaign.model_dump(), "state": state})
+            self.store.save(updated)
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            log.warning("agenda set_state failed: %s", exc)
+            return {"ok": False, "error": self.config.redact(str(exc))}
+        return {"ok": True, "state": state}
+
+    async def stop(self, send: SendFn) -> dict[str, Any]:
+        """Kill-switch: stop the campaign and cancel its in-flight jobs.
+
+        The state is set to ``stopped`` *first* (and persisted) so no concurrent
+        tick can submit after the switch; then every in-flight leaf is
+        best-effort cancelled.  Cancellation failures are collected as data,
+        never raised -- the switch itself must always succeed.
+
+        Args:
+            send: Async RCP sender from the running transport.
+
+        Returns:
+            ``{"ok": True, "state": "stopped", "cancelled": [...],
+            "errors": [...]}``, or a soft error when no transport/campaign.
+
+        """
+        if not self.store.exists():
+            return {"ok": False, "error": "no_campaign"}
+        try:
+            campaign = self.store.load(Campaign)
+        except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+            return {"ok": False, "error": self.config.redact(str(exc))}
+        # Flip the switch and persist before any cancellation, so a crash mid-
+        # cancellation still leaves the campaign stopped.
+        self.store.save(campaign.model_copy(update={"state": "stopped"}))
+        in_flight = [
+            sim.sim_id
+            for _, sim in campaign.agenda.simulations()
+            if sim.status in {"submitted", "running"} and sim.sim_id
+        ]
+        cancelled: list[str] = []
+        errors: list[dict[str, str]] = []
+        for sim_id in in_flight:
+            try:
+                await self.submit_service.control(send, sim_id, SimulationOp.CANCEL)
+                cancelled.append(sim_id)
+            except Exception as exc:  # ruff: ignore[blind-except] - collect, never raise
+                errors.append({"sim_id": sim_id, "error": self.config.redact(str(exc))})
+        return {"ok": True, "state": "stopped", "cancelled": cancelled, "errors": errors}
 
     def take_callbacks(self) -> dict[str, Any]:
         """Return and durably clear the pending decision-point callbacks.

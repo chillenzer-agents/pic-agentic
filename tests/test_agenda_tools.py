@@ -289,3 +289,22 @@ async def test_add_leaf_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     result = await _call(config, "add_agenda_leaf", {"name": "x", "spec": {"sim": {"replica": 0}}})
     assert result == {"ok": False, "error": "no_campaign"}
+
+
+async def test_pause_and_resume_tools(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    assert await _call(config, "pause_agenda", {}) == {"ok": True, "state": "paused"}
+    # A paused tick holds the ready leaf.
+    held = await _call(config, "advance_agenda", {})
+    assert held["submitted"] == []
+    assert held["held"] == ["leaf0"]
+    assert held["state"] == "paused"
+    # Resume and it submits.
+    assert await _call(config, "resume_agenda", {}) == {"ok": True, "state": "running"}
+    tick = await _call(config, "advance_agenda", {})
+    assert tick["submitted"] == ["leaf0"]
+
+
+async def test_pause_without_campaign_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
+    assert await _call(config, "pause_agenda", {}) == {"ok": False, "error": "no_campaign"}

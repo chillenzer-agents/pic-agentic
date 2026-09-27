@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.agenda.budget import Budget, BudgetUsage
-from pic_agentic.agenda.campaign import Callback, Campaign, utc_now_iso
+from pic_agentic.agenda.campaign import Callback, Campaign, CampaignState, utc_now_iso
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.planner import (
     PlanStep,
@@ -103,6 +103,10 @@ class TickResult(BaseModel):
     usage: BudgetUsage = BudgetUsage()
     #: Decision-point callbacks emitted this tick (newly done/failed leaves).
     callbacks: list[Callback] = Field(default_factory=list)
+    #: The campaign's lifecycle state after this tick.
+    state: CampaignState = "running"
+    #: Leaves the planner would have submitted but the lifecycle held back.
+    held: list[str] = Field(default_factory=list)
 
 
 class AgendaEngine:
@@ -158,13 +162,19 @@ class AgendaEngine:
         # observed in this tick survives a crash before the first submission,
         # and the incremental saves below lock in each accepted leaf.
         self.store.save(campaign)
-        result = TickResult()
+        result = TickResult(state=campaign.state)
         in_flight = campaign.usage.jobs_running
         concurrency_cap = budget.max_concurrent_jobs
         for path, step in steps:
             if step.action != "submit":
                 campaign = self._persist_terminal(campaign, path, step.action)
                 _bucket(result, path, step.action)
+                continue
+            if campaign.state != "running":
+                # Paused/stopped: observe, fold and emit callbacks as usual, but
+                # hold every submission (no gate, no usage).  Resuming simply
+                # lets the next tick submit the still-planned leaves.
+                result.held.append(path)
                 continue
             if len(result.submitted) >= self.policy.max_submits_per_tick:
                 result.waiting.append(path)
@@ -337,6 +347,7 @@ class AgendaEngine:
             )
         return {
             "name": campaign.name,
+            "state": campaign.state,
             "complete": _is_complete(campaign.agenda),
             "counts": counts,
             "usage": campaign.usage.model_dump(),
