@@ -7,6 +7,24 @@
 The envelope is a pydantic model: validation and (de)serialisation come from
 the model itself, and the signed payload is a filtered JSON dump so the wire
 format and the signed bytes cannot drift apart.
+
+Float safety
+------------
+
+Synapse's canonical JSON (the ``canonicaljson`` used by the reference
+homeserver) **rejects every floating-point value** anywhere in a Matrix event
+content object -- not only ``NaN``/``Inf`` but ordinary values such as ``0.5``
+or ``3.0``.  An event carrying a raw float is refused with ``Bad JSON value:
+float`` and is never delivered, so a single float in a payload silently drops
+the whole message (observed live on the terminal lifecycle event carrying
+``core_hours``/``gpu_hours``).
+
+:func:`_encode_wire` is the single chokepoint that removes floats from
+*every* RCP message before it is signed and sent, and :func:`_decode_wire`
+restores them on receipt.  Because both :meth:`RcpMessage.sign` and
+:meth:`RcpMessage.verify` hash the *encoded* form, the signature covers exactly
+the float-free bytes that travel, and the in-memory payload still carries real
+floats for consumers.  New payload fields therefore cannot reintroduce the bug.
 """
 
 from __future__ import annotations
@@ -21,6 +39,55 @@ from pic_agentic.rcp.crypto import sign, verify
 
 RCP_NAMESPACE = "io.picongpu.rcp"
 VERSION = 0
+
+#: Sentinel key under which a float is carried on the Matrix wire.
+#:
+#: A float is encoded as the single-entry object ``{FLOAT_TAG: repr(value)}``
+#: and restored on receipt.  The key is namespaced (``$``-prefixed, like Matrix
+#: event fields) and never produced by the protocol itself, so a collision with
+#: genuine payload data is not expected; payload values that are mappings are
+#: otherwise free-form and must not use this key.
+FLOAT_TAG = "$rcp_float"
+
+
+def _encode_wire(value: Any) -> Any:
+    """Recursively replace every float with a JSON-safe tagged encoding.
+
+    ``bool`` is checked before ``float`` because it is an ``int`` subclass and
+    must survive unchanged; integers, strings, ``None`` and booleans are already
+    accepted by Synapse and pass through.  ``repr`` round-trips a Python float
+    exactly, including ``nan``/``inf``.
+
+    Returns:
+        ``value`` with all floats encoded for the Matrix wire.
+
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return {FLOAT_TAG: repr(value)}
+    if isinstance(value, dict):
+        return {key: _encode_wire(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_wire(item) for item in value]
+    return value
+
+
+def _decode_wire(value: Any) -> Any:
+    """Recursively restore :func:`_encode_wire`-tagged floats to real floats.
+
+    Returns:
+        ``value`` with every tagged float restored; all other data unchanged.
+
+    """
+    if isinstance(value, dict):
+        if set(value) == {FLOAT_TAG} and isinstance(value[FLOAT_TAG], str):
+            return float(value[FLOAT_TAG])
+        return {key: _decode_wire(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_wire(item) for item in value]
+    return value
+
 
 #: Envelope fields that participate in the HMAC (everything except ``sig`` and
 #: the transport-only metadata fields).
@@ -87,22 +154,28 @@ class RcpMessage(BaseModel):
     def signed_payload(self) -> dict[str, Any]:
         """Return the envelope fields covered by the signature.
 
+        The payload is passed through :func:`_encode_wire` so the signed bytes
+        are exactly the float-free bytes that travel on the Matrix wire (see the
+        module docstring).
+
         Returns:
             The signed fields as a JSON-mode mapping (enums as strings), which
             is exactly the subset hashed by :func:`~pic_agentic.rcp.crypto.sign`.
 
         """
-        return self.model_dump(mode="json", include=set(SIGNED_FIELDS))
+        signed = self.model_dump(mode="python", include=set(SIGNED_FIELDS))
+        return _encode_wire(signed)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the full wire envelope including the signature.
 
         Returns:
-            The signed fields plus ``sig``; the transport-only metadata fields
-            are excluded by the model.
+            The signed fields (float-free, see :func:`_encode_wire`) plus
+            ``sig``; the transport-only metadata fields are excluded by the
+            model.
 
         """
-        return self.model_dump(mode="json")
+        return _encode_wire(self.model_dump(mode="python"))
 
     def sign(self, secret: str) -> RcpMessage:
         """Sign this message in place.
@@ -191,6 +264,10 @@ class RcpMessage(BaseModel):
     def from_dict(cls, data: dict[str, Any]) -> RcpMessage:
         """Build a message from a raw wire envelope mapping.
 
+        The wire encoding is decoded first, so the in-memory payload carries
+        real floats again (see the module docstring); :meth:`verify` then
+        re-encodes deterministically when checking the signature.
+
         Args:
             data: The envelope mapping, typically from a Matrix event.
 
@@ -198,7 +275,7 @@ class RcpMessage(BaseModel):
             The validated message.
 
         """
-        return cls.model_validate(data)
+        return cls.model_validate(_decode_wire(data))
 
     @classmethod
     def from_content(cls, content: dict[str, Any]) -> RcpMessage:
