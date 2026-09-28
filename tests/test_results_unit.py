@@ -12,6 +12,7 @@ path must be exercised, so the suite passes with ``openpmd_api`` ABSENT.
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -539,6 +540,7 @@ def test_real_openpmd_series_roundtrip(tmp_path) -> None:
     rho.reset_dataset(api.Dataset(api.Datatype.DOUBLE, [2]))
     rho.store_chunk(np.array([5.0, 7.0]))
     series.flush()
+    series.close()
     del series
 
     def show(op, **kw: object):
@@ -578,6 +580,7 @@ def test_real_openpmd_nested_picongpu_series_is_discovered(tmp_path) -> None:
         mesh["x"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [4]))
         mesh["x"].store_chunk(np.full(4, value))
         series.flush()
+        series.close()
         del series
 
     def show(op, **kw: object):
@@ -602,3 +605,122 @@ def test_real_openpmd_nested_picongpu_series_is_discovered(tmp_path) -> None:
         )["error_code"]
         == "no_results"
     )
+
+
+def _write_hdf5_series(directory: Path, prefix: str, record: str, component: str, values: dict[int, float]) -> None:
+    """Write a small ``<prefix>_%06T.h5`` series with one component record."""
+    import numpy as np
+    import openpmd_api as api
+
+    for step, value in values.items():
+        series = api.Series(str(directory / f"{prefix}_%06T.h5"), api.Access.create)
+        mesh = series.iterations[step].meshes[record]
+        mesh[component].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [2]))
+        mesh[component].store_chunk(np.full(2, value))
+        series.flush()
+        series.close()
+        del series
+
+
+@pytest.mark.skipif(importlib.util.find_spec("openpmd_api") is None, reason="openpmd_api not installed")
+def test_real_openpmd_adios2_directory_series_is_discovered(tmp_path) -> None:
+    """A ``.bp5`` series is a *directory* and must still be discovered.
+
+    PIConGPU's default backend is ``bp5``; each iteration is a directory
+    (``fields_000000.bp5/``), so a discovery that only accepts files misses
+    every default run.
+    """
+    import numpy as np
+    import openpmd_api as api
+
+    series_dir = tmp_path / "simOutput" / "openPMD" / "simOutput"
+    series_dir.mkdir(parents=True)
+    for step, value in ((0, 1.0), (50, 2.0)):
+        series = api.Series(str(series_dir / "fields_%06T.bp5"), api.Access.create)
+        mesh = series.iterations[step].meshes["E"]
+        mesh["x"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [2]))
+        mesh["x"].store_chunk(np.full(2, value))
+        series.flush()
+        series.close()
+        del series
+    assert (series_dir / "fields_000000.bp5").is_dir()  # ADIOS2 series is a directory
+
+    slice_ = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.SLICE, record="E", component="x"),
+        run_dir=tmp_path,
+        sim_id=SIM_ID,
+    )
+    assert slice_["n_points"] == 2
+    # An explicit concrete-directory path resolves to that series too.
+    stats = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.STATS,
+            path="openPMD/simOutput/fields_000050.bp5",
+            record="E",
+            component="x",
+        ),
+        run_dir=tmp_path,
+        sim_id=SIM_ID,
+    )
+    assert stats["stats"]["mean"] == pytest.approx(2.0)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("openpmd_api") is None, reason="openpmd_api not installed")
+def test_discovery_prefers_the_requested_record_family(tmp_path) -> None:
+    """With several series, the one containing the requested record wins.
+
+    Guards against silently binding an ``E`` slice to a ``particles_*`` series
+    (which would return the wrong data or a spurious "record not found").
+    """
+    series_dir = tmp_path / "simOutput" / "openPMD" / "simOutput"
+    series_dir.mkdir(parents=True)
+    _write_hdf5_series(series_dir, "particles", "electrons", "x", {0: 7.0})
+    _write_hdf5_series(series_dir, "fields", "E", "x", {0: 1.0})
+
+    slice_ = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.SLICE, record="E", component="x"),
+        run_dir=tmp_path,
+        sim_id=SIM_ID,
+    )
+    assert slice_["data"] == [1.0, 1.0]
+    particles = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.SLICE, record="electrons", component="x"),
+        run_dir=tmp_path,
+        sim_id=SIM_ID,
+    )
+    assert particles["data"] == [7.0, 7.0]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("openpmd_api") is None, reason="openpmd_api not installed")
+def test_discovery_deprioritises_checkpoint_series(tmp_path) -> None:
+    """A checkpoint series must never be preferred over the field output."""
+    out = tmp_path / "simOutput"
+    (out / "openPMD" / "simOutput").mkdir(parents=True)
+    (out / "zeta_checkpoints").mkdir()
+    _write_hdf5_series(out / "openPMD" / "simOutput", "fields", "E", "x", {0: 1.0})
+    _write_hdf5_series(out / "zeta_checkpoints", "checkpoint", "E", "x", {0: 9.0})
+
+    slice_ = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.SLICE, record="E", component="x"),
+        run_dir=tmp_path,
+        sim_id=SIM_ID,
+    )
+    assert slice_["data"] == [1.0, 1.0]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("openpmd_api") is None, reason="openpmd_api not installed")
+def test_compute_const_program_needs_no_series(tmp_path) -> None:
+    """A constant program evaluates even when the run has no openPMD output."""
+    run = tmp_path / "run"
+    (run / "simOutput").mkdir(parents=True)
+    payload = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            program={"output": {"kind": "const", "value": 42}},
+        ),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert payload["stats"]["value"] == pytest.approx(42.0)

@@ -29,7 +29,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pic_agentic.protocol.simulation import (
     MAX_RESULT_BYTES,
@@ -42,6 +42,9 @@ from pic_agentic.protocol.simulation import (
 )
 from pic_agentic.rcp import encode_wire
 from pic_agentic.simclient.simulation import SimulationErrorCode, find_stdout_path
+
+if TYPE_CHECKING:
+    from pic_agentic.analysis_program import AnalysisProgram
 
 #: Maximum directory depth a scan descends.  PIConGPU output nests a handful of
 #: levels at most; a deeper tree is either pathological or a symlink cycle.
@@ -60,10 +63,14 @@ _OPENPMD_SUFFIXES = {".bp": "openpmd-adios2", ".bp5": "openpmd-adios2", ".h5": "
 #: Iteration selectors that mean "the newest available iteration".
 _LAST_ITERATIONS = frozenset({None, "last"})
 
-#: Trailing integer run in a series file's stem: the iteration infix PIConGPU
-#: writes (``fields_000050.h5`` -> ``000050``).  Rewritten to openPMD's ``%T``
-#: wildcard so a series is opened across every iteration, not just one file.
-_ITERATION_INFIX_RE = re.compile(r"\d+$")
+#: Maximal digit run in a series name: the iteration infix PIConGPU writes
+#: (``fields_000050.h5``, radiation's ``spec_000050_0_0_0.h5``).  Only the
+#: **first** run is the iteration, so the template is derived with ``count=1``.
+_ITERATION_INFIX_RE = re.compile(r"\d+")
+
+#: Substring marking a checkpoint series; deprioritised so a coincidental
+#: record in a checkpoint is never silently preferred over the field output.
+_CHECKPOINT_MARKER = "checkpoint"
 
 #: The sentinel component name openPMD reports for a scalar (componentless)
 #: mesh record; it must not be presented as a selectable component.
@@ -286,45 +293,203 @@ def _open_series(path: Path) -> Any:
         raise ResultsReaderError(msg) from exc
 
 
-def _find_series(output: Path, relpath: str | None) -> Path | None:
-    """Locate the openPMD series file/pattern for a run's ``simOutput``.
+def _series_patterns(path: Path) -> list[Path]:
+    """Return openPMD ``%T`` pattern candidates for a concrete series name.
+
+    PIConGPU's iteration infix is a digit run, but its position varies: standard
+    field output is ``fields_000050.h5`` (trailing run) while the radiation
+    plugin writes ``spec_000050_0_0_0.h5`` (leading run).  Rather than guess, the
+    first and last digit runs are offered as candidates (first first, so the
+    common trailing-only name is unchanged); :func:`_find_series` keeps whichever
+    actually opens.
+
+    Returns:
+        Candidate pattern paths (first-run substitution first), deduplicated.
+
+    """
+    spans = [match.span() for match in _ITERATION_INFIX_RE.finditer(path.stem)]
+    if not spans:
+        return [path]
+    # Trailing run first (PIConGPU's standard field output), then the leading run
+    # (the radiation plugin's ``spec_000050_0_0_0.h5``).  At most two candidates.
+    ordered = [(spans[-1])] if len(spans) == 1 else [(spans[-1]), (spans[0])]
+    patterns: list[Path] = []
+    seen: set[str] = set()
+    for start, end in ordered:
+        stem = f"{path.stem[:start]}%T{path.stem[end:]}"
+        name = stem + path.suffix
+        if name not in seen:
+            seen.add(name)
+            patterns.append(path.with_name(name))
+    return patterns
+
+
+def _is_series_name(path: Path) -> bool:
+    """Whether a filename suffix marks an openPMD series.
+
+    Returns:
+        True for a ``.bp``/``.bp5``/``.h5``/``.hdf5`` name or directory.
+
+    """
+    return path.suffix.lower() in _OPENPMD_SUFFIXES
+
+
+def _series_candidates(base: Path) -> list[Path]:
+    """Return deterministic openPMD series pattern candidates at or under ``base``.
+
+    Treats an openPMD-suffixed **directory** as a series leaf (ADIOS2 ``.bp``/
+    ``.bp5`` series are directories) and does not descend into it.  The result is
+    sorted lexically and checkpoint series are moved last, so discovery does not
+    depend on ``os.scandir`` order and never silently prefers a checkpoint.
+
+    Args:
+        base: A file or directory to search.
+
+    Returns:
+        Candidate series patterns (possibly empty).
+
+    """
+    if base.is_file() or (base.is_dir() and _is_series_name(base)):
+        # A file, or an explicit path naming the series itself (ADIOS2 directory):
+        # map it directly instead of walking into it.
+        return _series_patterns(base) if _is_series_name(base) else []
+    if not base.is_dir():
+        return []
+    found = [pattern for path in _walk_series(base) for pattern in _series_patterns(path)]
+    found.sort(key=lambda path: (_CHECKPOINT_MARKER in path.name.lower(), str(path)))
+    return _dedupe(found)
+
+
+def _walk_series(root: Path) -> list[Path]:
+    """Return every openPMD series leaf at or under ``root``.
+
+    Returns:
+        The concrete series files/directories (not patterns), unsorted.
+
+    """
+    found: list[Path] = []
+    work: list[tuple[Path, int]] = [(root, 0)]
+    while work:
+        directory, depth = work.pop()
+        try:
+            with os.scandir(directory) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                if not is_dir and not entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            child = Path(entry.path)
+            if _is_series_name(child):
+                found.append(child)  # a series leaf; never descend into it
+            elif is_dir and depth < _MAX_SCAN_DEPTH:
+                work.append((child, depth + 1))
+    return found
+
+
+def _dedupe(paths: list[Path]) -> list[Path]:
+    """Return ``paths`` without repeats, preserving order.
+
+    Returns:
+        The deduplicated list.
+
+    """
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _find_series(output: Path, relpath: str | None, record: str | None = None) -> Path | None:
+    """Locate an *openable* openPMD series for a run's ``simOutput``.
 
     A PICMI diagnostic's own ``result_path(prefix)`` returns an openPMD *pattern*
     with a ``%T`` iteration wildcard (e.g. ``.../openPMD/simOutput/fields_%06T.h5``),
     which is exactly what :meth:`openpmd_api.Series` accepts.  That pattern is not
-    persisted to the cluster, so it is reconstructed here from the files on disk:
-    the caller's ``path`` selects a file or tree, or the whole ``simOutput`` is
-    searched, and the first openPMD-backend file found is rewritten to a ``%T``
-    pattern by replacing its trailing iteration number.  This is picongpu-free and
-    makes no assumption about the nesting depth PIConGPU uses.
+    persisted to the cluster, so it is reconstructed from the entries on disk
+    (:func:`_series_candidates`, :func:`_series_patterns`).  Candidates that do
+    not open are skipped, so a mis-derived ``%T`` position cannot mask a good
+    series, and tools that merely *list* candidates never open a file.  When
+    several series open and ``record`` is given, the one that contains that
+    record is preferred, so a request cannot bind to the wrong family (e.g.
+    ``particles_*`` for an ``E`` slice).
 
     Args:
         output: The run's linked ``simOutput`` directory.
-        relpath: The request's relative path (a file, a directory, or None).
+        relpath: The request's relative path (a file, a directory, or None); an
+            unsafe value makes ``_safe_join`` raise, which the caller maps to
+            ``path_unsafe``.
+        record: Optional record name used to disambiguate several series.
 
     Returns:
-        The discovered series path (possibly a ``%T`` pattern), or None when the
-        path is unsafe, absent, or contains no openPMD file.
+        The discovered series path, or None when the path is absent or contains
+        no openable series.
 
     """
     base = output
     if relpath:
-        try:
-            base = _safe_join(output, relpath)
-        except ValueError:
-            return None
-    if base.is_file():
-        return base
-    if not base.is_dir():
+        base = _safe_join(output, relpath)  # raises ValueError when unsafe
+    candidates = _series_candidates(base)
+    if not candidates:
         return None
-    for path, entry_is_dir in _collect_entries(base):
-        if entry_is_dir or path.suffix.lower() not in _OPENPMD_SUFFIXES:
-            continue
-        # Substitute on the *stem* only: ``\d+$`` on the whole name would match
-        # the trailing digit of the extension (``.h5``), not the iteration.
-        pattern = _ITERATION_INFIX_RE.sub("%T", path.stem) + path.suffix
-        return path.with_name(pattern)
-    return None
+    if len(candidates) == 1:
+        # Unambiguous: open it lazily in the reader, so callers that stub
+        # ``_load_dataset`` (the evaluator tests) are not forced to build a
+        # real series and a listing caller never opens a file.
+        return candidates[0]
+    openable = [path for path in candidates if _can_open_series(path)]
+    if not openable:
+        return candidates[0]
+    if record:
+        return next((path for path in openable if _series_has_record(path, record)), openable[0])
+    return openable[0]
+
+
+def _can_open_series(path: Path) -> bool:
+    """Whether ``path`` opens as an openPMD series.
+
+    Returns:
+        True when the series opens; a failure is simply "not a candidate".
+
+    """
+    try:
+        series = _open_series(path)
+    except Exception:  # ruff: ignore[blind-except] - a bad candidate is not an error
+        return False
+    closer = getattr(series, "close", None)
+    if callable(closer):
+        closer()
+    return True
+
+
+def _series_has_record(path: Path, record: str) -> bool:
+    """Whether an openable series exposes ``record`` in any iteration.
+
+    Best-effort and bounded: a probe that cannot be opened simply does not match,
+    so a broken candidate never masks a good one.
+
+    Returns:
+        True when the record is present.
+
+    """
+    try:
+        series = _open_series(path)
+        for step in series.iterations:
+            if record in series.iterations[step].meshes:
+                return True
+    except Exception:  # ruff: ignore[blind-except] - a probe is best-effort
+        return False
+    return False
 
 
 def _select_iteration(series: Any, iteration: int | str | None) -> int:
@@ -795,28 +960,33 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
     )
     from pic_agentic.analysis_program import AnalysisProgram  # ruff: ignore[import-outside-top-level] - optional seam
 
-    preflight = _compute_preflight(params, output)
-    if preflight is not None:
-        return preflight
+    if params.program is None:
+        return _error(SimulationErrorCode.UNSUPPORTED, "compute requires a program")
     try:
         program = AnalysisProgram.model_validate(params.program)
     except Exception as exc:  # ruff: ignore[blind-except] - an invalid program is ack data
         return _error(SimulationErrorCode.UNSUPPORTED, f"invalid analysis program: {exc}")
 
-    series = _find_series(output, params.path)
-    if series is None:
-        return _error(SimulationErrorCode.NO_RESULTS, "no openPMD output found for this run")
+    preflight = _compute_preflight(params, program, output)
+    if preflight is not None:
+        return preflight
 
     def resolve(selector: Any) -> list[float]:
         # A selector resolves to one mesh component; the reader applies the
         # same validation the slice path uses.  A selector that omits
         # record/component falls back to the request's top-level ones, and an
-        # empty record means the first available mesh.
+        # empty record means the first available mesh.  Series discovery is
+        # lazy: a constant/pure program that reads no data must not require the
+        # run to have openPMD output.
         record = getattr(selector, "record", None) or params.record
         component = getattr(selector, "component", None) or params.component
         iteration = getattr(selector, "iteration", None)
         if iteration is None:
             iteration = params.iteration
+        series = _find_series(output, params.path, record)
+        if series is None:
+            msg = "no openPMD output found for this run"
+            raise ResultsReaderError(msg)
         return _load_dataset(series, record, component, iteration)
 
     try:
@@ -830,11 +1000,15 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
     return _shape_compute(payload)
 
 
-def _compute_preflight(params: ResultParams, output: Path) -> dict[str, Any] | None:
+def _compute_preflight(params: ResultParams, program: AnalysisProgram, output: Path) -> dict[str, Any] | None:
     """Return a compute error for a request that cannot proceed, else None.
+
+    The output directory is only required when the program actually reads data
+    (it declares ``selectors``); a constant/pure program evaluates on any run.
 
     Args:
         params: The validated result request.
+        program: The validated analysis program.
         output: The run's linked ``simOutput`` directory.
 
     Returns:
@@ -845,7 +1019,7 @@ def _compute_preflight(params: ResultParams, output: Path) -> dict[str, Any] | N
         return _error(SimulationErrorCode.READER_UNAVAILABLE, "the optional openpmd_api reader is not installed")
     if params.program is None:
         return _error(SimulationErrorCode.UNSUPPORTED, "compute requires a program")
-    if not output.is_dir():
+    if program.selectors and not output.is_dir():
         return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
     return None
 
@@ -907,7 +1081,10 @@ def _reader_op(  # ruff: ignore[too-many-return-statements]
         )
     if not output.is_dir():
         return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
-    target = _find_series(output, params.path)
+    try:
+        target = _find_series(output, params.path, params.record)
+    except ValueError:
+        return _error(SimulationErrorCode.PATH_UNSAFE, "unsafe result path")
     if target is None:
         return _error(SimulationErrorCode.NO_RESULTS, "no openPMD output found for this run")
     try:
