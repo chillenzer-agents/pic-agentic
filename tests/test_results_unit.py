@@ -553,3 +553,52 @@ def test_real_openpmd_series_roundtrip(tmp_path) -> None:
     assert show(ResultOp.STATS, path="fields.h5", record="nope")["error_code"] == "no_results"
     assert show(ResultOp.STATS, path="fields.h5", record="E", component="nope")["error_code"] == "no_results"
     assert show(ResultOp.STATS, path="fields.h5", record="E", iteration=999)["error_code"] == "no_results"
+
+
+@pytest.mark.skipif(importlib.util.find_spec("openpmd_api") is None, reason="openpmd_api not installed")
+def test_real_openpmd_nested_picongpu_series_is_discovered(tmp_path) -> None:
+    """A real PIConGPU layout (nested, ``%06T`` infix) is found without a path.
+
+    Regression for the live gap: ``resolve_result`` opened ``<run>/simOutput``
+    directly, but PIConGPU nests the series at
+    ``simOutput/openPMD/simOutput/fields_%06T.h5`` (see the diagnostics'
+    ``result_path``), so ``slice``/``stats``/``compute`` all failed with
+    ``no_results``.  Discovery must reconstruct the ``%T`` pattern so *every*
+    iteration is visible, not just one file.
+    """
+    import numpy as np
+    import openpmd_api as api
+
+    # Exactly the nesting NativeFieldDump.result_path(run_dir) yields.
+    series_dir = tmp_path / "simOutput" / "openPMD" / "simOutput"
+    series_dir.mkdir(parents=True)
+    for step, value in ((0, 1.0), (50, 2.0), (200, 3.0)):
+        series = api.Series(str(series_dir / "fields_%06T.h5"), api.Access.create)
+        mesh = series.iterations[step].meshes["E"]
+        mesh["x"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [4]))
+        mesh["x"].store_chunk(np.full(4, value))
+        series.flush()
+        del series
+
+    def show(op, **kw: object):
+        return results.resolve_result(ResultParams(sim_id=SIM_ID, op=op, **kw), run_dir=tmp_path, sim_id=SIM_ID)
+
+    # No path: the series is discovered under simOutput.
+    assert show(ResultOp.SLICE, record="E", component="x")["n_points"] == 4
+    # A path naming the series tree narrows the search the same way.
+    assert show(ResultOp.SLICE, path="openPMD/simOutput", record="E", component="x")["n_points"] == 4
+    # The pattern must span all iterations, so 'last' resolves to step 200.
+    last = show(ResultOp.STATS, record="E", component="x", iteration="last")
+    assert last["stats"]["mean"] == pytest.approx(3.0)
+    assert show(ResultOp.STATS, record="E", component="x", iteration=50)["stats"]["mean"] == pytest.approx(2.0)
+    # A missing series is still a clean error.
+    empty = tmp_path / "empty"
+    (empty / "simOutput").mkdir(parents=True)
+    assert (
+        results.resolve_result(
+            ResultParams(sim_id=SIM_ID, op=ResultOp.SLICE, record="E"),
+            run_dir=empty,
+            sim_id=SIM_ID,
+        )["error_code"]
+        == "no_results"
+    )

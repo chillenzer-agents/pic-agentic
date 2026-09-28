@@ -618,6 +618,8 @@ def cmd_slice(args: argparse.Namespace) -> int:
         msg = "--slice requires --record <name>"
         raise SystemExit(msg)
     arguments: dict = {"sim_id": args.sim_id, "record": args.record, "iteration": args.iteration}
+    if args.result_path:
+        arguments["path"] = args.result_path
     if args.component:
         arguments["component"] = args.component
     if args.downsample is not None:
