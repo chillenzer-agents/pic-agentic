@@ -39,6 +39,7 @@ from pic_agentic.protocol.simulation import (
     ResultParams,
     ResultRef,
 )
+from pic_agentic.rcp import encode_wire
 from pic_agentic.simclient.simulation import SimulationErrorCode, find_stdout_path
 
 #: Maximum directory depth a scan descends.  PIConGPU output nests a handful of
@@ -601,7 +602,13 @@ def _safe_join(base: Path, relpath: str) -> Path:
 
 
 def _escaped_size(value: Any) -> int:
-    """Return the JSON-escaped wire size of a value.
+    """Return the JSON-escaped *wire* size of a value.
+
+    The value is passed through :func:`~pic_agentic.rcp.encode_wire` first, so
+    the size reflects what actually travels: a float is carried as the larger
+    tagged object ``{"$rcp_float": "..."}``, and measuring the pre-encoding form
+    would under-count a float-heavy slice and let an over-budget ack reach the
+    homeserver (where it is dropped).  Non-JSON scalars are normalised too.
 
     Args:
         value: The value that will travel inside an ack payload.
@@ -610,7 +617,7 @@ def _escaped_size(value: Any) -> int:
         The length in bytes of its ASCII-escaped JSON encoding.
 
     """
-    return len(json.dumps(value, ensure_ascii=True).encode("ascii"))
+    return len(json.dumps(encode_wire(value), ensure_ascii=True).encode("ascii"))
 
 
 def _describe(output: Path, *, sim_id: str, run_dir: Path, local_root: str) -> dict[str, Any]:
@@ -871,12 +878,19 @@ def _reader_op(  # ruff: ignore[too-many-return-statements]
 def _cap_slice(result: dict[str, Any], downsample: int | None) -> dict[str, Any]:
     """Stride, hard-cap and size-check a slice result.
 
+    The slice must fit :data:`MAX_RESULT_BYTES` *on the wire*, where each float
+    costs the larger tagged encoding (see
+    :func:`~pic_agentic.rcp.encode_wire`), so a ``SLICE_MAX_POINTS``-point slice
+    of floats does not fit and is strided down until it does.  Striding (rather
+    than truncating) keeps the returned points spread across the whole range.
+
     Args:
         result: ``{"data": list[float], "n_points": int}`` from the reader.
         downsample: Optional stride (values ``<= 1`` are ignored).
 
     Returns:
-        The bounded slice, or a ``RESULT_TOO_LARGE`` error.
+        The bounded slice, or a ``RESULT_TOO_LARGE`` error only when even a
+        single point overflows.
 
     """
     data = list(result.get("data", []))
@@ -884,6 +898,8 @@ def _cap_slice(result: dict[str, Any], downsample: int | None) -> dict[str, Any]
         data = data[::downsample]
     if len(data) > SLICE_MAX_POINTS:
         data = data[:SLICE_MAX_POINTS]
+    while len(data) > 1 and _escaped_size({"data": data, "n_points": len(data)}) > MAX_RESULT_BYTES:
+        data = data[::2]
     capped = {"data": data, "n_points": len(data)}
     if _escaped_size(capped) > MAX_RESULT_BYTES:
         return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"slice exceeds {MAX_RESULT_BYTES} wire bytes")

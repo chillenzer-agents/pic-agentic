@@ -283,8 +283,28 @@ def test_resolve_slice_hard_caps_points(tmp_path, monkeypatch) -> None:
         run_dir=out.parent,
         sim_id=SIM_ID,
     )
-    assert payload["n_points"] == SLICE_MAX_POINTS
-    assert len(payload["data"]) == SLICE_MAX_POINTS
+    # The point cap is respected, and the float-tagged wire form fits the budget
+    # (a full SLICE_MAX_POINTS float slice does not fit once floats are tagged,
+    # so _cap_slice strides it down).
+    assert 1 <= payload["n_points"] <= SLICE_MAX_POINTS
+    assert len(payload["data"]) == payload["n_points"]
+    assert results._escaped_size({"data": payload["data"], "n_points": payload["n_points"]}) <= results.MAX_RESULT_BYTES
+
+
+def test_cap_slice_strides_a_float_heavy_slice_to_fit() -> None:
+    """A SLICE_MAX_POINTS float slice exceeds the wire budget and is strided."""
+    full = {"data": [0.0] * SLICE_MAX_POINTS, "n_points": SLICE_MAX_POINTS}
+    assert results._escaped_size(full) > results.MAX_RESULT_BYTES
+    capped = results._cap_slice(
+        {"data": [float(i) for i in range(SLICE_MAX_POINTS)], "n_points": SLICE_MAX_POINTS},
+        None,
+    )
+    assert "error_code" not in capped
+    assert 1 < capped["n_points"] < SLICE_MAX_POINTS
+    assert results._escaped_size(capped) <= results.MAX_RESULT_BYTES
+    # Striding keeps the endpoints, spreading the returned points across the range.
+    assert repr(capped["data"][0]) == repr(0.0)
+    assert capped["data"][-1] > capped["data"][1]
 
 
 def test_resolve_slice_downsample_applied(tmp_path, monkeypatch) -> None:

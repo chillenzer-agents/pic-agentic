@@ -17,6 +17,8 @@ from pic_agentic.rcp.envelope import (
     Kind,
     RcpMessage,
     SenderRole,
+    decode_wire,
+    encode_wire,
     now_ts,
 )
 from pic_agentic.rcp.state import DedupStore, SequenceState
@@ -31,6 +33,8 @@ __all__ = [
     "SenderRole",
     "SequenceState",
     "canonical_bytes",
+    "decode_wire",
+    "encode_wire",
     "new_cmd_id",
     "new_secret_hex",
     "now_ts",

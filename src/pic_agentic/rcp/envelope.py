@@ -19,12 +19,24 @@ float`` and is never delivered, so a single float in a payload silently drops
 the whole message (observed live on the terminal lifecycle event carrying
 ``core_hours``/``gpu_hours``).
 
-:func:`_encode_wire` is the single chokepoint that removes floats from
-*every* RCP message before it is signed and sent, and :func:`_decode_wire`
+:func:`encode_wire` is the single chokepoint that removes floats from
+*every* RCP message before it is signed and sent, and :func:`decode_wire`
 restores them on receipt.  Because both :meth:`RcpMessage.sign` and
 :meth:`RcpMessage.verify` hash the *encoded* form, the signature covers exactly
 the float-free bytes that travel, and the in-memory payload still carries real
 floats for consumers.  New payload fields therefore cannot reintroduce the bug.
+
+Encoding is a bijection, so no legitimate payload can be corrupted:
+
+* non-JSON scalars (``datetime``, ``Decimal``, ``bytes``, ``UUID``, sets,
+  float dict keys, ...) are first normalised with pydantic's ``to_jsonable_python``
+  -- careful: this *preserves* floats (including ``nan``/``inf``) so they can be
+  tagged next;
+* every float becomes ``{FLOAT_TAG: repr(value)}``, which round-trips bit-exactly;
+* a user mapping key that is, or starts with, the reserved ``_ESCAPE_PREFIX`` is
+  escaped, so a genuine ``{"$rcp_float": "1.0"}`` mapping can never be mistaken
+  for an encoded float (``encode({"x": {"$rcp_float": "1.0"}})`` differs from
+  ``encode({"x": 1.0})`` and decodes back to the original mapping).
 """
 
 from __future__ import annotations
@@ -34,29 +46,67 @@ from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic_core import to_jsonable_python
 
 from pic_agentic.rcp.crypto import sign, verify
 
 RCP_NAMESPACE = "io.picongpu.rcp"
 VERSION = 0
 
+#: Reserved key prefix for the float wire encoding; user mapping keys that start
+#: with it are escaped on the way out (see the module docstring).
+_ESCAPE_PREFIX = "$rcp_"
+
 #: Sentinel key under which a float is carried on the Matrix wire.
 #:
-#: A float is encoded as the single-entry object ``{FLOAT_TAG: repr(value)}``
-#: and restored on receipt.  The key is namespaced (``$``-prefixed, like Matrix
-#: event fields) and never produced by the protocol itself, so a collision with
-#: genuine payload data is not expected; payload values that are mappings are
-#: otherwise free-form and must not use this key.
+#: A float is encoded as the single-entry object ``{FLOAT_TAG: repr(value)}`` and
+#: restored on receipt.  The key is namespaced (``$``-prefixed, like Matrix event
+#: fields); because user keys with the reserved prefix are escaped on encode, the
+#: tag is unambiguous and cannot collide with genuine payload data.
 FLOAT_TAG = "$rcp_float"
+
+
+def _encode_key(key: Any) -> Any:
+    """Escape a mapping key that would collide with the reserved prefix.
+
+    Returns:
+        The key, escaped when it is a string starting with the reserved prefix.
+
+    """
+    if isinstance(key, str) and key.startswith(_ESCAPE_PREFIX):
+        return _ESCAPE_PREFIX + key
+    return key
+
+
+def _decode_key(key: Any) -> Any:
+    """Reverse :func:`_encode_key`.
+
+    Returns:
+        The original key when it carries the escape prefix, else ``key``.
+
+    """
+    if isinstance(key, str) and key.startswith(_ESCAPE_PREFIX + _ESCAPE_PREFIX):
+        return key[len(_ESCAPE_PREFIX) :]
+    return key
+
+
+def encode_wire(value: Any) -> Any:
+    """Return the JSON-safe, float-free, collision-free form of ``value``.
+
+    Non-JSON scalars are normalised first (pydantic keeps floats intact, which
+    the next step tags); ``bool`` is inspected before ``float`` because it is an
+    ``int`` subclass.  ``repr`` round-trips a Python float exactly, including
+    ``nan``/``inf``.
+
+    Returns:
+        ``value`` with all floats encoded for the Matrix wire.
+
+    """
+    return _encode_wire(to_jsonable_python(value))
 
 
 def _encode_wire(value: Any) -> Any:
     """Recursively replace every float with a JSON-safe tagged encoding.
-
-    ``bool`` is checked before ``float`` because it is an ``int`` subclass and
-    must survive unchanged; integers, strings, ``None`` and booleans are already
-    accepted by Synapse and pass through.  ``repr`` round-trips a Python float
-    exactly, including ``nan``/``inf``.
 
     Returns:
         ``value`` with all floats encoded for the Matrix wire.
@@ -67,25 +117,33 @@ def _encode_wire(value: Any) -> Any:
     if isinstance(value, float):
         return {FLOAT_TAG: repr(value)}
     if isinstance(value, dict):
-        return {key: _encode_wire(item) for key, item in value.items()}
+        return {_encode_key(key): _encode_wire(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_encode_wire(item) for item in value]
     return value
 
 
-def _decode_wire(value: Any) -> Any:
-    """Recursively restore :func:`_encode_wire`-tagged floats to real floats.
+def decode_wire(value: Any) -> Any:
+    """Recursively restore :func:`encode_wire`-tagged floats to real floats.
 
     Returns:
         ``value`` with every tagged float restored; all other data unchanged.
 
+    Raises:
+        ValueError: If a tagged float carries a value that does not parse as a
+            float (a malformed message).
+
     """
     if isinstance(value, dict):
         if set(value) == {FLOAT_TAG} and isinstance(value[FLOAT_TAG], str):
-            return float(value[FLOAT_TAG])
-        return {key: _decode_wire(item) for key, item in value.items()}
+            try:
+                return float(value[FLOAT_TAG])
+            except ValueError as exc:
+                msg = f"malformed {FLOAT_TAG} value: {value[FLOAT_TAG]!r}"
+                raise ValueError(msg) from exc
+        return {_decode_key(key): decode_wire(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_decode_wire(item) for item in value]
+        return [decode_wire(item) for item in value]
     return value
 
 
@@ -164,18 +222,18 @@ class RcpMessage(BaseModel):
 
         """
         signed = self.model_dump(mode="python", include=set(SIGNED_FIELDS))
-        return _encode_wire(signed)
+        return encode_wire(signed)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the full wire envelope including the signature.
 
         Returns:
-            The signed fields (float-free, see :func:`_encode_wire`) plus
+            The signed fields (float-free, see :func:`encode_wire`) plus
             ``sig``; the transport-only metadata fields are excluded by the
             model.
 
         """
-        return _encode_wire(self.model_dump(mode="python"))
+        return encode_wire(self.model_dump(mode="python"))
 
     def sign(self, secret: str) -> RcpMessage:
         """Sign this message in place.
@@ -275,7 +333,7 @@ class RcpMessage(BaseModel):
             The validated message.
 
         """
-        return cls.model_validate(_decode_wire(data))
+        return cls.model_validate(decode_wire(data))
 
     @classmethod
     def from_content(cls, content: dict[str, Any]) -> RcpMessage:

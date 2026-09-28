@@ -35,7 +35,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, computed_field, field_validator
 
-from pic_agentic.rcp import Kind, RcpMessage, SenderRole, canonical_bytes, new_cmd_id
+from pic_agentic.rcp import Kind, RcpMessage, SenderRole, canonical_bytes, encode_wire, new_cmd_id
 from pic_agentic.version import WIRE_FORMAT_VERSION
 
 #: The only top-level key a transmitted runner spec may carry.
@@ -1139,7 +1139,9 @@ def build_result_ack(
     # Single chokepoint: a result ack must fit the homeserver event budget, so
     # an over-budget encoding is replaced by a clean RESULT_TOO_LARGE error
     # rather than being sent and rejected (which would look like a pull timeout).
-    if len(json.dumps(payload, ensure_ascii=True, separators=(",", ":"))) > MAX_RESULT_BYTES:
+    # Measure the *encoded* payload: a float is carried as the larger tagged
+    # object {"$rcp_float": "..."}, so the raw form would under-count.
+    if len(json.dumps(encode_wire(payload), ensure_ascii=True, separators=(",", ":"))) > MAX_RESULT_BYTES:
         payload = {
             "cmd_id": cmd_id,
             "sim_id": sim_id,

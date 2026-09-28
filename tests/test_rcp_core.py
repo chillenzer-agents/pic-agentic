@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from pic_agentic.rcp import (
@@ -23,6 +25,7 @@ from pic_agentic.rcp import (
     sign,
     verify,
 )
+from pic_agentic.rcp.envelope import FLOAT_TAG
 
 SECRET = "0123456789abcdef" * 2
 
@@ -209,8 +212,9 @@ def _synapse_canonical_json(value: object) -> object:
     """Mimic Synapse's ``canonicaljson``: raise on ANY float in event content.
 
     The reference homeserver refuses an event whose content carries a float
-    (``Bad JSON value: float``), whether finite or not.  This encoder is the
-    offline stand-in for that rule: if it accepts the content, Synapse will too.
+    (``Bad JSON value: float``), whether finite or not, in a value *or a key*.
+    This encoder is the offline stand-in for that rule: if it accepts the
+    content, Synapse will too.
 
     Returns:
         ``value`` unchanged, so it can be chained into a JSON dump.
@@ -223,9 +227,10 @@ def _synapse_canonical_json(value: object) -> object:
         msg = f"Synapse would reject the float {value!r}"
         raise TypeError(msg)
     if isinstance(value, dict):
-        for item in value.values():
+        for key, item in value.items():
+            _synapse_canonical_json(key)
             _synapse_canonical_json(item)
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         for item in value:
             _synapse_canonical_json(item)
     return value
@@ -248,9 +253,7 @@ def test_no_float_survives_into_matrix_event_content() -> None:
     content = msg.to_content()
     # The whole Matrix content object, not just the RCP envelope, is float-free.
     _synapse_canonical_json(content)
-    import json
-
-    json.dumps(content, allow_nan=False)  # also proves no NaN/Inf slipped through
+    json.dumps(content, allow_nan=False)  # allow_nan=False also proves no NaN/Inf slipped through
 
 
 def test_float_wire_encoding_roundtrips_and_verifies() -> None:
@@ -281,6 +284,50 @@ def test_booleans_are_not_treated_as_floats() -> None:
     restored = RcpMessage.from_dict(msg.to_content()["io.picongpu.rcp"])
     assert restored.payload == {"ok": True, "n": 2, "name": "x"}
     assert restored.verify(SECRET)
+
+
+def test_float_tag_like_user_mapping_is_not_corrupted() -> None:
+    """A genuine mapping shaped like the tag must survive, not become a float."""
+    original = {"x": {FLOAT_TAG: "1.0"}, "y": {FLOAT_TAG: "not-a-number"}}
+    msg = make(kind=Kind.EVENT, payload=original).sign(SECRET)
+    raw = msg.to_content()["io.picongpu.rcp"]
+    _synapse_canonical_json(raw)
+    restored = RcpMessage.from_dict(raw)
+    assert restored.verify(SECRET)
+    assert restored.payload == original
+    # The encoded form must differ from encoding a real float (bijectivity).
+    assert msg.to_dict()["payload"]["x"] != {FLOAT_TAG: "1.0"}
+
+
+def test_non_json_scalars_are_normalized_and_roundtrip() -> None:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from uuid import UUID
+
+    msg = make(
+        kind=Kind.EVENT,
+        payload={"when": datetime(2026, 1, 1, tzinfo=UTC), "amount": Decimal("1.5"), "uid": UUID(int=0)},
+    ).sign(SECRET)
+    raw = msg.to_content()["io.picongpu.rcp"]
+    _synapse_canonical_json(raw)
+    # sign() no longer raises, and the signature still verifies after the trip.
+    restored = RcpMessage.from_dict(raw)
+    assert restored.verify(SECRET)
+    assert restored.payload["when"] == "2026-01-01T00:00:00Z"
+    assert restored.payload["amount"] == "1.5"
+
+
+def test_float_dict_keys_do_not_reach_the_wire() -> None:
+    msg = make(payload={"mapping": {1.5: "x", 2: "y"}}).sign(SECRET)
+    content = msg.to_content()
+    _synapse_canonical_json(content)
+
+
+def test_malformed_float_tag_is_rejected_on_receive() -> None:
+    raw = make(kind=Kind.EVENT, payload={"x": 1.0}).sign(SECRET).to_content()["io.picongpu.rcp"]
+    raw["payload"]["x"] = {FLOAT_TAG: "not-a-number"}
+    with pytest.raises(ValueError, match="malformed"):
+        RcpMessage.from_dict(raw)
 
 
 def test_signature_binds_the_float_free_wire_form() -> None:
