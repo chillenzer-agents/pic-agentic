@@ -150,9 +150,20 @@ def test_invalid_program_is_rejected_by_the_model() -> None:
 
 
 def test_compute_program_round_trips_on_the_wire() -> None:
+    """The program must survive the builder, not just the pydantic model.
+
+    Regression for a live bug: ``build_result_command`` omitted ``program``, so
+    every ``run_analysis``/``COMPUTE`` request reached the simclient with no
+    program and failed with "compute requires a program".
+    """
+    from pic_agentic.protocol.simulation import build_result_command
+
     params = ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program())
-    assert params.program == _spectrum_program()
-    assert params.model_dump()["program"]["output"]["op"] == "histogram"
+    command = build_result_command(sim=SIM_ID, seq=1, params=params, cmd_id="c")
+    assert command.payload["program"] == _spectrum_program()
+    # A non-compute op must not carry a program key at all.
+    read = build_result_command(sim=SIM_ID, seq=2, params=ResultParams(sim_id=SIM_ID, op=ResultOp.READ), cmd_id="d")
+    assert "program" not in read.payload
 
 
 @pytest.mark.skipif(
