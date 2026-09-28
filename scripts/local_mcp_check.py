@@ -488,6 +488,75 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compute(args: argparse.Namespace) -> int:
+    """Call ``run_analysis`` with a program read from a JSON file or inline.
+
+    The program is the safe declarative analysis AST (see
+    :mod:`pic_agentic.analysis_program`): no code is executed.  Supply it with
+    ``--program-file`` or ``--program``.
+
+    Returns:
+        The process exit code (non-zero on an error).
+
+    Raises:
+        SystemExit: If no program was supplied or it is not valid JSON.
+
+    """
+    state = _load_state(args)
+    if args.program_file:
+        try:
+            program = json.loads(Path(args.program_file).expanduser().read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            msg = f"cannot read analysis program {args.program_file!r}: {exc}"
+            raise SystemExit(msg) from exc
+        if not isinstance(program, dict):
+            bad = "analysis program must be a JSON object"
+            raise SystemExit(bad)
+    elif args.program:
+        try:
+            program = json.loads(args.program)
+        except ValueError as exc:
+            msg = f"--program is not valid JSON: {exc}"
+            raise SystemExit(msg) from exc
+    else:
+        program = _default_energy_spectrum_program()
+    result = _result_tool_call(state, "run_analysis", {"sim_id": args.sim_id, "program": program})
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if result.get("ok", "error" not in result) else 1
+
+
+def _default_energy_spectrum_program() -> dict:
+    """Return a small default analysis program: an energy spectrum histogram.
+
+    Returns:
+        A declarative program computing ``histogram(sqrt(px^2+py^2))`` over the
+        ``E`` record's ``x``/``y`` components.
+
+    """
+
+    def var(comp: str) -> dict:
+        return {"kind": "var", "name": comp, "record": "E", "component": comp}
+
+    return {
+        "selectors": [var("x"), var("y")],
+        "output": {
+            "kind": "reduce",
+            "op": "histogram",
+            "bins": 64,
+            "operand": {
+                "kind": "unop",
+                "op": "sqrt",
+                "operand": {
+                    "kind": "binop",
+                    "op": "add",
+                    "left": {"kind": "binop", "op": "mul", "left": var("x"), "right": var("x")},
+                    "right": {"kind": "binop", "op": "mul", "left": var("y"), "right": var("y")},
+                },
+            },
+        },
+    }
+
+
 def cmd_describe(args: argparse.Namespace) -> int:
     """Call ``describe_results`` and print the manifest summary.
 
@@ -1142,6 +1211,21 @@ def _print_event(message) -> int | None:
     return None
 
 
+def _add_analysis_mode_args(mode: argparse._MutuallyExclusiveGroup) -> None:
+    """Add the read-only analysis mode flags to ``mode``.
+
+    Args:
+        mode: The mutually exclusive mode group.
+
+    """
+    mode.add_argument("--analyze", action="store_true", help="call analyze_output and print the analysis sections")
+    mode.add_argument(
+        "--compute",
+        action="store_true",
+        help="call run_analysis with a declarative program (--program FILE or --program JSON)",
+    )
+
+
 def _add_agenda_callback_args(mode: argparse._MutuallyExclusiveGroup) -> None:
     """Add the callback/refinement/lifecycle agenda mode flags to ``mode``.
 
@@ -1172,6 +1256,21 @@ def _add_agenda_callback_args(mode: argparse._MutuallyExclusiveGroup) -> None:
     )
 
 
+def _add_result_mode_args(mode: argparse._MutuallyExclusiveGroup) -> None:
+    """Add the results-access mode flags to ``mode``.
+
+    Args:
+        mode: The mutually exclusive mode group.
+
+    """
+    mode.add_argument("--describe", action="store_true", help="call describe_results and print the manifest summary")
+    _add_analysis_mode_args(mode)
+    mode.add_argument("--read", action="store_true", help="call read_result for one sim")
+    mode.add_argument("--slice", action="store_true", help="call get_result_slice for one sim")
+    mode.add_argument("--export", action="store_true", help="call export_results for one sim")
+    mode.add_argument("--wait-results", action="store_true", help="poll describe_results until results appear")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all mutually exclusive modes.
 
@@ -1193,12 +1292,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="call an M3 control tool for --sim-id",
     )
-    mode.add_argument("--describe", action="store_true", help="call describe_results and print the manifest summary")
-    mode.add_argument("--analyze", action="store_true", help="call analyze_output and print the analysis sections")
-    mode.add_argument("--read", action="store_true", help="call read_result for one sim")
-    mode.add_argument("--slice", action="store_true", help="call get_result_slice for one sim")
-    mode.add_argument("--export", action="store_true", help="call export_results for one sim")
-    mode.add_argument("--wait-results", action="store_true", help="poll describe_results until results appear")
+    _add_result_mode_args(mode)
     mode.add_argument("--agenda-init", action="store_true", help="build and save a campaign file for the agenda tools")
     mode.add_argument("--agenda-advance", action="store_true", help="call advance_agenda (one engine tick)")
     mode.add_argument("--agenda-status", action="store_true", help="call agenda_status and print the campaign view")
@@ -1217,6 +1311,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--events", action="store_true", help="with --status: return get_events instead")
     parser.add_argument("--stream", default="stdout", help="log stream for --logs/--read")
     parser.add_argument("--query", default="", help="free-text query for --analyze")
+    parser.add_argument("--program", default="", help="inline JSON analysis program for --compute")
+    parser.add_argument("--program-file", default="", help="JSON file analysis program for --compute")
     parser.add_argument("--tail", type=int, default=100, help="log lines for --logs")
     parser.add_argument("--result-path", default="", help="relative result path for --read")
     parser.add_argument("--record", default="", help="openPMD record name for --slice")
@@ -1283,6 +1379,7 @@ def main() -> None:
         (bool(args.control), cmd_control),
         (args.describe, cmd_describe),
         (args.analyze, cmd_analyze),
+        (args.compute, cmd_compute),
         (args.read, cmd_read),
         (args.slice, cmd_slice),
         (args.export, cmd_export),

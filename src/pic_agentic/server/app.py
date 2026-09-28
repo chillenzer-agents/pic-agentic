@@ -1103,6 +1103,22 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         return _redact_dict(runtime, runtime.export_agenda_cwl())
 
     @server.tool(
+        title="Run a tailored analysis program on a simulation",
+        description=(
+            "Evaluate a declarative analysis program on the cluster next to the "
+            "data, without executing any code: select openPMD mesh components by "
+            "name and combine them with a bounded expression tree (arithmetic, "
+            "abs/sqrt/log/exp/sin/cos/tanh and reductions such as sum/mean/std/"
+            "min/max/median/quantile/histogram/fft_peak). Returns a scalar, a "
+            "bounded numeric array, or a histogram/spectrum. Invalid or oversized "
+            "programs are rejected; the output is capped to the ack budget."
+        ),
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    async def run_analysis(sim_id: str, program: dict[str, Any]) -> dict[str, Any]:
+        return await _result_tool(runtime, ResultOp.COMPUTE, sim_id=sim_id, program=program)
+
+    @server.tool(
         title="Get the aggregate fleet status",
         description=(
             "Report the whole fleet at a glance: total/active/terminal counts, "
