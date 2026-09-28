@@ -189,6 +189,10 @@ class ResultOp(StrEnum):
     #: Milestone A: compose the RO-Crate + pypicongpu metadata + a deterministic
     #: ``answer`` summary (no LLM call) for one run.
     ANALYZE = "analyze"
+    #: Secure tailored analysis: evaluate a validated declarative program
+    #: (selectors + expression AST + reductions) on the cluster.  No code is
+    #: executed; see :mod:`pic_agentic.analysis_program`.
+    COMPUTE = "compute"
 
 
 #: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
@@ -859,6 +863,9 @@ class ResultParams(BaseModel):
     downsample: int | None = None
     stream: str | None = None
     tail: int | None = None
+    #: The declarative analysis program for ``COMPUTE`` (validated by
+    #: :class:`~pic_agentic.analysis_program.AnalysisProgram` before evaluation).
+    program: dict[str, Any] | None = None
 
     @field_validator("path")
     @classmethod
@@ -896,6 +903,39 @@ class ResultParams(BaseModel):
         if value not in {"stdout", "stderr"}:
             msg = f"unknown result stream {value!r}; expected 'stdout' or 'stderr'"
             raise ValueError(msg)
+        return value
+
+    @field_validator("program")
+    @classmethod
+    def _validate_program(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Validate a ``COMPUTE`` program (and its source-size cap) eagerly.
+
+        Validating here means an invalid or oversized program is rejected by the
+        model, before it can reach the evaluator and before any data is read.
+
+        Returns:
+            The validated program dict, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the program is invalid, too large, or non-finite.
+
+        """
+        if value is None:
+            return None
+        from pic_agentic.analysis_program import (  # ruff: ignore[import-outside-top-level] - avoids a protocol/models cycle
+            MAX_SOURCE_BYTES,
+            AnalysisProgram,
+        )
+
+        encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if len(encoded) > MAX_SOURCE_BYTES:
+            msg = f"analysis program exceeds {MAX_SOURCE_BYTES} bytes"
+            raise ValueError(msg)
+        try:
+            AnalysisProgram.model_validate(value)
+        except Exception as exc:
+            msg = f"invalid analysis program: {exc}"
+            raise ValueError(msg) from exc
         return value
 
 

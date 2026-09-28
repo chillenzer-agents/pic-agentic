@@ -722,6 +722,111 @@ def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:
     )
 
 
+def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:
+    """Answer a ``COMPUTE`` request by evaluating a validated analysis program.
+
+    Each ``var`` selector in the program is resolved to one openPMD mesh
+    component through the same allow-listed record/component/iteration logic as
+    the existing reads (no paths, no code), then the program is evaluated with
+    stdlib math.  The result is capped to the same 48 KiB wire budget.
+
+    Returns:
+        The ack fields (``result``/``n_points``/``result_kind`` or ``data``), or
+        a clean error when the reader, output or program is unusable.
+
+    """
+    from pic_agentic.analysis_eval import (  # ruff: ignore[import-outside-top-level] - optional seam
+        ProgramError,
+        evaluate,
+    )
+    from pic_agentic.analysis_program import AnalysisProgram  # ruff: ignore[import-outside-top-level] - optional seam
+
+    preflight = _compute_preflight(params, output)
+    if preflight is not None:
+        return preflight
+    try:
+        program = AnalysisProgram.model_validate(params.program)
+    except Exception as exc:  # ruff: ignore[blind-except] - an invalid program is ack data
+        return _error(SimulationErrorCode.UNSUPPORTED, f"invalid analysis program: {exc}")
+
+    def resolve(selector: Any) -> list[float]:
+        # A selector resolves to one mesh component; the reader applies the
+        # same validation the slice path uses.  A selector that omits
+        # record/component falls back to the request's top-level ones, and an
+        # empty record means the first available mesh.
+        record = getattr(selector, "record", None) or params.record
+        component = getattr(selector, "component", None) or params.component
+        iteration = getattr(selector, "iteration", None)
+        if iteration is None:
+            iteration = params.iteration
+        return _load_dataset(output, record, component, iteration)
+
+    try:
+        payload = evaluate(program, resolve)
+    except ResultsUnavailable as exc:
+        return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
+    except ProgramError as exc:
+        return _error(SimulationErrorCode.UNSUPPORTED, str(exc))
+    except (ResultsReaderError, KeyError, OSError, ValueError) as exc:
+        return _error(SimulationErrorCode.NO_RESULTS, str(exc))
+    return _shape_compute(payload)
+
+
+def _compute_preflight(params: ResultParams, output: Path) -> dict[str, Any] | None:
+    """Return a compute error for a request that cannot proceed, else None.
+
+    Args:
+        params: The validated result request.
+        output: The run's linked ``simOutput`` directory.
+
+    Returns:
+        An error pair, or None when the request is ready to evaluate.
+
+    """
+    if _reader_name() is None:
+        return _error(SimulationErrorCode.READER_UNAVAILABLE, "the optional openpmd_api reader is not installed")
+    if params.program is None:
+        return _error(SimulationErrorCode.UNSUPPORTED, "compute requires a program")
+    if not output.is_dir():
+        return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
+    return None
+
+
+def _shape_compute(payload: dict[str, Any]) -> dict[str, Any]:
+    """Shape an evaluator payload into the frozen result-ack fields.
+
+    The ack carries a fixed key set, so the numeric array travels as ``data``
+    (``data_encoding="float"``), a scalar as ``stats["value"]``, and the
+    evaluator's metadata as ``result``.
+
+    Returns:
+        The shaped ack fields, or a ``RESULT_TOO_LARGE`` error.
+
+    """
+    result = payload.get("result")
+    metadata: dict[str, Any] = {"result_kind": payload.get("result_kind", "scalar")}
+    if "points" in payload:
+        metadata["points"] = payload["points"]
+    if isinstance(result, list):
+        if len(result) > SLICE_MAX_POINTS:
+            result = result[:SLICE_MAX_POINTS]
+        shaped: dict[str, Any] = {
+            "result": metadata,
+            "data": result,
+            "data_encoding": "float",
+            "n_points": len(result),
+        }
+    else:
+        shaped = {
+            "result": metadata,
+            "stats": {"value": float(result) if result is not None else 0.0},
+            "n_points": 1,
+        }
+    if _escaped_size(shaped) > MAX_RESULT_BYTES:
+        return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"result exceeds {MAX_RESULT_BYTES} wire bytes")
+    return shaped
+
+
 def _reader_op(  # ruff: ignore[too-many-return-statements]
     params: ResultParams,
     *,
@@ -846,6 +951,8 @@ def resolve_result(
         # ANALYZE is handled by the simclient's analysis engine, not here; a
         # direct caller must not silently fall through to the openPMD reader.
         return _error(SimulationErrorCode.UNSUPPORTED, "analyze is served by the analysis engine, not the reader")
+    if params.op is ResultOp.COMPUTE:
+        return _compute(params, output=output)
     return _reader_op(params, output=output)
 
 
