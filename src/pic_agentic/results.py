@@ -27,6 +27,7 @@ import io
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -54,10 +55,15 @@ _DEFAULT_READ_TAIL = 200
 _TEXT_SUFFIXES = frozenset({".txt", ".csv", ".log"})
 
 #: Filename suffix -> manifest ``format`` for the openPMD backends.
-_OPENPMD_SUFFIXES = {".bp": "openpmd-adios2", ".h5": "openpmd-hdf5", ".hdf5": "openpmd-hdf5"}
+_OPENPMD_SUFFIXES = {".bp": "openpmd-adios2", ".bp5": "openpmd-adios2", ".h5": "openpmd-hdf5", ".hdf5": "openpmd-hdf5"}
 
 #: Iteration selectors that mean "the newest available iteration".
 _LAST_ITERATIONS = frozenset({None, "last"})
+
+#: Trailing integer run in a series file's stem: the iteration infix PIConGPU
+#: writes (``fields_000050.h5`` -> ``000050``).  Rewritten to openPMD's ``%T``
+#: wildcard so a series is opened across every iteration, not just one file.
+_ITERATION_INFIX_RE = re.compile(r"\d+$")
 
 #: The sentinel component name openPMD reports for a scalar (componentless)
 #: mesh record; it must not be presented as a selectable component.
@@ -278,6 +284,47 @@ def _open_series(path: Path) -> Any:
     except Exception as exc:
         msg = f"cannot open openPMD series at {path}: {exc}"
         raise ResultsReaderError(msg) from exc
+
+
+def _find_series(output: Path, relpath: str | None) -> Path | None:
+    """Locate the openPMD series file/pattern for a run's ``simOutput``.
+
+    A PICMI diagnostic's own ``result_path(prefix)`` returns an openPMD *pattern*
+    with a ``%T`` iteration wildcard (e.g. ``.../openPMD/simOutput/fields_%06T.h5``),
+    which is exactly what :meth:`openpmd_api.Series` accepts.  That pattern is not
+    persisted to the cluster, so it is reconstructed here from the files on disk:
+    the caller's ``path`` selects a file or tree, or the whole ``simOutput`` is
+    searched, and the first openPMD-backend file found is rewritten to a ``%T``
+    pattern by replacing its trailing iteration number.  This is picongpu-free and
+    makes no assumption about the nesting depth PIConGPU uses.
+
+    Args:
+        output: The run's linked ``simOutput`` directory.
+        relpath: The request's relative path (a file, a directory, or None).
+
+    Returns:
+        The discovered series path (possibly a ``%T`` pattern), or None when the
+        path is unsafe, absent, or contains no openPMD file.
+
+    """
+    base = output
+    if relpath:
+        try:
+            base = _safe_join(output, relpath)
+        except ValueError:
+            return None
+    if base.is_file():
+        return base
+    if not base.is_dir():
+        return None
+    for path, entry_is_dir in _collect_entries(base):
+        if entry_is_dir or path.suffix.lower() not in _OPENPMD_SUFFIXES:
+            continue
+        # Substitute on the *stem* only: ``\d+$`` on the whole name would match
+        # the trailing digit of the extension (``.h5``), not the iteration.
+        pattern = _ITERATION_INFIX_RE.sub("%T", path.stem) + path.suffix
+        return path.with_name(pattern)
+    return None
 
 
 def _select_iteration(series: Any, iteration: int | str | None) -> int:
@@ -729,7 +776,7 @@ def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:
     )
 
 
-def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:
+def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: ignore[too-many-return-statements] - one return per clean error
     """Answer a ``COMPUTE`` request by evaluating a validated analysis program.
 
     Each ``var`` selector in the program is resolved to one openPMD mesh
@@ -756,6 +803,10 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:
     except Exception as exc:  # ruff: ignore[blind-except] - an invalid program is ack data
         return _error(SimulationErrorCode.UNSUPPORTED, f"invalid analysis program: {exc}")
 
+    series = _find_series(output, params.path)
+    if series is None:
+        return _error(SimulationErrorCode.NO_RESULTS, "no openPMD output found for this run")
+
     def resolve(selector: Any) -> list[float]:
         # A selector resolves to one mesh component; the reader applies the
         # same validation the slice path uses.  A selector that omits
@@ -766,7 +817,7 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:
         iteration = getattr(selector, "iteration", None)
         if iteration is None:
             iteration = params.iteration
-        return _load_dataset(output, record, component, iteration)
+        return _load_dataset(series, record, component, iteration)
 
     try:
         payload = evaluate(program, resolve)
@@ -856,12 +907,9 @@ def _reader_op(  # ruff: ignore[too-many-return-statements]
         )
     if not output.is_dir():
         return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
-    target = output
-    if params.path is not None:
-        try:
-            target = _safe_join(output, params.path)
-        except ValueError:
-            return _error(SimulationErrorCode.PATH_UNSAFE, "unsafe result path")
+    target = _find_series(output, params.path)
+    if target is None:
+        return _error(SimulationErrorCode.NO_RESULTS, "no openPMD output found for this run")
     try:
         result = _dispatch_reader(params, target)
     except ResultsUnavailable as exc:
