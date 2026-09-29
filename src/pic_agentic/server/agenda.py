@@ -20,6 +20,8 @@ local file and submission is delegated to the injected service.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -28,9 +30,11 @@ from pic_agentic.agenda.campaign import Campaign, CampaignState
 from pic_agentic.agenda.engine import ActualUsage, AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
 from pic_agentic.agenda.model import AgendaSim
 from pic_agentic.agenda.refine import summary as refine_summary
+from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
 from pic_agentic.protocol.simulation import SimulationOp
 from pic_agentic.server.hello import AckTimeoutError
+from pic_agentic.server.simulation import _spec_provenance
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -88,12 +92,33 @@ class AgendaService:
         self.submit_service = submit_service
         self.policy = policy or _policy_from_config(config)
         self.store = _store_for(config)
+        #: Content-addressed reuse registry beside the campaign, so a spec that
+        #: already completed can be linked instead of re-submitted.
+        self.reuse_store = AgendaStore(self.store.root, filename=DEFAULT_REUSE_FILE)
         #: Serialise every campaign read-modify-write (advance and the lifecycle
         #: mutators) on one lock.  Without this, a tick's incremental save can
         #: clobber a concurrent add_leaf/approve/drain, and -- worst -- a stop
         #: issued mid-tick is overwritten by the tick's stale in-memory campaign,
         #: resurrecting the campaign and letting it keep submitting.
         self._lock = asyncio.Lock()
+
+    def _load_reuse(self) -> ReuseRegistry:
+        """Load the reuse registry, or an empty one when absent/corrupt.
+
+        A malformed registry is treated as empty rather than fatal: reuse is an
+        optimisation, and a corrupt cache must never block a tick.
+
+        Returns:
+            The persisted registry, or a fresh empty one.
+
+        """
+        if not self.reuse_store.exists():
+            return ReuseRegistry()
+        try:
+            return ReuseRegistry.model_validate_json(self.reuse_store.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable reuse registry: %s", exc)
+            return ReuseRegistry()
 
     async def advance(self, send: SendFn) -> dict[str, Any]:
         """Run one durable engine tick over the persisted campaign.
@@ -113,7 +138,25 @@ class AgendaService:
         """
         if not self.store.exists():
             return {"ok": False, "error": "no_campaign"}
+        engine = self._build_engine(send)
+        async with self._lock:
+            try:
+                result = await engine.tick()
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda tick failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+        return result.model_dump()
 
+    def _build_engine(self, send: SendFn) -> AgendaEngine:
+        """Assemble the engine with its live observation/submission callables.
+
+        Kept out of :meth:`advance` so the tick loop reads as one straight line;
+        every callable closes over ``self`` and the running transport's ``send``.
+
+        Returns:
+            The engine wired to the shared submit service and reuse registry.
+
+        """
         registry = self.submit_service.registry
 
         def observe() -> Mapping[str, str]:
@@ -141,20 +184,32 @@ class AgendaService:
                 raise RuntimeError(msg)
             return outcome.sim_id
 
-        engine = AgendaEngine(
+        def reuse_key(spec: dict[str, Any]) -> str:
+            # Fold the provenance tuple into the reuse key, so identical physics
+            # authored for a different PIConGPU revision/schema is *not* reused
+            # (the result would not be attributable to the campaign's revision).
+            provenance = _spec_provenance(spec, self.submit_service.picongpu_revision)
+            payload = {"sim": spec.get("sim"), "provenance": provenance}
+            canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+        def reuse_lookup(key: str) -> ReuseRecord | None:
+            return self._load_reuse().lookup(key)
+
+        def reuse_record(key: str, sim_id: str, state: str) -> None:
+            updated = self._load_reuse().remember(ReuseRecord(wire_hash=key, sim_id=sim_id, state=state))
+            self.reuse_store.save(updated)
+
+        return AgendaEngine(
             store=self.store,
             submit=submit,
             observe=observe,
             policy=self.policy,
             actuals=actuals,
+            reuse_lookup=reuse_lookup,
+            reuse_record=reuse_record,
+            reuse_key=reuse_key,
         )
-        async with self._lock:
-            try:
-                result = await engine.tick()
-            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
-                log.warning("agenda tick failed: %s", exc)
-                return {"ok": False, "error": self.config.redact(str(exc))}
-        return result.model_dump()
 
     def status(self) -> dict[str, Any]:
         """Return the aggregate campaign status (redacted-safe).
