@@ -654,29 +654,37 @@ def _parameter_for(patch_path: str) -> str:
 def _patch_spec(spec: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
     r"""Return a deep copy of ``spec`` with the dotted JSON path set to ``value``.
 
-    Byte-for-byte the driver's ``_patch_spec`` (``scripts/local_mcp_check.py``),
-    so a campaign the agent creates here is identical to one built by
-    ``--agenda-init``.  A path segment that is a decimal integer indexes a list
-    (negative indices count from the end); any other segment indexes a dict, so
-    list-shaped Runner specs (``sim.laser.0.focus_pos_si.1.component``) can be
-    swept.
+    Behaviourally equivalent to the driver's ``_patch_spec``
+    (``scripts/local_mcp_check.py``): the two agree on every valid path.  They
+    deliberately diverge only in *error convention* -- the server raises
+    ``TypeError``/``IndexError`` (surfaced as the ``invalid_campaign`` soft
+    error) while the CLI raises ``SystemExit`` -- so they are not byte-identical
+    and need not be.
+
+    The rule for a segment is decided by the *current node*, not by the
+    segment's spelling: a dict node is indexed by its key (so a numeric-looking
+    dict key such as a boundary-condition map ``{"0": "periodic"}`` is
+    reachable via ``sim.bc.0``), and a list node is indexed by the integer the
+    segment spells (negative indices count from the end).  This is the
+    least-surprising rule and fixes the ``sim.bc.0`` ambiguity; list-shaped
+    Runner specs (``sim.laser.0.focus_pos_si.1.component``) still work because
+    the nodes there really are lists.
 
     Args:
         spec: The base Runner spec (a deep copy is patched, the base is not
             mutated).
-        dotted: A dotted path such as ``sim.time_steps``; a segment matching
-            ``-?\d+`` addresses the list element at that index.
+        dotted: A dotted path such as ``sim.time_steps``.
         value: The JSON value to set.
 
     Returns:
         The patched deep copy.
 
     Raises:
-        TypeError: If a non-numeric intermediate segment is missing (a bad
-            ``patch_path`` must be a soft error, not a corrupt campaign), or
-            when a numeric segment addresses a non-list node.  A numeric
-            segment out of range for its list raises ``IndexError`` implicitly;
-            both surface as the ``invalid_campaign`` soft error.
+        TypeError: If a dict segment is missing, or when a list node is
+            addressed by a non-numeric segment.
+
+    A list index out of range raises ``IndexError`` implicitly; both it and the
+    ``TypeError`` surface as the ``invalid_campaign`` soft error.
 
     """
     patched = json.loads(json.dumps(spec))
@@ -685,25 +693,25 @@ def _patch_spec(spec: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]
     for part in parts[:-1]:
         node = _patch_child(node, dotted, part)
     last = parts[-1]
-    if _LIST_INDEX_RE.fullmatch(last):
-        if not isinstance(node, list):
-            msg = f"patch path {dotted!r} has no list at {last!r}"
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(last):
+            msg = f"patch path {dotted!r} has no numeric index at {last!r}"
             raise TypeError(msg)
         node[int(last)] = value
-    else:
-        if not isinstance(node, dict):
-            msg = f"patch path {dotted!r} has no object at {last!r}"
-            raise TypeError(msg)
+    elif isinstance(node, dict):
         node[last] = value
+    else:
+        msg = f"patch path {dotted!r} has no object at {last!r}"
+        raise TypeError(msg)
     return patched
 
 
 def _patch_child(node: Any, dotted: str, part: str) -> Any:
     """Return the child of ``node`` addressed by one intermediate path segment.
 
-    A decimal-integer segment indexes a list (Python indexing, so ``-1`` is the
-    last element); any other segment indexes a dict.  Mirrors the driver's
-    ``_patch_spec`` so the two stay behaviourally identical.
+    A dict node is indexed by ``part`` as a key; a list node is indexed by the
+    integer ``part`` spells (Python indexing, so ``-1`` is the last element).
+    Mirrors the driver's ``_patch_child`` behaviourally for valid paths.
 
     Args:
         node: The current dict or list node.
@@ -714,23 +722,23 @@ def _patch_child(node: Any, dotted: str, part: str) -> Any:
         The addressed child node (dict or list).
 
     Raises:
-        TypeError: If a dict segment is missing or a numeric segment addresses a
-            non-list node.
+        TypeError: If a dict segment is missing, a list node is addressed by a
+            non-numeric segment, or an intermediate node is neither.
 
     """
-    if _LIST_INDEX_RE.fullmatch(part):
-        if not isinstance(node, list):
-            msg = f"patch path {dotted!r} has no list at {part!r}"
+    if isinstance(node, dict):
+        child = node.get(part)
+        if not isinstance(child, (dict, list)):
+            msg = f"patch path {dotted!r} has no object at {part!r}"
+            raise TypeError(msg)
+        return child
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(part):
+            msg = f"patch path {dotted!r} has no numeric index at {part!r}"
             raise TypeError(msg)
         return node[int(part)]
-    if not isinstance(node, dict):
-        msg = f"patch path {dotted!r} has no object at {part!r}"
-        raise TypeError(msg)
-    child = node.get(part)
-    if not isinstance(child, (dict, list)):
-        msg = f"patch path {dotted!r} has no object at {part!r}"
-        raise TypeError(msg)
-    return child
+    msg = f"patch path {dotted!r} has no object at {part!r}"
+    raise TypeError(msg)
 
 
 def _point_for(parameter: str, value: Any) -> dict[str, float | int | str] | None:

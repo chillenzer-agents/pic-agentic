@@ -99,6 +99,52 @@ def test_patch_spec_rejects_an_out_of_range_list_index() -> None:
         local_mcp_check._patch_spec(base, "sim.laser.3.focus_pos_si.0.component", 1.0)
 
 
+#: ``(base, path, value)`` cases run through BOTH patchers; the shared truth
+#: table catches drift between the server copy (``pic_agentic.server.agenda``)
+#: and the driver copy.  ``expected`` is the patched ``base`` on success, or
+#: ``None`` for a rejected path.
+_PATCH_TRUTH_TABLE = [
+    ({"a": [1, 2, 3]}, "a.0", 9, {"a": [9, 2, 3]}),
+    ({"a": [1, 2, 3]}, "a.-1", 9, {"a": [1, 2, 9]}),
+    ({"a": [1, 2, 3]}, "a.3", 9, None),
+    ({"a": [1, 2, 3]}, "a.-4", 9, None),
+    ({"a": {"b": {"c": 1}}}, "a.b.c", 9, {"a": {"b": {"c": 9}}}),
+    ({"a": {"b": {"c": 1}}}, "a.b.d", 9, {"a": {"b": {"c": 1, "d": 9}}}),
+    ({"a": [{"b": [{"c": 1}]}]}, "a.0.b.0.c", 9, {"a": [{"b": [{"c": 9}]}]}),
+    ({"a": [{"b": [{"c": 1}]}]}, "a.0.b.1.c", 9, None),
+    # A numeric-looking dict key is reached as a key, not mis-indexed as a list.
+    ({"sim": {"bc": {"0": "periodic"}}}, "sim.bc.0", "open", {"sim": {"bc": {"0": "open"}}}),
+    # A real list node still indexes numerically.
+    ({"a": [[1, 2]]}, "a.0.1", 9, {"a": [[1, 9]]}),
+    ({"a": [1, 2]}, "a.1", {"x": 1}, {"a": [1, {"x": 1}]}),
+    ({"a": [1, 2]}, "a.x", 9, None),
+]
+
+
+def test_patch_spec_driver_and_server_agree_on_the_truth_table() -> None:
+    """Both patchers produce the same valid output and reject the same paths."""
+    from pic_agentic.server.agenda import _patch_spec as server_patch
+
+    for base, path, value, expected in _PATCH_TRUTH_TABLE:
+        original = json.loads(json.dumps(base))
+        driver_view: object
+        try:
+            driver_view = local_mcp_check._patch_spec(json.loads(json.dumps(base)), path, value)
+        except SystemExit:
+            driver_view = None
+        server_view: object
+        try:
+            server_view = server_patch(json.loads(json.dumps(base)), path, value)
+        except (TypeError, IndexError, ValueError):
+            server_view = None
+
+        assert driver_view == expected, (path, driver_view)
+        assert server_view == expected, (path, server_view)
+        assert driver_view == server_view, path
+        # Neither patcher mutates the base spec.
+        assert base == original, path
+
+
 def test_agenda_init_omits_invalid_points() -> None:
     """A non-scalar/bool sweep value yields ``point=None`` instead of crashing."""
     assert local_mcp_check._point_for("p", 5) == {"p": 5}

@@ -722,22 +722,30 @@ def _agenda_spec(path: str) -> dict:
 def _patch_spec(spec: dict, dotted: str, value: object) -> dict:
     r"""Return a copy of ``spec`` with the dotted JSON path set to ``value``.
 
-    A path segment that is a decimal integer indexes a list (negative indices
-    count from the end); any other segment indexes a dict, so list-shaped Runner
-    specs (``sim.laser.0.focus_pos_si.1.component``) can be swept.
+    Behaviourally equivalent to the server's ``_patch_spec``
+    (``pic_agentic.server.agenda``): the two agree on every valid path.  They
+    deliberately diverge only in *error convention* -- this CLI raises
+    ``SystemExit`` while the server raises ``TypeError``/``IndexError`` (turned
+    into the ``invalid_campaign`` soft error) -- so they are not byte-identical
+    and need not be.
+
+    The rule for a segment is decided by the *current node*: a dict node is
+    indexed by its key (so a numeric-looking dict key such as a
+    boundary-condition map ``{"0": "periodic"}`` is reachable via
+    ``sim.bc.0``), and a list node is indexed by the integer the segment spells
+    (negative indices count from the end).
 
     Args:
         spec: The base Runner spec (mutated in a deep copy).
-        dotted: A dotted path such as ``sim.time_steps``; a segment matching
-            ``-?\d+`` addresses the list element at that index.
+        dotted: A dotted path such as ``sim.time_steps``.
         value: The JSON value to set.
 
     Returns:
         The patched deep copy.
 
     Raises:
-        SystemExit: If a dict segment is missing, a numeric segment addresses a
-            non-list node, or a numeric segment is out of range for its list.
+        SystemExit: If a dict segment is missing, a list node is addressed by a
+            non-numeric segment, or a list index is out of range.
 
     """
     patched = json.loads(json.dumps(spec))
@@ -746,29 +754,29 @@ def _patch_spec(spec: dict, dotted: str, value: object) -> dict:
     for part in parts[:-1]:
         node = _patch_child(node, dotted, part)
     last = parts[-1]
-    if _LIST_INDEX_RE.fullmatch(last):
-        if not isinstance(node, list):
-            msg = f"agenda patch path {dotted!r} has no list at {last!r}"
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(last):
+            msg = f"agenda patch path {dotted!r} has no numeric index at {last!r}"
             raise SystemExit(msg)
         try:
             node[int(last)] = value
         except IndexError as exc:
             msg = f"agenda patch path {dotted!r} has no list element at {last!r}"
             raise SystemExit(msg) from exc
-    else:
-        if not isinstance(node, dict):
-            msg = f"agenda patch path {dotted!r} has no object at {last!r}"
-            raise SystemExit(msg)
+    elif isinstance(node, dict):
         node[last] = value
+    else:
+        msg = f"agenda patch path {dotted!r} has no object at {last!r}"
+        raise SystemExit(msg)
     return patched
 
 
 def _patch_child(node: object, dotted: str, part: str) -> object:
     """Return the child of ``node`` addressed by one intermediate path segment.
 
-    A decimal-integer segment indexes a list (Python indexing, so ``-1`` is the
-    last element); any other segment indexes a dict.  Mirrors the server's
-    ``_patch_spec`` so the two stay behaviourally identical.
+    A dict node is indexed by ``part`` as a key; a list node is indexed by the
+    integer ``part`` spells (Python indexing, so ``-1`` is the last element).
+    Mirrors the server's ``_patch_child`` behaviourally for valid paths.
 
     Args:
         node: The current dict or list node.
@@ -779,27 +787,27 @@ def _patch_child(node: object, dotted: str, part: str) -> object:
         The addressed child node (dict or list).
 
     Raises:
-        SystemExit: If a dict segment is missing, a numeric segment addresses a
-            non-list node, or a numeric segment is out of range for its list.
+        SystemExit: If a dict segment is missing, a list node is addressed by a
+            non-numeric segment, or an intermediate node is neither.
 
     """
-    if _LIST_INDEX_RE.fullmatch(part):
-        if not isinstance(node, list):
-            msg = f"agenda patch path {dotted!r} has no list at {part!r}"
+    if isinstance(node, dict):
+        child = node.get(part)
+        if not isinstance(child, (dict, list)):
+            msg = f"agenda patch path {dotted!r} has no object at {part!r}"
+            raise SystemExit(msg)
+        return child
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(part):
+            msg = f"agenda patch path {dotted!r} has no numeric index at {part!r}"
             raise SystemExit(msg)
         try:
             return node[int(part)]
         except IndexError as exc:
             msg = f"agenda patch path {dotted!r} has no list element at {part!r}"
             raise SystemExit(msg) from exc
-    if not isinstance(node, dict):
-        msg = f"agenda patch path {dotted!r} has no object at {part!r}"
-        raise SystemExit(msg)
-    child = node.get(part)
-    if not isinstance(child, (dict, list)):
-        msg = f"agenda patch path {dotted!r} has no object at {part!r}"
-        raise SystemExit(msg)
-    return child
+    msg = f"agenda patch path {dotted!r} has no object at {part!r}"
+    raise SystemExit(msg)
 
 
 def _tag_replica(spec: dict, index: int) -> dict:
