@@ -36,7 +36,7 @@ def _built(runner: dict | None = None) -> BuiltSimulation:
     return BuiltSimulation(
         runner=runner or _runner_dump(),
         picongpu_version="0.9.0-dev",
-        picongpu_revision="91c3ee5fb4c9425b00d4673d9608f4370593cacf",
+        picongpu_revision="667c537620e685486aceeaa77deb6550ac9972cf",
         schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
     )
 
