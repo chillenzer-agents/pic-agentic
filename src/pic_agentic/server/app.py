@@ -46,6 +46,7 @@ from pic_agentic.protocol.simulation import (
 from pic_agentic.server.agenda import AgendaService, no_campaign_error
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
 from pic_agentic.server.simulation import (
+    BuiltSpec,
     SimRecord,
     SubmitOutcome,
     SubmitService,
@@ -370,6 +371,19 @@ class HelloRuntime:
             raise RuntimeError(msg)
         script_path = resolve_script(picmi_script, workdir=Path(tempfile.gettempdir()) / "pic-agentic")
         return await self.submit_service.submit(self._transport.send, script_path, params=params)
+
+    async def build_spec(self, picmi_script: str) -> BuiltSpec:
+        """Build one PICMI script into a Runner spec without submitting it.
+
+        Args:
+            picmi_script: A path to a PICMI script or inline PICMI code.
+
+        Returns:
+            The built wire spec plus its provenance and inline wire size.
+
+        """
+        script_path = resolve_script(picmi_script, workdir=Path(tempfile.gettempdir()) / "pic-agentic")
+        return await self.submit_service.build_spec(script_path)
 
     def registry(self) -> dict[str, SimRecord]:
         """Return the submit service's sim_id-keyed registry.
@@ -708,6 +722,26 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         except _SUBMIT_TOOL_ERRORS as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
         return _submit_outcome_dict(runtime, outcome)
+
+    @server.tool(
+        title="Build a simulation spec without submitting",
+        description=(
+            "Build a PICMI simulation script into a PyPIConGPU Runner spec and "
+            "return it without sending anything to the cluster. Use it to obtain "
+            "a base spec for create_campaign or add_agenda_leaf. The returned "
+            "`spec` is the inline `{sim: ...}` wire object accepted by those "
+            "tools; the result also reports the encoded wire size and whether it "
+            "fits the 48 KiB inline submission limit."
+        ),
+        # read-tier: it builds locally and starts no cluster work.
+        annotations=_READ_ONLY,
+    )
+    async def build_spec(picmi_script: str) -> dict[str, Any]:
+        try:
+            built = await runtime.build_spec(picmi_script)
+        except _SUBMIT_TOOL_ERRORS as exc:
+            return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
+        return _built_spec_dict(runtime, built)
 
     _register_reporting_tools(server, runtime)
     _register_control_result_tools(server, runtime)
@@ -1443,6 +1477,39 @@ def _redact_dict(runtime: HelloRuntime, payload: Any, _depth: int = 0) -> Any:
     if isinstance(payload, list):
         return [_redact_dict(runtime, value, _depth + 1) for value in payload]
     return payload
+
+
+def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
+    """Shape a dry-run build result for the ``build_spec`` tool.
+
+    The spec is returned when it fits the 48 KiB inline submission cap (the only
+    transport M2 has).  An over-cap spec is *not* returned: it could be stored on
+    a campaign leaf but never submitted, so the failure mode is made explicit
+    instead of handing the agent a spec that would fail later at
+    ``advance_agenda``.
+
+    Returns:
+        ``{"ok": True, "spec", "wire_bytes", ...}``, or a soft error naming the
+        over-cap condition.
+
+    """
+    if not built.within_inline_limit:
+        return {
+            "ok": False,
+            "error": "spec_exceeds_inline_limit",
+            "wire_bytes": built.wire_bytes,
+            "inline_limit_bytes": built.inline_limit_bytes,
+        }
+    payload = {
+        "ok": True,
+        "spec": built.spec,
+        "wire_bytes": built.wire_bytes,
+        "inline_limit_bytes": built.inline_limit_bytes,
+        "picongpu_version": built.picongpu_version,
+        "picongpu_revision": built.picongpu_revision,
+        "schema_hash": built.schema_hash,
+    }
+    return _redact_dict(runtime, payload)
 
 
 def _submit_outcome_dict(runtime: HelloRuntime, outcome: SubmitOutcome) -> dict[str, Any]:

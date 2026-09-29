@@ -485,6 +485,27 @@ def provenance_mismatches(payload: SimulationPayload, local: dict[str, str]) -> 
     return mismatches
 
 
+def payload_wire_size(payload: SimulationPayload) -> int:
+    """Return the homeserver-facing size of an inline payload, in bytes.
+
+    This is the same measure :func:`payload_wire_bytes` enforces: the canonical
+    payload body is carried as a JSON *string* inside the event content, so the
+    escaped form (``json.dumps`` doubles every quote/backslash) plus
+    :data:`_ENVELOPE_ALLOWANCE_BYTES` is what the homeserver's event limit sees.
+    Exposed so the dry-run builder can report the size it would send without
+    building the binary body.
+
+    Args:
+        payload: The payload to measure.
+
+    Returns:
+        The escaped body size plus the envelope allowance.
+
+    """
+    body = payload.model_dump_json(exclude_computed_fields=True)
+    return len(json.dumps(body, ensure_ascii=True).encode("ascii")) + _ENVELOPE_ALLOWANCE_BYTES
+
+
 def payload_wire_bytes(payload: SimulationPayload) -> bytes:
     """Serialise a payload for inline transport, enforcing the size cap.
 
@@ -514,8 +535,7 @@ def payload_wire_bytes(payload: SimulationPayload) -> bytes:
     # The body is carried as a JSON string inside the event content, so measure
     # the escaped form (json.dumps doubles every quote/backslash) plus the
     # envelope budget -- that is what the homeserver's 64 KiB event limit sees.
-    encoded = len(json.dumps(body.decode("utf-8"), ensure_ascii=True).encode("ascii"))
-    size = encoded + _ENVELOPE_ALLOWANCE_BYTES
+    size = payload_wire_size(payload)
     if size > MAX_INLINE_PAYLOAD_BYTES:
         msg = (
             f"encoded simulation payload is ~{size} bytes; the inline limit is "
