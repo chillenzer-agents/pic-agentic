@@ -656,6 +656,27 @@ class HelloRuntime:
             await self._transport.close()
 
 
+#: Seeded MCP instructions.  They point the agent at the PIConGPU documentation
+#: and examples that ship with the pinned ``picongpu`` package, so an agent that
+#: does not know PICMI/PyPIConGPU can find how to define a simulation and how to
+#: scan parameters without us bundling an example script.
+SERVER_INSTRUCTIONS = (
+    "Submit and follow PIConGPU simulations on a remote SLURM cluster. "
+    "The 'hello' tool performs an end-to-end connectivity check. "
+    "A simulation is defined either as a PICMI Python script (submit_simulation) "
+    "or, for parameter studies, as a pypicongpu Runner spec "
+    "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
+    "a spec field across values). "
+    "For how to write a PICMI input file and how to define or scan multiple "
+    "simulations, see the PyPIConGPU documentation: the page 'Defining Your "
+    "Simulation' under python_package/foundations/defining_simulation "
+    "(published at https://picongpu.readthedocs.io/en/latest/python_package/) "
+    "covers simulation definition and static/dynamic parameter scans; the "
+    "tutorial and the examples under lib/python/examples/ in the picongpu "
+    "source tree show complete setups."
+)
+
+
 def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
     """Create the MCP server and its runtime, wired together via lifespan.
 
@@ -675,10 +696,7 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
 
     server = MCPServer(
         "pic-agentic",
-        instructions=(
-            "Submit and follow PIConGPU simulations on a remote SLURM cluster. "
-            "The 'hello' tool performs an end-to-end connectivity check."
-        ),
+        instructions=SERVER_INSTRUCTIONS,
         lifespan=lifespan,
     )
 
