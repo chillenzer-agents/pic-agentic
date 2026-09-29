@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
 from pic_agentic.agenda.engine import ActualUsage, AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
-from pic_agentic.agenda.model import AgendaSim
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.refine import summary as refine_summary
 from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
@@ -529,6 +529,84 @@ class AgendaService:
         except Exception:  # ruff: ignore[blind-except] - classification must never mask the error
             return "invalid_leaf"
 
+    async def create_campaign(
+        self,
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        """Create and persist a campaign with one leaf per sweep value.
+
+        The server-side equivalent of the driver's ``--agenda-init``: a fresh
+        campaign is created with one leaf per entry in ``values``, each holding
+        a deep copy of ``base_spec`` with the dotted Runner-spec path
+        ``patch_path`` set to that value.  Each leaf records
+        ``point={parameter: value}`` (the last path segment) exactly as
+        :meth:`AgendaSim` and the driver do, so the refinement engine can score
+        the sweep.  The campaign is written through the same
+        :class:`~pic_agentic.agenda.store.AgendaStore` the other agenda tools
+        read, so ``advance_agenda`` picks it up on the next tick.
+
+        Creating over an existing campaign would clobber its state, so it is
+        refused rather than overwritten.
+
+        Args:
+            name: The campaign's display name.
+            base_spec: The base Runner spec (a wire spec carrying ``sim``).
+            patch_path: A dotted path into ``base_spec`` (e.g.
+                ``sim.time_steps``).
+            values: One value per leaf; each patches ``patch_path``.
+
+        Returns:
+            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
+            error (``campaign_exists``, ``no_values``, ``invalid_campaign``).
+
+        """
+        async with self._lock:
+            try:
+                return self._create_campaign(name, base_spec, patch_path, values)
+            except (TypeError, ValueError) as exc:
+                # A bad patch path or an invalid leaf name/value is a
+                # model-level error: report it as data, not a tool exception.
+                return {"ok": False, "error": "invalid_campaign", "detail": self.config.redact(str(exc))}
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda create_campaign failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+
+    def _create_campaign(
+        self,
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        """Build the campaign and save it (may raise).
+
+        Returns:
+            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or the
+            ``campaign_exists``/``no_values`` soft errors.
+
+        """
+        if self.store.exists():
+            return {"ok": False, "error": "campaign_exists"}
+        if not values:
+            return {"ok": False, "error": "no_values"}
+        parameter = _parameter_for(patch_path)
+        agenda = AgendaGroup(name="campaign")
+        leaves: list[str] = []
+        for index, value in enumerate(values):
+            leaf_name = f"leaf{index:03d}"
+            leaf = AgendaSim(
+                name=leaf_name,
+                spec=_patch_spec(base_spec, patch_path, value),
+                point=_point_for(parameter, value),
+            )
+            agenda = agenda.add(**{leaf_name: leaf})
+            leaves.append(leaf_name)
+        self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
+        return {"ok": True, "name": name, "leaves": leaves}
+
     def _add_leaf(
         self,
         name: str,
@@ -553,6 +631,70 @@ class AgendaService:
         agenda = campaign.agenda.add(**{name: leaf})
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": name}
+
+
+def _parameter_for(patch_path: str) -> str:
+    """Return the sweep parameter name encoded in a dotted patch path.
+
+    Mirrors the driver: the leaf's ``point`` key is the last segment of the
+    dotted Runner-spec path (``sim.time_steps`` -> ``time_steps``).
+
+    Returns:
+        The final path segment.
+
+    """
+    return patch_path.rsplit(".", 1)[-1]
+
+
+def _patch_spec(spec: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
+    """Return a deep copy of ``spec`` with the dotted JSON path set to ``value``.
+
+    Byte-for-byte the driver's ``_patch_spec`` (``scripts/local_mcp_check.py``),
+    so a campaign the agent creates here is identical to one built by
+    ``--agenda-init``.
+
+    Args:
+        spec: The base Runner spec (a deep copy is patched, the base is not
+            mutated).
+        dotted: A dotted path such as ``sim.time_steps``.
+        value: The JSON value to set.
+
+    Returns:
+        The patched deep copy.
+
+    Raises:
+        TypeError: If any intermediate path segment is missing (a bad
+            ``patch_path`` must be a soft error, not a corrupt campaign).
+
+    """
+    patched = json.loads(json.dumps(spec))
+    node: dict[str, Any] = patched
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            msg = f"patch path {dotted!r} has no object at {part!r}"
+            raise TypeError(msg)
+        node = child
+    node[parts[-1]] = value
+    return patched
+
+
+def _point_for(parameter: str, value: Any) -> dict[str, float | int | str] | None:
+    """Return the leaf ``point`` for one sweep value, or None when unusable.
+
+    ``AgendaSim.point`` accepts only ``float | int | str`` (and rejects bools via
+    pydantic).  A value that is not one of those (a list/dict/null, or a bool)
+    cannot be a valid point, so it is omitted rather than aborting the whole
+    creation.  Identical to the driver's ``_point_for``.
+
+    Returns:
+        ``{parameter: value}`` when the value is a valid point, else None.
+
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    return {parameter: value}
 
 
 def _analysis_points(campaign: Campaign) -> dict[str, float | None]:

@@ -515,6 +515,21 @@ class HelloRuntime:
         """
         return await self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
 
+    async def create_campaign(
+        self,
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        """Create and persist a campaign with one leaf per sweep value.
+
+        Returns:
+            ``{"ok": True, "name": name, "leaves": [...]}``, or a soft error.
+
+        """
+        return await self.agenda_service.create_campaign(name, base_spec, patch_path, values)
+
     async def record_analysis(self, path: str, analysis: dict[str, Any]) -> dict[str, Any]:
         """Record one leaf's analysis on the campaign.
 
@@ -1063,6 +1078,29 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     )
     async def take_agenda_callbacks() -> dict[str, Any]:
         return _redact_dict(runtime, await runtime.take_agenda_callbacks())
+
+    @server.tool(
+        title="Create a simulation campaign",
+        description=(
+            "Create and persist a campaign with one leaf per value: each leaf is "
+            "`base_spec` with the dotted Runner-spec path `patch_path` set to "
+            "that value (e.g. patch_path='sim.time_steps'), and records "
+            "point={last path segment: value}. This is the entry point for the "
+            "research loop -- call build_spec first to get base_spec, then "
+            "advance_agenda. Refuses to overwrite an existing campaign."
+        ),
+        # write/resource tier: it creates persisted campaign state but starts no
+        # cluster work itself; it is not destructive.
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    async def create_campaign(
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        result = await runtime.create_campaign(name, base_spec, patch_path, values)
+        return _redact_dict(runtime, result)
 
     @server.tool(
         title="Add a simulation leaf to the campaign",
