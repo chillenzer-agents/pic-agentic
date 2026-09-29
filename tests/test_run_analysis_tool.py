@@ -94,6 +94,16 @@ async def test_run_analysis_tool_is_registered() -> None:
     assert annotations.destructive_hint is False
 
 
+async def test_run_analysis_description_documents_the_program() -> None:
+    server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    description = tools["run_analysis"].description or ""
+    for keyword in ("kind: 'var'", "kind: 'binop'", "kind: 'unop'", "kind: 'reduce'", "selectors", "output"):
+        assert keyword in description, keyword
+    assert '"op": "histogram"' in description
+    assert description.index("Worked example") < description.index('"selectors"')
+
+
 async def test_run_analysis_returns_the_spectrum() -> None:
     config = Config(rcp_secret=SECRET)
     payload = await _call(config, "run_analysis", {"sim_id": SIM_ID, "program": _spectrum_program()})

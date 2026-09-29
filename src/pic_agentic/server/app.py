@@ -1115,7 +1115,32 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "abs/sqrt/log/exp/sin/cos/tanh and reductions such as sum/mean/std/"
             "min/max/median/quantile/histogram/fft_peak). Returns a scalar, a "
             "bounded numeric array, or a histogram/spectrum. Invalid or oversized "
-            "programs are rejected; the output is capped to the ack budget."
+            "programs are rejected; the output is capped to the ack budget.\n"
+            "The program is a fully validated expression tree (never eval'd, "
+            "never a serialised sympy object); unknown fields are rejected. "
+            "Schema:\n"
+            "  program = {selectors?: [var, ...], output: expr, points?: expr}\n"
+            "  var     = {kind: 'var', name: str, record?: str, component?: str, iteration?: int|str}\n"
+            "  expr    = const | var | binop | unop | reduce\n"
+            "    const  = {kind: 'const', value: number}\n"
+            "    binop  = {kind: 'binop', op: 'add'|'sub'|'mul'|'div'|'pow', left: expr, right: expr}\n"
+            "    unop   = {kind: 'unop', op: 'neg'|'abs'|'sqrt'|'log'|'exp'|'sin'|'cos'|'tanh'|'sign', operand: expr}\n"
+            "    reduce = {kind: 'reduce', op: 'sum'|'mean'|'std'|'min'|'max'|'median'|"
+            "'argmax'|'argmin'|'quantile'|'histogram'|'fft_peak'|'fft_freq', operand: expr, "
+            "q?: 0..1, bins?: int}\n"
+            "The optional `selectors` list documents the `var` inputs (a `var` may "
+            "also appear bare, with its `name` resolved to an openPMD record/"
+            "component). `output` is the returned expression; `points` is an "
+            "optional parallel expression (e.g. an FFT frequency axis).\n"
+            "Worked example - the transverse energy spectrum of the E field:\n"
+            '{"selectors": [{"kind": "var", "name": "px", "record": "E", "component": "x"}, '
+            '{"kind": "var", "name": "py", "record": "E", "component": "y"}], '
+            '"output": {"kind": "reduce", "op": "histogram", "bins": 4, "operand": '
+            '{"kind": "binop", "op": "add", '
+            '"left": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "px"}, '
+            '"right": {"kind": "var", "name": "px"}}, '
+            '"right": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "py"}, '
+            '"right": {"kind": "var", "name": "py"}}}}'
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
