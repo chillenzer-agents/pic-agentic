@@ -43,7 +43,7 @@ from pic_agentic.protocol.simulation import (
     SubmitParams,
     UnsupportedPayloadError,
 )
-from pic_agentic.server.agenda import AgendaService
+from pic_agentic.server.agenda import AgendaService, no_campaign_error
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
 from pic_agentic.server.simulation import (
     SimRecord,
@@ -541,7 +541,7 @@ class HelloRuntime:
 
         """
         if not self.agenda_service.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         try:
             campaign = self.agenda_service.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
@@ -591,7 +591,7 @@ class HelloRuntime:
 
         """
         if not self.agenda_service.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         try:
             campaign = self.agenda_service.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise

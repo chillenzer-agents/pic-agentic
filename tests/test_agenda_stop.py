@@ -21,6 +21,7 @@ from pic_agentic.protocol.simulation import (
     build_submit_ack,
 )
 from pic_agentic.rcp import new_secret_hex
+from pic_agentic.server.agenda import NO_CAMPAIGN_MESSAGE
 from pic_agentic.server.app import build_server
 from pic_agentic.transport.memory import MemoryTransport
 
@@ -124,7 +125,7 @@ async def test_stop_without_campaign_is_a_soft_error(tmp_path) -> None:
     mcp_t, sim_t, server, _ = _runtime(config)
     try:
         result = (await server.call_tool("stop_agenda", {})).structured_content
-        assert result == {"ok": False, "error": "no_campaign"}
+        assert result == {"ok": False, "error": "no_campaign", "message": NO_CAMPAIGN_MESSAGE}
     finally:
         await mcp_t.close()
         await sim_t.close()

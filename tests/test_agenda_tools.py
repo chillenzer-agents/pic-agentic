@@ -20,12 +20,16 @@ from pic_agentic.agenda.store import AgendaStore
 from pic_agentic.config import Config
 from pic_agentic.protocol.simulation import SimulationState, SimulationType, build_submit_ack
 from pic_agentic.rcp import new_secret_hex
+from pic_agentic.server.agenda import NO_CAMPAIGN_MESSAGE
 from pic_agentic.server.app import build_server
 from pic_agentic.server.simulation import SubmitService
 from pic_agentic.transport.memory import MemoryTransport
 
 SECRET = new_secret_hex()
 SIM = "7f3a2b1c"
+
+#: The actionable ``no_campaign`` soft error every campaign tool returns.
+NO_CAMPAIGN = {"ok": False, "error": "no_campaign", "message": NO_CAMPAIGN_MESSAGE}
 
 #: A minimal (allow-list-clean) Runner spec: the wire payload is ``{"sim": ...}``.
 _SPEC = {"sim": {"time_steps": 4}}
@@ -146,9 +150,26 @@ async def test_agenda_status_shape(tmp_path) -> None:
 async def test_no_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     advance = await _call(config, "advance_agenda", {})
-    assert advance == {"ok": False, "error": "no_campaign"}
+    assert advance == NO_CAMPAIGN
     status = await _call(config, "agenda_status", {})
-    assert status == {"ok": False, "error": "no_campaign"}
+    assert status == NO_CAMPAIGN
+
+
+async def test_no_campaign_error_is_actionable(tmp_path) -> None:
+    """Every campaign tool's ``no_campaign`` error tells the caller how to recover."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
+    for tool, arguments in (
+        ("advance_agenda", {}),
+        ("agenda_status", {}),
+        ("pause_agenda", {}),
+        ("add_agenda_leaf", {"name": "x", "spec": {"sim": {"replica": 0}}}),
+        ("take_agenda_callbacks", {}),
+    ):
+        result = await _call(config, tool, arguments)
+        assert result["error"] == "no_campaign", tool
+        assert result["message"] == NO_CAMPAIGN_MESSAGE, tool
+        assert "create_campaign" in result["message"], tool
+        assert "create a campaign first" in result["message"], tool
 
 
 async def test_agenda_status_redacts_secrets(tmp_path) -> None:
@@ -203,7 +224,7 @@ async def test_approve_unknown_leaf_is_a_soft_error(tmp_path) -> None:
 async def test_approve_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     result = await _call(config, "approve_agenda_leaf", {"path": "leaf0"})
-    assert result == {"ok": False, "error": "no_campaign"}
+    assert result == NO_CAMPAIGN
 
 
 async def test_agenda_status_reports_approval_flags(tmp_path) -> None:
@@ -288,7 +309,7 @@ async def test_add_duplicate_leaf_is_a_soft_error(tmp_path) -> None:
 async def test_add_leaf_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     result = await _call(config, "add_agenda_leaf", {"name": "x", "spec": {"sim": {"replica": 0}}})
-    assert result == {"ok": False, "error": "no_campaign"}
+    assert result == NO_CAMPAIGN
 
 
 async def test_pause_and_resume_tools(tmp_path) -> None:
@@ -307,4 +328,4 @@ async def test_pause_and_resume_tools(tmp_path) -> None:
 
 async def test_pause_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
-    assert await _call(config, "pause_agenda", {}) == {"ok": False, "error": "no_campaign"}
+    assert await _call(config, "pause_agenda", {}) == NO_CAMPAIGN

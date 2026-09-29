@@ -130,14 +130,14 @@ def _usage():
 
 async def test_server_soft_errors(tmp_path: Path) -> None:
     from pic_agentic.config import Config
-    from pic_agentic.server.agenda import AgendaService
+    from pic_agentic.server.agenda import AgendaService, no_campaign_error
 
     missing = Config(rcp_secret="x", agenda_file=str(tmp_path / "missing.json"))
     service = AgendaService(missing, _FakeSubmit())
-    assert await service.set_state("paused") == {"ok": False, "error": "no_campaign"}
-    assert await service.take_callbacks() == {"ok": False, "error": "no_campaign"}
-    assert await service.approve("leaf0") == {"ok": False, "error": "no_campaign"}
-    assert await service.add_leaf("leaf0", {"sim": {}}) == {"ok": False, "error": "no_campaign"}
+    assert await service.set_state("paused") == no_campaign_error()
+    assert await service.take_callbacks() == no_campaign_error()
+    assert await service.approve("leaf0") == no_campaign_error()
+    assert await service.add_leaf("leaf0", {"sim": {}}) == no_campaign_error()
 
     # A corrupt campaign file degrades every mutator to a redacted soft error.
     path = tmp_path / "bad.json"

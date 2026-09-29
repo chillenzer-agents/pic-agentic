@@ -46,6 +46,25 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+#: Actionable text attached to every ``no_campaign`` soft error, naming the tool
+#: that creates a campaign so the caller knows how to recover.
+NO_CAMPAIGN_MESSAGE = "no campaign is persisted; create a campaign first, e.g. with create_campaign, then retry."
+
+
+def no_campaign_error() -> dict[str, Any]:
+    """Return the actionable ``no_campaign`` soft error.
+
+    Every campaign-scoped operation that finds no persisted campaign returns
+    this, so the error carries a recovery hint (``message``) alongside the
+    stable machine-readable ``error`` code.
+
+    Returns:
+        ``{"ok": False, "error": "no_campaign", "message": <actionable text>}``.
+
+    """
+    return {"ok": False, "error": "no_campaign", "message": NO_CAMPAIGN_MESSAGE}
+
+
 def _store_for(config: Config) -> AgendaStore:
     """Build the campaign store for ``config``.
 
@@ -137,7 +156,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         engine = self._build_engine(send)
         async with self._lock:
             try:
@@ -220,7 +239,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         engine = AgendaEngine(store=self.store, submit=_never_submit, observe=dict, policy=self.policy)
         try:
             return engine.status()
@@ -243,7 +262,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 return self._approve_leaf(path)
@@ -335,7 +354,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         try:
             campaign = self.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
@@ -351,7 +370,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -371,7 +390,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -406,7 +425,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -446,7 +465,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -483,7 +502,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 return self._add_leaf(name, spec, point=point, depends_on=depends_on)
@@ -597,4 +616,4 @@ async def _never_submit(_spec: dict[str, Any], _key: str) -> str:  # ruff: ignor
     raise RuntimeError(msg)
 
 
-__all__ = ["AgendaService"]
+__all__ = ["NO_CAMPAIGN_MESSAGE", "AgendaService", "no_campaign_error"]
