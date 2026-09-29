@@ -550,6 +550,24 @@ async def test_create_campaign_rejects_an_over_cap_spec(tmp_path) -> None:
     assert not (tmp_path / "campaign.json").exists()
 
 
+async def test_create_campaign_reaches_a_numeric_dict_key(tmp_path) -> None:
+    """A numeric-looking dict key is addressed as a key, not as a list index (M2)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "bc",
+            "base_spec": {"sim": {"bc": {"0": "periodic"}}},
+            "patch_path": "sim.bc.0",
+            "values": ["open"],
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["bc"] == {"0": "open"}
+
+
 async def test_create_campaign_rejects_a_typo_field(tmp_path) -> None:
     """A path whose final segment does not exist is refused, not silently added (M3)."""
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
