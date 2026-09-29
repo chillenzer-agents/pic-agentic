@@ -1544,11 +1544,22 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
     instead of handing the agent a spec that would fail later at
     ``advance_agenda``.
 
+    The built spec is trusted builder output (it passed ``check_allowlist``),
+    not untrusted free text, so it is returned **verbatim**: routing it through
+    :func:`_redact_dict` would hit the ``_REDACT_MAX_DEPTH`` structural cap on
+    any legitimate spec whose ``sim`` nests deeply (the shipped
+    rotation/frequency config does), silently replacing real config with a
+    ``"[REDACTED: nesting too deep]"`` marker while still reporting ``ok=True``.
+    The scalar metadata (version/revision/schema hash) is redacted individually,
+    matching the submit path, and the cap path is the same shape (no structural
+    redaction on either branch).
+
     Returns:
         ``{"ok": True, "spec", "wire_bytes", ...}``, or a soft error naming the
         over-cap condition.
 
     """
+    redact = runtime.config.redact
     if not built.within_inline_limit:
         return {
             "ok": False,
@@ -1556,16 +1567,15 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
             "wire_bytes": built.wire_bytes,
             "inline_limit_bytes": built.inline_limit_bytes,
         }
-    payload = {
+    return {
         "ok": True,
         "spec": built.spec,
         "wire_bytes": built.wire_bytes,
         "inline_limit_bytes": built.inline_limit_bytes,
-        "picongpu_version": built.picongpu_version,
-        "picongpu_revision": built.picongpu_revision,
+        "picongpu_version": redact(built.picongpu_version),
+        "picongpu_revision": redact(built.picongpu_revision),
         "schema_hash": built.schema_hash,
     }
-    return _redact_dict(runtime, payload)
 
 
 def _submit_outcome_dict(runtime: HelloRuntime, outcome: SubmitOutcome) -> dict[str, Any]:

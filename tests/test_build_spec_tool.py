@@ -114,6 +114,28 @@ async def test_build_spec_over_inline_limit_is_an_explicit_soft_error() -> None:
     assert len(builder.calls) == 1
 
 
+async def test_build_spec_deep_legitimate_spec_round_trips_exactly() -> None:
+    """A depth>=8 legitimate spec is returned verbatim, never redacted (B1).
+
+    The old path routed the built spec through ``_redact_dict``, whose
+    ``_REDACT_MAX_DEPTH`` cutoff replaced deeply nested (but entirely
+    legitimate) config with a marker while still reporting ``ok=True``.
+    """
+    runner = _runner_dump()
+    # Push a real, allow-listed branch deeper: depth(sim) becomes 7 (>= 8 when
+    # counted through the {"sim": ...} wrapper + payload).
+    runner["sim"]["output"][0]["config"]["radiation"]["frequencies"] = {
+        "type_linear_frequencies": {"omega_min": 1.0, "omega_max": 2.0},
+    }
+    builder = _StubBuilder(_built(runner))
+    server, _runtime = _server_with_builder(builder)
+    payload = (await server.call_tool("build_spec", {"picmi_script": "# picmi\n"})).structured_content
+
+    assert payload["ok"] is True
+    assert payload["spec"] == {"sim": runner["sim"]}
+    assert "nesting too deep" not in json.dumps(payload["spec"])
+
+
 async def test_build_spec_build_failure_is_a_soft_error() -> None:
     builder = _StubBuilder(SimulationBuildError("PICMI script failed"))
     server, _runtime = _server_with_builder(builder)
