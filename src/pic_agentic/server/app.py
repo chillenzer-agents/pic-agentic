@@ -1230,7 +1230,7 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             '"left": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "px"}, '
             '"right": {"kind": "var", "name": "px"}}, '
             '"right": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "py"}, '
-            '"right": {"kind": "var", "name": "py"}}}}'
+            '"right": {"kind": "var", "name": "py"}}}}}'
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
