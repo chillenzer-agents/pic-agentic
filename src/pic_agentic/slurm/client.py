@@ -348,13 +348,21 @@ class SlurmClient:
                 return info
             await asyncio.sleep(interval_s)
 
-    async def signal(self, job_id: int, signal: str, *, batch: bool = True) -> None:
-        """Send a signal via ``scancel``; ``signal`` comes from a fixed set.
+    async def signal(self, job_id: int, signal: str, *, batch: bool = False) -> None:
+        """Send a signal to a job's steps via ``scancel --signal``.
+
+        By default the signal reaches every job *step* (the running application
+        ranks) but not the batch shell -- the M3 requirement, since the batch
+        shell does not trap signals on this site.  ``batch=True`` targets only
+        the batch shell instead (for a shell that explicitly traps the signal);
+        it must not be used for a plain ``srun``-launched application, whose
+        ranks would be missed.
 
         Args:
             job_id: The SLURM job id.
             signal: One of :data:`ALLOWED_SIGNALS`.
-            batch: Whether to target the batch step (``--batch``).
+            batch: Target only the batch shell (``--batch``) instead of the
+                steps.  Defaults to False (all steps).
 
         Raises:
             SlurmError: If the signal is not allowed or ``scancel`` fails.
@@ -377,65 +385,75 @@ class SlurmClient:
 
         Args:
             job_id: The SLURM job id.
-            mode: ``graceful`` (USR2, step-boundary stop) or ``hard`` (KILL).
+            mode: ``graceful`` (USR2 to all steps, step-boundary stop) or
+                ``hard`` (SIGKILL to all steps).
 
         Raises:
-            SlurmError: If ``mode`` is unknown or the signal fails.
+            SlurmError: If ``mode`` is unknown or the command fails.
 
         """
         if mode == "graceful":
             await self.signal(job_id, "USR2")
         elif mode == "hard":
-            await self.signal(job_id, "KILL", batch=False)
+            await self.signal(job_id, "KILL")
         else:
             msg = f"unknown cancel mode: {mode}"
             raise SlurmError(msg)
 
     async def signal_job(self, job_id: int, signal: str) -> str:
-        """Deliver a signal to *all* of a job's tasks via ``scontrol signal``.
+        """Deliver a signal to every task of a job via ``scancel --signal``.
 
         This is the M3 control path: PIConGPU installs its handlers in every MPI
-        rank and each rank must receive the signal, which ``scontrol signal``
-        (unlike ``scancel --signal``) does.  ``signal`` is checked against the
-        fixed allow-list, so a wire value never reaches the command.
+        rank and each rank must receive the signal.  The job is launched as a
+        batch script that runs PIConGPU in an ``srun`` step, and
+        ``scancel --signal=<SIG> <job>`` signals all job *steps* (the running
+        PIConGPU ranks) while leaving the batch shell itself untouched -- which
+        matters for checkpoint-only, where the job must survive the signal.
+        ``scontrol signal`` does NOT exist in Slurm (a stale M3-contract
+        assumption, rejected live by Slurm 24.05).  ``signal`` is checked against
+        the fixed allow-list, so a wire value never reaches the command.
 
         Args:
             job_id: The SLURM job id.
             signal: One of :data:`ALLOWED_SIGNALS`.
 
         Returns:
-            The combined stdout and stderr of ``scontrol``.
+            The combined stdout and stderr of ``scancel``.
 
         Raises:
-            SlurmError: If the signal is not allowed or ``scontrol`` fails.
+            SlurmError: If the signal is not allowed or ``scancel`` fails.
 
         """
         if signal not in ALLOWED_SIGNALS:
             msg = f"unsupported signal: {signal}"
             raise SlurmError(msg)
-        argv = [self._exe("scontrol"), "signal", signal, str(job_id)]
+        argv = [self._exe("scancel"), f"--signal={signal}", str(job_id)]
         rc, stdout, stderr = await self._run(argv)
         if rc != 0:
-            msg = f"scontrol signal failed ({rc}): {stderr.strip() or stdout.strip()}"
+            msg = f"scancel --signal={signal} failed ({rc}): {stderr.strip() or stdout.strip()}"
             raise SlurmError(msg)
         return (stdout + stderr).strip()
 
     async def cancel_job(self, job_id: int) -> str:
-        """Hard-cancel a job via ``scontrol cancel``.
+        """Hard-cancel a job via plain ``scancel``.
+
+        A bare ``scancel <job>`` sends SIGCONT, then SIGTERM, then SIGKILL after
+        the configured grace period -- the documented immediate job death.
+        (``scontrol cancel`` does not exist in Slurm.)
 
         Args:
             job_id: The SLURM job id.
 
         Returns:
-            The combined stdout and stderr of ``scontrol``.
+            The combined stdout and stderr of ``scancel``.
 
         Raises:
-            SlurmError: If ``scontrol`` fails.
+            SlurmError: If ``scancel`` fails.
 
         """
-        argv = [self._exe("scontrol"), "cancel", str(job_id)]
+        argv = [self._exe("scancel"), str(job_id)]
         rc, stdout, stderr = await self._run(argv)
         if rc != 0:
-            msg = f"scontrol cancel failed ({rc}): {stderr.strip() or stdout.strip()}"
+            msg = f"scancel failed ({rc}): {stderr.strip() or stdout.strip()}"
             raise SlurmError(msg)
         return (stdout + stderr).strip()

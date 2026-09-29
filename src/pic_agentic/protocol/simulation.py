@@ -142,11 +142,12 @@ class SimulationOp(StrEnum):
     """M3 control verbs (``rcp.control_request``).
 
     Mapped 1:1 onto PIConGPU's signal handler (``pmacc/simulationControl/
-    signal.cpp``) delivered to every MPI rank via ``scontrol signal``:
+    signal.cpp``) delivered to every MPI rank via ``scancel --signal=<SIG>``:
     ``checkpoint``->``SIGUSR1`` (dump a checkpoint at the next common step and
     keep running), ``stop``->``SIGTERM`` (clean stop at the next step),
     ``checkpoint_and_stop``->``SIGALRM`` (checkpoint *then* stop) and
-    ``cancel``->``scontrol cancel`` (immediate job death).
+    ``cancel``->plain ``scancel`` (immediate job death).  ``scontrol signal`` is
+    NOT a Slurm command (a stale early-design assumption).
     """
 
     CHECKPOINT = "checkpoint"
@@ -156,7 +157,7 @@ class SimulationOp(StrEnum):
 
 
 #: Control op -> the signal delivered to the job's tasks; ``None`` means the op
-#: uses ``scontrol cancel`` instead of ``scontrol signal``.
+#: uses a plain ``scancel`` instead of ``scancel --signal``.
 CONTROL_SIGNAL: dict[SimulationOp, str | None] = {
     SimulationOp.CHECKPOINT: "USR1",
     SimulationOp.STOP: "TERM",

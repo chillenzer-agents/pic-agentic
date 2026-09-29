@@ -4,33 +4,57 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Test double for ``scancel``."""
+"""Test double for ``scancel``.
 
+It mirrors the real delivery paths the client uses:
+
+* ``scancel --signal=<SIG> <jobid>`` records ``SIG`` in ``<jobid>.signals``;
+  ``--signal=KILL`` kills the steps but leaves the job (the man page: a KILL
+  signal "will cancel the active job steps but not cancel the job itself");
+* a plain ``scancel <jobid>`` (no ``--signal``) marks the job ``CANCELLED`` --
+  the hard-cancel path.
+
+The argv is also appended to ``<jobid>.scancel_argv`` (one JSON array per line)
+so tests can pin the exact command shape, including ``--batch``.
+"""
+
+import json
 import os
 import sys
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm"))
-_DEFAULT_SIGNAL = "USR2"
 
 
 def main(argv: list[str]) -> int:
-    """Record the cancel in the job's state file and return the exit code."""
-    signal = _DEFAULT_SIGNAL
+    """Record the signal/cancel for a job and return the exit code."""
+    signal = None
     job_id = None
     for arg in argv:
         if arg.startswith("--signal="):
             signal = arg.split("=", 1)[1]
         elif arg.isdigit():
             job_id = arg
+        elif arg.startswith("-"):
+            print(f"scancel: error: unrecognized option {arg}", file=sys.stderr)
+            return 1
     if job_id is None:
         print("scancel: error: no job id", file=sys.stderr)
         return 1
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     state_file = STATE_DIR / f"{job_id}.state"
+    with (STATE_DIR / f"{job_id}.scancel_argv").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(argv) + "\n")
+    if signal is not None:
+        with (STATE_DIR / f"{job_id}.signals").open("a", encoding="utf-8") as handle:
+            handle.write(f"{signal}\n")
+        # --signal=KILL kills the steps but does NOT cancel the job itself.
+        print(f"scancel: sent {signal} to job {job_id}")
+        return 0
+    # No --signal: a real scancel terminates the job.
     if state_file.exists():
-        state = "CANCELLED" if signal == "KILL" else "RUNNING"
-        state_file.write_text(f"{state}\n0\n", encoding="utf-8")
-    print(f"scancel: sent {signal} to job {job_id}")
+        state_file.write_text("CANCELLED\n0\n", encoding="utf-8")
+    print(f"scancel: cancelled job {job_id}")
     return 0
 
 

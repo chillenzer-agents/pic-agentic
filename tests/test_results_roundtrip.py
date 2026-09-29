@@ -122,7 +122,7 @@ async def test_server_control_pull_resolves_against_real_client(tmp_path) -> Non
             payload = await service.control(mcp_t.send, "ctl12345", SimulationOp.CHECKPOINT)
             assert payload["ok"] is True
             assert payload["signal"] == "USR1"
-            assert "Signal USR1 sent" in payload["slurm_reason"]
+            assert "scancel: sent USR1" in payload["slurm_reason"]
             assert (state_dir / f"{job_id}.signals").read_text(encoding="utf-8").splitlines() == ["USR1"]
         finally:
             for task in tasks:
