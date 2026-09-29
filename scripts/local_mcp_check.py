@@ -817,20 +817,28 @@ def cmd_agenda_init(args: argparse.Namespace) -> int:
     spec_source = args.agenda_script or str(_AGENDA_SPEC_FIXTURE)
     base_spec = _agenda_spec(spec_source)
     if args.agenda_patch:
-        specs = [_patch_spec(base_spec, args.agenda_patch, value) for value in _parse_agenda_values(args.agenda_values)]
+        # Parse the sweep parameter name from the dotted patch path (the leaf's
+        # ``point`` is what the refinement engine scores: see
+        # ``server.agenda._leaf_score``).
+        parameter = args.agenda_patch.rsplit(".", 1)[-1]
+        leaves = [
+            (f"leaf{index:03d}", _patch_spec(base_spec, args.agenda_patch, value), {parameter: value})
+            for index, value in enumerate(_parse_agenda_values(args.agenda_values))
+        ]
     else:
-        specs = [_tag_replica(base_spec, index) for index in range(max(1, args.agenda_replicas))]
+        leaves = [
+            (f"leaf{index:03d}", _tag_replica(base_spec, index), None) for index in range(max(1, args.agenda_replicas))
+        ]
 
     agenda = AgendaGroup(name="campaign")
-    for index, spec in enumerate(specs):
-        name = f"leaf{index:03d}"
-        agenda = agenda.add(**{name: AgendaSim(name=name, spec=spec)})
+    for name, spec, point in leaves:
+        agenda = agenda.add(**{name: AgendaSim(name=name, spec=spec, point=point)})
     campaign = Campaign(name=args.agenda_name, agenda=agenda).with_created_ts()
 
     file_path = Path(args.agenda_file).expanduser()
     store = AgendaStore(file_path.parent, filename=file_path.name)
     store.save(campaign)
-    print(json.dumps({"ok": True, "agenda_file": str(file_path), "leaves": len(specs)}, indent=2), flush=True)
+    print(json.dumps({"ok": True, "agenda_file": str(file_path), "leaves": len(leaves)}, indent=2), flush=True)
     return 0
 
 

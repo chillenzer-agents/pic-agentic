@@ -47,6 +47,7 @@ from pic_agentic.agenda.planner import (
 )
 
 if TYPE_CHECKING:
+    from pic_agentic.agenda.reuse import ReuseRecord
     from pic_agentic.agenda.store import AgendaStore
 
 #: Async ``(spec, idempotency_key) -> sim_id`` submission callable.  The key is
@@ -56,6 +57,12 @@ SubmitFn = Callable[[dict[str, Any], str], Awaitable[str]]
 
 #: ``() -> {sim_id: state}`` observation callable.
 ObserveFn = Callable[[], Mapping[str, str]]
+
+#: ``(wire_hash) -> ReuseRecord | None``: lookup a completed run to reuse.
+ReuseLookupFn = Callable[[str], "ReuseRecord | None"]
+
+#: ``(wire_hash, sim_id, state, run_dir) -> None``: record a completed run.
+ReuseRecordFn = Callable[[str, str, str, str | None], None]
 
 #: ``() -> {sim_id: ActualUsage}`` actual-cost observation callable (gap 4).
 ActualsFn = Callable[[], Mapping[str, "ActualUsage"]]
@@ -125,6 +132,9 @@ class TickResult(BaseModel):
     waiting: list[str] = Field(default_factory=list)
     done: list[str] = Field(default_factory=list)
     failed: list[str] = Field(default_factory=list)
+    #: Leaves linked to an already-completed identical run instead of being
+    #: submitted again (content-addressed reuse).
+    reused: list[str] = Field(default_factory=list)
     complete: bool = False
     usage: BudgetUsage = BudgetUsage()
     #: Decision-point callbacks emitted this tick (newly done/failed leaves).
@@ -151,6 +161,8 @@ class AgendaEngine:
         policy: EnginePolicy | None = None,
         approve: Callable[[str], bool] | None = None,
         actuals: ActualsFn | None = None,
+        reuse_lookup: ReuseLookupFn | None = None,
+        reuse_record: ReuseRecordFn | None = None,
     ) -> None:
         """Create an engine.
 
@@ -166,6 +178,13 @@ class AgendaEngine:
             actuals: Optional ``() -> {sim_id: ActualUsage}`` callable supplying
                 the cluster's actual cost for finished runs (gap 4); when given,
                 a finished leaf's usage estimate is corrected to the actual.
+            reuse_lookup: Optional ``(wire_hash) -> ReuseRecord | None`` that
+                returns a completed run whose spec is byte-identical, so the
+                leaf is linked to it instead of being submitted again.  Without
+                it (and without ``reuse_record``) no reuse is attempted.
+            reuse_record: Optional ``(wire_hash, sim_id, state, run_dir)`` called
+                when a leaf finishes successfully, so a later identical spec can
+                reuse it.
 
         """
         self.store = store
@@ -175,6 +194,8 @@ class AgendaEngine:
         self.policy = policy or EnginePolicy()
         self.approve = approve
         self.actuals = actuals
+        self.reuse_lookup = reuse_lookup
+        self.reuse_record = reuse_record
 
     async def tick(self) -> TickResult:
         """Run one durable, idempotent engine tick.
@@ -203,6 +224,26 @@ class AgendaEngine:
         campaign, emitted = self._emit_callbacks(campaign, before)
         result = TickResult(state=campaign.state, callbacks=list(emitted))
         self.store.save(campaign)
+        campaign = await self._run_steps(campaign, steps, result, budget)
+        result.complete = _is_complete(campaign.agenda)
+        result.usage = campaign.usage
+        self._record_reuse(campaign)
+        self.store.save(campaign)
+        return result
+
+    async def _run_steps(
+        self,
+        campaign: Campaign,
+        steps: list[tuple[str, PlanStep]],
+        result: TickResult,
+        budget: Budget,
+    ) -> Campaign:
+        """Execute the planner's steps in order, updating ``result`` in place.
+
+        Returns:
+            The campaign after all steps (incrementally persisted).
+
+        """
         in_flight = campaign.usage.jobs_running
         concurrency_cap = budget.max_concurrent_jobs
         for path, step in steps:
@@ -212,24 +253,21 @@ class AgendaEngine:
                     result.callbacks.append(terminal)
                 _bucket(result, path, step.action)
                 continue
-            if campaign.state != "running":
-                # Paused/stopped: observe, fold and emit callbacks as usual, but
-                # hold every submission (no gate, no usage).  Resuming simply
-                # lets the next tick submit the still-planned leaves.
-                result.held.append(path)
+            blocked = self._submission_block(campaign, path, step, result, in_flight=in_flight, cap=concurrency_cap)
+            if blocked is not None:
+                {"held": result.held, "waiting": result.waiting, "pending_approval": result.pending_approval}[
+                    blocked
+                ].append(path)
                 continue
-            if len(result.submitted) >= self.policy.max_submits_per_tick:
-                result.waiting.append(path)
-                continue
-            if concurrency_cap is not None and in_flight >= concurrency_cap:
-                # The concurrency headroom is enforced here so one tick cannot
-                # over-fill (the planner also caps, but the observed in-flight
-                # count is authoritative).
-                result.waiting.append(path)
-                continue
-            leaf = leaf_at(campaign.agenda, path)
-            if not self._may_submit(leaf, step):
-                result.pending_approval.append(path)
+            reused = self._try_reuse(campaign, path, step)
+            if reused is not None:
+                # An identical spec already completed in an earlier run: link
+                # this leaf to that run instead of spending cluster time again.
+                campaign, reuse_callback = reused
+                result.reused.append(path)
+                if reuse_callback is not None:
+                    result.callbacks.append(reuse_callback)
+                self.store.save(campaign)
                 continue
             campaign, failure, deferred = await self._submit_one(campaign, path, step)
             if deferred:
@@ -248,10 +286,44 @@ class AgendaEngine:
             # Incremental persistence: a crash after this point must not
             # resubmit the leaf (the next tick sees its recorded sim_id).
             self.store.save(campaign)
-        result.complete = _is_complete(campaign.agenda)
-        result.usage = campaign.usage
-        self.store.save(campaign)
-        return result
+        return campaign
+
+    def _submission_block(
+        self,
+        campaign: Campaign,
+        path: str,
+        step: PlanStep,
+        result: TickResult,
+        *,
+        in_flight: int,
+        cap: int | None,
+    ) -> str | None:
+        """Return the bucket a step is held in, or None when it may proceed.
+
+        Encodes the lifecycle, per-tick, concurrency and approval gates in one
+        place so the submission loop stays flat.  ``result`` is only read (for
+        the per-tick submission count).
+
+        Returns:
+            ``"held"``, ``"waiting"`` or ``"pending_approval"`` when blocked,
+            else None.
+
+        """
+        if campaign.state != "running":
+            # Paused/stopped: observe, fold and emit callbacks as usual, but
+            # hold every submission (no gate, no usage).  Resuming simply lets
+            # the next tick submit the still-planned leaves.
+            return "held"
+        if len(result.submitted) >= self.policy.max_submits_per_tick:
+            return "waiting"
+        if cap is not None and in_flight >= cap:
+            # The concurrency headroom is enforced here so one tick cannot
+            # over-fill (the planner also caps, but the observed in-flight count
+            # is authoritative).
+            return "waiting"
+        if not self._may_submit(leaf_at(campaign.agenda, path), step):
+            return "pending_approval"
+        return None
 
     async def _submit_one(
         self,
@@ -287,6 +359,53 @@ class AgendaEngine:
             callback = Callback(path=path, kind="failed", sim_id=leaf.sim_id, ts=utc_now_iso())
             updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
             return updated, callback, False
+
+    def _try_reuse(self, campaign: Campaign, path: str, step: PlanStep) -> tuple[Campaign, Callback | None] | None:
+        """Link ``path`` to a completed identical run, or return None.
+
+        Reuse is keyed on the **full** wire hash (never the 32-bit ``sim_id``),
+        so a chance ``sim_id`` collision between different specs cannot be
+        mistaken for a hit.  On a hit the leaf is marked ``done`` immediately
+        with the recorded run's ``sim_id`` and **without** accruing estimated
+        usage (no new job was launched); the actual cost of the reused run was
+        already accounted when it first completed.  A ``done`` callback is
+        emitted so the agent's decision point is preserved.
+
+        Returns:
+            ``(campaign, callback)`` when reused, else None.
+
+        """
+        if self.reuse_lookup is None:
+            return None
+        record = self.reuse_lookup(_wire_hash(step.spec))
+        if record is None:
+            return None
+        agenda = campaign.agenda.model_copy(deep=True)
+        leaf = leaf_at(agenda, path)
+        if leaf is None:
+            return None
+        leaf.sim_id = record.sim_id
+        leaf.status = "done"
+        callback = Callback(path=path, kind="done", sim_id=record.sim_id, ts=utc_now_iso())
+        updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
+        return updated, callback
+
+    def _record_reuse(self, campaign: Campaign) -> None:
+        """Offer every newly-completed leaf to the reuse registry.
+
+        Best-effort: a registry write must never break a tick.  Only leaves that
+        reached ``done`` are offered (a failed run is not reusable).
+
+        """
+        if self.reuse_record is None:
+            return
+        for _, sim in campaign.agenda.simulations():
+            if sim.status != "done" or not sim.sim_id:
+                continue
+            try:
+                self.reuse_record(_wire_hash(sim.spec), sim.sim_id, sim.status, None)
+            except Exception:  # ruff: ignore[blind-except] - recording is best-effort
+                log.warning("reuse record failed for sim %s", sim.sim_id)
 
     @staticmethod
     def _emit_callbacks(campaign: Campaign, before: Mapping[str, str]) -> tuple[Campaign, list[Callback]]:

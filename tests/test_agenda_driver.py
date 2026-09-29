@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 from pathlib import Path
@@ -43,3 +44,34 @@ def test_replica_tag_preserves_existing_custom_input() -> None:
 def test_replica_tag_json_round_trips() -> None:
     tagged = local_mcp_check._tag_replica({"sim": {"time_steps": 4}}, 3)
     assert json.loads(json.dumps(tagged)) == tagged
+
+
+def test_agenda_init_records_sweep_points(tmp_path: Path) -> None:
+    """--agenda-init must record each leaf's sweep ``point``.
+
+    Regression: the builder created leaves without ``point``, so
+    ``--agenda-refinement`` scored nothing (``analysed: 0``) even after an
+    analysis was recorded, because the refiner falls back to the leaf's point.
+    """
+    agenda_file = tmp_path / "campaign.json"
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps({"sim": {"time_steps": 4}}))
+    args = argparse.Namespace(
+        agenda_file=agenda_file,
+        agenda_script=str(spec_file),
+        agenda_name="campaign",
+        agenda_replicas=1,
+        agenda_patch="sim.time_steps",
+        agenda_values="50,100,200",
+    )
+    assert local_mcp_check.cmd_agenda_init(args) == 0
+    campaign = json.loads(agenda_file.read_text())
+    points = {name: leaf["point"] for name, leaf in campaign["agenda"]["entries"].items()}
+    assert points == {
+        "leaf000": {"time_steps": 50},
+        "leaf001": {"time_steps": 100},
+        "leaf002": {"time_steps": 200},
+    }
+    # The patched spec still carries the value, so spec and point agree.
+    for leaf in campaign["agenda"]["entries"].values():
+        assert leaf["spec"]["sim"]["time_steps"] == leaf["point"]["time_steps"]
