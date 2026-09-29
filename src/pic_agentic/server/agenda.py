@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,9 @@ log = logging.getLogger(__name__)
 #: Actionable text attached to every ``no_campaign`` soft error, naming the tool
 #: that creates a campaign so the caller knows how to recover.
 NO_CAMPAIGN_MESSAGE = "no campaign is persisted; create a campaign first, e.g. with create_campaign, then retry."
+
+#: A dotted patch-path segment that indexes a list rather than a dict key.
+_LIST_INDEX_RE = re.compile(r"-?\d+")
 
 
 def no_campaign_error() -> dict[str, Any]:
@@ -566,9 +570,10 @@ class AgendaService:
         async with self._lock:
             try:
                 return self._create_campaign(name, base_spec, patch_path, values)
-            except (TypeError, ValueError) as exc:
-                # A bad patch path or an invalid leaf name/value is a
-                # model-level error: report it as data, not a tool exception.
+            except (TypeError, ValueError, IndexError) as exc:
+                # A bad patch path (including an out-of-range list index) or an
+                # invalid leaf name/value is a model-level error: report it as
+                # data, not a tool exception.
                 return {"ok": False, "error": "invalid_campaign", "detail": self.config.redact(str(exc))}
             except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
                 log.warning("agenda create_campaign failed: %s", exc)
@@ -647,37 +652,85 @@ def _parameter_for(patch_path: str) -> str:
 
 
 def _patch_spec(spec: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
-    """Return a deep copy of ``spec`` with the dotted JSON path set to ``value``.
+    r"""Return a deep copy of ``spec`` with the dotted JSON path set to ``value``.
 
     Byte-for-byte the driver's ``_patch_spec`` (``scripts/local_mcp_check.py``),
     so a campaign the agent creates here is identical to one built by
-    ``--agenda-init``.
+    ``--agenda-init``.  A path segment that is a decimal integer indexes a list
+    (negative indices count from the end); any other segment indexes a dict, so
+    list-shaped Runner specs (``sim.laser.0.focus_pos_si.1.component``) can be
+    swept.
 
     Args:
         spec: The base Runner spec (a deep copy is patched, the base is not
             mutated).
-        dotted: A dotted path such as ``sim.time_steps``.
+        dotted: A dotted path such as ``sim.time_steps``; a segment matching
+            ``-?\d+`` addresses the list element at that index.
         value: The JSON value to set.
 
     Returns:
         The patched deep copy.
 
     Raises:
-        TypeError: If any intermediate path segment is missing (a bad
-            ``patch_path`` must be a soft error, not a corrupt campaign).
+        TypeError: If a non-numeric intermediate segment is missing (a bad
+            ``patch_path`` must be a soft error, not a corrupt campaign), or
+            when a numeric segment addresses a non-list node.  A numeric
+            segment out of range for its list raises ``IndexError`` implicitly;
+            both surface as the ``invalid_campaign`` soft error.
 
     """
     patched = json.loads(json.dumps(spec))
-    node: dict[str, Any] = patched
+    node: Any = patched
     parts = dotted.split(".")
     for part in parts[:-1]:
-        child = node.get(part)
-        if not isinstance(child, dict):
-            msg = f"patch path {dotted!r} has no object at {part!r}"
+        node = _patch_child(node, dotted, part)
+    last = parts[-1]
+    if _LIST_INDEX_RE.fullmatch(last):
+        if not isinstance(node, list):
+            msg = f"patch path {dotted!r} has no list at {last!r}"
             raise TypeError(msg)
-        node = child
-    node[parts[-1]] = value
+        node[int(last)] = value
+    else:
+        if not isinstance(node, dict):
+            msg = f"patch path {dotted!r} has no object at {last!r}"
+            raise TypeError(msg)
+        node[last] = value
     return patched
+
+
+def _patch_child(node: Any, dotted: str, part: str) -> Any:
+    """Return the child of ``node`` addressed by one intermediate path segment.
+
+    A decimal-integer segment indexes a list (Python indexing, so ``-1`` is the
+    last element); any other segment indexes a dict.  Mirrors the driver's
+    ``_patch_spec`` so the two stay behaviourally identical.
+
+    Args:
+        node: The current dict or list node.
+        dotted: The whole dotted path, used in the error message.
+        part: The segment to descend through.
+
+    Returns:
+        The addressed child node (dict or list).
+
+    Raises:
+        TypeError: If a dict segment is missing or a numeric segment addresses a
+            non-list node.
+
+    """
+    if _LIST_INDEX_RE.fullmatch(part):
+        if not isinstance(node, list):
+            msg = f"patch path {dotted!r} has no list at {part!r}"
+            raise TypeError(msg)
+        return node[int(part)]
+    if not isinstance(node, dict):
+        msg = f"patch path {dotted!r} has no object at {part!r}"
+        raise TypeError(msg)
+    child = node.get(part)
+    if not isinstance(child, (dict, list)):
+        msg = f"patch path {dotted!r} has no object at {part!r}"
+        raise TypeError(msg)
+    return child
 
 
 def _point_for(parameter: str, value: Any) -> dict[str, float | int | str] | None:

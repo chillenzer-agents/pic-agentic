@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.store import AgendaStore
@@ -407,12 +409,66 @@ async def test_create_campaign_refuses_to_clobber_an_existing_campaign(tmp_path)
     assert result == {"ok": False, "error": "campaign_exists"}
 
 
+async def test_create_campaign_patches_a_list_indexed_path(tmp_path) -> None:
+    """A numeric patch-path segment indexes a list (real specs are list-shaped).
+
+    The focal-position sweep patches ``sim.laser.0.focus_pos_si.1.component``:
+    ``sim.laser`` and ``focus_pos_si`` are lists, so the patcher must descend
+    through list indices and leave the nested siblings intact.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}, {"component": 4.6e-5}, {"component": 0.0}]}]}}
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "focal",
+            "base_spec": base,
+            "patch_path": "sim.laser.0.focus_pos_si.1.component",
+            "values": [4.4e-5, 4.8e-5],
+        },
+    )
+    assert result == {"ok": True, "name": "focal", "leaves": ["leaf000", "leaf001"]}
+
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    expected = {"leaf000": 4.4e-5, "leaf001": 4.8e-5}
+    for name, value in expected.items():
+        leaf = campaign.agenda.entries[name]
+        focus = leaf.spec["sim"]["laser"][0]["focus_pos_si"]
+        assert focus[1]["component"] == pytest.approx(value)
+        # The point names the last path segment and agrees with the patched spec.
+        assert leaf.point == {"component": value}
+        # The nested siblings survive untouched.
+        assert focus[0]["component"] == pytest.approx(0.0)
+        assert focus[2]["component"] == pytest.approx(0.0)
+    # The base spec is not mutated by the per-leaf patch.
+    assert base["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(4.6e-5)
+
+
 async def test_create_campaign_bad_patch_path_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
     result = await _call(
         config,
         "create_campaign",
         {"name": "scan", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.missing.deeper", "values": [1]},
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign"
+    # The failed creation persisted nothing.
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_out_of_range_list_index_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "scan",
+            "base_spec": {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}]}]}},
+            "patch_path": "sim.laser.3.focus_pos_si.0.component",
+            "values": [1.0],
+        },
     )
     assert result["ok"] is False
     assert result["error"] == "invalid_campaign"

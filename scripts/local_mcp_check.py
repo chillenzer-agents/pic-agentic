@@ -91,6 +91,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -689,6 +690,9 @@ def cmd_wait_results(args: argparse.Namespace) -> int:
 #: Default Runner-spec fixture used by ``--agenda-init`` when no script is given.
 _AGENDA_SPEC_FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "pypicongpu_runner.json"
 
+#: A dotted patch-path segment that indexes a list rather than a dict key.
+_LIST_INDEX_RE = re.compile(r"-?\d+")
+
 
 def _agenda_spec(path: str) -> dict:
     """Load a Runner spec (a full runner dump or a bare ``{"sim": ...}``).
@@ -716,31 +720,86 @@ def _agenda_spec(path: str) -> dict:
 
 
 def _patch_spec(spec: dict, dotted: str, value: object) -> dict:
-    """Return a copy of ``spec`` with the dotted JSON path set to ``value``.
+    r"""Return a copy of ``spec`` with the dotted JSON path set to ``value``.
+
+    A path segment that is a decimal integer indexes a list (negative indices
+    count from the end); any other segment indexes a dict, so list-shaped Runner
+    specs (``sim.laser.0.focus_pos_si.1.component``) can be swept.
 
     Args:
         spec: The base Runner spec (mutated in a deep copy).
-        dotted: A dotted path such as ``sim.time_steps``.
+        dotted: A dotted path such as ``sim.time_steps``; a segment matching
+            ``-?\d+`` addresses the list element at that index.
         value: The JSON value to set.
 
     Returns:
         The patched deep copy.
 
     Raises:
-        SystemExit: If any intermediate path segment is missing.
+        SystemExit: If a dict segment is missing, a numeric segment addresses a
+            non-list node, or a numeric segment is out of range for its list.
 
     """
     patched = json.loads(json.dumps(spec))
-    node: dict = patched
+    node: object = patched
     parts = dotted.split(".")
     for part in parts[:-1]:
-        child = node.get(part)
-        if not isinstance(child, dict):
-            msg = f"agenda patch path {dotted!r} has no object at {part!r}"
+        node = _patch_child(node, dotted, part)
+    last = parts[-1]
+    if _LIST_INDEX_RE.fullmatch(last):
+        if not isinstance(node, list):
+            msg = f"agenda patch path {dotted!r} has no list at {last!r}"
             raise SystemExit(msg)
-        node = child
-    node[parts[-1]] = value
+        try:
+            node[int(last)] = value
+        except IndexError as exc:
+            msg = f"agenda patch path {dotted!r} has no list element at {last!r}"
+            raise SystemExit(msg) from exc
+    else:
+        if not isinstance(node, dict):
+            msg = f"agenda patch path {dotted!r} has no object at {last!r}"
+            raise SystemExit(msg)
+        node[last] = value
     return patched
+
+
+def _patch_child(node: object, dotted: str, part: str) -> object:
+    """Return the child of ``node`` addressed by one intermediate path segment.
+
+    A decimal-integer segment indexes a list (Python indexing, so ``-1`` is the
+    last element); any other segment indexes a dict.  Mirrors the server's
+    ``_patch_spec`` so the two stay behaviourally identical.
+
+    Args:
+        node: The current dict or list node.
+        dotted: The whole dotted path, used in the error message.
+        part: The segment to descend through.
+
+    Returns:
+        The addressed child node (dict or list).
+
+    Raises:
+        SystemExit: If a dict segment is missing, a numeric segment addresses a
+            non-list node, or a numeric segment is out of range for its list.
+
+    """
+    if _LIST_INDEX_RE.fullmatch(part):
+        if not isinstance(node, list):
+            msg = f"agenda patch path {dotted!r} has no list at {part!r}"
+            raise SystemExit(msg)
+        try:
+            return node[int(part)]
+        except IndexError as exc:
+            msg = f"agenda patch path {dotted!r} has no list element at {part!r}"
+            raise SystemExit(msg) from exc
+    if not isinstance(node, dict):
+        msg = f"agenda patch path {dotted!r} has no object at {part!r}"
+        raise SystemExit(msg)
+    child = node.get(part)
+    if not isinstance(child, (dict, list)):
+        msg = f"agenda patch path {dotted!r} has no object at {part!r}"
+        raise SystemExit(msg)
+    return child
 
 
 def _tag_replica(spec: dict, index: int) -> dict:

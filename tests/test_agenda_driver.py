@@ -11,6 +11,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _DRIVER = Path(__file__).resolve().parent.parent / "scripts" / "local_mcp_check.py"
 _SPEC = importlib.util.spec_from_file_location("local_mcp_check", _DRIVER)
 if _SPEC is None or _SPEC.loader is None:  # pragma: no cover - loader always present
@@ -75,6 +77,26 @@ def test_agenda_init_records_sweep_points(tmp_path: Path) -> None:
     # The patched spec still carries the value, so spec and point agree.
     for leaf in campaign["agenda"]["entries"].values():
         assert leaf["spec"]["sim"]["time_steps"] == leaf["point"]["time_steps"]
+
+
+def test_patch_spec_indexes_lists_by_decimal_segment() -> None:
+    """A numeric segment descends a list; a non-numeric segment descends a dict."""
+    base = {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}, {"component": 4.6e-5}]}]}}
+    patched = local_mcp_check._patch_spec(base, "sim.laser.0.focus_pos_si.1.component", 4.4e-5)
+    assert patched["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(4.4e-5)
+    assert patched["sim"]["laser"][0]["focus_pos_si"][0]["component"] == pytest.approx(0.0)
+    # A negative index counts from the end (Python list indexing).
+    tail = local_mcp_check._patch_spec(base, "sim.laser.-1.focus_pos_si.0.component", 9.9)
+    assert tail["sim"]["laser"][0]["focus_pos_si"][0]["component"] == pytest.approx(9.9)
+    # The base spec is not mutated.
+    assert base["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(4.6e-5)
+
+
+def test_patch_spec_rejects_an_out_of_range_list_index() -> None:
+    """A decimal segment beyond the list length is a soft ``SystemExit``."""
+    base = {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}]}]}}
+    with pytest.raises(SystemExit):
+        local_mcp_check._patch_spec(base, "sim.laser.3.focus_pos_si.0.component", 1.0)
 
 
 def test_agenda_init_omits_invalid_points() -> None:
