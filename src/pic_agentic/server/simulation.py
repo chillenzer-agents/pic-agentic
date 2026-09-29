@@ -634,6 +634,34 @@ class SubmitService:
         cmd_id, _payload, command = self._build_spec_payload(runner_dump, params=params, cmd_id=cmd_id)
         return await self._dispatch(send, cmd_id, command)
 
+    def prepare_spec(self, runner_dump: dict[str, Any]) -> SimulationPayload:
+        """Build and allow-list a Runner spec exactly as a submission would.
+
+        The shared validation front-end for every path that turns an existing
+        spec into a submit command: :meth:`_build_spec_payload` (submission) and
+        the agenda's ``create_campaign`` (campaign creation) both call this, so
+        a leaf is validated by the same allow-list check it will meet at submit
+        time -- and rejected at creation rather than at the next tick.  No
+        command is signed and no sequence is consumed.
+
+        Args:
+            runner_dump: A full runner dump (or a wire spec carrying ``sim``).
+
+        Returns:
+            The validated payload; an allow-list failure propagates from
+            ``SimulationPayload.check_allowlist``.
+
+        """
+        provenance = _spec_provenance(runner_dump, self.picongpu_revision)
+        payload = SimulationPayload.build(
+            picongpu_version=provenance["picongpu_version"],
+            picongpu_revision=provenance["picongpu_revision"],
+            schema_hash=provenance["schema_hash"],
+            runner_dump=runner_dump,
+        )
+        payload.check_allowlist()
+        return payload
+
     def _build_spec_payload(
         self,
         runner_dump: dict[str, Any],
@@ -653,14 +681,7 @@ class SubmitService:
 
         """
         command_id = cmd_id or new_cmd_id()
-        provenance = _spec_provenance(runner_dump, self.picongpu_revision)
-        payload = SimulationPayload.build(
-            picongpu_version=provenance["picongpu_version"],
-            picongpu_revision=provenance["picongpu_revision"],
-            schema_hash=provenance["schema_hash"],
-            runner_dump=runner_dump,
-        )
-        payload.check_allowlist()
+        payload = self.prepare_spec(runner_dump)
         seq = self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER)
         command = build_submit_command(
             sim=self.sim,

@@ -33,7 +33,12 @@ from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.refine import summary as refine_summary
 from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
-from pic_agentic.protocol.simulation import SimulationOp
+from pic_agentic.protocol.simulation import (
+    MAX_INLINE_PAYLOAD_BYTES,
+    SimulationOp,
+    UnsupportedPayloadError,
+    payload_wire_size,
+)
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
 
@@ -555,16 +560,27 @@ class AgendaService:
         Creating over an existing campaign would clobber its state, so it is
         refused rather than overwritten.
 
+        Every patched leaf is built and validated through
+        :meth:`SubmitService.prepare_spec` and :func:`payload_wire_size` -- the
+        *same* allow-list and escaped inline-size checks a submission runs -- so
+        a campaign that could never be submitted is refused at creation time
+        rather than surfacing a bare error at ``advance_agenda``.  Duplicate
+        patched specs (e.g. ``values=[4, 4]``) are rejected up front too: they
+        map to one ``sim_id`` and the engine would later refuse the tick.
+        Nothing is persisted unless every leaf validates.
+
         Args:
             name: The campaign's display name.
             base_spec: The base Runner spec (a wire spec carrying ``sim``).
             patch_path: A dotted path into ``base_spec`` (e.g.
-                ``sim.time_steps``).
+                ``sim.time_steps``); the final segment must already exist.
             values: One value per leaf; each patches ``patch_path``.
 
         Returns:
             ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
-            error (``campaign_exists``, ``no_values``, ``invalid_campaign``).
+            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
+            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
+            ``duplicate_campaign_spec``).
 
         """
         async with self._lock:
@@ -589,8 +605,10 @@ class AgendaService:
         """Build the campaign and save it (may raise).
 
         Returns:
-            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or the
-            ``campaign_exists``/``no_values`` soft errors.
+            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
+            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
+            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
+            ``duplicate_campaign_spec``).  No file is written on any error.
 
         """
         if self.store.exists():
@@ -598,19 +616,50 @@ class AgendaService:
         if not values:
             return {"ok": False, "error": "no_values"}
         parameter = _parameter_for(patch_path)
+        patched: list[dict[str, Any]] = [_patch_spec(base_spec, patch_path, value) for value in values]
+        for spec in patched:
+            invalid = self._validate_leaf_spec(spec)
+            if invalid is not None:
+                return invalid
+        collision = _duplicate_leaf_error(patched)
+        if collision is not None:
+            return collision
+
         agenda = AgendaGroup(name="campaign")
         leaves: list[str] = []
-        for index, value in enumerate(values):
+        for index, spec in enumerate(patched):
             leaf_name = f"leaf{index:03d}"
-            leaf = AgendaSim(
-                name=leaf_name,
-                spec=_patch_spec(base_spec, patch_path, value),
-                point=_point_for(parameter, value),
-            )
+            leaf = AgendaSim(name=leaf_name, spec=spec, point=_point_for(parameter, values[index]))
             agenda = agenda.add(**{leaf_name: leaf})
             leaves.append(leaf_name)
         self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
         return {"ok": True, "name": name, "leaves": leaves}
+
+    def _validate_leaf_spec(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Validate one patched leaf through the submission path.
+
+        Runs the same allow-list check and escaped inline-size cap a
+        ``submit_spec`` would, so a leaf that could never be submitted is
+        rejected at creation.
+
+        Returns:
+            ``None`` when the leaf is a valid, in-cap wire spec, else the soft
+            error dict to return.
+
+        """
+        try:
+            payload = self.submit_service.prepare_spec(spec)
+        except UnsupportedPayloadError as exc:
+            return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(str(exc))}
+        size = payload_wire_size(payload)
+        if size > MAX_INLINE_PAYLOAD_BYTES:
+            return {
+                "ok": False,
+                "error": "spec_exceeds_inline_limit",
+                "wire_bytes": size,
+                "inline_limit_bytes": MAX_INLINE_PAYLOAD_BYTES,
+            }
+        return None
 
     def _add_leaf(
         self,
@@ -739,6 +788,37 @@ def _patch_child(node: Any, dotted: str, part: str) -> Any:
         return node[int(part)]
     msg = f"patch path {dotted!r} has no object at {part!r}"
     raise TypeError(msg)
+
+
+def _duplicate_leaf_error(specs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return a soft error when two patched leaves share a wire payload.
+
+    Identical specs map to one ``sim_id`` and the engine later refuses the whole
+    tick (``duplicate payload ...``), so the collision is caught here, at
+    creation.  The comparison uses the ``{"sim": ...}`` wire form, the same
+    bytes :func:`~pic_agentic.agenda.engine._wire_hash` hashes.
+
+    Returns:
+        ``{"ok": False, "error": "duplicate_campaign_spec", ...}`` on the first
+        colliding pair, else None.
+
+    """
+    seen: dict[str, int] = {}
+    for index, spec in enumerate(specs):
+        sim = spec.get("sim") if isinstance(spec, dict) else None
+        key = json.dumps({"sim": sim}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if key in seen:
+            return {
+                "ok": False,
+                "error": "duplicate_campaign_spec",
+                "detail": (
+                    f"leaves leaf{seen[key]:03d} and leaf{index:03d} have identical specs; "
+                    "identical simulations map to the same sim_id and would collapse into one job; "
+                    "make the values distinct"
+                ),
+            }
+        seen[key] = index
+    return None
 
 
 def _point_for(parameter: str, value: Any) -> dict[str, float | int | str] | None:

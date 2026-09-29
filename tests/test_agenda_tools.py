@@ -494,3 +494,57 @@ async def test_create_campaign_omits_non_scalar_points(tmp_path) -> None:
     assert campaign.agenda.entries["leaf000"].point is None
     assert campaign.agenda.entries["leaf000"].spec["sim"]["grid"] == [1, 2]
     assert campaign.agenda.entries["leaf001"].point == {"grid": 7}
+
+
+async def test_create_campaign_rejects_duplicate_values(tmp_path) -> None:
+    """Identical patched specs are refused up front (B2).
+
+    They would map to one ``sim_id`` and the engine would later abort the whole
+    tick with ``duplicate payload ...``; the agent must not be able to wedge a
+    campaign that can never advance.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "d", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": [4, 4]},
+    )
+    assert result["ok"] is False
+    assert result["error"] == "duplicate_campaign_spec"
+    # Nothing was persisted, so the agent can retry with distinct values.
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_rejects_a_non_wire_spec(tmp_path) -> None:
+    """A base_spec that is not an allow-listed ``{"sim": ...}`` wire is refused (B2)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "bad",
+            "base_spec": {"not_sim": {"time_steps": 4}},
+            "patch_path": "not_sim.time_steps",
+            "values": [1, 2],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_rejects_an_over_cap_spec(tmp_path) -> None:
+    """A leaf over the escaped inline cap is refused at creation (B2)."""
+    from pic_agentic.protocol.simulation import MAX_INLINE_PAYLOAD_BYTES
+
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = {"sim": {"blob": "a" * (MAX_INLINE_PAYLOAD_BYTES * 2), "time_steps": 4}}
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "big", "base_spec": base, "patch_path": "sim.time_steps", "values": [5]},
+    )
+    assert result["ok"] is False
+    assert result["error"] == "spec_exceeds_inline_limit"
+    assert result["wire_bytes"] > MAX_INLINE_PAYLOAD_BYTES
+    assert not (tmp_path / "campaign.json").exists()
