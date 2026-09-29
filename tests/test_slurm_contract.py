@@ -63,6 +63,34 @@ async def test_cancel_modes(fake_env) -> None:
         await client.cancel(4701, "nonsense")
 
 
+async def test_control_uses_scancel_not_scontrol(monkeypatch) -> None:
+    """The M3 delivery commands must be real Slurm (``scancel``, not ``scontrol``).
+
+    Regression for the live finding: the M3 contract assumed ``scontrol signal``
+    and ``scontrol cancel``, neither of which exists in Slurm; the cluster
+    rejected ``checkpoint`` with "invalid keyword: signal".
+    """
+    recorded: list[list[str]] = []
+
+    async def fake_run(self: SlurmClient, argv: list[str], *, timeout_s: float | None = None):
+        recorded.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(SlurmClient, "_run", fake_run)
+    client = SlurmClient()  # empty bin_dir: _exe returns the bare name
+    await client.signal_job(4701, "USR1")
+    await client.cancel_job(4701)
+    # No --batch on the step signals: the M3 path must reach the srun ranks,
+    # not just the (untrapped) batch shell.
+    assert recorded[0] == ["scancel", "--signal=USR1", "4701"]
+    assert recorded[1] == ["scancel", "4701"]
+    recorded.clear()
+    await client.cancel(4701, "graceful")
+    await client.cancel(4701, "hard")
+    assert recorded[0] == ["scancel", "--signal=USR2", "4701"]
+    assert recorded[1] == ["scancel", "--signal=KILL", "4701"]
+
+
 def test_validate_shared_path_accepts_inside_base(tmp_path) -> None:
     base = tmp_path / "shared"
     base.mkdir()

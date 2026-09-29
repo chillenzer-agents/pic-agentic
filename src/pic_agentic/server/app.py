@@ -829,7 +829,7 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
         title="Checkpoint a simulation",
         description=(
             "Ask a running simulation to write a checkpoint at the next step "
-            "and keep running (SIGUSR1 via scontrol signal)."
+            "and keep running (SIGUSR1 via scancel --signal)."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
@@ -840,7 +840,7 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
         title="Stop a simulation",
         description=(
             "Ask a running simulation to stop cleanly at the next step (SIGTERM "
-            "via scontrol signal), leaving any checkpoint it has already written."
+            "via scancel --signal), leaving any checkpoint it has already written."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
@@ -849,7 +849,7 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
 
     @server.tool(
         title="Cancel a simulation",
-        description="Cancel a simulation's SLURM job immediately (scontrol cancel).",
+        description="Cancel a simulation's SLURM job immediately (plain scancel).",
         # destructive: it kills the job outright -- no clean shutdown, and any
         # output since the last checkpoint is lost.
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
@@ -861,7 +861,7 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
         title="Checkpoint and stop a simulation",
         description=(
             "Ask a running simulation to write a checkpoint at the next step "
-            "and then stop cleanly (SIGALRM via scontrol signal) -- the atomic "
+            "and then stop cleanly (SIGALRM via scancel --signal) -- the atomic "
             "'save state and finish' control."
         ),
         annotations=_CONTROL_ANNOTATIONS,

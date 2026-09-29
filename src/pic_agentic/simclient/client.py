@@ -985,7 +985,7 @@ class SimClient:
             )
         if tracked.job_id is None:
             # No scheduler job id (a local ``bash`` run, or an unparseable id):
-            # there is nothing signalable, and ``scontrol`` must never see a
+            # there is nothing signalable, and ``scancel`` must never see a
             # placeholder like ``0`` (some SLURM versions treat it as "all my
             # jobs").  Applies to cancel too, not only the signal ops.
             return await self._send_control_ack(

@@ -7,7 +7,8 @@
 A real ``submit_simulation`` drives the follow watcher to ``RUNNING``; the
 ``CONTROL_COMMAND`` path is then exercised against a test-injected ``control_fn``
 that wraps the real :class:`~pic_agentic.slurm.SlurmClient`, i.e. the fake
-``scontrol signal``/``cancel`` doubles.  State-gate rejections plus a successful
+``scancel`` double (``scontrol`` is only used for ``show job``; real Slurm has no
+``scontrol signal``/``cancel``).  State-gate rejections plus a successful
 hard cancel are covered too.  No cluster or homeserver is involved.
 """
 
@@ -181,7 +182,7 @@ async def test_submit_checkpoint_stop_e2e(shared_dir, tmp_path, fake_runner) -> 
         sim_id = outcome.sim_id
         await _wait_for(lambda: sim_id in client._tracked)
 
-        # checkpoint: ok ack, USR1 recorded by the fake scontrol, event emitted.
+        # checkpoint: ok ack, USR1 recorded by the fake scancel, event emitted.
         cp_ack = await client.handle(_control(sim_id, SimulationOp.CHECKPOINT, seq=200))
         assert cp_ack is not None
         assert cp_ack.type == SimulationType.CONTROL_ACK
@@ -190,7 +191,7 @@ async def test_submit_checkpoint_stop_e2e(shared_dir, tmp_path, fake_runner) -> 
         assert cp_ack.payload["signal"] == "USR1"
         assert cp_ack.payload["state"] == SimulationState.CHECKPOINT.value
         assert cp_ack.payload["job_id"] == JOB_ID
-        assert cp_ack.payload["slurm_reason"] == f"Signal USR1 sent to JobId={JOB_ID}"
+        assert cp_ack.payload["slurm_reason"] == f"scancel: sent USR1 to job {JOB_ID}"
         assert (state_dir / f"{JOB_ID}.signals").read_text(encoding="utf-8").splitlines() == ["USR1"]
         await _wait_for(
             lambda: any(
@@ -259,8 +260,8 @@ async def test_cancel_e2e_flips_state(shared_dir, tmp_path) -> None:
         assert cancel_ack.payload["ok"] is True
         assert cancel_ack.payload["op"] == "cancel"
         assert "signal" not in cancel_ack.payload
-        assert cancel_ack.payload["slurm_reason"] == f"cancel: JobId={job_id} cancelled"
-        assert (state_dir / f"{job_id}.state").read_text(encoding="utf-8").strip() == "CANCELLED"
+        assert cancel_ack.payload["slurm_reason"] == f"scancel: cancelled job {job_id}"
+        assert (state_dir / f"{job_id}.state").read_text(encoding="utf-8").splitlines()[0] == "CANCELLED"
         assert control.calls == [(SimulationOp.CANCEL, job_id)]
         # The watcher observes CANCELLED and reports its own terminal state.
         await _wait_for(
@@ -347,7 +348,7 @@ async def test_control_rejected_when_submit_disabled(shared_dir) -> None:
 
 
 async def test_cancel_without_job_id_never_reaches_slurm(shared_dir, tmp_path) -> None:
-    """A tracked sim with no job id must not yield ``scontrol cancel 0``."""
+    """A tracked sim with no job id must not yield ``scancel 0``."""
     shared, _state_dir = shared_dir
     _mcp_t, sim_t, _service, client, control = _make_pair(shared)
     run = tmp_path / "run"

@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-r"""Test double for ``scontrol show job <id>`` / ``signal`` / ``cancel``.
+r"""Test double for ``scontrol show job <id>``.
 
 The state file under ``FAKE_SLURM_STATE`` holds one or more *entries*, each one
 ``STATE`` optionally followed by an integer exit code.  The original single
@@ -13,9 +13,9 @@ reported forever.  A file with several entries is a *sequence*: each invocation
 pops the first entry and writes the remainder back, so successive calls walk
 ``PENDING`` -> ``RUNNING`` -> ``COMPLETED 0``.
 
-``signal <SIG> <jobid>`` appends the signal to ``<jobid>.signals`` and
-``cancel <jobid>`` rewrites ``<jobid>.state`` to ``CANCELLED``; both are the M3
-control delivery paths.
+Only ``show job`` is supported: the M3 control delivery paths go through
+``scancel`` (``scontrol`` has no ``signal``/``cancel`` subcommand in real Slurm,
+as the live cluster confirmed).
 """
 
 import os
@@ -53,10 +53,6 @@ def parse_entries(lines: list[str]) -> list[tuple[str, int]]:
 
 def main(argv: list[str]) -> int:
     """Print the fake ``scontrol`` report and return the exit code."""
-    if len(argv) >= 3 and argv[0] == "signal":
-        return _signal(argv[1], argv[2])
-    if len(argv) >= 2 and argv[0] == "cancel":
-        return _cancel(argv[1])
     if len(argv) < 3 or argv[0] != "show" or argv[1] != "job":
         print("scontrol: error: unsupported invocation", file=sys.stderr)
         return 1
@@ -78,38 +74,6 @@ def main(argv: list[str]) -> int:
     print(f"JobId={job_id} JobName=wrap")
     print(f"   JobState={state} Reason=None")
     print(f"   ExitCode={exit_code}:0 RunTime=00:00:01 TimeLimit=01:00:00")
-    return 0
-
-
-def _signal(signal: str, job_id: str) -> int:
-    """Record a delivered signal for the M3 control path.
-
-    Returns:
-        The exit code (1 when the job is unknown).
-
-    """
-    if not (STATE_DIR / f"{job_id}.state").exists():
-        print(f"scontrol: error: Job {job_id} not found", file=sys.stderr)
-        return 1
-    with (STATE_DIR / f"{job_id}.signals").open("a", encoding="utf-8") as handle:
-        handle.write(f"{signal}\n")
-    print(f"Signal {signal} sent to JobId={job_id}")
-    return 0
-
-
-def _cancel(job_id: str) -> int:
-    """Rewrite a job's state to CANCELLED for the M3 hard-cancel path.
-
-    Returns:
-        The exit code (1 when the job is unknown).
-
-    """
-    state_file = STATE_DIR / f"{job_id}.state"
-    if not state_file.exists():
-        print(f"scontrol: error: Job {job_id} not found", file=sys.stderr)
-        return 1
-    state_file.write_text("CANCELLED\n", encoding="utf-8")
-    print(f"cancel: JobId={job_id} cancelled")
     return 0
 
 

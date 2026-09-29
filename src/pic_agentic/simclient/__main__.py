@@ -46,7 +46,7 @@ def _make_control_fn(
         job_id = tracked.job_id
         if job_id is None:
             # Defensive: the client's gate already rejects this, but never pass
-            # a placeholder id to scontrol (``cancel 0`` can mean "all jobs").
+            # a placeholder id to scancel (``scancel 0`` can mean "all jobs").
             msg = "no scheduler job id for this simulation"
             raise ValueError(msg)
         if op is SimulationOp.CANCEL:
