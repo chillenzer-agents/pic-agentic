@@ -136,6 +136,96 @@ async def test_build_spec_deep_legitimate_spec_round_trips_exactly() -> None:
     assert "nesting too deep" not in json.dumps(payload["spec"])
 
 
+async def test_build_spec_wire_bytes_matches_the_escaped_submission_measure() -> None:
+    """``wire_bytes`` is the escaped size ``submit_spec`` enforces (n2)."""
+    from pic_agentic.protocol.simulation import SimulationPayload, payload_wire_size
+
+    builder = _StubBuilder(_built())
+    server, _runtime = _server_with_builder(builder)
+    payload = (await server.call_tool("build_spec", {"picmi_script": "# picmi\n"})).structured_content
+
+    runner = _runner_dump()
+    expected = SimulationPayload.build(
+        picongpu_version="0.9.0-dev",
+        picongpu_revision="667c537620e685486aceeaa77deb6550ac9972cf",
+        schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
+        runner_dump=runner,
+    )
+    assert payload["wire_bytes"] == payload_wire_size(expected)
+    # The escaped measure is genuinely larger than the raw inner object.
+    assert payload["wire_bytes"] > len(json.dumps({"sim": runner["sim"]}))
+
+
+async def test_build_spec_cap_boundary_is_inclusive() -> None:
+    """Exactly the cap passes; one byte more fails (n2)."""
+    from pic_agentic.protocol.simulation import (
+        _ENVELOPE_ALLOWANCE_BYTES,
+        SimulationPayload,
+        payload_wire_size,
+    )
+
+    runner = _runner_dump()
+    base_payload = SimulationPayload.build(
+        picongpu_version="0.9.0-dev",
+        picongpu_revision="667c537620e685486aceeaa77deb6550ac9972cf",
+        schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
+        runner_dump=runner,
+    )
+
+    def sized(blob: int) -> dict:
+        candidate = json.loads(json.dumps(runner))
+        candidate["sim"]["blob"] = "a" * blob
+        return candidate
+
+    # Grow the raw blob until the escaped size is exactly the cap.
+    lo, hi = 0, MAX_INLINE_PAYLOAD_BYTES
+    while lo < hi:
+        mid = (lo + hi) // 2
+        probe = SimulationPayload.build(
+            picongpu_version="0.9.0-dev",
+            picongpu_revision="667c537620e685486aceeaa77deb6550ac9972cf",
+            schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
+            runner_dump=sized(mid),
+        )
+        if payload_wire_size(probe) < MAX_INLINE_PAYLOAD_BYTES:
+            lo = mid + 1
+        else:
+            hi = mid
+    # ``lo`` yields size >= cap; step back to land exactly on the cap.
+    exact = None
+    for blob in (lo, lo - 1, lo + 1):
+        if blob < 0:
+            continue
+        probe = SimulationPayload.build(
+            picongpu_version="0.9.0-dev",
+            picongpu_revision="667c537620e685486aceeaa77deb6550ac9972cf",
+            schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
+            runner_dump=sized(blob),
+        )
+        if payload_wire_size(probe) == MAX_INLINE_PAYLOAD_BYTES:
+            exact = blob
+            break
+    assert exact is not None, "no raw blob lands exactly on the escaped cap"
+    assert payload_wire_size(base_payload) < MAX_INLINE_PAYLOAD_BYTES
+
+    # Exactly the cap: accepted.
+    builder = _StubBuilder(_built(sized(exact)))
+    server, _runtime = _server_with_builder(builder)
+    ok = (await server.call_tool("build_spec", {"picmi_script": "# picmi\n"})).structured_content
+    assert ok["ok"] is True
+    assert ok["wire_bytes"] == MAX_INLINE_PAYLOAD_BYTES
+    assert "spec" in ok
+
+    # One raw byte more: rejected.
+    builder = _StubBuilder(_built(sized(exact + 1)))
+    server, _runtime = _server_with_builder(builder)
+    over = (await server.call_tool("build_spec", {"picmi_script": "# picmi\n"})).structured_content
+    assert over["ok"] is False
+    assert over["error"] == "spec_exceeds_inline_limit"
+    assert over["wire_bytes"] > MAX_INLINE_PAYLOAD_BYTES
+    assert _ENVELOPE_ALLOWANCE_BYTES > 0  # sanity: the allowance is part of the measure
+
+
 async def test_build_spec_build_failure_is_a_soft_error() -> None:
     builder = _StubBuilder(SimulationBuildError("PICMI script failed"))
     server, _runtime = _server_with_builder(builder)
