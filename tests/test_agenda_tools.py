@@ -548,3 +548,21 @@ async def test_create_campaign_rejects_an_over_cap_spec(tmp_path) -> None:
     assert result["error"] == "spec_exceeds_inline_limit"
     assert result["wire_bytes"] > MAX_INLINE_PAYLOAD_BYTES
     assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_rejects_a_typo_field(tmp_path) -> None:
+    """A path whose final segment does not exist is refused, not silently added (M3)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "typo",
+            "base_spec": {"sim": {"time_steps": 4}},
+            "patch_path": "sim.time_step",
+            "values": [50],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign"
+    assert not (tmp_path / "campaign.json").exists()

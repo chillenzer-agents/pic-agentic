@@ -616,6 +616,15 @@ class AgendaService:
         if not values:
             return {"ok": False, "error": "no_values"}
         parameter = _parameter_for(patch_path)
+        if not _leaf_target_exists(base_spec, patch_path):
+            return {
+                "ok": False,
+                "error": "invalid_campaign",
+                "detail": (
+                    f"patch path {patch_path!r} does not address an existing field; "
+                    "refusing to create it (check the Runner-spec field name)"
+                ),
+            }
         patched: list[dict[str, Any]] = [_patch_spec(base_spec, patch_path, value) for value in values]
         for spec in patched:
             invalid = self._validate_leaf_spec(spec)
@@ -788,6 +797,44 @@ def _patch_child(node: Any, dotted: str, part: str) -> Any:
         return node[int(part)]
     msg = f"patch path {dotted!r} has no object at {part!r}"
     raise TypeError(msg)
+
+
+def _leaf_target_exists(spec: dict[str, Any], dotted: str) -> bool:
+    """Whether the final segment of ``dotted`` already addresses a real field.
+
+    ``create_campaign`` uses this to reject a typo (``sim.time_step`` for
+    ``sim.time_steps``) instead of silently adding an unknown key that the
+    Runner ignores.  The walk follows the same dict-key/list-index rule as
+    :func:`_patch_spec`; a dict key must be present (any value, including
+    ``None``) and a list index must be in range.
+
+    Returns:
+        True when the final segment addresses an existing dict key or an
+        in-range list index, else False.
+
+    """
+    node: Any = spec
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        if isinstance(node, dict):
+            child = node.get(part)
+        elif isinstance(node, list) and _LIST_INDEX_RE.fullmatch(part):
+            index = int(part)
+            child = node[index] if -len(node) <= index < len(node) else None
+        else:
+            return False
+        if not isinstance(child, (dict, list)):
+            return False
+        node = child
+    last = parts[-1]
+    if isinstance(node, dict):
+        return last in node
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(last):
+            return False
+        index = int(last)
+        return -len(node) <= index < len(node)
+    return False
 
 
 def _duplicate_leaf_error(specs: list[dict[str, Any]]) -> dict[str, Any] | None:
