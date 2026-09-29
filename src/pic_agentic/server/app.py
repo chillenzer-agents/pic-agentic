@@ -615,8 +615,9 @@ class HelloRuntime:
         """Return the campaign's RO-Crate provenance document.
 
         Returns:
-            The ``ro-crate-metadata.json`` dict, or ``{"ok": False, "error":
-            "no_campaign"}`` when no campaign is persisted.
+            The ``ro-crate-metadata.json`` dict, or the actionable
+            ``{"ok": False, "error": "no_campaign", "message": <recovery hint>}``
+            soft error when no campaign is persisted.
 
         """
         if not self.agenda_service.store.exists():
