@@ -670,7 +670,7 @@ SERVER_INSTRUCTIONS = (
     "For how to write a PICMI input file and how to define or scan multiple "
     "simulations, see the PyPIConGPU documentation: the page 'Defining Your "
     "Simulation' under python_package/foundations/defining_simulation "
-    "(published at https://picongpu.readthedocs.io/en/latest/python_package/) "
+    "(published at https://picongpu.readthedocs.io/en/latest/python_package/foundations/) "
     "covers simulation definition and static/dynamic parameter scans; the "
     "tutorial and the examples under lib/python/examples/ in the picongpu "
     "source tree show complete setups."
