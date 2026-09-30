@@ -172,6 +172,32 @@ def test_plugin_emittance_stub_last_slice_peak_does_not_crash(tmp_path: Path, mo
     assert summary["max_y_slice_m"] == pytest.approx(3.0)
 
 
+def test_plugin_reader_soft_error_is_no_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed-but-parseable file that raises TypeError is a soft error (N4)."""
+
+    class _BrokenReader:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (iteration, species, species_filter, kwargs)
+            msg = "None column labels"
+            raise TypeError(msg)
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _BrokenReader)
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "e_energyHistogram_all.dat").write_text("x\n", encoding="utf-8")
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    assert payload["error_code"] == "no_results"
+
+
 def test_bound_plugin_strides_to_fit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(results, "MAX_RESULT_BYTES", 512)
     summary = {
