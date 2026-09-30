@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from pic_agentic.protocol.simulation import (
     ResultOp,
     ResultParams,
@@ -103,14 +105,18 @@ async def test_describe_and_read_without_openpmd(tmp_path) -> None:
 async def test_plugin_request_routes_to_the_engine(tmp_path) -> None:
     """A PLUGIN request reaches ``resolve_result`` through ``_handle_result``.
 
-    Offline (no picongpu) this is a clean ``reader_unavailable``; the point is
-    that the new op is not refused as an unsupported/invalid params request.
+    Offline (no picongpu) this is a clean ``reader_unavailable``; with the real
+    readers installed the request runs against a faithful fixture and returns a
+    summary.  The point is that the new op is neither refused as an
+    unsupported/invalid params request nor crashes.
     """
     import importlib.util
 
+    from plugin_fixtures import energy_histogram_dat, write_output_unit
+
     run = tmp_path / "run"
-    (run / "simOutput").mkdir(parents=True)
-    (run / "simOutput" / "e_energyHistogram_all.dat").write_text("x\n", encoding="utf-8")
+    write_output_unit(run)
+    energy_histogram_dat(run)
     sim_t, client = _client(tmp_path)
     try:
         _track_sim(client, run)
@@ -122,7 +128,9 @@ async def test_plugin_request_routes_to_the_engine(tmp_path) -> None:
         if importlib.util.find_spec("picongpu") is None:
             assert ack.payload.get("error_code") == "reader_unavailable"
         else:
-            assert "error" not in ack.payload
+            assert "error" not in ack.payload, ack.payload
+            assert ack.payload["result"]["iteration"] == 100
+            assert ack.payload["result"]["total"] == pytest.approx(44.0)
     finally:
         await sim_t.close()
 
