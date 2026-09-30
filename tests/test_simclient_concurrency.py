@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -510,6 +511,118 @@ def test_build_concurrency_resolver(monkeypatch) -> None:
     assert client_mod.resolve_build_concurrency(None) == 3
     assert client_mod.resolve_build_concurrency("0") == 1
     assert client_mod.resolve_build_concurrency("nonsense") == 1
+
+
+def test_shutdown_grace_resolver(monkeypatch) -> None:
+    assert client_mod.resolve_shutdown_grace(None) == pytest.approx(client_mod.DEFAULT_SHUTDOWN_GRACE_S)
+    monkeypatch.setenv(client_mod.SHUTDOWN_GRACE_ENV, "7.5")
+    assert client_mod.resolve_shutdown_grace(None) == pytest.approx(7.5)
+    assert client_mod.resolve_shutdown_grace("0") == pytest.approx(0.0)
+    assert client_mod.resolve_shutdown_grace("-3") == pytest.approx(0.0)
+    assert client_mod.resolve_shutdown_grace("nonsense") == pytest.approx(client_mod.DEFAULT_SHUTDOWN_GRACE_S)
+
+
+async def test_shutdown_drains_an_in_flight_build(tmp_path, monkeypatch) -> None:
+    """B2: serve() waits for a build (to_thread) to finish before returning."""
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    client = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=tmp_path,
+        submit_config=SubmitConfig(setup_root=tmp_path / "sims"),
+        poll_interval_s=0.01,
+        shutdown_grace_s=5.0,
+    )
+    started = asyncio.Event()
+    finished = False
+
+    async def slow_submit(*, prepared, emit, job_id_reader) -> dict:
+        nonlocal finished
+        started.set()
+        # The real build runs uncancellably in a worker thread; model that so
+        # cancelling the coroutine cannot stop it.
+        await asyncio.to_thread(time.sleep, 0.5)
+        finished = True
+        return {
+            "sim_id": prepared.payload.sim_id,
+            "state": SimulationState.WORKFLOW_FINISHED.value,
+            "job_id": None,
+            "run_dir": "/tmp/x",
+            "stdout_path": None,
+        }
+
+    monkeypatch.setattr(client_mod, "execute_submit", slow_submit)
+    prepared = PreparedSubmit(
+        payload=SimpleNamespace(sim_id=SIM),
+        params=SubmitParams(),
+        runner=None,
+        config=SubmitConfig(setup_root=tmp_path / "sims"),
+    )
+    serve_task = asyncio.create_task(client.serve())
+    try:
+        await asyncio.sleep(0.02)
+        client._serving = True
+        client._start_submit_task(cmd_id="a" * 32, prepared=prepared, payload_hash="h", declared_sim_id=SIM)
+        await asyncio.wait_for(started.wait(), timeout=3)
+        serve_task.cancel()
+        await asyncio.gather(serve_task, return_exceptions=True)
+    finally:
+        await sim_t.close()
+        await mcp_t.close()
+    assert finished, "serve() returned while the in-flight build was still running"
+
+
+async def test_shutdown_grace_expiry_cancels_without_hanging(tmp_path, monkeypatch, caplog) -> None:
+    """A build past the grace is abandoned (logged), not awaited forever."""
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    client = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=tmp_path,
+        submit_config=SubmitConfig(setup_root=tmp_path / "sims"),
+        poll_interval_s=0.01,
+        shutdown_grace_s=0.2,
+    )
+    started = asyncio.Event()
+
+    async def slow_submit(*, prepared, emit, job_id_reader) -> dict:
+        started.set()
+        await asyncio.sleep(5)
+        return {
+            "sim_id": prepared.payload.sim_id,
+            "state": SimulationState.WORKFLOW_FINISHED.value,
+            "job_id": None,
+            "run_dir": "/tmp/x",
+            "stdout_path": None,
+        }
+
+    monkeypatch.setattr(client_mod, "execute_submit", slow_submit)
+    prepared = PreparedSubmit(
+        payload=SimpleNamespace(sim_id=SIM),
+        params=SubmitParams(),
+        runner=None,
+        config=SubmitConfig(setup_root=tmp_path / "sims"),
+    )
+    serve_task = asyncio.create_task(client.serve())
+    try:
+        await asyncio.sleep(0.02)
+        client._serving = True
+        client._start_submit_task(cmd_id="b" * 32, prepared=prepared, payload_hash="h", declared_sim_id=SIM)
+        await asyncio.wait_for(started.wait(), timeout=3)
+        loop = asyncio.get_running_loop()
+        with caplog.at_level("WARNING", logger="pic_agentic.simclient.client"):
+            deadline = loop.time() + 2.0
+            serve_task.cancel()
+            await asyncio.gather(serve_task, return_exceptions=True)
+            assert loop.time() < deadline
+    finally:
+        await sim_t.close()
+        await mcp_t.close()
+    assert any("shutdown grace" in record.message for record in caplog.records)
 
 
 async def test_build_gate_serialises_by_default(tmp_path, monkeypatch, fake_runner) -> None:
