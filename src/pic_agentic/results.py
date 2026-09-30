@@ -22,17 +22,20 @@ imports cleanly when they are absent, and the reader entry points raise
 from __future__ import annotations
 
 import base64
+import dataclasses
 import importlib.util
 import io
 import json
 import math
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pic_agentic.protocol.simulation import (
     MAX_RESULT_BYTES,
+    PLUGIN_READER_NAMES,
     RESULT_TEXT_MAX_BYTES,
     SLICE_MAX_POINTS,
     ResultManifest,
@@ -79,6 +82,48 @@ _SCALAR_COMPONENT = "\x0bScalar"
 #: Directory (relative to ``run_dir``) the workflow links the results into.
 _SIM_OUTPUT = "simOutput"
 
+#: Default [keV] window for the ``count_in_window`` histogram reduction.  PIConGPU
+#: energy histograms are commonly configured over 0--1000 keV; the window is
+#: always reported in the summary, so the caller need not know the default.
+_DEFAULT_WINDOW_KEV = (100.0, 1000.0)
+
+#: Target number of array points per plugin summary.  The summary is strided
+#: down further if it still exceeds :data:`MAX_RESULT_BYTES`.
+_PLUGIN_MAX_POINTS = 256
+
+
+@dataclasses.dataclass(frozen=True)
+class _PluginReader:
+    """One registered PIConGPU text-plugin reader.
+
+    Attributes:
+        pattern: The ``simOutput`` filename glob the reader's output matches.
+        module: The ``picongpu.extra.plugins.data`` class name to import.
+        required: The kwargs the reader entry point needs (beyond ``iteration``).
+        needs_iteration: Whether the reader requires an explicit iteration.
+
+    """
+
+    pattern: re.Pattern[str]
+    module: str
+    required: tuple[str, ...] = ("species",)
+    needs_iteration: bool = False
+
+
+#: Registry of shipped text-plugin readers, keyed by the frozen wire name.  The
+#: filename patterns mirror the PIConGPU readers: energy histogram and emittance
+#: are per-species/file-name text files; transition radiation is per iteration.
+_PLUGIN_READERS: dict[str, _PluginReader] = {
+    "energy_histogram": _PluginReader(re.compile(r"^[A-Za-z0-9_]+_energyHistogram_[A-Za-z0-9_]+\.dat$"), "EnergyHistogramData"),
+    "emittance": _PluginReader(re.compile(r"^[A-Za-z0-9_]+_emittance_[A-Za-z0-9_]+\.dat$"), "EmittanceData"),
+    "transition_radiation": _PluginReader(
+        re.compile(r"^[A-Za-z0-9_]+_transRad_[0-9]+\.dat$"),
+        "TransitionRadiationData",
+        required=("species", "iteration"),
+        needs_iteration=True,
+    ),
+}
+
 
 class ResultsUnavailable(RuntimeError):  # ruff: ignore[error-suffix-on-exception-name] - contract-frozen name
     """Raised when an optional reader is required but not installed."""
@@ -108,8 +153,8 @@ def _sniff_format(name: str, *, is_dir: bool = False) -> str:
         is_dir: Whether the entry is a directory.
 
     Returns:
-        One of ``openpmd-adios2``, ``openpmd-hdf5``, ``text``, ``dir`` or
-        ``binary``.
+        One of ``openpmd-adios2``, ``openpmd-hdf5``, a registered plugin reader
+        name, ``text``, ``dir`` or ``binary``.
 
     """
     if is_dir:
@@ -117,6 +162,9 @@ def _sniff_format(name: str, *, is_dir: bool = False) -> str:
     suffix = Path(name).suffix.lower()
     if suffix in _OPENPMD_SUFFIXES:
         return _OPENPMD_SUFFIXES[suffix]
+    for reader, spec in _PLUGIN_READERS.items():
+        if spec.pattern.fullmatch(name):
+            return reader
     if suffix in _TEXT_SUFFIXES:
         return "text"
     return "binary"
@@ -905,6 +953,308 @@ def _read(params: ResultParams, *, run_dir: Path, output: Path) -> dict[str, Any
     return {"data": lines, "data_encoding": "text", "n_points": len(lines)}
 
 
+def _import_plugin_reader(name: str) -> type:
+    """Import one shipped PIConGPU text-plugin reader class.
+
+    Args:
+        name: A registered reader name.
+
+    Returns:
+        The reader class from ``picongpu.extra.plugins.data``.
+
+    Raises:
+        ResultsUnavailable: If PIConGPU (with its readers) is not installed.
+
+    """
+    import importlib  # ruff: ignore[import-outside-top-level] - optional dependency
+
+    spec = _PLUGIN_READERS[name]
+    try:
+        module = importlib.import_module("picongpu.extra.plugins.data")
+    except ImportError as exc:
+        msg = "the optional picongpu plugin readers are not installed"
+        raise ResultsUnavailable(msg) from exc
+    try:
+        return getattr(module, spec.module)
+    except AttributeError as exc:  # pragma: no cover - a PIConGPU version drift
+        msg = f"picongpu does not ship the {spec.module} reader"
+        raise ResultsUnavailable(msg) from exc
+
+
+def _plugin_target(output: Path, params: ResultParams, spec: _PluginReader) -> Path | None:
+    """Resolve the plugin output file a request refers to.
+
+    A ``path`` narrows the search when given; otherwise the first filename
+    matching the reader's pattern (optionally narrowed by ``species``) is used.
+
+    Returns:
+        The resolved file, or None when none is found or the path is unsafe.
+
+    """
+    if params.path is not None:
+        try:
+            return _safe_join(output, params.path)
+        except ValueError:
+            return None
+    candidates = [
+        path
+        for path, is_dir in _collect_entries(output)
+        if not is_dir and spec.pattern.fullmatch(path.name) and _plugin_species_matches(path.name, params)
+    ]
+    candidates.sort(key=lambda path: path.name)
+    return candidates[0] if candidates else None
+
+
+def _plugin_species_matches(name: str, params: ResultParams) -> bool:
+    """Whether a plugin filename belongs to the requested species/filter.
+
+    Returns:
+        True when the request names no species, or the name matches it.
+
+    """
+    if params.species is not None and not name.startswith(f"{params.species}_"):
+        return False
+    return not (params.species_filter != "all" and not name.endswith(f"_{params.species_filter}.dat"))
+
+
+def _derive_plugin_names(reader: str, name: str) -> tuple[str, str, int | None]:
+    """Derive (species, filter, iteration) from a plugin output filename.
+
+    The shipped readers re-resolve their file from these values, so the target
+    found by discovery must agree with them.
+
+    Returns:
+        The species, species filter and (transition-radiation only) iteration.
+
+    Raises:
+        ResultsReaderError: If the filename does not match the reader pattern.
+
+    """
+    if reader == "energy_histogram":
+        match = re.fullmatch(r"(?P<species>.+)_energyHistogram_(?P<filter>.+)\.dat", name)
+    elif reader == "emittance":
+        match = re.fullmatch(r"(?P<species>.+)_emittance_(?P<filter>.+)\.dat", name)
+    else:
+        match = re.fullmatch(r"(?P<species>.+)_transRad_(?P<iteration>\d+)\.dat", name)
+    if match is None:  # pragma: no cover - guarded by the registry pattern
+        msg = f"filename {name!r} does not match the {reader} reader"
+        raise ResultsReaderError(msg)
+    groups = match.groupdict()
+    return groups["species"], groups.get("filter", "all"), int(groups["iteration"]) if "iteration" in groups else None
+
+
+def _resolve_plugin_iteration(available: list[int], iteration: int | str | None) -> int:
+    """Pick a concrete iteration from a plugin's available steps.
+
+    Returns:
+        The selected iteration.
+
+    Raises:
+        ResultsReaderError: If no iterations exist or the request is missing.
+
+    """
+    if not available:
+        msg = "plugin output has no iterations"
+        raise ResultsReaderError(msg)
+    if iteration in _LAST_ITERATIONS:
+        return max(available)
+    if iteration == "first":
+        return min(available)
+    selected = int(iteration)
+    if selected not in available:
+        msg = f"iteration {selected} is not available; have {sorted(available)}"
+        raise ResultsReaderError(msg)
+    return selected
+
+
+def _stride(values: list[float], max_points: int = _PLUGIN_MAX_POINTS) -> tuple[list[float], bool]:
+    """Stride a numeric array down to ``max_points``.
+
+    Returns:
+        ``(values, downsampled)``; striding keeps the endpoints.
+
+    """
+    if len(values) <= max_points:
+        return values, False
+    step = math.ceil(len(values) / max_points)
+    return values[::step], True
+
+
+def _plugin_summary(reader: str, instance: Any, species: str, species_filter: str, iteration: int | str | None) -> dict[str, Any]:
+    """Call one plugin reader and shape a bounded numeric summary.
+
+    Returns:
+        The reader-specific summary dict.
+
+    """
+    if reader == "transition_radiation":
+        available = [int(step) for step in instance.get_iterations(species)]
+    else:
+        available = [int(step) for step in instance.get_iterations(species, species_filter)]
+    selected = _resolve_plugin_iteration(available, iteration)
+    return _PLUGIN_BUILDERS[reader](instance, species, species_filter, selected)
+
+
+def _build_energy_histogram(instance: Any, species: str, species_filter: str, iteration: int) -> dict[str, Any]:
+    """Reduce an ``EnergyHistogramData`` result to a bounded summary.
+
+    Returns:
+        Bins (keV), counts, the count in the default window and scalars.
+
+    """
+    counts, bins, _iteration, _dt = instance.get(
+        iteration=iteration,
+        species=species,
+        species_filter=species_filter,
+    )
+    counts = [float(value) for value in counts]
+    bins = [float(value) for value in bins]
+    low, high = _DEFAULT_WINDOW_KEV
+    in_window = sum(count for bin_kev, count in zip(bins, counts) if low <= bin_kev <= high)
+    peak = max(range(len(counts)), key=counts.__getitem__) if counts else 0
+    strided_bins, downsampled = _stride(bins)
+    strided_counts, _ = _stride(counts)
+    return {
+        "bins_kev": strided_bins,
+        "counts": strided_counts,
+        "count_in_window": {"min_kev": low, "max_kev": high, "count": in_window},
+        "total": sum(counts),
+        "max_energy_kev": bins[peak] if bins else None,
+        "iteration": iteration,
+        "downsampled": downsampled,
+    }
+
+
+def _build_emittance(instance: Any, species: str, species_filter: str, iteration: int) -> dict[str, Any]:
+    """Reduce an ``EmittanceData`` result to a bounded summary.
+
+    Returns:
+        Slice positions (m), slice emittances (m rad) and scalars.
+
+    """
+    slice_emit, y_slices, _iteration, _dt = instance.get(
+        iteration=iteration,
+        species=species,
+        species_filter=species_filter,
+    )
+    slice_emit = [float(value) for value in slice_emit]
+    y_slices = [float(value) for value in y_slices]
+    peak = max(range(len(slice_emit)), key=slice_emit.__getitem__) if slice_emit else 0
+    strided_y, downsampled = _stride(y_slices)
+    strided_emit, _ = _stride(slice_emit)
+    return {
+        "y_slices_m": strided_y,
+        "slice_emit_mrad": strided_emit,
+        "total_emit_mrad": sum(slice_emit),
+        "max_emit_mrad": max(slice_emit) if slice_emit else None,
+        "max_y_slice_m": y_slices[peak] if y_slices else None,
+        "iteration": iteration,
+        "downsampled": downsampled,
+    }
+
+
+def _build_transition_radiation(instance: Any, species: str, species_filter: str, iteration: int) -> dict[str, Any]:
+    """Reduce a ``TransitionRadiationData`` result to a bounded summary.
+
+    The reader's ``spectrum`` view (the brightest angles) is a bounded 1D
+    spectrum, which suits a wire summary better than the full 3D cube.
+
+    Returns:
+        Frequency (SI 1/s), intensity and scalars.
+
+    """
+    _ = species_filter
+    omegas, spectrum = instance.get(
+        iteration=iteration,
+        species=species,
+        type="spectrum",
+        theta=None,
+        phi=None,
+        omega=None,
+    )
+    omegas = [float(value) for value in omegas]
+    spectrum = [float(value) for value in spectrum]
+    peak = max(range(len(spectrum)), key=spectrum.__getitem__) if spectrum else 0
+    strided_omega, downsampled = _stride(omegas)
+    strided_spectrum, _ = _stride(spectrum)
+    return {
+        "omega_per_s": strided_omega,
+        "intensity": strided_spectrum,
+        "total_intensity": sum(spectrum),
+        "peak_intensity": max(spectrum) if spectrum else None,
+        "peak_omega_per_s": omegas[peak] if omegas else None,
+        "iteration": iteration,
+        "downsampled": downsampled,
+    }
+
+
+#: Reader name -> the summary builder that calls the reader instance.
+_PLUGIN_BUILDERS: dict[str, Callable[[Any, str, str, int], dict[str, Any]]] = {
+    "energy_histogram": _build_energy_histogram,
+    "emittance": _build_emittance,
+    "transition_radiation": _build_transition_radiation,
+}
+
+
+def _bound_plugin(summary: dict[str, Any]) -> dict[str, Any] | None:
+    """Stride a plugin summary's arrays until it fits the wire budget.
+
+    Args:
+        summary: The reader-specific summary (arrays + scalars).
+
+    Returns:
+        The bounded summary, or None when even the scalars overflow the budget.
+
+    """
+    if _escaped_size(summary) <= MAX_RESULT_BYTES:
+        return summary
+    bounded = dict(summary)
+    bounded["downsampled"] = True
+    while _escaped_size(bounded) > MAX_RESULT_BYTES:
+        arrays = [key for key, value in bounded.items() if isinstance(value, list) and len(value) > 1]
+        if not arrays:
+            return None
+        for key in arrays:
+            bounded[key] = bounded[key][::2]
+    return bounded
+
+
+def _plugin(params: ResultParams, *, output: Path) -> dict[str, Any]:
+    """Answer a ``PLUGIN`` request by running a shipped PIConGPU reader.
+
+    The reader runs in-process on the cluster (the caller wraps this in
+    :func:`asyncio.to_thread`); its raw output is reduced to a bounded numeric
+    summary that fits :data:`MAX_RESULT_BYTES`.
+
+    Returns:
+        ``{"result": <summary>}`` or a clean error pair.
+
+    """
+    reader = params.reader
+    if reader is None or reader not in _PLUGIN_READERS:
+        return _error(SimulationErrorCode.UNSUPPORTED, f"unknown plugin reader {reader!r}")
+    spec = _PLUGIN_READERS[reader]
+    if not output.is_dir():
+        return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
+    target = _plugin_target(output, params, spec)
+    if target is None or not target.is_file():
+        return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
+    try:
+        species, species_filter, derived_iteration = _derive_plugin_names(reader, target.name)
+        iteration = params.iteration if params.iteration is not None else derived_iteration
+        reader_class = _import_plugin_reader(reader)
+        instance = reader_class(str(output.parent))
+        summary = _plugin_summary(reader, instance, species, species_filter, iteration)
+    except ResultsUnavailable as exc:
+        return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
+    except (ResultsReaderError, KeyError, OSError, ValueError, IndexError) as exc:
+        return _error(SimulationErrorCode.NO_RESULTS, str(exc))
+    bounded = _bound_plugin(summary)
+    if bounded is None:
+        return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"plugin summary exceeds {MAX_RESULT_BYTES} wire bytes")
+    return {"result": bounded}
+
+
 def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:
     """Call the reader entry point for a ``slice``/``stats``/``image`` op.
 
@@ -1194,6 +1544,8 @@ def resolve_result(
         return _error(SimulationErrorCode.UNSUPPORTED, "analyze is served by the analysis engine, not the reader")
     if params.op is ResultOp.COMPUTE:
         return _compute(params, output=output)
+    if params.op is ResultOp.PLUGIN:
+        return _plugin(params, output=output)
     return _reader_op(params, output=output)
 
 
