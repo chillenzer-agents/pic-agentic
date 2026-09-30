@@ -647,6 +647,44 @@ def test_real_calorimeter_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["max_energy_J"] == pytest.approx(73.0)
 
 
+def test_real_calorimeter_reader_end_to_end_bp(tmp_path: Path) -> None:
+    """The ``calorimeter`` reader serves an ADIOS2 ``.bp`` directory series (B2/B3/M2).
+
+    An ADIOS2 series is a *directory* per iteration; the registry used to reject
+    the directory (wrong ``kind``) and iteration discovery skipped it, so a real
+    ``.bp`` calorimeter returned ``no_results``.  Both the explicit and the
+    default (latest) iteration are read to cover directory iteration discovery.
+    """
+    pytest.importorskip("picongpu")
+    pytest.importorskip("openpmd_api")
+    from plugin_fixtures import _adios2_available
+
+    _adios2_available()
+    run = tmp_path / "run"
+    write_output_unit(run)
+    calorimeter_h5(run, shape=(2, 3, 4), ext="bp")
+    series_dir = run / "simOutput" / "e_calorimeter" / "e_calorimeter_all_50.bp"
+    assert series_dir.is_dir(), series_dir
+
+    explicit = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="calorimeter", species="e", iteration=50)
+    payload = results.resolve_result(explicit, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 50
+    assert summary["n_energy"] == 2
+    assert summary["n_pitch"] == 3
+    assert summary["n_yaw"] == 4
+    assert summary["total_energy_J"] == pytest.approx(276.0 + 50 * 24)
+    assert summary["per_pitch_J"] == pytest.approx([460.0, 492.0, 524.0])
+
+    # The default must discover the latest iteration from the directories.
+    default = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="calorimeter", species="e")
+    latest = results.resolve_result(default, run_dir=run, sim_id=SIM_ID)
+    assert "result" in latest, latest
+    assert latest["result"]["iteration"] == 100
+    assert latest["result"]["total_energy_J"] == pytest.approx(276.0 + 100 * 24)
+
+
 def test_real_radiation_reader_end_to_end(tmp_path: Path) -> None:
     """The real ``RadiationData`` opens the generated series (slice 2)."""
     pytest.importorskip("picongpu")
