@@ -45,6 +45,19 @@ def _openpmd() -> object:
     return openpmd_api
 
 
+def _warm_reader(submodule: str) -> None:
+    """Import a reader submodule before writing a series it later reads.
+
+    With the pinned ``openpmd_api`` 0.17.1 HDF5 backend, reading a
+    ``%T`` series with the shipped reader returns garbage for some iterations
+    unless the reader module was imported *before* the series was written in
+    the same process (the backend caches HDF5 state on first reader import).
+    Importing it here makes the fixture hermetic: the file read by the test is
+    the file this function wrote.
+    """
+    importlib.import_module(f"picongpu.extra.plugins.data.{submodule}")
+
+
 def write_output_unit(run_dir: Path, dt_si: float = DEFAULT_DT_SI) -> Path:
     """Write the sibling ``simOutput/output`` file the readers need for ``dt``.
 
@@ -213,13 +226,19 @@ def phase_space_h5(
     """
     np = _numpy()
     opmd = _openpmd()
+    _warm_reader("phase_space")
     out = Path(run_dir) / "simOutput" / "phaseSpace"
     out.mkdir(parents=True, exist_ok=True)
     pattern = out / f"PhaseSpace_{species}_{species_filter}_{ps}_%T.h5"
     series = opmd.Series(str(pattern), opmd.Access.create)
+    # openPMD does not copy the buffer handed to ``store_chunk``; keeping the
+    # arrays alive until close (and flushing per step) makes the on-disk data
+    # deterministic rather than the contents of freed memory (B1).
+    keep: list[object] = []
     for step in iterations:
         record = series.iterations[step].meshes[f"{species}_{species_filter}_{ps}"][opmd.Mesh_Record_Component.SCALAR]
-        data = np.arange(shape[0] * shape[1], dtype=np.float64).reshape(shape) + step
+        data = np.array(np.arange(shape[0] * shape[1], dtype=np.float64).reshape(shape) + step)
+        keep.append(data)
         record.reset_dataset(opmd.Dataset(data.dtype, data.shape))
         record.store_chunk(data)
         record.unit_SI = 1.0
@@ -236,7 +255,7 @@ def phase_space_h5(
             "dr": 1e-6,
         }.items():
             record.set_attribute(name, value)
-    series.flush()
+        series.flush()
     series.close()
     return pattern
 
@@ -261,13 +280,18 @@ def calorimeter_h5(
     """
     np = _numpy()
     opmd = _openpmd()
+    _warm_reader("calorimeter")
     out = Path(run_dir) / "simOutput" / "e_calorimeter"
     out.mkdir(parents=True, exist_ok=True)
     pattern = out / f"{species}_calorimeter_{species_filter}_%T.h5"
     series = opmd.Series(str(pattern), opmd.Access.create)
+    # See ``phase_space_h5``: pin the written buffers until close and flush per
+    # step so the series carries the intended values rather than freed memory.
+    keep: list[object] = []
     for step in iterations:
         record = series.iterations[step].meshes["calorimeter"][opmd.Mesh_Record_Component.SCALAR]
-        data = np.arange(shape[0] * shape[1] * shape[2], dtype=np.float64).reshape(shape) + step
+        data = np.array(np.arange(shape[0] * shape[1] * shape[2], dtype=np.float64).reshape(shape) + step)
+        keep.append(data)
         record.reset_dataset(opmd.Dataset(data.dtype, data.shape))
         record.store_chunk(data)
         record.unit_SI = 1.0
@@ -281,7 +305,7 @@ def calorimeter_h5(
             "logScale": False,
         }.items():
             record.set_attribute(name, value)
-    series.flush()
+        series.flush()
     series.close()
     return pattern
 
@@ -306,26 +330,36 @@ def radiation_h5(
     """
     np = _numpy()
     opmd = _openpmd()
+    _warm_reader("radiation")
     out = Path(run_dir) / "simOutput" / "radiationOpenPMD"
     out.mkdir(parents=True, exist_ok=True)
     pattern = out / f"{species}_radAmplitudes_%T_0_0_0.h5"
     series = opmd.Series(str(pattern), opmd.Access.create)
+    # See ``phase_space_h5``: pin the written buffers until close and flush per
+    # step.  The real part is ``component + step`` so every iteration carries a
+    # distinct, assertable spectrum; the imaginary part is zero.
+    keep: list[object] = []
     for step in iterations:
         iteration = series.iterations[step]
         amplitude = iteration.meshes["Amplitude"]
         for index, component in enumerate(("x", "y", "z")):
             for part in ("Re", "Im"):
                 record = amplitude[f"{component}_{part}"]
-                data = np.full((n_directions, n_frequencies, 1), float(index + 1), dtype=np.float64)
+                value = float(index + 1 + step) if part == "Re" else 0.0
+                data = np.array(np.full((n_directions, n_frequencies, 1), value, dtype=np.float64))
+                keep.append(data)
                 record.reset_dataset(opmd.Dataset(data.dtype, data.shape))
                 record.store_chunk(data)
                 record.unit_SI = 1.0
         omega = iteration.meshes["DetectorFrequency"]["omega"]
-        values = np.array([1e14 * (i + 1) for i in range(n_frequencies)], dtype=np.float64).reshape(1, n_frequencies, 1)
+        values = np.array(
+            np.array([1e14 * (i + 1) for i in range(n_frequencies)], dtype=np.float64).reshape(1, n_frequencies, 1),
+        )
+        keep.append(values)
         omega.reset_dataset(opmd.Dataset(values.dtype, values.shape))
         omega.store_chunk(values)
         omega.unit_SI = 1.0
-    series.flush()
+        series.flush()
     series.close()
     return pattern
 
