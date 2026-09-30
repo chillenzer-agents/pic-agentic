@@ -266,7 +266,7 @@ class _FakeApi:
     def __init__(self, values: list[float]) -> None:
         self._dataset = _FakeDataset(values)
 
-    def Series(self, path: object, access: object) -> _FakeSeries:  # ruff: ignore[invalid-function-name]
+    def Series(self, path: object, access: object) -> _FakeSeries:
         _ = (path, access)
         return _FakeSeries({0: _FakeStep({}), 10: _FakeStep({"E": _FakeMesh({"x": self._dataset})})})
 
