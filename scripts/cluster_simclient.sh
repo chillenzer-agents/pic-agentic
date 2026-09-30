@@ -159,6 +159,16 @@ PYREV
   else
     log "picongpu revision matches the pin ($PICONGPU_REVISION)"
   fi
+
+  # 4c. Capability self-check: the git checkout must carry the M3 control+result
+  #     wiring.  A checkout on an older branch (e.g. the default 'main', which is
+  #     M2b-era) accepts submits but answers every result read with a
+  #     hello_ack/rejected_by_policy, so the agent can never read results.  Fail
+  #     loudly rather than run a client that silently cannot do the job.
+  if ! grep -q "SimulationType.RESULT_COMMAND," "$SRC/src/pic_agentic/simclient/client.py"; then
+    die "checkout $SRC ($BRANCH) lacks M3 result handling; set PIC_AGENTIC_BRANCH to the stack head (e.g. agent-onboarding)"
+  fi
+  log "capability check: simclient handles control + result requests"
 fi
 
 # 5. Interactive MAS device login (once).
