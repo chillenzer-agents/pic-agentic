@@ -1,0 +1,172 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+"""Tests for the G1 PIConGPU text-plugin result readers.
+
+The offline tests use a stub reader injected in place of the optional PIConGPU
+package, so the default suite (no picongpu) still passes.  The final test runs
+the *real* ``EnergyHistogramData`` reader and is skipped unless PIConGPU is
+importable; run it with a PIConGPU venv, e.g.::
+
+    PYTHONPATH=<repo>/src /tmp/opencode/pic-stack-venv/bin/python -m pytest tests/test_results_plugin.py -q
+
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+from plugin_fixtures import energy_histogram_dat, write_output_unit
+
+from pic_agentic import results
+from pic_agentic.protocol.simulation import ResultOp, ResultParams
+
+SIM_ID = "abcd1234"
+
+
+class _StubReader:
+    """A minimal stand-in for ``EnergyHistogramData``."""
+
+    def __init__(self, run_directory: str) -> None:
+        self.run_directory = run_directory
+
+    @staticmethod
+    def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+        _ = (species, species_filter)
+        return [0, 50, 100]
+
+    @staticmethod
+    def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+        _ = (species, species_filter, kwargs)
+        bins = [1000.0 * (i + 1) / 10 for i in range(10)]
+        counts = [0.0] * 10
+        counts[0] = 1.0
+        counts[4] = 42.0
+        counts[-1] = 1.0
+        return counts, bins, [iteration], 1e-16
+
+
+def _tree(tmp_path: Path) -> Path:
+    """Build a run dir with one energy-histogram output and the unit file."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run)
+    return run
+
+
+def _params(**kwargs: object) -> ResultParams:
+    return ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_histogram", **kwargs)
+
+
+def test_scandir_names_the_plugin_reader(tmp_path: Path) -> None:
+    run = _tree(tmp_path)
+    manifest = results.scan_output(run / "simOutput", sim_id=SIM_ID, run_dir=str(run))
+    formats = {ref.path: ref.format for ref in manifest.files}
+    assert formats["e_energyHistogram_all.dat"] == "energy_histogram"
+    assert formats["output"] == "binary"
+
+
+def test_plugin_missing_output_is_no_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubReader)
+    run = tmp_path / "run"
+    (run / "simOutput").mkdir(parents=True)
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    assert payload["error_code"] == "no_results"
+
+
+def test_plugin_unknown_reader_is_unsupported(tmp_path: Path) -> None:
+    run = _tree(tmp_path)
+    # Bypass the wire validator to exercise the engine's own guard.
+    params = ResultParams.model_construct(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="bogus", species_filter="all")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert payload["error_code"] == "unsupported"
+
+
+def test_plugin_reader_unavailable_without_picongpu(tmp_path: Path) -> None:
+    if importlib.util.find_spec("picongpu") is not None:
+        pytest.skip("picongpu is installed in this environment")
+    run = _tree(tmp_path)
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    assert payload["error_code"] == "reader_unavailable"
+
+
+def test_plugin_stub_summary_and_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubReader)
+    run = _tree(tmp_path)
+    payload = results.resolve_result(_params(species="e", iteration="last"), run_dir=run, sim_id=SIM_ID)
+    summary = payload["result"]
+    assert summary["iteration"] == 100
+    assert summary["total"] == pytest.approx(44.0)
+    assert summary["count_in_window"]["count"] == pytest.approx(44.0)
+    assert len(summary["bins_kev"]) == len(summary["counts"]) == 10
+    assert summary["downsampled"] is False
+
+
+def test_plugin_emittance_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _StubEmittance:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            return [1.0, 2.0, 3.0], [0.0, 1.0, 2.0], [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubEmittance)
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "e_emittance_all.dat").write_text("x\n", encoding="utf-8")
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="emittance", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    summary = payload["result"]
+    assert summary["total_emit_mrad"] == pytest.approx(6.0)
+    assert summary["max_emit_mrad"] == pytest.approx(3.0)
+    assert summary["max_y_slice_m"] == pytest.approx(2.0)
+
+
+def test_bound_plugin_strides_to_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "MAX_RESULT_BYTES", 512)
+    summary = {
+        "bins_kev": [float(i) for i in range(1000)],
+        "counts": [float(i) for i in range(1000)],
+        "total": 1.0,
+        "iteration": 0,
+        "downsampled": False,
+    }
+    bounded = results._bound_plugin(summary)
+    assert bounded is not None
+    assert bounded["downsampled"] is True
+    assert len(bounded["bins_kev"]) < 1000
+    assert results._escaped_size(bounded) <= 512
+
+
+def test_result_params_rejects_extra_fields() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="bogus"):
+        ResultParams.model_validate({"sim_id": SIM_ID, "op": "plugin", "reader": "energy_histogram", "bogus": 1})
+
+
+def test_real_energy_histogram_reader_end_to_end(tmp_path: Path) -> None:
+    """The real ``EnergyHistogramData`` runs through the tool path.
+
+    Run with a PIConGPU venv (see the module docstring); skipped in the default
+    suite where picongpu is absent.
+    """
+    pytest.importorskip("picongpu")
+    run = _tree(tmp_path)
+    payload = results.resolve_result(_params(species="e", iteration=50), run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 50
+    assert summary["count_in_window"]["count"] == pytest.approx(44.0)
+    assert summary["total"] == pytest.approx(44.0)
+    assert summary["bins_kev"][-1] == pytest.approx(1000.0)
