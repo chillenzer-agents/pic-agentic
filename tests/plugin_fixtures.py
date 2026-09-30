@@ -2,22 +2,47 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Reproducible fixtures for the PIConGPU text-plugin readers.
+"""Reproducible fixtures for the PIConGPU plugin readers.
 
-The energy-histogram header format is chosen to round-trip through the shipped
-``picongpu.extra.plugins.data.EnergyHistogramData`` reader: the reader splits
-the header on single spaces and needs the ``>`` marker and ``count`` word to be
-*two* space-separated tokens, so the C++ writer's literal ``">"`` is emitted
-with a space before it.  The counts line therefore has ``num_bins + 2`` values
-(underflow, the real bins, overflow) plus the sum, matching ``realNumBins``.
+The text fixtures are chosen to round-trip through the shipped
+``picongpu.extra.plugins.data`` readers: the energy-histogram header splits on
+single spaces and needs the ``>`` marker and ``count`` word to be *two*
+space-separated tokens, so the C++ writer's literal ``">"`` is emitted with a
+space before it, and the counts line has ``num_bins + 2`` values (underflow, the
+real bins, overflow) plus the sum.
+
+The openPMD fixtures (:func:`phase_space_h5`, :func:`calorimeter_h5`,
+:func:`radiation_h5`) are written with the pinned ``openpmd_api`` and reproduce
+the *real* layout the shipped readers expect (record names, attributes and the
+``%T`` series pattern).  They are the closest possible integration: the
+``PhaseSpaceData``/``particleCalorimeter``/``RadiationData`` classes open the
+generated series and return arrays through the engine, exactly as on a cluster -
+only the producing C++ binary is replaced by the Python API.
 """
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 #: Default time step the synthetic ``simOutput/output`` records.
 DEFAULT_DT_SI = 1.39e-16
+
+
+def _openpmd() -> object:
+    """Import the optional ``openpmd_api``, skipping the test when absent.
+
+    Returns:
+        The ``openpmd_api`` module.
+
+    """
+    import pytest
+
+    if importlib.util.find_spec("openpmd_api") is None:
+        pytest.skip("openpmd_api not installed")
+    import openpmd_api
+
+    return openpmd_api
 
 
 def write_output_unit(run_dir: Path, dt_si: float = DEFAULT_DT_SI) -> Path:
@@ -163,3 +188,189 @@ def transrad_dat(
     path = sim_output / f"{species}_transRad_{iteration}.dat"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def phase_space_h5(
+    run_dir: Path,
+    *,
+    species: str = "e",
+    species_filter: str = "all",
+    ps: str = "ypy",
+    iterations: tuple[int, ...] = (0, 50, 100),
+    shape: tuple[int, int] = (4, 3),
+) -> Path:
+    """Write a ``PhaseSpace_<species>_<filter>_<ps>_<iteration>.h5`` series.
+
+    Reproduces the real layout the shipped ``PhaseSpaceData`` reads: a scalar
+    mesh named ``<species>_<filter>_<ps>`` carrying the ``dV``/``dr_unit``/
+    ``sim_unit``/``p_unit``/``p_min``/``p_max``/``movingWindowOffset``/
+    ``movingWindowSize``/``_global_start``/``dr`` attributes.  Each iteration
+    adds ``iteration`` to a fixed ramp so a reader can tell steps apart.
+
+    Returns:
+        The openPMD pattern path (with ``%T``).
+
+    """
+    np = _numpy()
+    opmd = _openpmd()
+    out = Path(run_dir) / "simOutput" / "phaseSpace"
+    out.mkdir(parents=True, exist_ok=True)
+    pattern = out / f"PhaseSpace_{species}_{species_filter}_{ps}_%T.h5"
+    series = opmd.Series(str(pattern), opmd.Access.create)
+    for step in iterations:
+        record = series.iterations[step].meshes[f"{species}_{species_filter}_{ps}"][opmd.Mesh_Record_Component.SCALAR]
+        data = np.arange(shape[0] * shape[1], dtype=np.float64).reshape(shape) + step
+        record.reset_dataset(opmd.Dataset(data.dtype, data.shape))
+        record.store_chunk(data)
+        record.unit_SI = 1.0
+        for name, value in {
+            "dV": 1e-18,
+            "dr_unit": 1.0,
+            "sim_unit": 1.0,
+            "p_unit": 1.0,
+            "p_min": -1.0,
+            "p_max": 1.0,
+            "movingWindowOffset": 0,
+            "movingWindowSize": shape[0],
+            "_global_start": np.array([0, 0, 0], dtype=np.uint64),
+            "dr": 1e-6,
+        }.items():
+            record.set_attribute(name, value)
+    series.flush()
+    series.close()
+    return pattern
+
+
+def calorimeter_h5(
+    run_dir: Path,
+    *,
+    species: str = "e",
+    species_filter: str = "all",
+    iterations: tuple[int, ...] = (0, 50, 100),
+    shape: tuple[int, int, int] = (2, 3, 4),
+) -> Path:
+    """Write a ``<species>_calorimeter_<filter>_<iteration>.h5`` series.
+
+    Reproduces the shipped ``particleCalorimeter`` layout: a scalar ``calorimeter``
+    mesh of shape ``(N_energy, N_pitch, N_yaw)`` with the yaw/pitch/energy
+    metadata attributes.
+
+    Returns:
+        The openPMD pattern path (with ``%T``).
+
+    """
+    np = _numpy()
+    opmd = _openpmd()
+    out = Path(run_dir) / "simOutput" / "e_calorimeter"
+    out.mkdir(parents=True, exist_ok=True)
+    pattern = out / f"{species}_calorimeter_{species_filter}_%T.h5"
+    series = opmd.Series(str(pattern), opmd.Access.create)
+    for step in iterations:
+        record = series.iterations[step].meshes["calorimeter"][opmd.Mesh_Record_Component.SCALAR]
+        data = np.arange(shape[0] * shape[1] * shape[2], dtype=np.float64).reshape(shape) + step
+        record.reset_dataset(opmd.Dataset(data.dtype, data.shape))
+        record.store_chunk(data)
+        record.unit_SI = 1.0
+        for name, value in {
+            "maxYaw[deg]": 30.0,
+            "maxPitch[deg]": 40.0,
+            "posYaw[deg]": 0.0,
+            "posPitch[deg]": 0.0,
+            "minEnergy[keV]": 10.0,
+            "maxEnergy[keV]": 1000.0,
+            "logScale": False,
+        }.items():
+            record.set_attribute(name, value)
+    series.flush()
+    series.close()
+    return pattern
+
+
+def radiation_h5(
+    run_dir: Path,
+    *,
+    species: str = "e",
+    iterations: tuple[int, ...] = (0, 50, 100),
+    n_directions: int = 2,
+    n_frequencies: int = 5,
+) -> Path:
+    """Write a ``<species>_radAmplitudes_<iteration>_0_0_0.h5`` series.
+
+    Reproduces the shipped ``RadiationData`` layout: an ``Amplitude`` record with
+    six components ``{x,y,z}_{Re,Im}`` of shape ``(n_dir, n_freq, 1)`` and a
+    ``DetectorFrequency/omega`` record.
+
+    Returns:
+        The openPMD pattern path (with ``%T``).
+
+    """
+    np = _numpy()
+    opmd = _openpmd()
+    out = Path(run_dir) / "simOutput" / "radiationOpenPMD"
+    out.mkdir(parents=True, exist_ok=True)
+    pattern = out / f"{species}_radAmplitudes_%T_0_0_0.h5"
+    series = opmd.Series(str(pattern), opmd.Access.create)
+    for step in iterations:
+        iteration = series.iterations[step]
+        amplitude = iteration.meshes["Amplitude"]
+        for index, component in enumerate(("x", "y", "z")):
+            for part in ("Re", "Im"):
+                record = amplitude[f"{component}_{part}"]
+                data = np.full((n_directions, n_frequencies, 1), float(index + 1), dtype=np.float64)
+                record.reset_dataset(opmd.Dataset(data.dtype, data.shape))
+                record.store_chunk(data)
+                record.unit_SI = 1.0
+        omega = iteration.meshes["DetectorFrequency"]["omega"]
+        values = np.array([1e14 * (i + 1) for i in range(n_frequencies)], dtype=np.float64).reshape(1, n_frequencies, 1)
+        omega.reset_dataset(opmd.Dataset(values.dtype, values.shape))
+        omega.store_chunk(values)
+        omega.unit_SI = 1.0
+    series.flush()
+    series.close()
+    return pattern
+
+
+def png_file(
+    run_dir: Path,
+    *,
+    species: str = "e",
+    axis: str = "yx",
+    slice_point: float = 0.5,
+    iteration: int = 0,
+    height: int = 8,
+    width: int = 12,
+) -> Path:
+    """Write one ``<species>_png_<axis>_<slice_point>_<iteration>.png`` image.
+
+    The PNG plugin names its output directory ``png<SpeciesLongName><AXIS>``;
+    only the ``e``→``Electrons`` mapping is shipped.
+
+    Returns:
+        The written image's path.
+
+    """
+    import imageio
+
+    np = _numpy()
+    long_name = {"e": "Electrons"}.get(species, species)
+    out = Path(run_dir) / "simOutput" / f"png{long_name}{axis.upper()}"
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"{species}_png_{axis}_{slice_point}_{iteration:06d}.png"
+    imageio.imwrite(path, (np.arange(height * width * 3, dtype=np.uint8).reshape(height, width, 3) + iteration))
+    return path
+
+
+def _numpy() -> object:
+    """Import ``numpy`` (already required by the openPMD/PNG readers).
+
+    Returns:
+        The ``numpy`` module.
+
+    """
+    import pytest
+
+    if importlib.util.find_spec("numpy") is None:
+        pytest.skip("numpy not installed")
+    import numpy as np
+
+    return np
