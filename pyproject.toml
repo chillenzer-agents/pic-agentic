@@ -76,7 +76,9 @@ addopts = "-ra --strict-config --strict-markers"
 markers = [
   "integration: requires a local homeserver or SLURM (skipped when unavailable)",
 ]
-filterwarnings = ["error"]
+filterwarnings = [
+  "error",
+]
 
 [tool.ruff]
 line-length = 120
@@ -139,6 +141,9 @@ author = "Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf"
   "DOC201",
   "DOC501",
   "INP001",
+  # Reader stand-in fixtures must keep the exact (mixed-case) method names of
+  # the shipped PIConGPU classes.
+  "N802",
   "PLC0415",
   # Tests intentionally exercise private helpers (env allow-list, wire
   # normalisation, marker parsing) that have no public entry point.

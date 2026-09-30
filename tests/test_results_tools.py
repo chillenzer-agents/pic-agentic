@@ -116,6 +116,18 @@ def _ack_for(command: SimulationType, payload: dict[str, object], *, event_id: s
             data_encoding="float",
             n_points=3,
         ).sign(SECRET)
+    if op is ResultOp.IMAGE:
+        return build_result_ack(
+            sim=SIM,
+            seq=6,
+            cmd_id=cmd_id,
+            sim_id=sim_id,
+            op=op,
+            in_reply_to=event_id,
+            data="aGVsbG8=",
+            data_encoding="png",
+            n_points=1,
+        ).sign(SECRET)
     # READ: a small text tail (or a shaped reader error).
     return build_result_ack(
         sim=SIM,
@@ -200,13 +212,14 @@ async def test_tool_registration_shape() -> None:
         "checkpoint_and_stop_simulation",
         "describe_results",
         "get_result_slice",
+        "get_result_image",
         "read_result",
         "read_plugin_result",
         "export_results",
     }
     assert expected <= set(tools)
     # The frozen tool surface the LLM sees: one new tool must not go missing.
-    assert len(tools) == 33
+    assert len(tools) == 34
     for name in (
         "checkpoint_simulation",
         "stop_simulation",
@@ -223,7 +236,14 @@ async def test_tool_registration_shape() -> None:
     assert cancel is not None
     assert cancel.read_only_hint is False
     assert cancel.destructive_hint is True
-    for name in ("describe_results", "get_result_slice", "read_result", "read_plugin_result", "export_results"):
+    for name in (
+        "describe_results",
+        "get_result_slice",
+        "get_result_image",
+        "read_result",
+        "read_plugin_result",
+        "export_results",
+    ):
         annotations = tools[name].annotations
         assert annotations is not None
         assert annotations.read_only_hint is True
@@ -237,6 +257,13 @@ async def test_tool_registration_shape() -> None:
         "axis",
         "index",
         "downsample",
+    }
+    assert set(tools["get_result_image"].input_schema["properties"]) == {
+        "sim_id",
+        "record",
+        "path",
+        "component",
+        "iteration",
     }
     assert set(tools["read_result"].input_schema["properties"]) == {"sim_id", "path", "stream", "tail"}
     assert set(tools["read_plugin_result"].input_schema["properties"]) == {
@@ -306,6 +333,14 @@ async def test_result_tools_via_server() -> None:
         {"sim_id": SIM_ID, "record": "E", "iteration": "last"},
     )
     assert slice_payload["data"] == [1.0, 2.0, 3.0]
+
+    image_payload = await _call_tool(
+        Config(rcp_secret=SECRET),
+        "get_result_image",
+        {"sim_id": SIM_ID, "record": "E", "iteration": "last"},
+    )
+    assert image_payload["data"] == "aGVsbG8="
+    assert image_payload["data_encoding"] == "png"
 
     read = await _call_tool(Config(rcp_secret=SECRET), "read_result", {"sim_id": SIM_ID, "path": _REL_PATH})
     assert read["data"] == ["line-1", "line-2"]

@@ -73,7 +73,9 @@ def test_scan_output_is_sorted_and_total_bytes_matches(tmp_path) -> None:
     [
         ("fields.bp", "openpmd-adios2"),
         ("fields.h5", "openpmd-hdf5"),
-        ("fields.hdf5", "openpmd-hdf5"),
+        # The pinned openpmd_api 0.17.1 rejects ``.hdf5`` ("Unknown file
+        # format"); it is not advertised as an openPMD series suffix (M1).
+        ("fields.hdf5", "binary"),
         ("foo.txt", "text"),
         ("bar.csv", "text"),
         ("run.log", "text"),
@@ -266,7 +268,7 @@ class _FakeApi:
     def __init__(self, values: list[float]) -> None:
         self._dataset = _FakeDataset(values)
 
-    def Series(self, path: object, access: object) -> _FakeSeries:  # ruff: ignore[invalid-function-name]
+    def Series(self, path: object, access: object) -> _FakeSeries:
         _ = (path, access)
         return _FakeSeries({0: _FakeStep({}), 10: _FakeStep({"E": _FakeMesh({"x": self._dataset})})})
 
