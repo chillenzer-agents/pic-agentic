@@ -79,8 +79,8 @@ bash scripts/install-mcp.sh reset    # clear campaign/reuse state only
 It installs `pic-agentic[sim]` non-editably from a pinned 40-hex commit into a
 dedicated venv, writes the 0600 config, registers the server under the
 `pic-agentic` key in `~/.config/opencode/opencode.json`, and runs preflights
-(tool surface plus a room/secret rendezvous check). The environment topology it
-assumes:
+(tool surface, installed-revision/capability, plus a room/secret rendezvous
+check). The environment topology it assumes:
 
 - **The agent sees only the MCP tool surface.** The pic-agentic source, this
   README, `AGENTS.md`, `docs/beta-test-prompts.md`, the tests and the git
@@ -91,8 +91,14 @@ assumes:
   the MCP `environment` block — never in the workspace, logs, or tool output.
 - **The cluster-side simclient uses the same room, secret and pinned stack.**
   The preflight fails loudly when the configured secret verifies none of the
-  room's server-role messages, which is the signature of a stale/mismatched
-  secret.
+  room's RCP messages, which is the signature of a stale/mismatched secret. On
+  a fresh room with no traffic yet it only warns (there is nothing to verify
+  against), and it verifies either role's messages since both sign with the
+  same shared secret.
+- **A stale pin fails loudly.** The installer asserts the venv's installed
+  `pic-agentic` revision equals the pin and that its simclient carries the M3
+  result handling and non-blocking dispatch, both at install time and in
+  `--check`, so the old blocking control plane cannot be shipped silently.
 
 The end-to-end invariants and the beta acceptance checks are recorded in the
 beta-container handover; the installer's `--check` mode implements the

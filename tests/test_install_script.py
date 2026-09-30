@@ -86,3 +86,19 @@ def test_preflight_installed_is_wired_into_install_and_check() -> None:
     text = _script_text()
     assert "preflight_installed || die" in text, "install path does not assert the installed revision"
     assert "if preflight_installed; then" in text, "`--check` does not report the installed revision"
+
+
+def test_room_preflight_accepts_either_role_and_warns_on_empty_room() -> None:
+    text = _script_text()
+    # No server-role-only filter remains.
+    assert 'm.sender_role == "mcpserver"' not in text
+    assert "no RCP messages in the room yet" in text, "fresh-room warn path missing"
+    assert "m.verify(c.rcp_secret)" in text, "verification over all roles missing"
+
+
+def test_help_does_not_print_the_set_euo_pipefail_line() -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+    result = subprocess.run([bash, str(SCRIPT), "--help"], capture_output=True, text=True, check=True)
+    assert "set -euo pipefail" not in result.stdout
