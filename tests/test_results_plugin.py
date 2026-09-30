@@ -247,6 +247,37 @@ def test_real_energy_histogram_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["count_in_window"]["count"] == pytest.approx(44.0)
     assert summary["total"] == pytest.approx(44.0)
     assert summary["bins_kev"][-1] == pytest.approx(1000.0)
+    # The highest populated bin is 1000 keV even though the modal bin is 500.
+    assert summary["max_energy_kev"] == pytest.approx(1000.0)
+
+
+def test_max_energy_is_the_highest_populated_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``max_energy_kev`` is not the modal (argmax-count) edge (M2)."""
+
+    class _StubHistogram:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            bins = [100.0, 500.0, 1000.0]
+            counts = [0.0, 42.0, 2.0]
+            return counts, bins, [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubHistogram)
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "e_energyHistogram_all.dat").write_text("x\n", encoding="utf-8")
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_histogram", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    assert payload["result"]["max_energy_kev"] == pytest.approx(1000.0)
 
 
 def test_real_emittance_reader_end_to_end(tmp_path: Path) -> None:

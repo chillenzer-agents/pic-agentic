@@ -1179,7 +1179,10 @@ def _build_energy_histogram(instance: Any, species: str, species_filter: str, it
     bins = [float(value) for value in bins]
     low, high = _DEFAULT_WINDOW_KEV
     in_window = sum(count for bin_kev, count in zip(bins, counts, strict=True) if low <= bin_kev <= high)
-    peak = max(range(len(counts)), key=counts.__getitem__) if counts else 0
+    # ``max_energy_kev`` is the highest bin edge that actually holds particles,
+    # not the modal (argmax-count) edge: the high-energy tail is the number the
+    # caller is after.
+    populated = [bin_kev for bin_kev, count in zip(bins, counts, strict=True) if count > 0]
     strided_bins, downsampled = _stride(bins)
     strided_counts, _ = _stride(counts)
     return {
@@ -1187,7 +1190,7 @@ def _build_energy_histogram(instance: Any, species: str, species_filter: str, it
         "counts": strided_counts,
         "count_in_window": {"min_kev": low, "max_kev": high, "count": in_window},
         "total": sum(counts),
-        "max_energy_kev": bins[peak] if bins else None,
+        "max_energy_kev": max(populated) if populated else None,
         "iteration": iteration,
         "downsampled": downsampled,
     }
