@@ -85,6 +85,16 @@ DEFAULT_POLL_INTERVAL_S = 30.0
 #: Default cap for the watcher's backing-off poll interval (the plan's 5 min).
 DEFAULT_POLL_MAX_INTERVAL_S = 300.0
 
+#: Default number of build/run workflows a simclient executes concurrently.  One
+#: keeps the shared login node from being stampeded by simultaneous builds;
+#: override with ``PIC_AGENTIC_BUILD_CONCURRENCY``.  This is an explicit gate:
+#: without it the non-blocking control plane would start every build at once.
+DEFAULT_BUILD_CONCURRENCY = 1
+
+#: Environment variable naming the build concurrency (see
+#: :data:`DEFAULT_BUILD_CONCURRENCY`).
+BUILD_CONCURRENCY_ENV = "PIC_AGENTIC_BUILD_CONCURRENCY"
+
 #: Assume a log line is at most this long when sizing the tail read window; a
 #: longer line is still returned in full once the window is aligned to a
 #: newline, but may cover fewer than ``tail`` lines.
@@ -121,6 +131,27 @@ def derive_setup_dir(run_dir: Path | str) -> Path | None:
     if setup.parent != base:
         return None
     return setup
+
+
+def resolve_build_concurrency(raw: str | None = None) -> int:
+    """Resolve the build concurrency from an argument or the environment.
+
+    Args:
+        raw: Optional explicit value (the environment is read when omitted).
+
+    Returns:
+        The configured concurrency, clamped to at least one.
+
+    """
+    value = raw if raw is not None else os.environ.get(BUILD_CONCURRENCY_ENV)
+    if value is None or not str(value).strip():
+        return DEFAULT_BUILD_CONCURRENCY
+    try:
+        parsed = int(value)
+    except ValueError:
+        log.warning("ignoring invalid %s=%r; using %d", BUILD_CONCURRENCY_ENV, value, DEFAULT_BUILD_CONCURRENCY)
+        return DEFAULT_BUILD_CONCURRENCY
+    return max(1, parsed)
 
 
 class HelloResult(BaseModel):
@@ -185,6 +216,7 @@ class SimClient:
         allowed_sender_user_id: str | None = None,
         submit_config: SubmitConfig | None = None,
         control_fn: Callable[[SimulationOp, TrackedSim], Awaitable[str]] | None = None,
+        build_concurrency: int | None = None,
     ) -> None:
         """Create a simulation-side client.
 
@@ -203,6 +235,10 @@ class SimClient:
                 when omitted the M2 handler is disabled.
             control_fn: Optional M3 control translation ``(op, tracked) -> str``
                 returning SLURM's output; ``None`` disables the control handler.
+            build_concurrency: Maximum number of build/run workflows executed
+                concurrently; defaults to
+                :data:`DEFAULT_BUILD_CONCURRENCY` (1), overridable via
+                ``PIC_AGENTIC_BUILD_CONCURRENCY``.
 
         """
         self.sim = sim
@@ -225,6 +261,18 @@ class SimClient:
         #: Every live watcher task, including a superseded one still winding
         #: down, so shutdown reaps orphans the dict slot no longer points at.
         self._follow_tasks_all: set[asyncio.Task[None]] = set()
+        #: Explicit gate on concurrent build/run workflows (see
+        #: :data:`DEFAULT_BUILD_CONCURRENCY`); acquired in :meth:`_run_submit`.
+        self.build_concurrency = resolve_build_concurrency(
+            str(build_concurrency) if build_concurrency is not None else None,
+        )
+        self._build_semaphore = asyncio.Semaphore(self.build_concurrency)
+        #: Background tasks running a whole build+workflow+follow for one
+        #: submission, keyed by ``cmd_id``; reaped on shutdown.
+        self._submit_tasks: dict[str, asyncio.Task[None]] = {}
+        #: Every background control-plane task (submissions and per-message
+        #: dispatches), so shutdown can reap them all.
+        self._background_tasks: set[asyncio.Task[None]] = set()
         #: Detached watchers are started only while :meth:`serve` owns the event
         #: loop, so a direct ``handle`` call in a test does not leave a task
         #: (and its subprocesses) running past the test.
@@ -698,6 +746,8 @@ class SimClient:
 
         sim_id = prepared.payload.sim_id
         # First ack: accepted (coarse; per-stage acks wait for upstream #55).
+        # Emitted on the receive path so a multi-minute build never delays the
+        # control plane; the build itself runs as a background task below.
         accepted = self._build_submit_ack(
             message,
             cmd_id=cmd_id,
@@ -706,6 +756,90 @@ class SimClient:
             job_id=None,
         )
         await self.transport.send(accepted)
+        # While serving, the build runs in a background task so the receive loop
+        # keeps answering other commands.  A direct ``handle`` call (a unit
+        # test, not owning an event loop) runs it inline, preserving the
+        # pre-existing synchronous contract and leaving no task behind.
+        if self._serving:
+            self._start_submit_task(
+                cmd_id=cmd_id,
+                prepared=prepared,
+                payload_hash=payload_hash,
+                declared_sim_id=sim_id,
+            )
+        else:
+            await self._run_submit(
+                cmd_id=cmd_id,
+                prepared=prepared,
+                payload_hash=payload_hash,
+                declared_sim_id=sim_id,
+            )
+        return accepted
+
+    def _start_submit_task(
+        self,
+        *,
+        cmd_id: str,
+        prepared: PreparedSubmit,
+        payload_hash: str,
+        declared_sim_id: str,
+    ) -> None:
+        """Run one accepted submission's build/workflow/follow in the background.
+
+        The task is tracked (``cmd_id`` for the submission slot, plus the shared
+        background set) so :meth:`_cancel_submit_tasks` can reap it on shutdown.
+        """
+        task = asyncio.create_task(
+            self._run_submit(
+                cmd_id=cmd_id,
+                prepared=prepared,
+                payload_hash=payload_hash,
+                declared_sim_id=declared_sim_id,
+            ),
+        )
+        self._submit_tasks[cmd_id] = task
+        self._background_tasks.add(task)
+
+        def _reap(finished: asyncio.Task[None]) -> None:
+            self._background_tasks.discard(finished)
+            if self._submit_tasks.get(cmd_id) is finished:
+                del self._submit_tasks[cmd_id]
+
+        task.add_done_callback(_reap)
+
+    async def _run_submit(
+        self,
+        *,
+        cmd_id: str,
+        prepared: PreparedSubmit,
+        payload_hash: str,
+        declared_sim_id: str,
+    ) -> None:
+        """Execute one accepted submission and report its outcome.
+
+        Runs in a background task: acquires the explicit build gate, then drives
+        ``execute_submit`` to completion and starts the follow watcher.  A
+        failure is reported as a ``failed`` event and recorded; the accepted ack
+        was already sent by :meth:`_handle_submit`.
+        """
+        async with self._build_semaphore:
+            await self._execute_accepted_submit(
+                cmd_id=cmd_id,
+                prepared=prepared,
+                payload_hash=payload_hash,
+                declared_sim_id=declared_sim_id,
+            )
+
+    async def _execute_accepted_submit(
+        self,
+        *,
+        cmd_id: str,
+        prepared: PreparedSubmit,
+        payload_hash: str,
+        declared_sim_id: str,
+    ) -> None:
+        """Build, run and follow one already-accepted submission."""
+        sim_id = declared_sim_id
 
         async def emit(state: SimulationState, *, job_id: int | None = None, **fields: object) -> None:
             event = self._build_submit_event(
@@ -742,7 +876,7 @@ class SimClient:
                         error_code=exc.code,
                     )
                 )
-            return accepted
+            return
         if cmd_id:
             self._persist_processed(
                 ProcessedCommand(
@@ -762,7 +896,6 @@ class SimClient:
             stdout_path=result.get("stdout_path"),
             submit_system=prepared.params.submit_system,
         )
-        return accepted
 
     async def _start_follower(
         self,
@@ -841,6 +974,23 @@ class SimClient:
                 await follower_task
         self._follow_tasks.clear()
         self._follow_tasks_all.clear()
+
+    async def _cancel_submit_tasks(self) -> None:
+        """Stop and await every background submission task (idempotent).
+
+        A task still waiting on the build gate, or mid-build, is cancelled;
+        a partial build directory is left for the operator (the durable record
+        already marks the command incomplete).  Best-effort, like the follower
+        reaping.
+        """
+        tasks = set(self._submit_tasks.values()) | set(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._submit_tasks.clear()
+        self._background_tasks.clear()
 
     @staticmethod
     def _state_for_info(info: JobInfo, run_dir: str) -> str:
@@ -1553,22 +1703,41 @@ class SimClient:
         outdir.mkdir(parents=True, exist_ok=True)
         return outdir / f"hello-{cmd_id}.out"
 
+    async def _dispatch_message(self, message: RcpMessage) -> None:
+        """Validate, handle and reap one inbound message.
+
+        Runs as a background task so a slow build cannot stall the receive loop;
+        a handler failure is logged, never propagated (the loop lives on).
+
+        Raises:
+            asyncio.CancelledError: If the task is cancelled at shutdown.
+
+        """
+        try:
+            await self.handle(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("error handling inbound RCP message")
+
+    def _track_dispatched(self, task: asyncio.Task[None]) -> None:
+        """Keep a dispatched handler task alive until it finishes."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     async def serve(self) -> None:
         """Consume inbound messages until the transport closes.
 
-        Raises:
-            asyncio.CancelledError: If the serving task is cancelled.
-
+        Each message is dispatched as a background task, so the receive loop
+        never awaits a build: ``hello``/``status``/``logs``/``result``/control
+        keep flowing while a submission is in flight.  On exit every dispatched
+        task, submission and follow watcher is cancelled and awaited.
         """
         self._serving = True
         try:
             async for message in self.transport.receive():
-                try:
-                    await self.handle(message)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception("error handling inbound RCP message")
+                self._track_dispatched(asyncio.create_task(self._dispatch_message(message)))
         finally:
             self._serving = False
+            await self._cancel_submit_tasks()
             await self._cancel_followers()
