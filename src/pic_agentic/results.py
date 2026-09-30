@@ -1039,7 +1039,9 @@ def _plugin_species_matches(name: str, params: ResultParams) -> bool:
     """
     if params.species is not None and not name.startswith(f"{params.species}_"):
         return False
-    return not (params.species_filter != "all" and not name.endswith(f"_{params.species_filter}.dat"))
+    # An unset filter means PIConGPU's default "all"; only an explicit
+    # non-default filter narrows the match.
+    return not (params.species_filter not in {None, "all"} and not name.endswith(f"_{params.species_filter}.dat"))
 
 
 def _derive_plugin_names(reader: str, name: str) -> tuple[str, str, int | None]:

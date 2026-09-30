@@ -1022,7 +1022,7 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
         reader: str,
         *,
         species: str | None = None,
-        species_filter: str = "all",
+        species_filter: str | None = None,
         iteration: int | str | None = None,
         path: str | None = None,
     ) -> dict[str, Any]:

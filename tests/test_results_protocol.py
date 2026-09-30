@@ -92,12 +92,26 @@ def test_result_params_rejects_unsafe_species(name: str) -> None:
 
 def test_result_params_plugin_defaults_and_round_trip() -> None:
     params = ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="energy_histogram", species="e")
-    assert params.species_filter == "all"
+    # Unset means "unspecified" and is normalized by the reader path; it must
+    # not be serialized for every result op (N1).
+    assert params.species_filter is None
     assert params.iteration is None
     command = build_result_command(sim=SIM, seq=1, params=params, cmd_id=CMD_ID)
     assert command.payload["reader"] == "energy_histogram"
     assert command.payload["species"] == "e"
-    assert command.payload["species_filter"] == "all"
+    assert "species_filter" not in command.payload
+
+
+def test_result_params_explicit_species_filter_is_forwarded() -> None:
+    params = ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="emittance", species="e", species_filter="openPMD")
+    command = build_result_command(sim=SIM, seq=1, params=params, cmd_id=CMD_ID)
+    assert command.payload["species_filter"] == "openPMD"
+
+
+def test_result_params_non_plugin_ops_omit_species_filter() -> None:
+    for op in (ResultOp.DESCRIBE, ResultOp.READ, ResultOp.EXPORT):
+        command = build_result_command(sim=SIM, seq=1, params=ResultParams(sim_id=SIM, op=op), cmd_id=CMD_ID)
+        assert "species_filter" not in command.payload
 
 
 def test_result_params_forbids_extra_fields() -> None:
