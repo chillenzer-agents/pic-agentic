@@ -494,6 +494,12 @@ class _ThreadBufferHandler(logging.Handler):
     workflow lands in that run's buffer, while a record from any other thread
     is dropped here (it still reaches the real stderr via cwltool's own
     ``defaultStreamHandler``), so concurrent runs stay isolated.
+
+    This routing (and :meth:`_CapturingStderr.fileno`) assumes cwltool's
+    default ``SingleJobExecutor``, which runs each step in the calling thread.
+    A ``MultithreadedJobExecutor`` (or cwltool spawning its own worker threads)
+    would resolve the wrong thread's buffer/fd and cross-attribute stderr; the
+    pinned ``pypicongpu.Runner`` does not configure one.
     """
 
     def __init__(self) -> None:
