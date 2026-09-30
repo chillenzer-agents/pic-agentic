@@ -95,6 +95,17 @@ DEFAULT_BUILD_CONCURRENCY = 1
 #: :data:`DEFAULT_BUILD_CONCURRENCY`).
 BUILD_CONCURRENCY_ENV = "PIC_AGENTIC_BUILD_CONCURRENCY"
 
+#: Default grace period (seconds) :meth:`SimClient.serve` grants an in-flight
+#: build to drain on shutdown before it logs and returns.  A build runs in
+#: ``asyncio.to_thread`` and cannot be cancelled mid-compile, so shutdown waits
+#: for it rather than abandoning the worker thread; override with
+#: ``PIC_AGENTIC_SHUTDOWN_GRACE_S`` (``0`` = do not wait at all).
+DEFAULT_SHUTDOWN_GRACE_S = 120.0
+
+#: Environment variable naming the shutdown build-drain grace (see
+#: :data:`DEFAULT_SHUTDOWN_GRACE_S`).
+SHUTDOWN_GRACE_ENV = "PIC_AGENTIC_SHUTDOWN_GRACE_S"
+
 #: Assume a log line is at most this long when sizing the tail read window; a
 #: longer line is still returned in full once the window is aligned to a
 #: newline, but may cover fewer than ``tail`` lines.
@@ -152,6 +163,27 @@ def resolve_build_concurrency(raw: str | None = None) -> int:
         log.warning("ignoring invalid %s=%r; using %d", BUILD_CONCURRENCY_ENV, value, DEFAULT_BUILD_CONCURRENCY)
         return DEFAULT_BUILD_CONCURRENCY
     return max(1, parsed)
+
+
+def resolve_shutdown_grace(raw: str | None = None) -> float:
+    """Resolve the shutdown build-drain grace from an argument or the environment.
+
+    Args:
+        raw: Optional explicit value (the environment is read when omitted).
+
+    Returns:
+        The grace period in seconds, clamped to non-negative.
+
+    """
+    value = raw if raw is not None else os.environ.get(SHUTDOWN_GRACE_ENV)
+    if value is None or not str(value).strip():
+        return DEFAULT_SHUTDOWN_GRACE_S
+    try:
+        parsed = float(value)
+    except ValueError:
+        log.warning("ignoring invalid %s=%r; using %.0fs", SHUTDOWN_GRACE_ENV, value, DEFAULT_SHUTDOWN_GRACE_S)
+        return DEFAULT_SHUTDOWN_GRACE_S
+    return max(0.0, parsed)
 
 
 class HelloResult(BaseModel):
@@ -217,6 +249,7 @@ class SimClient:
         submit_config: SubmitConfig | None = None,
         control_fn: Callable[[SimulationOp, TrackedSim], Awaitable[str]] | None = None,
         build_concurrency: int | None = None,
+        shutdown_grace_s: float | None = None,
     ) -> None:
         """Create a simulation-side client.
 
@@ -239,6 +272,10 @@ class SimClient:
                 concurrently; defaults to
                 :data:`DEFAULT_BUILD_CONCURRENCY` (1), overridable via
                 ``PIC_AGENTIC_BUILD_CONCURRENCY``.
+            shutdown_grace_s: Seconds :meth:`serve` waits for an in-flight
+                build to drain on shutdown; defaults to
+                :data:`DEFAULT_SHUTDOWN_GRACE_S`, overridable via
+                ``PIC_AGENTIC_SHUTDOWN_GRACE_S``.
 
         """
         self.sim = sim
@@ -267,6 +304,11 @@ class SimClient:
             str(build_concurrency) if build_concurrency is not None else None,
         )
         self._build_semaphore = asyncio.Semaphore(self.build_concurrency)
+        #: Grace period for draining an in-flight build on shutdown (a build in
+        #: ``asyncio.to_thread`` cannot be cancelled mid-compile).
+        self.shutdown_grace_s = resolve_shutdown_grace(
+            str(shutdown_grace_s) if shutdown_grace_s is not None else None,
+        )
         #: Background tasks running a whole build+workflow+follow for one
         #: submission, keyed by ``cmd_id``; reaped on shutdown.
         self._submit_tasks: dict[str, asyncio.Task[None]] = {}
@@ -980,19 +1022,48 @@ class SimClient:
         self._follow_tasks_all.clear()
 
     async def _cancel_submit_tasks(self) -> None:
-        """Stop and await every background submission task (idempotent).
+        """Drain/cancel background submission tasks on shutdown (idempotent).
 
-        A task still waiting on the build gate, or mid-build, is cancelled;
-        a partial build directory is left for the operator (the durable record
-        already marks the command incomplete).  Best-effort, like the follower
-        reaping.
+        A build executes in ``asyncio.to_thread`` and cannot be cancelled
+        mid-compile, so cancelling the awaiting coroutine would leave the
+        worker thread (and the CWL subprocesses it owns) running while
+        :meth:`serve` returned; the interpreter then blocks at exit joining
+        the non-daemon thread.  Shutdown therefore *waits* for the in-flight
+        build/run coroutines to finish, bounded by ``shutdown_grace_s``
+        (:data:`DEFAULT_SHUTDOWN_GRACE_S`), and cancels them -- best-effort,
+        the thread still runs -- only if the grace expires.  A partial build
+        directory is left for the operator either way.
+
+        Non-submission control-plane tasks (message dispatches) own no build
+        thread and are cancelled immediately.
         """
-        tasks = set(self._submit_tasks.values()) | set(self._background_tasks)
-        for task in tasks:
+        submits = {task for task in self._submit_tasks.values() if not task.done()}
+        others = {task for task in self._background_tasks if task not in submits and not task.done()}
+        for task in others:
             task.cancel()
-        for task in tasks:
+        for task in others:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        if submits:
+            _done, pending = await asyncio.wait(submits, timeout=self.shutdown_grace_s)
+            if pending:
+                log.warning(
+                    "shutdown grace (%.1fs) expired with %d build(s) still running; "
+                    "cancelling the coroutines (the worker threads finish in the background)",
+                    self.shutdown_grace_s,
+                    len(pending),
+                )
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            # A submission normally reports its own failures as events; any
+            # exception that reaches the task itself is a bug and must not
+            # vanish with the task.
+            for task in submits:
+                if not task.cancelled() and (error := task.exception()) is not None:
+                    log.error("error in an in-flight submit during shutdown", exc_info=error)
         self._submit_tasks.clear()
         self._background_tasks.clear()
 
@@ -1734,8 +1805,17 @@ class SimClient:
 
         Each message is dispatched as a background task, so the receive loop
         never awaits a build: ``hello``/``status``/``logs``/``result``/control
-        keep flowing while a submission is in flight.  On exit every dispatched
-        task, submission and follow watcher is cancelled and awaited.
+        keep flowing while a submission is in flight.
+
+        On exit, ``serve`` grants an in-flight build a bounded grace period to
+        finish (``shutdown_grace_s``) before it logs and returns; a build runs
+        in a thread and cannot be cancelled mid-compile, so draining it is the
+        only way to guarantee the process does not return from ``serve`` with a
+        build still writing.  Control dispatch tasks and follow watchers are
+        cancelled and awaited immediately.  If the grace expires, the
+        submission coroutines are cancelled and a warning is logged; the worker
+        threads still running are a best-effort, non-blocking exit (the
+        operator sees the warning).
         """
         self._serving = True
         try:
