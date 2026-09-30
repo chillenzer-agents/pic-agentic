@@ -73,7 +73,7 @@ case "${1:-install}" in
   --check | check) MODE="check" ;;
   reset) MODE="reset" ;;
   -h | --help | help)
-    sed -n '2,40p' "$0"
+    sed -n '2,29p' "$0"
     exit 0
     ;;
   *)
@@ -266,7 +266,7 @@ from pic_agentic.transport.matrix import MatrixTransport
 timeout = float(sys.argv[1])
 BAD_SECRET = (
     "secret does not match the room; re-mint with `fresh` or update the secret "
-    "(the configured rcp_secret verifies none of the room's server-role messages)"
+    "(the configured rcp_secret verifies none of the room's RCP messages)"
 )
 
 
@@ -287,17 +287,26 @@ async def main() -> int:
         sys.exit(f"room preflight timed out after {timeout:.0f}s (homeserver unreachable?)")
     finally:
         await transport.close()
-    server_msgs = [m for m in messages if m.sender_role == "mcpserver"]
-    if not server_msgs:
-        print(BAD_SECRET, file=sys.stderr)
-        print(f"(no server-role messages in the room; {len(messages)} messages seen)", file=sys.stderr)
-        return 1
-    verified = sum(1 for m in server_msgs if m.verify(c.rcp_secret))
+    if not messages:
+        # A fresh host: the server has not run yet and the cluster may not have
+        # posted either.  This is NOT a bad secret; warn and pass so a correct
+        # first install is not aborted.
+        print(
+            "WARN - no RCP messages in the room yet; secret consistency is unverified "
+            "(re-run --check after the first exchange)",
+        )
+        return 0
+    # Both roles sign with the same shared secret, so whichever role has posted
+    # is valid evidence.  A fresh host has only simclient-role messages (the
+    # cluster side), never server-role ones, so verifying server-only was a
+    # false negative.
+    verified = sum(1 for m in messages if m.verify(c.rcp_secret))
     if verified == 0:
         print(BAD_SECRET, file=sys.stderr)
-        print(f"(0 of {len(server_msgs)} server-role messages verified)", file=sys.stderr)
+        print(f"(0 of {len(messages)} RCP messages verified)", file=sys.stderr)
         return 1
-    print(f"OK - {verified}/{len(server_msgs)} server-role messages verify under the configured secret")
+    roles = sorted({m.sender_role.value for m in messages if m.verify(c.rcp_secret)})
+    print(f"OK - {verified}/{len(messages)} RCP messages verify under the configured secret (roles: {', '.join(roles)})")
     return 0
 
 
@@ -332,7 +341,8 @@ if env.get("PIC_AGENTIC_SIM") != "cluster":
     problems.append("PIC_AGENTIC_SIM != cluster")
 if env.get("PIC_AGENTIC_CONFIG") != config:
     problems.append("PIC_AGENTIC_CONFIG does not match")
-if not isinstance(entry.get("timeout"), int) or entry["timeout"] <= 0:
+timeout = entry.get("timeout")
+if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
     problems.append("timeout missing/invalid")
 if problems:
     sys.exit("; ".join(problems))
@@ -406,7 +416,7 @@ log "settings: room=$ROOM_ID sim=$SIM"
 log "          pin=$PIC_AGENTIC_PIN"
 log "          venv=$VENV"
 log "          config=$CONFIG"
-log "          secret_len=${#RCP_SECRET} msgdir=$MESSAGE_DIR"
+log "          msgdir=$MESSAGE_DIR"
 
 ensure_dir "$(dirname "$CONFIG")"
 ensure_dir "$(dirname "$OPENCODE_JSON")"
