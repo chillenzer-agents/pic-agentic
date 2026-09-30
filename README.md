@@ -265,6 +265,43 @@ table is also read, with the environment taking precedence):
 | `PIC_AGENTIC_CLUSTER_TEMPLATE_DIR` | Cluster-local picongpu template directory |
 | `PIC_AGENTIC_CLUSTER_PRESET` | Cluster-local CMake preset name |
 
+## Results tools
+
+The MCP server exposes a read-only results surface over a run's linked
+`simOutput`:
+
+| Tool | Purpose |
+|------|---------|
+| `describe_results` | scandir-only manifest (path, format, size) |
+| `get_result_slice` | bounded 1D slice of one openPMD record/component |
+| `get_result_image` | bounded base64 PNG thumbnail of one openPMD record |
+| `read_result` | a small text tail (file, or captured stdout/stderr) |
+| `read_plugin_result` | a bounded summary from a shipped PIConGPU plugin reader |
+| `export_results` | a transfer ticket (the bulk data never moves itself) |
+
+`describe_results` labels each file with a `format`: `openpmd-adios2` /
+`openpmd-hdf5` for openPMD series, `text` / `dir` / `binary`, or a **plugin
+reader name** when the filename matches one. The plugin match is a filename-only
+heuristic; the reader re-validates the file and returns a clean `no_results` on
+a mismatch.
+
+`read_plugin_result` runs one registered reader on the cluster (in-process, over
+the same 48 KiB wire budget as the other results) and returns a bounded summary:
+
+| Reader | Output | Summary |
+|--------|--------|---------|
+| `energy_histogram` | `*_energyHistogram_*.dat` | bins/counts (keV), window count, `max_energy_kev` |
+| `emittance` | `*_emittance_*.dat` | slice positions/emittances, total, peak |
+| `transition_radiation` | `*_transRad_<iter>.dat` | omega/intensity spectrum, peak |
+| `phase_space` | `PhaseSpace_<sp>_<filter>_<ps>_<iter>.h5` | axis ranges, projected marginals, peak bin |
+| `radiation` | `*_radAmplitudes_<iter>_0_0_0.h5` | direction-summed spectrum, peak |
+| `calorimeter` | `*_calorimeter_<filter>_<iter>.h5` | yaw/pitch marginals, energy edges |
+| `png` | `*_png_<axis>_<slice>_<iter>.png` | metadata only (dimensions, path); image via `export` |
+
+`iteration` defaults to `last`. A missing PIConGPU (or, for the openPMD/image
+readers, `openpmd_api`/`imageio`) degrades that reader to `reader_unavailable`;
+readers degrade independently, so `png` still works without `openpmd_api`.
+
 ## Tests and tooling
 
 ```bash
