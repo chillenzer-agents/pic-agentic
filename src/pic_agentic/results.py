@@ -26,6 +26,7 @@ import dataclasses
 import importlib.util
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -131,6 +132,15 @@ class ResultsUnavailable(RuntimeError):  # ruff: ignore[error-suffix-on-exceptio
 
 class ResultsReaderError(RuntimeError):
     """Raised when the optional reader is present but cannot serve a request."""
+
+
+log = logging.getLogger(__name__)
+
+#: Exceptions a text-plugin reader can raise on a malformed-but-parseable file
+#: that should degrade to a clean ``no_results`` rather than escape as a generic
+#: ``result_failed``.  ``TypeError``/``AttributeError`` cover e.g. ``None``
+#: column labels from a corrupted file.
+_PLUGIN_SOFT_ERRORS = (ResultsReaderError, KeyError, OSError, ValueError, IndexError, TypeError, AttributeError)
 
 
 def _reader_name() -> str | None:
@@ -1327,7 +1337,8 @@ def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean 
         summary = _plugin_result(reader, spec, output, params, target)
     except ResultsUnavailable as exc:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
-    except (ResultsReaderError, KeyError, OSError, ValueError, IndexError) as exc:
+    except _PLUGIN_SOFT_ERRORS as exc:
+        log.debug("plugin reader %r failed: %s", reader, exc)
         return _error(SimulationErrorCode.NO_RESULTS, str(exc))
     bounded = _bound_plugin(summary)
     if bounded is None:
