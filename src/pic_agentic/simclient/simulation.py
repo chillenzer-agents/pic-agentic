@@ -503,7 +503,7 @@ def _install_capture_context() -> None:
         if _CAPTURE_PROXY is not None:
             return
         try:
-            from picongpu.pypicongpu import runner as runner_module  # ruff: ignore[import-outside-top-level] - optional dependency
+            from picongpu.pypicongpu import runner as runner_module  # ruff: ignore[import-outside-top-level]
         except ImportError:
             return
         proxy = _CapturingStderr(sys.stderr)
