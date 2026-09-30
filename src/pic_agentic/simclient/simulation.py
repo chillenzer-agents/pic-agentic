@@ -13,9 +13,11 @@ local configuration, never from the payload.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -338,33 +340,62 @@ _ERROR_LINE_RE = re.compile(
 )
 
 
-#: Per-thread scratch buffer for :class:`_CapturingStderr`; set for the
-#: duration of one workflow run so concurrent runs never share a buffer.
+#: Per-thread capture scratch for :class:`_CapturingStderr`; set for the
+#: duration of one workflow run so concurrent runs never share a buffer.  Holds
+#: the text ``buffer``, the write end of the run's pipe (``write_fd``) and a
+#: ``lock`` serialising the two writers (the pipe reader and the cwltool logger
+#: handler) onto the shared buffer.
 _CAPTURE_STATE = threading.local()
 
 #: Serialises the one-time ``RuntimeContext`` install.
 _CAPTURE_INSTALL_LOCK = threading.Lock()
 
+#: Serialises the one-time cwltool logger-handler install.
+_CAPTURE_HANDLER_LOCK = threading.Lock()
+
+#: The process-wide cwltool logger handler (installed once); it routes a record
+#: to the emitting thread's buffer, so concurrent runs stay isolated.
+_CAPTURE_LOGGER_HANDLER: _ThreadBufferHandler | None = None
+
 #: The shared capture proxy injected process-wide; per-run isolation comes from
 #: the thread-local buffer, not from the proxy identity.
 _CAPTURE_PROXY: _CapturingStderr | None = None
+
+#: Chunk size for the per-run pipe reader (matches the removed ``os.dup2``
+#: reader).
+_CAPTURE_READ_CHUNK = 4096
 
 
 class _CapturingStderr:
     """A per-run ``stderr`` proxy that tees into the invoking thread's buffer.
 
     cwltool passes ``RuntimeContext.default_stderr`` to every step subprocess
-    and, for its own messages, hands it to the ``cwltool`` logger.  Redirecting
-    *that* object (rather than process-wide file descriptor 2) makes the capture
-    per run: two workflows in different threads write to their own buffers,
-    since :class:`_CapturingStderr` resolves the current thread's buffer on
-    every write.  The real stderr is still written through, so operator logs
-    stay visible.
+    and uses its file descriptor for the child's stderr, so the fd must be a
+    real OS descriptor.  Each run therefore owns a pipe: :func:`_run_workflow`
+    starts a daemon reader on the read end that tees every chunk to *both* the
+    real stderr (operator logs stay visible, as the removed ``os.dup2`` reader
+    did) and the run's text buffer, and points this proxy's ``fileno()`` at the
+    write end.  Two workflows in different threads have their own pipes and
+    buffers, so concurrent runs never observe each other's output.  cwltool's
+    *own* diagnostics (``cwltool._logger``) do not go through the child fd, so
+    they are captured separately by a thread-routed logging handler (see
+    :func:`_install_capture_logger`).
     """
 
     def __init__(self, real: Any) -> None:
         """Wrap ``real`` (the process stderr) as the pass-through sink."""
         self._real = real
+
+    @staticmethod
+    def _buffer() -> Any:
+        """Return the current thread's capture buffer, if one is active.
+
+        Returns:
+            The thread-local buffer, or ``None`` when this thread is not
+            running a workflow.
+
+        """
+        return getattr(_CAPTURE_STATE, "buffer", None)
 
     def _target(self) -> Any:
         """Return the thread's capture buffer, or fall back to the real sink.
@@ -373,38 +404,56 @@ class _CapturingStderr:
             The active buffer for this thread, else the wrapped real stream.
 
         """
-        return getattr(_CAPTURE_STATE, "buffer", None) or self._real
+        return self._buffer() or self._real
 
     def write(self, text: str) -> int:
-        """Write ``text`` to the per-run buffer and the real stderr.
+        """Write ``text`` to the per-run buffer and the real stderr (tee).
 
         Returns:
-            The number of characters written (as reported by the sink).
+            The number of characters written to the capture buffer, or to the
+            real stderr when no run is active on this thread.
 
         """
-        return self._target().write(text)
+        buffer = self._buffer()
+        if buffer is None:
+            return self._real.write(text)
+        with _CAPTURE_STATE.lock:
+            written = buffer.write(text)
+        self._real.write(text)
+        return written
 
     def flush(self) -> None:
-        """Flush the current thread's sink."""
-        self._target().flush()
+        """Flush the buffer and the real stderr (both may hold pending text)."""
+        buffer = self._buffer()
+        if buffer is not None:
+            with _CAPTURE_STATE.lock:
+                buffer.flush()
+        self._real.flush()
 
     def fileno(self) -> int:
-        """Return the underlying file descriptor.
+        """Return the descriptor a step subprocess should inherit.
+
+        While a run is active on this thread this is the write end of the run's
+        capture pipe (read and teed by :func:`_run_workflow`); outside a run it
+        falls back to the real stderr.
 
         Returns:
-            The file descriptor of the current thread's sink.
+            The run's pipe write fd, or the real stderr's fd.
 
         """
-        return self._target().fileno()
+        write_fd = getattr(_CAPTURE_STATE, "write_fd", None)
+        if write_fd is not None:
+            return write_fd
+        return self._real.fileno()
 
     def isatty(self) -> bool:
-        """Report whether the current thread's sink is a terminal.
+        """Report whether the real stderr is a terminal.
 
         Returns:
-            True when the sink is a terminal.
+            True when the real stderr is a terminal.
 
         """
-        return self._target().isatty()
+        return self._real.isatty()
 
     @staticmethod
     def writable() -> bool:
@@ -418,8 +467,8 @@ class _CapturingStderr:
 
     @property
     def encoding(self) -> str:
-        """The sink's text encoding (used by subprocess)."""
-        return getattr(self._target(), "encoding", None) or "utf-8"
+        """The real stderr's text encoding (used by subprocess)."""
+        return getattr(self._real, "encoding", None) or "utf-8"
 
     def close(self) -> None:
         """No-op: the per-run buffer outlives the stream cwltool may close."""
@@ -432,6 +481,54 @@ class _CapturingStderr:
 
         """
         return getattr(self._real, name)
+
+
+class _ThreadBufferHandler(logging.Handler):
+    """Route the ``cwltool`` logger's output into the emitting thread's buffer.
+
+    cwltool emits its own diagnostics (e.g. a missing ``baseCommand``
+    executable) through ``cwltool._logger.error(...)``, which never touches
+    ``RuntimeContext.default_stderr``; without this handler a ``Completed
+    permanentFail`` carries no cause (M2).  The handler is installed once,
+    process-wide, and routes by thread: a record emitted on a thread running a
+    workflow lands in that run's buffer, while a record from any other thread
+    is dropped here (it still reaches the real stderr via cwltool's own
+    ``defaultStreamHandler``), so concurrent runs stay isolated.
+    """
+
+    def __init__(self) -> None:
+        """Create the handler with a message-only formatter."""
+        super().__init__()
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Append the formatted record to the current thread's buffer."""
+        buffer = getattr(_CAPTURE_STATE, "buffer", None)
+        if buffer is None:
+            return
+        try:
+            with _CAPTURE_STATE.lock:
+                buffer.write(self.format(record) + "\n")
+        except Exception:  # ruff: ignore[blind-except] - logging must never raise into cwltool
+            self.handleError(record)
+
+
+def _install_capture_logger() -> None:
+    """Install the process-wide ``cwltool`` logger capture handler once.
+
+    Safe under concurrency: the handler is shared, but dispatch is thread-local
+    (see :class:`_ThreadBufferHandler`).
+    """
+    global _CAPTURE_LOGGER_HANDLER  # ruff: ignore[global-statement] - one-time process-wide install
+    with _CAPTURE_HANDLER_LOCK:
+        if _CAPTURE_LOGGER_HANDLER is not None:
+            return
+        try:
+            import cwltool.loghandler  # ruff: ignore[import-outside-top-level] - optional dependency, imported lazily
+        except ImportError:
+            return
+        _CAPTURE_LOGGER_HANDLER = _ThreadBufferHandler()
+        cwltool.loghandler._logger.addHandler(_CAPTURE_LOGGER_HANDLER)  # ruff: ignore[private-member-access] - cwltool's module logger
 
 
 def _capture_runtime_context(base: Any, proxy: _CapturingStderr) -> type:
@@ -454,11 +551,17 @@ def _capture_runtime_context(base: Any, proxy: _CapturingStderr) -> type:
 def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
     """Run the CWL workflow, returning its captured error lines.
 
-    cwltool raises only ``Completed permanentFail``; the actual step command
-    error (e.g. ``cmake: command not found``) is written to stderr by cwltool
-    and the step subprocess, bypassing the ``cwltool`` logger.  The capture is
-    per run (see :class:`_CapturingStderr`), so concurrent submissions never
-    observe each other's output.
+    Captures two streams for *this* run:
+
+    - the step subprocesses' stderr, via a per-run pipe: their inherited fd is
+      the pipe's write end and a daemon reader tees every chunk to the real
+      stderr (operator visibility) and this run's buffer;
+    - cwltool's own logger diagnostics (e.g. a missing ``baseCommand``), via a
+      process-wide handler that routes records to the emitting thread's buffer.
+
+    cwltool raises only ``Completed permanentFail``; both streams above carry
+    the actual cause.  The capture is per run (see :class:`_CapturingStderr`),
+    so concurrent submissions never observe each other's output.
 
     Args:
         runner: The ``pypicongpu.Runner`` to run.
@@ -472,11 +575,39 @@ def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
     """
     buffer = tempfile.TemporaryFile(mode="w+", encoding="utf-8")  # ruff: ignore[open-file-with-context-handler]
     _install_capture_context()
+    # Tee the child-fd output to the same real stream the proxy passes writes
+    # to, so both capture paths agree (and a test can substitute the sink).
+    real = _CAPTURE_PROXY._real if _CAPTURE_PROXY is not None else sys.stderr  # ruff: ignore[private-member-access] - same class
+    read_fd, write_fd = os.pipe()
+
+    lock = threading.Lock()
+
+    def reader() -> None:
+        # Tee each chunk to the real stderr (operator logs stay visible) and
+        # the run's buffer; a daemon thread so a stuck child cannot wedge exit.
+        with os.fdopen(read_fd, "rb", closefd=True) as stream:
+            for chunk in iter(lambda: stream.read(_CAPTURE_READ_CHUNK), b""):
+                text = chunk.decode("utf-8", errors="replace")
+                real.write(text)
+                with lock:
+                    buffer.write(text)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    _install_capture_logger()
     _CAPTURE_STATE.buffer = buffer
+    _CAPTURE_STATE.lock = lock
+    _CAPTURE_STATE.write_fd = write_fd
     try:
         runner.run()
     finally:
         _CAPTURE_STATE.buffer = None
+        _CAPTURE_STATE.write_fd = None
+        # Close our write end first so the reader sees EOF once every inheriting
+        # child has also closed it; only then join.
+        with contextlib.suppress(OSError):  # pragma: no cover - a child could not close our fd
+            os.close(write_fd)
+        thread.join(timeout=10)
         text = ""
         try:
             buffer.seek(0)

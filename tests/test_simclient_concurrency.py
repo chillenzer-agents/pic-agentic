@@ -14,7 +14,11 @@ new contract: inbound messages are dispatched concurrently, a submit acks
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import io
 import json
+import logging
+import os
 import sys
 import threading
 import types
@@ -320,6 +324,7 @@ def fake_picongpu_runner(monkeypatch):
     monkeypatch.setitem(sys.modules, "picongpu.pypicongpu", pypicongpu)
     monkeypatch.setitem(sys.modules, "picongpu.pypicongpu.runner", module)
     monkeypatch.setattr(sim_mod, "_CAPTURE_PROXY", None)
+    monkeypatch.setattr(sim_mod, "_CAPTURE_LOGGER_HANDLER", None)
     return module
 
 
@@ -370,6 +375,133 @@ async def test_execute_submit_reports_this_runs_stderr(fake_picongpu_runner, tmp
     with pytest.raises(SimulationExecutionError) as excinfo:
         await execute_submit(prepared=prepared, emit=emit, job_id_reader=lambda _run, _payload: None)
     assert "MARKER-solo" in str(excinfo.value)
+
+
+class _RealStub:
+    """A minimal real-stream stub for the proxy tee test."""
+
+    def __init__(self) -> None:
+        self.data = io.StringIO()
+
+    def write(self, text: str) -> int:
+        return self.data.write(text)
+
+    def flush(self) -> None:
+        self.data.flush()
+
+    def isatty(self) -> bool:
+        return self.data.isatty()
+
+
+def test_capturing_stderr_tees_to_real_stderr() -> None:
+    """M1: a proxy write reaches both the run buffer and the real stderr."""
+    real = _RealStub()
+    buffer = io.StringIO()
+    proxy = sim_mod._CapturingStderr(real)
+    old_buffer = getattr(sim_mod._CAPTURE_STATE, "buffer", None)
+    sim_mod._CAPTURE_STATE.buffer = buffer
+    sim_mod._CAPTURE_STATE.lock = threading.Lock()
+    try:
+        proxy.write("HELLO-STEP-ERROR\n")
+    finally:
+        sim_mod._CAPTURE_STATE.buffer = old_buffer
+    assert buffer.getvalue() == "HELLO-STEP-ERROR\n"
+    assert real.data.getvalue() == "HELLO-STEP-ERROR\n", "the operator's stderr must still receive the text"
+
+
+def test_capturing_stderr_without_a_run_uses_real_stderr() -> None:
+    """Outside a run the proxy is a transparent pass-through."""
+    real = _RealStub()
+    proxy = sim_mod._CapturingStderr(real)
+    sim_mod._CAPTURE_STATE.buffer = None
+    proxy.write("plain\n")
+    assert real.data.getvalue() == "plain\n"
+
+
+class _LoggerOnlyRunner:
+    """Fake runner that emits a cwltool log record and raises permanentFail."""
+
+    setup_dir = Path("/nonexistent/input")
+    run_dir = Path("/nonexistent/run")
+
+    @staticmethod
+    def generate(**_flags: object) -> None:
+        return
+
+    @staticmethod
+    def run() -> None:
+        # cwltool's own diagnostics go through its logger, not the child fd.
+        import cwltool.loghandler
+
+        cwltool.loghandler._logger.error("'definitely-not-a-real-command-xyz' not found")
+        raise SimulationExecutionError(SimulationErrorCode.RUN_FAILED, "Completed permanentFail", SimulationStage.RUN)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("cwltool") is None, reason="cwltool not installed")
+def test_capture_includes_cwltool_logger_errors(tmp_path) -> None:
+    """M2: a permanentFail carries the cause cwltool logged, not just its raise."""
+    capture: list[str] = []
+    with pytest.raises(SimulationExecutionError):
+        sim_mod._run_workflow(_LoggerOnlyRunner(), capture)
+    detail = sim_mod._workflow_failure_detail(Path("/nonexistent/run"), capture[0] if capture else "")
+    assert "definitely-not-a-real-command-xyz" in detail
+
+
+class _FdWriterRunner:
+    """Fake runner that writes to the inherited stderr fd (like a child process)."""
+
+    setup_dir = Path("/nonexistent/input")
+    run_dir = Path("/nonexistent/run")
+
+    @staticmethod
+    def generate(**_flags: object) -> None:
+        return
+
+    @staticmethod
+    def run() -> None:
+        runtime_context = sys.modules["picongpu.pypicongpu.runner"].RuntimeContext
+        context = runtime_context(kwargs={})
+        os.write(context.default_stderr.fileno(), b"child: command not found\n")
+        raise SimulationExecutionError(SimulationErrorCode.RUN_FAILED, "boom", SimulationStage.RUN)
+
+
+def test_child_stderr_fd_is_teed_and_captured(fake_picongpu_runner, tmp_path) -> None:
+    """M1: child-fd stderr reaches both the run buffer and the real stderr."""
+    sim_mod._install_capture_context()
+    real_path = tmp_path / "real-stderr.log"
+    saved_target = sim_mod._CAPTURE_PROXY._real
+    with real_path.open("w", encoding="utf-8") as real_fh:
+        sim_mod._CAPTURE_PROXY._real = real_fh
+        capture: list[str] = []
+        try:
+            with pytest.raises(SimulationExecutionError):
+                sim_mod._run_workflow(_FdWriterRunner(), capture)
+        finally:
+            sim_mod._CAPTURE_PROXY._real = saved_target
+    assert "child: command not found" in (capture[0] if capture else ""), "child fd output must be captured per run"
+    assert "child: command not found" in real_path.read_text(encoding="utf-8"), "child output must stay visible"
+
+
+def test_thread_buffer_handler_routes_to_emitting_thread() -> None:
+    """M2: the shared logger handler captures only the emitting run's buffer."""
+    handler = sim_mod._ThreadBufferHandler()
+    record = logging.LogRecord("cwltool", logging.ERROR, __file__, 1, "boom %s", ("cause",), None)
+    run_buffer = io.StringIO()
+    old_buffer = getattr(sim_mod._CAPTURE_STATE, "buffer", None)
+    old_lock = getattr(sim_mod._CAPTURE_STATE, "lock", None)
+    sim_mod._CAPTURE_STATE.lock = threading.Lock()
+    try:
+        # A thread with no active run drops the record (cwltool's own stream
+        # handler still prints it).
+        sim_mod._CAPTURE_STATE.buffer = None
+        handler.emit(record)
+        sim_mod._CAPTURE_STATE.buffer = run_buffer
+        handler.emit(record)
+    finally:
+        sim_mod._CAPTURE_STATE.buffer = old_buffer
+        sim_mod._CAPTURE_STATE.lock = old_lock
+        handler.close()
+    assert "boom cause" in run_buffer.getvalue()
 
 
 def test_build_concurrency_resolver(monkeypatch) -> None:
