@@ -879,7 +879,10 @@ async def _logs_tool(runtime: HelloRuntime, sim_id: str, *, stream: str, tail: i
     return _redact_dict(runtime, payload)
 
 
-def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> None:
+def _register_control_result_tools(  # ruff: ignore[complex-structure] - one registration block per verb
+    server: MCPServer,
+    runtime: HelloRuntime,
+) -> None:
     """Register the M3 control and results tools on ``server``.
 
     Control verbs are write-tier pulls (not destructive, not idempotent); the
