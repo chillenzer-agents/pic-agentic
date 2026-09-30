@@ -30,9 +30,14 @@
 set -euo pipefail
 
 # ---- pinned revision --------------------------------------------------------
-# Immutable 40-hex commit on chillenzer-agents/pic-agentic.  Bump deliberately;
-# an override is allowed for testing but production must pin a SHA.
-PIC_AGENTIC_PIN="${PIC_AGENTIC_PIN:-96d86a4611d239159e160092125ffe9cce33e6ac}"
+# Immutable 40-hex commit on chillenzer-agents/pic-agentic carrying the
+# non-blocking control plane + per-run stderr work this installer ships.
+# Bump deliberately; an override is allowed for testing but production must pin
+# a SHA.  NOTE: this is the wave2-g2 head the installer was authored against;
+# bump it to the final merge/release commit once that exists (the capability
+# preflight below refuses a pin that lacks the required simclient features, so
+# a stale pin fails loudly rather than silently installing the old client).
+PIC_AGENTIC_PIN="${PIC_AGENTIC_PIN:-7c2e6907b89b2bbe097b7d8788b9305d493f2de1}"
 PIC_AGENTIC_REPO="${PIC_AGENTIC_REPO:-https://github.com/chillenzer-agents/pic-agentic}"
 RAW_REPO="${PIC_AGENTIC_RAW_REPO:-https://raw.githubusercontent.com/chillenzer-agents/pic-agentic}"
 
@@ -196,10 +201,59 @@ asyncio.run(main())
 PYFLY
 }
 
+# Installed-revision + capability preflight: the venv's pic-agentic must be the
+# pinned commit and its simclient must carry the M3 result handling and the
+# non-blocking control plane this installer ships.  This is the check that
+# makes a stale/mismatched PIC_AGENTIC_PIN fail loudly instead of silently
+# installing the old blocking client (the live beta timeouts).  Mirrors
+# cluster_simclient.sh's capability self-check.
+preflight_installed() {
+  "$VENV/bin/python" - "$PIC_AGENTIC_PIN" <<'PYREV'
+import json
+import sys
+from importlib.metadata import PackageNotFoundError, distribution
+from pathlib import Path
+
+pin = sys.argv[1]
+try:
+    dist = distribution("pic-agentic")
+except PackageNotFoundError:
+    sys.exit("pic-agentic is not installed in the venv")
+direct_url = dist.read_text("direct_url.json") or ""
+installed = ""
+try:
+    installed = json.loads(direct_url).get("vcs_info", {}).get("commit_id", "")
+except ValueError:
+    installed = ""
+if not installed:
+    sys.exit("pic-agentic has no recorded VCS revision (not a git install?)")
+if installed != pin:
+    sys.exit(f"installed revision {installed} != pin {pin} (stale install)")
+
+import pic_agentic.simclient.client as client_mod
+import pic_agentic.simclient.simulation as sim_mod
+
+client_source = Path(client_mod.__file__).read_text(encoding="utf-8")
+source = client_source + Path(sim_mod.__file__).read_text(encoding="utf-8")
+required = {
+    "M3 result handling": "SimulationType.RESULT_COMMAND",
+    "non-blocking dispatch": "_dispatch_message",
+    "build gate": "_build_semaphore",
+    "per-run stderr capture": "_CapturingStderr",
+}
+missing = [label for label, marker in required.items() if marker not in source]
+if missing:
+    sys.exit(f"installed simclient lacks: {', '.join(missing)}")
+print(f"OK - installed revision {installed}; simclient carries M3 + non-blocking dispatch")
+PYREV
+}
+
 # Room/secret rendezvous preflight: connect to the room, backfill the recent
-# timeline and require at least one server-role RCP message to verify under the
-# configured secret.  This catches the live bad-secret failure (config secret
-# != the secret the cluster simclient signs with) before declaring success.
+# timeline and require at least one RCP message (from either role -- a fresh
+# host has no server-role traffic yet) to verify under the configured secret.
+# This catches the live bad-secret failure (config secret != the secret the
+# cluster signs with) before declaring success, while not failing a correct
+# fresh install just because no MCP tool has run yet.
 preflight_room() {
   PIC_AGENTIC_CONFIG="$CONFIG" "$VENV/bin/python" - "$ROOM_PREFLIGHT_TIMEOUT_S" <<'PYROOM'
 import asyncio
@@ -312,6 +366,11 @@ if [ "$MODE" = "check" ]; then
   fi
 
   if [ -x "$VENV/bin/python" ] && [ -f "$CONFIG" ]; then
+    log "check: installed revision + simclient capability"
+    if preflight_installed; then ok "installed revision/capability"; else
+      bad "installed revision/capability"
+      failed=1
+    fi
     log "check: MCP registration"
     if preflight_registration; then ok "opencode registration"; else
       bad "opencode registration"
@@ -372,6 +431,11 @@ fi
 "$VENV/bin/python" -m pip install --quiet \
   "pic-agentic[sim] @ git+${PIC_AGENTIC_REPO}@${PIC_AGENTIC_PIN}"
 [ -x "$VENV/bin/pic-agentic-mcp" ] || die "install did not produce $VENV/bin/pic-agentic-mcp"
+# Refuse a stale pin here (not just in --check): the installed revision and
+# simclient capabilities must match what we advertise, so the old blocking
+# control plane can never be shipped silently.
+log "asserting the installed revision + simclient capability"
+preflight_installed || die "installed pic-agentic does not match the pin / lacks the M3 control plane"
 
 # 2. One-time Matrix device login writes the token fields and preserves any keys
 #    already present.  scripts/mas_login.py is not part of the installed wheel,
