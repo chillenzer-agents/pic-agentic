@@ -285,6 +285,12 @@ reader name** when the filename matches one. The plugin match is a filename-only
 heuristic; the reader re-validates the file and returns a clean `no_results` on
 a mismatch.
 
+The openPMD readers accept the `h5` (HDF5) and `bp`/`bp5` (ADIOS2) suffixes the
+pinned `openpmd_api` 0.17.1 can actually open; `.hdf5` is **not** advertised
+because that backend rejects it ("Unknown file format"). ADIOS2 series are
+directories (`fields_000050.bp/`), which iteration discovery and the plugin
+target resolver both accept.
+
 `read_plugin_result` runs one registered reader on the cluster (in-process, over
 the same 48 KiB wire budget as the other results) and returns a bounded summary:
 
@@ -297,6 +303,11 @@ the same 48 KiB wire budget as the other results) and returns a bounded summary:
 | `radiation` | `*_radAmplitudes_<iter>_0_0_0.h5` | direction-summed spectrum, peak |
 | `calorimeter` | `*_calorimeter_<filter>_<iter>.h5` | yaw/pitch marginals, energy edges |
 | `png` | `*_png_<axis>_<slice>_<iter>.png` | metadata only (dimensions, path); image via `export` |
+
+All openPMD readers accept the `h5` and `bp`/`bp5` suffixes. `species_filter`
+is honoured where the reader's filename carries a filter component; the
+`radiation` reader has none, so a non-default `species_filter` is rejected with
+`unsupported` rather than silently ignored.
 
 `iteration` defaults to `last`. A missing PIConGPU (or, for the openPMD/image
 readers, `openpmd_api`/`imageio`) degrades that reader to `reader_unavailable`;

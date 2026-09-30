@@ -578,6 +578,32 @@ def test_unknown_reader_names_are_rejected_by_the_wire() -> None:
         ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="openpmd")
 
 
+def test_radiation_rejects_a_species_filter(tmp_path: Path) -> None:
+    """A non-default ``species_filter`` for radiation is rejected, not ignored (m3).
+
+    ``*_radAmplitudes_*`` carries no filter component, so honouring the request
+    is impossible; the engine must say so instead of silently returning the
+    ``all`` series.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "radiationOpenPMD").mkdir(parents=True)
+    params = ResultParams(
+        sim_id=SIM_ID,
+        op=ResultOp.PLUGIN,
+        reader="radiation",
+        species="e",
+        species_filter="laser",
+    )
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert payload["error_code"] == "unsupported"
+    assert "species_filter" in payload["error"]
+    # The default "all" filter is accepted (and proceeds to the missing-file path).
+    default = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="radiation", species="e")
+    payload = results.resolve_result(default, run_dir=run, sim_id=SIM_ID)
+    assert payload["error_code"] == "no_results"
+
+
 # --- real readers (skipped without PIConGPU) --------------------------------
 
 
@@ -618,6 +644,33 @@ def test_real_phase_space_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["max_count"] == pytest.approx(111.0)
     assert summary["max_r_m"] == pytest.approx(3e-6)
     assert summary["max_p"] == pytest.approx(1.0 / 3.0)
+
+
+def test_real_phase_space_reader_end_to_end_bp(tmp_path: Path) -> None:
+    """``PhaseSpaceData`` reads an ADIOS2 ``.bp`` series when given the suffix (M1).
+
+    ``PhaseSpaceData.get_data_path`` defaults to ``h5``, so without threading the
+    target's suffix through, a ``.bp`` series was unreadable and returned
+    ``no_results`` even though the pattern advertised it.  The reader also only
+    accepts the exact suffix, so this is the regression guard for that path.
+    """
+    pytest.importorskip("picongpu")
+    pytest.importorskip("openpmd_api")
+    from plugin_fixtures import _adios2_available
+
+    _adios2_available()
+    run = tmp_path / "run"
+    write_output_unit(run)
+    phase_space_h5(run, shape=(4, 3), ext="bp")
+    assert (run / "simOutput" / "phaseSpace" / "PhaseSpace_e_all_ypy_100.bp").is_dir()
+
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="phase_space", species="e", iteration=100)
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 100
+    assert summary["total_count"] == pytest.approx(66.0 + 100 * 12)
+    assert summary["projection_r"] == pytest.approx([303.0, 312.0, 321.0, 330.0])
 
 
 def test_real_calorimeter_reader_end_to_end(tmp_path: Path) -> None:
@@ -712,8 +765,14 @@ def test_real_radiation_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["peak_omega_per_s"] == pytest.approx(1e14)
 
 
+@pytest.mark.filterwarnings("ignore:Starting with ImageIO v3:DeprecationWarning")
 def test_real_png_reader_returns_metadata(tmp_path: Path) -> None:
-    """The real ``PNGData`` returns dimensions, not pixels (slice 2)."""
+    """The real ``PNGData`` returns dimensions, not pixels (slice 2).
+
+    PIConGPU's shipped ``PNGData`` calls the deprecated ``imageio.imread``
+    (imageio v3 semantics), so this one test tolerates that third-party
+    ``DeprecationWarning``; the ignore is scoped here rather than globally.
+    """
     pytest.importorskip("picongpu")
     pytest.importorskip("imageio")
 
