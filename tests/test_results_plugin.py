@@ -61,6 +61,13 @@ def _params(**kwargs: object) -> ResultParams:
     return ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_histogram", **kwargs)
 
 
+def test_registry_matches_the_wire_names() -> None:
+    from pic_agentic.protocol.simulation import PLUGIN_READER_NAMES
+
+    assert set(results._PLUGIN_READERS) == set(PLUGIN_READER_NAMES)
+    assert set(results._PLUGIN_BUILDERS) == set(PLUGIN_READER_NAMES)
+
+
 def test_scandir_names_the_plugin_reader(tmp_path: Path) -> None:
     run = _tree(tmp_path)
     manifest = results.scan_output(run / "simOutput", sim_id=SIM_ID, run_dir=str(run))
