@@ -1139,8 +1139,11 @@ def _plugin_result(
         The reader-specific summary dict.
 
     """
-    species, species_filter, derived_iteration = _derive_plugin_names(reader, target.name)
-    iteration = params.iteration if params.iteration is not None else derived_iteration
+    species, species_filter, _derived_iteration = _derive_plugin_names(reader, target.name)
+    # ``iteration=None`` must mean "latest" for every reader, so never fall back
+    # to the iteration baked into the (alphabetically first) filename:
+    # ``_resolve_plugin_iteration`` maps ``None``/``"last"`` to the maximum.
+    iteration = params.iteration
     instance = _import_plugin_reader(reader)(str(output.parent))
     if reader == "transition_radiation":
         # The shipped ``get_iterations`` globs every ``*.dat`` and chokes on a
