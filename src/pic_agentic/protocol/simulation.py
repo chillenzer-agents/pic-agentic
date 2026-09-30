@@ -194,18 +194,27 @@ class ResultOp(StrEnum):
     #: (selectors + expression AST + reductions) on the cluster.  No code is
     #: executed; see :mod:`pic_agentic.analysis_program`.
     COMPUTE = "compute"
-    #: G1: run one of PIConGPU's shipped text-plugin readers on the cluster and
-    #: return a bounded numeric summary.  The reader is selected by name from
+    #: G1: run one of PIConGPU's shipped plugin readers on the cluster and
+    #: return a bounded summary.  The reader is selected by name from
     #: :data:`PLUGIN_READER_NAMES`.
     PLUGIN = "plugin"
 
 
-#: Registered PIConGPU text-plugin readers, by the name carried in
-#: :attr:`ResultParams.reader`.  The full registry (filename pattern, reader
-#: class, allowed kwargs) lives in :mod:`pic_agentic.results`; the names are
-#: frozen here so the wire model can validate ``reader`` without importing the
-#: optional engine.
-PLUGIN_READER_NAMES = ("energy_histogram", "emittance", "transition_radiation")
+#: Registered PIConGPU plugin readers, by the name carried in
+#: :attr:`ResultParams.reader`.  The first three are the text plugins; the last
+#: four are the openPMD/image readers (phase space, radiation, calorimeter, PNG).
+#: The full registry (filename pattern, reader class, allowed kwargs) lives in
+#: :mod:`pic_agentic.results`; the names are frozen here so the wire model can
+#: validate ``reader`` without importing the optional engine.
+PLUGIN_READER_NAMES = (
+    "energy_histogram",
+    "emittance",
+    "transition_radiation",
+    "phase_space",
+    "radiation",
+    "calorimeter",
+    "png",
+)
 
 
 #: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
@@ -904,7 +913,7 @@ class ResultParams(BaseModel):
     #: The declarative analysis program for ``COMPUTE`` (validated by
     #: :class:`~pic_agentic.analysis_program.AnalysisProgram` before evaluation).
     program: dict[str, Any] | None = None
-    #: The registered PIConGPU text-plugin reader for ``PLUGIN`` (one of
+    #: The registered PIConGPU plugin reader for ``PLUGIN`` (one of
     #: :data:`PLUGIN_READER_NAMES`).
     reader: str | None = None
     #: The particle species whose plugin output is read (``PLUGIN``).
@@ -1034,6 +1043,10 @@ class ResultRef(BaseModel):
 
     path: str
     uri: str
+    #: The sniffed format: ``openpmd-adios2``/``openpmd-hdf5``, ``text``,
+    #: ``dir``, ``binary``, or a registered plugin reader name
+    #: (:data:`PLUGIN_READER_NAMES`) when the filename matches one.  The match
+    #: is a filename-only heuristic; the reader re-validates the file.
     format: str
     size_bytes: int
     sha256: str | None = None
