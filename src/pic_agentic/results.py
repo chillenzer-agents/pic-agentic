@@ -1138,22 +1138,28 @@ def _build_emittance(instance: Any, species: str, species_filter: str, iteration
         Slice positions (m), slice emittances (m rad) and scalars.
 
     """
-    slice_emit, y_slices, _iteration, _dt = instance.get(
+    raw, y_slices, _iteration, _dt = instance.get(
         iteration=iteration,
         species=species,
         species_filter=species_filter,
     )
-    slice_emit = [float(value) for value in slice_emit]
+    # ``EmittanceData`` returns ``[emit_all, *slice_emit]``: the first value is
+    # the total (unsliced) emittance and the rest are the per-slice values, so
+    # the total must be split off before the slices are aligned with
+    # ``y_slices`` (which has exactly one fewer entry).
+    raw = [float(value) for value in raw]
     y_slices = [float(value) for value in y_slices]
+    total_emit = raw[0] if raw else None
+    slice_emit = raw[1:]
     peak = max(range(len(slice_emit)), key=slice_emit.__getitem__) if slice_emit else 0
     strided_y, downsampled = _stride(y_slices)
     strided_emit, _ = _stride(slice_emit)
     return {
         "y_slices_m": strided_y,
         "slice_emit_mrad": strided_emit,
-        "total_emit_mrad": sum(slice_emit),
+        "total_emit_mrad": total_emit,
         "max_emit_mrad": max(slice_emit) if slice_emit else None,
-        "max_y_slice_m": y_slices[peak] if y_slices else None,
+        "max_y_slice_m": y_slices[peak] if peak < len(y_slices) else None,
         "iteration": iteration,
         "downsampled": downsampled,
     }

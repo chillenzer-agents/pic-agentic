@@ -75,3 +75,39 @@ def energy_histogram_dat(
     path = sim_output / f"{species}_energyHistogram_{species_filter}.dat"
     path.write_text(header + "\n" + "\n".join(rows) + "\n", encoding="utf-8")
     return path
+
+
+def emittance_dat(
+    run_dir: Path,
+    *,
+    species: str = "e",
+    species_filter: str = "all",
+    iterations: tuple[int, ...] = (0, 50, 100),
+    y_slices: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0),
+    totals: tuple[float, ...] = (9.0, 9.0, 10.0),
+    slices: tuple[tuple[float, ...], ...] = (
+        (1.0, 2.0, 3.0, 4.0),
+        (1.0, 2.0, 3.0, 9.0),
+        (1.0, 2.0, 3.0, 5.0),
+    ),
+) -> Path:
+    """Write a ``<species>_emittance_<filter>.dat`` the real reader parses.
+
+    Each row is ``iteration sum <slice0> <slice1> ...``: the ``sum`` column is
+    the total emittance and the remaining columns the per-slice values, matching
+    ``EmittanceData``'s ``[emit_all, *slices]`` return shape.  ``iterations``,
+    ``totals`` and ``slices`` are parallel.
+
+    Returns:
+        The written data file's path.
+
+    """
+    sim_output = Path(run_dir) / "simOutput"
+    sim_output.mkdir(parents=True, exist_ok=True)
+    header = "iteration sum " + " ".join(f"{y:.10g}" for y in y_slices)
+    lines = [header]
+    for iteration, total, row in zip(iterations, totals, slices, strict=True):
+        lines.append(" ".join([str(iteration), str(int(total)), *[str(int(value)) for value in row]]))
+    path = sim_output / f"{species}_emittance_{species_filter}.dat"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path

@@ -125,7 +125,9 @@ def test_plugin_emittance_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         @staticmethod
         def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
             _ = (species, species_filter, kwargs)
-            return [1.0, 2.0, 3.0], [0.0, 1.0, 2.0], [iteration], 1e-16
+            # ``EmittanceData`` returns ``[emit_all, *slice_emit]``, one element
+            # longer than ``y_slices``.
+            return [6.0, 1.0, 2.0, 3.0], [0.0, 1.0, 2.0], [iteration], 1e-16
 
     monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubEmittance)
     run = tmp_path / "run"
@@ -134,9 +136,40 @@ def test_plugin_emittance_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="emittance", species="e")
     payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
+    assert summary["slice_emit_mrad"] == [1.0, 2.0, 3.0]
     assert summary["total_emit_mrad"] == pytest.approx(6.0)
     assert summary["max_emit_mrad"] == pytest.approx(3.0)
     assert summary["max_y_slice_m"] == pytest.approx(2.0)
+
+
+def test_plugin_emittance_stub_last_slice_peak_does_not_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A peak in the last slice must not index past ``y_slices`` (B1)."""
+
+    class _StubEmittance:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            return [9.0, 1.0, 2.0, 3.0, 4.0], [0.0, 1.0, 2.0, 3.0], [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubEmittance)
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "e_emittance_all.dat").write_text("x\n", encoding="utf-8")
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="emittance", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["total_emit_mrad"] == pytest.approx(9.0)
+    assert summary["max_emit_mrad"] == pytest.approx(4.0)
+    assert summary["max_y_slice_m"] == pytest.approx(3.0)
 
 
 def test_bound_plugin_strides_to_fit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,3 +222,34 @@ def test_real_energy_histogram_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["count_in_window"]["count"] == pytest.approx(44.0)
     assert summary["total"] == pytest.approx(44.0)
     assert summary["bins_kev"][-1] == pytest.approx(1000.0)
+
+
+def test_real_emittance_reader_end_to_end(tmp_path: Path) -> None:
+    """The real ``EmittanceData`` returns total and slices aligned (B1).
+
+    Drives the real reader through ``resolve_result``; skipped unless PIConGPU
+    is importable.  Iteration 50's last slice is its maximum, which used to
+    index past ``y_slices`` and degrade to ``no_results``.
+    """
+    pytest.importorskip("picongpu")
+    from plugin_fixtures import emittance_dat
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    emittance_dat(run)
+    params = ResultParams(
+        sim_id=SIM_ID,
+        op=ResultOp.PLUGIN,
+        reader="emittance",
+        species="e",
+        iteration=50,
+    )
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["y_slices_m"] == [0.0, 1.0, 2.0, 3.0]
+    assert summary["slice_emit_mrad"] == [1.0, 2.0, 3.0, 9.0]
+    assert summary["total_emit_mrad"] == pytest.approx(9.0)
+    assert summary["max_emit_mrad"] == pytest.approx(9.0)
+    assert summary["max_y_slice_m"] == pytest.approx(3.0)
+    assert summary["iteration"] == 50
