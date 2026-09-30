@@ -198,7 +198,7 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
         ),
         "particleCalorimeter",
         "calorimeter",
-        "calorimeter",
+        _KIND_OPENPMD,
         "openpmd_api",
     ),
     # ``<species>_png_<axis>_<slicePoint>_<iteration>.png``.  The PNG plugin has
@@ -1285,7 +1285,12 @@ def _plugin_iterations(output: Path, spec: _PluginReader, species: str, species_
     """
     iterations: set[int] = set()
     for path, is_dir in _collect_entries(output):
-        if is_dir or "iteration" not in spec.pattern.groupindex:
+        # An openPMD ADIOS2 series (``*.bp``/``*.bp5``) is itself a directory
+        # whose name still carries the iteration, so directories are valid
+        # sources for the openPMD readers; other readers only ever write files.
+        if is_dir and spec.kind != _KIND_OPENPMD:
+            continue
+        if "iteration" not in spec.pattern.groupindex:
             continue
         groups = _plugin_filename_groups(spec, path.name)
         if groups is None:

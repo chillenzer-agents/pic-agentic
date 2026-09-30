@@ -260,6 +260,25 @@ def phase_space_h5(
     return pattern
 
 
+def _adios2_available() -> bool:
+    """Whether the pinned ``openpmd_api`` was built with the ADIOS2 backend.
+
+    Returns:
+        True when ``.bp``/``.bp5`` series can be written and read.
+
+    """
+    import pytest
+
+    if importlib.util.find_spec("openpmd_api") is None:
+        pytest.skip("openpmd_api not installed")
+    import openpmd_api
+
+    variants = getattr(openpmd_api, "variants", {})
+    if not variants.get("adios2", False):
+        pytest.skip("openpmd_api was built without the ADIOS2 backend")
+    return True
+
+
 def calorimeter_h5(
     run_dir: Path,
     *,
@@ -267,12 +286,14 @@ def calorimeter_h5(
     species_filter: str = "all",
     iterations: tuple[int, ...] = (0, 50, 100),
     shape: tuple[int, int, int] = (2, 3, 4),
+    ext: str = "h5",
 ) -> Path:
-    """Write a ``<species>_calorimeter_<filter>_<iteration>.h5`` series.
+    """Write a ``<species>_calorimeter_<filter>_<iteration>.<ext>`` series.
 
     Reproduces the shipped ``particleCalorimeter`` layout: a scalar ``calorimeter``
     mesh of shape ``(N_energy, N_pitch, N_yaw)`` with the yaw/pitch/energy
-    metadata attributes.
+    metadata attributes.  ``ext`` may be ``h5`` (HDF5) or ``bp``/``bp5``
+    (ADIOS2, giving a directory series) to exercise both backends.
 
     Returns:
         The openPMD pattern path (with ``%T``).
@@ -283,7 +304,7 @@ def calorimeter_h5(
     _warm_reader("calorimeter")
     out = Path(run_dir) / "simOutput" / "e_calorimeter"
     out.mkdir(parents=True, exist_ok=True)
-    pattern = out / f"{species}_calorimeter_{species_filter}_%T.h5"
+    pattern = out / f"{species}_calorimeter_{species_filter}_%T.{ext}"
     series = opmd.Series(str(pattern), opmd.Access.create)
     # See ``phase_space_h5``: pin the written buffers until close and flush per
     # step so the series carries the intended values rather than freed memory.
