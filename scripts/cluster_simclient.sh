@@ -53,6 +53,7 @@ SIM_SETUP_ROOT="${PIC_AGENTIC_SIM_SETUP_ROOT:-$WORKDIR/sims}"
 CLUSTER_TEMPLATE_DIR="${PIC_AGENTIC_CLUSTER_TEMPLATE_DIR:-}"
 CLUSTER_PRESET="${PIC_AGENTIC_CLUSTER_PRESET:-}"
 PICONGPU_REVISION="${PIC_AGENTIC_PICONGPU_REVISION:-667c537620e685486aceeaa77deb6550ac9972cf}"
+PICONGPU_REPO_URL="${PIC_AGENTIC_PICONGPU_REPO_URL:-https://github.com/chillenzer-agents/picongpu}"
 JOB_WAIT_S="${PIC_AGENTIC_JOB_WAIT_TIMEOUT_S:-600}"
 ACK_S="${PIC_AGENTIC_ACK_TIMEOUT_S:-900}"
 POLL_S="${PIC_AGENTIC_POLL_INTERVAL_S:-30}"
@@ -133,6 +134,31 @@ else
   # the extra, so the `sdist`/`wheel` build needs git on the login node.
   log "installing with the [sim] extra (pinned picongpu + cwltool)"
   "$VENV/bin/python" -m pip install --quiet -e "${SRC}[sim]"
+
+  # 4b. pip does NOT upgrade an already-installed git dependency when only the
+  #     pinned revision changes, so the picongpu wheel silently lags the server
+  #     when the pin is bumped.  The simclient then rejects every submit with
+  #     `version_mismatch` (schema_hash differs) -- and the explicit
+  #     PIC_AGENTIC_PICONGPU_REVISION export below masks the revision check, so
+  #     the schema hash is the only signal.  Detect the drift and force-refresh.
+  installed_rev="$(
+    "$VENV/bin/python" - <<'PYREV'
+import json
+try:
+    from importlib.metadata import distribution
+    info = json.loads(distribution("picongpu").read_text("direct_url.json") or "{}")
+    print(info.get("vcs_info", {}).get("commit_id", ""))
+except Exception:
+    print("")
+PYREV
+  )"
+  if [ "$installed_rev" != "$PICONGPU_REVISION" ]; then
+    log "picongpu drift: installed=${installed_rev:-none} wanted=$PICONGPU_REVISION; force-reinstalling"
+    "$VENV/bin/python" -m pip install --quiet --force-reinstall --no-deps \
+      "picongpu @ git+${PICONGPU_REPO_URL}@${PICONGPU_REVISION}#subdirectory=lib/python"
+  else
+    log "picongpu revision matches the pin ($PICONGPU_REVISION)"
+  fi
 fi
 
 # 5. Interactive MAS device login (once).
