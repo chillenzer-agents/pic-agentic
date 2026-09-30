@@ -16,13 +16,19 @@ The engine has two deliberately separated layers:
 ``openpmd_api`` (and Pillow for image thumbnails) are optional: the module
 imports cleanly when they are absent, and the reader entry points raise
 :class:`ResultsUnavailable` so the caller can answer
-``error_code="reader_unavailable"`` instead of crashing.
+``error_code="reader_unavailable"`` instead of crashing.  The plugin reader
+surface spans the text plugins (``energy_histogram``, ``emittance``,
+``transition_radiation``) and the openPMD/image plugins (``phase_space``,
+``radiation``, ``calorimeter``, ``png``); each imports its own PIConGPU
+submodule lazily, so a reader whose optional dependency is missing degrades only
+itself.
 """
 
 from __future__ import annotations
 
 import base64
 import dataclasses
+import importlib
 import importlib.util
 import io
 import json
@@ -30,6 +36,8 @@ import logging
 import math
 import os
 import re
+import sys
+import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -92,44 +100,117 @@ _DEFAULT_WINDOW_KEV = (100.0, 1000.0)
 #: down further if it still exceeds :data:`MAX_RESULT_BYTES`.
 _PLUGIN_MAX_POINTS = 256
 
+#: Array-rank constants for the openPMD reader summaries.  The shipped readers
+#: return 2D phase-space planes and 2D radiation spectra, and a calorimeter cube
+#: that is 2D when no energy binning was configured; naming the ranks keeps the
+#: degenerate-shape branches legible.
+_NDIM_2D = 2
+_NDIM_3D = 3
+
+#: Element kinds the openPMD plugin reader classes live under.  ``"openpmd"``
+#: selects the ``%T``-series constructor, ``"image"`` the run-directory PNG
+#: reader, and ``"text"`` the delimiter-separated readers.
+_KIND_TEXT = "text"
+_KIND_OPENPMD = "openpmd"
+_KIND_IMAGE = "image"
+
 
 @dataclasses.dataclass(frozen=True)
 class _PluginReader:
-    """One registered PIConGPU text-plugin reader.
+    """One registered PIConGPU plugin reader.
 
     Attributes:
         pattern: The ``simOutput`` filename glob the reader's output matches.
-        module: The ``picongpu.extra.plugins.data`` class name to import.
+            Named groups (``species``, ``filter``, ``iteration``, ``ps``,
+            ``axis``, ``slice_point``) carry the components a reader needs.
+        module: The class name inside the reader's PIConGPU submodule.
+        submodule: The ``picongpu.extra.plugins.data`` submodule to import.
+        kind: ``"text"`` for the delimiter-separated plugins, ``"openpmd"`` for
+            the openPMD series plugins and ``"image"`` for the PNG plugin.  The
+            kind selects the constructor and summary builder.
+        needs: The importable optional module this reader requires; a missing
+            module degrades only this reader to ``reader_unavailable``.
 
     """
 
     pattern: re.Pattern[str]
     module: str
+    submodule: str
+    kind: str
+    needs: str
 
 
-#: Registry of shipped text-plugin readers, keyed by the frozen wire name.  The
-#: filename patterns mirror the PIConGPU readers: energy histogram and emittance
-#: are per-species/file-name text files; transition radiation is per iteration.
-#:
-#: The ``species``/``species_filter`` components are arbitrary PIConGPU
-#: identifiers, so these patterns cannot be tightened to a known species list.
-#: They are therefore a *heuristic* for the manifest ``format`` only (see
-#: :func:`_sniff_format`): a filename that merely resembles plugin output (e.g.
-#: ``notes_emittance_x.dat``) may be labelled as one.  The reader remains the
-#: authority - it re-resolves the file from the species/filter and returns a
-#: clean ``no_results`` when the name does not correspond.
+#: Filename patterns for the shipped readers.  The ``species``/``species_filter``
+#: components are arbitrary PIConGPU identifiers, so these patterns cannot be
+#: tightened to a known species list.  They are therefore a *heuristic* for the
+#: manifest ``format`` only (see :func:`_sniff_format`): a filename that merely
+#: resembles plugin output (e.g. ``notes_emittance_x.dat``) may be labelled as
+#: one.  The reader remains the authority - it re-resolves the file from the
+#: species/filter and returns a clean ``no_results`` when the name does not
+#: correspond.
 _PLUGIN_READERS: dict[str, _PluginReader] = {
     "energy_histogram": _PluginReader(
-        re.compile(r"^[A-Za-z0-9_]+_energyHistogram_[A-Za-z0-9_]+\.dat$"),
+        re.compile(r"^(?P<species>[A-Za-z0-9_]+)_energyHistogram_(?P<filter>[A-Za-z0-9_]+)\.dat$"),
         "EnergyHistogramData",
+        "energy_histogram",
+        _KIND_TEXT,
+        "picongpu",
     ),
     "emittance": _PluginReader(
-        re.compile(r"^[A-Za-z0-9_]+_emittance_[A-Za-z0-9_]+\.dat$"),
+        re.compile(r"^(?P<species>[A-Za-z0-9_]+)_emittance_(?P<filter>[A-Za-z0-9_]+)\.dat$"),
         "EmittanceData",
+        "emittance",
+        _KIND_TEXT,
+        "picongpu",
     ),
     "transition_radiation": _PluginReader(
-        re.compile(r"^[A-Za-z0-9_]+_transRad_[0-9]+\.dat$"),
+        re.compile(r"^(?P<species>[A-Za-z0-9_]+)_transRad_(?P<iteration>[0-9]+)\.dat$"),
         "TransitionRadiationData",
+        "transitionradiation",
+        _KIND_TEXT,
+        "picongpu",
+    ),
+    # ``PhaseSpace_<species>_<species_filter>_<ps>_<iteration>.h5`` (openPMD).
+    # ``<ps>`` is the 3-char spatial+momentum selection (e.g. ``ypy``).
+    "phase_space": _PluginReader(
+        re.compile(
+            r"^PhaseSpace_(?P<species>[A-Za-z0-9_]+)_(?P<filter>[A-Za-z0-9_]+)_(?P<ps>[A-Za-z0-9]+)_(?P<iteration>[0-9]+)"
+            r"\.(?:h5|hdf5|bp|bp5)$",
+        ),
+        "PhaseSpaceData",
+        "phase_space",
+        _KIND_OPENPMD,
+        "openpmd_api",
+    ),
+    # ``<species>_radAmplitudes_<iteration>_0_0_0.h5`` (openPMD).  The trailing
+    # ``_0_0_0`` is PIConGPU's radiation-plugin filename suffix.
+    "radiation": _PluginReader(
+        re.compile(r"^(?P<species>[A-Za-z0-9_]+)_radAmplitudes_(?P<iteration>[0-9]+)(?:_[0-9]+)*\.(?:h5|hdf5|bp|bp5)$"),
+        "RadiationData",
+        "radiation",
+        _KIND_OPENPMD,
+        "openpmd_api",
+    ),
+    # ``<species>_calorimeter_<filter>_<iteration>.h5`` (openPMD).
+    "calorimeter": _PluginReader(
+        re.compile(
+            r"^(?P<species>[A-Za-z0-9_]+)_calorimeter_(?P<filter>[A-Za-z0-9_]+)_(?P<iteration>[0-9]+)\.(?:h5|hdf5|bp|bp5)$",
+        ),
+        "particleCalorimeter",
+        "calorimeter",
+        "calorimeter",
+        "openpmd_api",
+    ),
+    # ``<species>_png_<axis>_<slicePoint>_<iteration>.png``.  The PNG plugin has
+    # no ``read`` surface (metadata only); images travel via ``export``.
+    "png": _PluginReader(
+        re.compile(
+            r"^(?P<species>[A-Za-z0-9_]+)_png_(?P<axis>[A-Za-z0-9]+)_(?P<slice_point>[0-9.]+)_(?P<iteration>[0-9]+)\.png$",
+        ),
+        "PNGData",
+        "png",
+        _KIND_IMAGE,
+        "imageio",
     ),
 }
 
@@ -144,10 +225,12 @@ class ResultsReaderError(RuntimeError):
 
 log = logging.getLogger(__name__)
 
-#: Exceptions a text-plugin reader can raise on a malformed-but-parseable file
-#: that should degrade to a clean ``no_results`` rather than escape as a generic
+#: Exceptions a plugin reader can raise on a malformed-but-parseable file that
+#: should degrade to a clean ``no_results`` rather than escape as a generic
 #: ``result_failed``.  ``TypeError``/``AttributeError`` cover e.g. ``None``
-#: column labels from a corrupted file.
+#: column labels from a corrupted file; the openPMD readers add an ``Exception``
+#: catch-all at the call site because ``openpmd_api`` raises plain ``Exception``
+#: for a bad series.
 _PLUGIN_SOFT_ERRORS = (ResultsReaderError, KeyError, OSError, ValueError, IndexError, TypeError, AttributeError)
 
 
@@ -184,12 +267,17 @@ def _sniff_format(name: str, *, is_dir: bool = False) -> str:
     """
     if is_dir:
         return "dir"
-    suffix = Path(name).suffix.lower()
-    if suffix in _OPENPMD_SUFFIXES:
-        return _OPENPMD_SUFFIXES[suffix]
+    # The plugin patterns are checked *before* the openPMD suffixes so a
+    # plugin series (``PhaseSpace_*_100.h5``, ``*_radAmplitudes_*.h5``,
+    # ``*_calorimeter_*_100.h5``) is named for its reader rather than merely as
+    # ``openpmd-hdf5``; a plain field series matches no plugin pattern and is
+    # still reported by its backend suffix below.
     for reader, spec in _PLUGIN_READERS.items():
         if spec.pattern.fullmatch(name):
             return reader
+    suffix = Path(name).suffix.lower()
+    if suffix in _OPENPMD_SUFFIXES:
+        return _OPENPMD_SUFFIXES[suffix]
     if suffix in _TEXT_SUFFIXES:
         return "text"
     return "binary"
@@ -979,7 +1067,14 @@ def _read(params: ResultParams, *, run_dir: Path, output: Path) -> dict[str, Any
 
 
 def _import_plugin_reader(name: str) -> type:
-    """Import one shipped PIConGPU text-plugin reader class.
+    """Import one shipped PIConGPU plugin reader class lazily.
+
+    The reader is imported from its own submodule rather than the package
+    ``__init__``, so a reader whose optional dependency is missing degrades only
+    itself: ``picongpu.extra.plugins.data.__init__`` eagerly imports every
+    reader, so importing it would make e.g. ``png`` fail when ``openpmd_api`` is
+    absent.  The submodule is imported without executing that package
+    ``__init__`` (a stub package is registered under the same name).
 
     Args:
         name: A registered reader name.
@@ -988,17 +1083,20 @@ def _import_plugin_reader(name: str) -> type:
         The reader class from ``picongpu.extra.plugins.data``.
 
     Raises:
-        ResultsUnavailable: If PIConGPU (with its readers) is not installed.
+        ResultsUnavailable: If PIConGPU, the reader's optional dependency, or
+            the reader class itself is not available.
 
     """
-    import importlib  # ruff: ignore[import-outside-top-level] - optional dependency
-
     spec = _PLUGIN_READERS[name]
     try:
-        module = importlib.import_module("picongpu.extra.plugins.data")
+        importlib.import_module("picongpu.extra.plugins")
     except ImportError as exc:
         msg = "the optional picongpu plugin readers are not installed"
         raise ResultsUnavailable(msg) from exc
+    if spec.needs != "picongpu" and importlib.util.find_spec(spec.needs) is None:
+        msg = f"the optional {spec.needs} reader is not installed"
+        raise ResultsUnavailable(msg)
+    module = _import_reader_module(spec)
     try:
         return getattr(module, spec.module)
     except AttributeError as exc:  # pragma: no cover - a PIConGPU version drift
@@ -1006,14 +1104,73 @@ def _import_plugin_reader(name: str) -> type:
         raise ResultsUnavailable(msg) from exc
 
 
+def _import_reader_module(spec: _PluginReader) -> types.ModuleType:
+    """Import the module that carries one plugin reader class.
+
+    The normal path imports the ``picongpu.extra.plugins.data`` package, so the
+    whole process sees PIConGPU's real package.  When that package (or the
+    cached stub left by an earlier degraded import) does not expose the class -
+    a *sibling* reader's optional dependency is missing, because the package
+    ``__init__`` imports every reader - it falls back to importing the bare
+    submodule, which bypasses the package ``__init__`` and lets readers degrade
+    independently.
+
+    Returns:
+        The package module, or the reader's submodule.
+
+    Raises:
+        ResultsUnavailable: If the submodule itself cannot be imported.
+
+    """
+    try:
+        module = importlib.import_module("picongpu.extra.plugins.data")
+    except ImportError:
+        module = None
+    if module is not None and hasattr(module, spec.module):
+        return module
+    plugins = sys.modules.get("picongpu.extra.plugins")
+    plugins_file = getattr(plugins, "__file__", None)
+    data_dir = Path(plugins_file).parent / "data" if plugins_file else Path()
+    _load_data_package(str(data_dir))
+    try:
+        return importlib.import_module(f"picongpu.extra.plugins.data.{spec.submodule}")
+    except ImportError as exc:
+        msg = f"the optional picongpu {spec.submodule} reader is not installed"
+        raise ResultsUnavailable(msg) from exc
+
+
+def _load_data_package(data_dir: str) -> types.ModuleType:
+    """Register (or reuse) a stub ``picongpu.extra.plugins.data`` package.
+
+    A package needs a module object with a ``__path__`` so its submodules import;
+    this one deliberately does not run PIConGPU's ``__init__``.
+
+    Returns:
+        The package module whose ``__path__`` points at ``data_dir``.
+
+    """
+    pkg_name = "picongpu.extra.plugins.data"
+    existing = sys.modules.get(pkg_name)
+    if isinstance(existing, types.ModuleType):
+        return existing
+    package = types.ModuleType(pkg_name)
+    package.__path__ = [data_dir]
+    package.__package__ = pkg_name
+    sys.modules[pkg_name] = package
+    return package
+
+
 def _plugin_target(output: Path, params: ResultParams, spec: _PluginReader) -> Path | None:
     """Resolve the plugin output file a request refers to.
 
     A ``path`` narrows the search when given; otherwise the first filename
     matching the reader's pattern (optionally narrowed by ``species``) is used.
+    For the openPMD-backed plugins the matching entry may be an ADIOS2 series
+    *directory* (``*.bp``/``*.bp5``), so directories are accepted there too.
 
     Returns:
-        The resolved file, or None when none is found or the path is unsafe.
+        The resolved file or series directory, or None when none is found or the
+        path is unsafe.
 
     """
     if params.path is not None:
@@ -1024,50 +1181,46 @@ def _plugin_target(output: Path, params: ResultParams, spec: _PluginReader) -> P
     candidates = [
         path
         for path, is_dir in _collect_entries(output)
-        if not is_dir and spec.pattern.fullmatch(path.name) and _plugin_species_matches(path.name, params)
+        if (not is_dir or spec.kind == _KIND_OPENPMD)
+        and spec.pattern.fullmatch(path.name)
+        and _plugin_species_matches(path.name, params, spec)
     ]
     candidates.sort(key=lambda path: path.name)
     return candidates[0] if candidates else None
 
 
-def _plugin_species_matches(name: str, params: ResultParams) -> bool:
+def _plugin_filename_groups(spec: _PluginReader, name: str) -> dict[str, str] | None:
+    """Parse a plugin filename into its named components.
+
+    Returns:
+        The named groups (``species``, ``filter``, ``iteration`` and the
+        reader-specific ``ps``/``axis``/``slice_point``), or None when the name
+        does not match the reader's pattern.
+
+    """
+    match = spec.pattern.fullmatch(name)
+    return match.groupdict() if match is not None else None
+
+
+def _plugin_species_matches(name: str, params: ResultParams, spec: _PluginReader) -> bool:
     """Whether a plugin filename belongs to the requested species/filter.
 
     Returns:
-        True when the request names no species, or the name matches it.
+        True when the request names no species/filter, or the filename's
+        components match them.
 
     """
-    if params.species is not None and not name.startswith(f"{params.species}_"):
+    groups = _plugin_filename_groups(spec, name)
+    if groups is None:
+        return False
+    if params.species is not None and groups.get("species") != params.species:
         return False
     # An unset filter means PIConGPU's default "all"; only an explicit
-    # non-default filter narrows the match.
-    return not (params.species_filter not in {None, "all"} and not name.endswith(f"_{params.species_filter}.dat"))
-
-
-def _derive_plugin_names(reader: str, name: str) -> tuple[str, str, int | None]:
-    """Derive (species, filter, iteration) from a plugin output filename.
-
-    The shipped readers re-resolve their file from these values, so the target
-    found by discovery must agree with them.
-
-    Returns:
-        The species, species filter and (transition-radiation only) iteration.
-
-    Raises:
-        ResultsReaderError: If the filename does not match the reader pattern.
-
-    """
-    if reader == "energy_histogram":
-        match = re.fullmatch(r"(?P<species>.+)_energyHistogram_(?P<filter>.+)\.dat", name)
-    elif reader == "emittance":
-        match = re.fullmatch(r"(?P<species>.+)_emittance_(?P<filter>.+)\.dat", name)
-    else:
-        match = re.fullmatch(r"(?P<species>.+)_transRad_(?P<iteration>\d+)\.dat", name)
-    if match is None:  # pragma: no cover - guarded by the registry pattern
-        msg = f"filename {name!r} does not match the {reader} reader"
-        raise ResultsReaderError(msg)
-    groups = match.groupdict()
-    return groups["species"], groups.get("filter", "all"), int(groups["iteration"]) if "iteration" in groups else None
+    # non-default filter narrows the match.  A reader without a filter component
+    # (radiation) matches any requested filter.
+    requested = params.species_filter
+    filter_component = groups.get("filter")
+    return requested in {None, "all"} or filter_component in {None, requested}
 
 
 def _resolve_plugin_iteration(available: list[int], iteration: int | str | None) -> int:
@@ -1118,12 +1271,13 @@ def _stride(values: list[float], max_points: int = _PLUGIN_MAX_POINTS) -> tuple[
 def _plugin_iterations(output: Path, spec: _PluginReader, species: str, species_filter: str) -> list[int]:
     """List the iterations a plugin's matching files on disk provide.
 
-    Used for the transition-radiation reader, whose per-iteration filenames
-    (``<species>_transRad_<iteration>.dat``) carry the step.  The shipped
-    ``TransitionRadiationData.get_iterations`` ignores ``species`` and globs
-    *every* ``*.dat`` in ``simOutput``, so a coexisting ``_energyHistogram_`` /
-    ``_emittance_`` file makes it raise ``ValueError``; enumerating the matching
-    filenames here avoids that entirely.
+    The iteration is read from the reader's filename pattern, so this works for
+    every per-iteration plugin that names its step (transition radiation,
+    radiation, phase space, calorimeter and PNG).  It is used instead of the
+    shipped readers' ``get_iterations`` where that would be unsafe: the
+    ``TransitionRadiationData`` reader globs *every* ``*.dat`` and raises on a
+    coexisting histogram/emittance file, and ``RadiationData`` has no iteration
+    listing at all (its constructor needs a concrete step).
 
     Returns:
         The sorted, de-duplicated iterations of the matching files.
@@ -1131,25 +1285,57 @@ def _plugin_iterations(output: Path, spec: _PluginReader, species: str, species_
     """
     iterations: set[int] = set()
     for path, is_dir in _collect_entries(output):
-        if is_dir or not spec.pattern.fullmatch(path.name):
+        if is_dir or "iteration" not in spec.pattern.groupindex:
             continue
-        if species and not path.name.startswith(f"{species}_"):
+        groups = _plugin_filename_groups(spec, path.name)
+        if groups is None:
             continue
-        if species_filter != "all" and not path.name.endswith(f"_{species_filter}.dat"):
+        if species and groups.get("species") != species:
             continue
-        match = re.fullmatch(r".+_transRad_(?P<iteration>\d+)\.dat", path.name)
-        if match is not None:
-            iterations.add(int(match.group("iteration")))
+        # An unset/default filter means "all"; only an explicit non-default
+        # filter narrows the match.
+        if species_filter != "all" and groups.get("filter") not in {None, species_filter}:
+            continue
+        iterations.add(int(groups["iteration"]))
     return sorted(iterations)
 
 
-def _plugin_summary(  # ruff: ignore[too-many-positional-arguments] - reader inputs stay explicit
+def _plugin_available_iterations(
+    reader: str,
+    spec: _PluginReader,
+    output: Path,
+    groups: dict[str, str],
+) -> list[int]:
+    """Determine the iterations a plugin reader can serve.
+
+    Prefers disk enumeration of the reader's matching filenames (robust against
+    a reader that cannot list its own steps); falls back to the shipped reader's
+    own listing for the text plugins, whose filenames carry no iteration and
+    therefore must be asked.
+
+    Returns:
+        The sorted available iterations.
+
+    """
+    species = groups.get("species", "")
+    species_filter = groups.get("filter", "all")
+    from_disk = _plugin_iterations(output, spec, species, species_filter)
+    if from_disk:
+        return from_disk
+    if reader in {"energy_histogram", "emittance", "transition_radiation"}:
+        instance = _import_plugin_reader(reader)(str(output.parent))
+        return [int(step) for step in instance.get_iterations(species, species_filter)]
+    return []
+
+
+def _plugin_summary(
     reader: str,
     instance: Any,
-    species: str,
-    species_filter: str,
+    groups: dict[str, str],
     iteration: int | str | None,
     available: list[int],
+    *,
+    target: Path,
 ) -> dict[str, Any]:
     """Call one plugin reader and shape a bounded numeric summary.
 
@@ -1158,7 +1344,61 @@ def _plugin_summary(  # ruff: ignore[too-many-positional-arguments] - reader inp
 
     """
     selected = _resolve_plugin_iteration(available, iteration)
-    return _PLUGIN_BUILDERS[reader](instance, species, species_filter, selected)
+    return _PLUGIN_BUILDERS[reader](instance, groups, selected, target)
+
+
+def _openpmd_pattern(spec: _PluginReader, name: str) -> str | None:
+    """Replace a concrete filename's iteration with openPMD's ``%T`` wildcard.
+
+    The radiation and calorimeter readers open the *whole* series (so a single
+    handle can select any step), unlike ``PhaseSpaceData``/``PNGData`` which
+    build the ``%T`` pattern internally.  The wildcard is placed exactly where
+    the reader's regex matched the iteration, so a filename with other digit
+    runs (radiation's ``_0_0_0`` suffix) is left intact.
+
+    Returns:
+        The pattern filename, or None when the name has no iteration group.
+
+    """
+    match = spec.pattern.fullmatch(name)
+    if match is None or "iteration" not in spec.pattern.groupindex:
+        return None
+    start, end = match.span("iteration")
+    return f"{name[:start]}%T{name[end:]}"
+
+
+def _build_plugin_instance(
+    reader: str,
+    spec: _PluginReader,
+    output: Path,
+    target: Path,
+    selected: int,
+) -> Any:
+    """Construct one plugin reader for a discovered target and selected step.
+
+    Every reader is instantiated against the run directory or an openPMD
+    ``%T`` pattern, never a single concrete file: the radiation and calorimeter
+    readers open a whole series, so a step other than the one baked into the
+    alphabetically first filename can still be read.
+
+    Returns:
+        The reader instance.
+
+    """
+    reader_class = _import_plugin_reader(reader)
+    if spec.kind == _KIND_TEXT:
+        return reader_class(str(output.parent))
+    if reader in {"phase_space", "png"}:
+        # These readers build the ``%T`` pattern (and, for PNG, the per-axis
+        # directory) from the run directory themselves.
+        return reader_class(str(output.parent))
+    # Radiation and calorimeter open the series directly; use the ``%T`` pattern
+    # so any selected step can be read, not only the one in the found filename.
+    pattern = _openpmd_pattern(spec, target.name)
+    series_path = str(target.parent / pattern) if pattern is not None else str(target)
+    if reader == "radiation":
+        return reader_class(series_path, selected)
+    return reader_class(series_path)
 
 
 def _plugin_result(
@@ -1173,30 +1413,315 @@ def _plugin_result(
     Returns:
         The reader-specific summary dict.
 
+    Raises:
+        ResultsReaderError: If the target filename stops matching its reader.
+
     """
-    species, species_filter, _derived_iteration = _derive_plugin_names(reader, target.name)
+    groups = _plugin_filename_groups(spec, target.name)
+    if groups is None:  # pragma: no cover - guarded by the registry pattern
+        msg = f"filename {target.name!r} does not match the {reader} reader"
+        raise ResultsReaderError(msg)
     # ``iteration=None`` must mean "latest" for every reader, so never fall back
     # to the iteration baked into the (alphabetically first) filename:
     # ``_resolve_plugin_iteration`` maps ``None``/``"last"`` to the maximum.
-    iteration = params.iteration
-    instance = _import_plugin_reader(reader)(str(output.parent))
-    if reader == "transition_radiation":
-        # The shipped ``get_iterations`` globs every ``*.dat`` and chokes on a
-        # coexisting histogram/emittance file, so enumerate the matching
-        # ``_transRad_<int>.dat`` names ourselves.
-        available = _plugin_iterations(output, spec, species, species_filter)
+    available = _plugin_available_iterations(reader, spec, output, groups)
+    selected = _resolve_plugin_iteration(available, params.iteration)
+    instance = _build_plugin_instance(reader, spec, output, target, selected)
+    return _plugin_summary(reader, instance, groups, selected, available, target=target)
+
+
+def _as_nested(data: Any) -> Any:
+    """Return ``data`` as plain Python lists (numpy arrays become nested lists).
+
+    The openPMD/PNG readers return numpy arrays, but the default server venv has
+    no numpy (it is optional with openpmd_api).  Reading the arrays through
+    ``tolist`` keeps the summaries pure-Python and lets the offline stub tests
+    drive them with lists.
+
+    Returns:
+        A nested ``list`` when ``data`` exposes ``tolist``; ``data`` unchanged
+        otherwise.
+
+    """
+    if hasattr(data, "tolist"):
+        return data.tolist()
+    return data
+
+
+def _nested_shape(value: Any) -> tuple[int, ...]:
+    """Return the shape of a (possibly ragged) nested list.
+
+    Returns:
+        The leading dimensions, stopping at the first non-sequence.
+
+    """
+    shape: list[int] = []
+    current = value
+    while isinstance(current, (list, tuple)):
+        shape.append(len(current))
+        current = current[0] if current else None
+    return tuple(shape)
+
+
+def _nested_sum(value: Any) -> float:
+    """Sum every leaf of a nested list.
+
+    Returns:
+        The total.
+
+    """
+    if isinstance(value, (list, tuple)):
+        return sum(_nested_sum(item) for item in value)
+    return float(value)
+
+
+def _nested_max(value: Any) -> float:
+    """Return the maximum leaf of a nested list.
+
+    Returns:
+        The maximum.
+
+    """
+    if isinstance(value, (list, tuple)):
+        return max((_nested_max(item) for item in value), default=0.0)
+    return float(value)
+
+
+def _phase_space_reduce(plane: list[list[float]]) -> tuple[int, int, list[float], list[float], int, int, float]:
+    """Project a 2D plane onto its axes and locate the peak bin.
+
+    Returns:
+        ``(n_r, n_p, projection_r, projection_p, peak_r, peak_p, max_count)``.
+
+    """
+    n_r, n_p = _nested_shape(plane)
+    projected_r = [sum(float(value) for value in row) for row in plane]
+    projected_p = [sum(float(plane[row][column]) for row in range(n_r)) for column in range(n_p)]
+    max_count = 0.0
+    peak_r = peak_p = 0
+    for row in range(n_r):
+        for column in range(n_p):
+            value = float(plane[row][column])
+            if value > max_count:
+                max_count, peak_r, peak_p = value, row, column
+    return n_r, n_p, projected_r, projected_p, peak_r, peak_p, max_count
+
+
+def _build_phase_space(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+) -> dict[str, Any]:
+    """Reduce a ``PhaseSpaceData`` histogram to a bounded summary.
+
+    The full 2D phase-space plane is far too large for the wire, so the summary
+    carries the histogram's axis ranges, its projections onto each axis (the
+    marginal distributions, strided to ``_PLUGIN_MAX_POINTS``) and the peak
+    location.  That answers "how many particles, over what ranges, peaked
+    where" without shipping the plane.
+
+    Returns:
+        Axis ranges, strided projections and scalars.
+
+    """
+    _ = target
+    plane, meta = instance.get(
+        iteration=iteration,
+        species=groups["species"],
+        species_filter=groups["filter"],
+        ps=groups["ps"],
+    )
+    plane = _as_nested(plane)
+    n_r, n_p, projected_r, projected_p, peak_r, peak_p, max_count = _phase_space_reduce(plane)
+    strided_r, downsampled = _stride(projected_r)
+    strided_p = _stride(projected_p)[0]
+    r_edges = [float(value) for value in meta.r_edges]
+    p_edges = [float(value) for value in meta.p_edges]
+    return {
+        "species": groups["species"],
+        "species_filter": groups["filter"],
+        "ps": groups["ps"],
+        "n_r": n_r,
+        "n_p": n_p,
+        "r_min_m": r_edges[0] if r_edges else None,
+        "r_max_m": r_edges[-1] if r_edges else None,
+        "p_min": p_edges[0] if p_edges else None,
+        "p_max": p_edges[-1] if p_edges else None,
+        "projection_r": strided_r,
+        "projection_p": strided_p,
+        "total_count": _nested_sum(plane),
+        "max_count": max_count,
+        "max_r_m": r_edges[peak_r] if peak_r < len(r_edges) else None,
+        "max_p": p_edges[peak_p] if peak_p < len(p_edges) else None,
+        "iteration": iteration,
+        "downsampled": downsampled,
+    }
+
+
+def _build_radiation(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+) -> dict[str, Any]:
+    """Reduce a ``RadiationData`` series to a bounded summary.
+
+    Returns:
+        Frequency (SI 1/s), the direction-summed spectrum and scalars.
+
+    """
+    _ = (groups, target)
+    spectra = _as_nested(instance.get_Spectra())
+    omegas = [float(value) for value in instance.get_omega()]
+    n_directions, n_frequencies = _nested_shape(spectra)
+    # Sum the (n_directions, n_frequencies) spectra over the observation
+    # directions so the summary is the total spectrum.
+    total_spectrum = [
+        sum(float(spectra[direction][frequency]) for direction in range(n_directions))
+        for frequency in range(n_frequencies)
+    ]
+    peak = max(range(len(total_spectrum)), key=total_spectrum.__getitem__) if total_spectrum else 0
+    strided_omega, downsampled = _stride(omegas)
+    strided_spectrum, _ = _stride(total_spectrum)
+    return {
+        "n_directions": n_directions,
+        "n_frequencies": n_frequencies,
+        "omega_per_s": strided_omega,
+        "spectrum": strided_spectrum,
+        "total_energy_J": _nested_sum(spectra),
+        "peak_spectrum_Js": max(total_spectrum) if total_spectrum else None,
+        "peak_omega_per_s": omegas[peak] if peak < len(omegas) else None,
+        "iteration": iteration,
+        "downsampled": downsampled,
+    }
+
+
+def _calorimeter_projections(
+    instance: Any,
+    iteration: int,
+) -> tuple[list[float] | None, list[float], list[float], float, float | None]:
+    """Project a calorimeter cube onto its energy, pitch and yaw axes.
+
+    The reader returns ``(n_energy, n_pitch, n_yaw)`` with energy binning or
+    ``(n_pitch, n_yaw)`` without; both are handled by one projection.
+
+    Returns:
+        ``(energy_keV or None, per_pitch_J, per_yaw_J, total_J, max_cell_J)``.
+
+    """
+    energy = instance.getEnergy()
+    data = _as_nested(instance.getData(iteration))
+    shape = _nested_shape(data)
+    if len(shape) == _NDIM_2D:
+        n_pitch, n_yaw = shape
+        per_pitch = [sum(float(value) for value in data[pitch]) for pitch in range(n_pitch)]
+        per_yaw = [sum(float(data[pitch][yaw]) for pitch in range(n_pitch)) for yaw in range(n_yaw)]
+        energy_kev = None
     else:
-        available = [int(step) for step in instance.get_iterations(species, species_filter)]
-    return _plugin_summary(reader, instance, species, species_filter, iteration, available)
+        n_energy, n_pitch, n_yaw = shape
+        per_pitch = [
+            sum(float(data[energy_index][pitch][yaw]) for energy_index in range(n_energy) for yaw in range(n_yaw))
+            for pitch in range(n_pitch)
+        ]
+        per_yaw = [
+            sum(float(data[energy_index][pitch][yaw]) for energy_index in range(n_energy) for pitch in range(n_pitch))
+            for yaw in range(n_yaw)
+        ]
+        energy_kev = [float(value) for value in energy] if energy is not None else None
+    total = _nested_sum(data)
+    peak = _nested_max(data) if total else None
+    return energy_kev, per_pitch, per_yaw, total, peak
 
 
-def _build_energy_histogram(instance: Any, species: str, species_filter: str, iteration: int) -> dict[str, Any]:
+def _build_calorimeter(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+) -> dict[str, Any]:
+    """Reduce a ``particleCalorimeter`` result to a bounded summary.
+
+    Returns:
+        Bin counts, energy edges, the yaw/pitch marginals and scalars.
+
+    """
+    _ = (groups, target)
+    energy_kev, per_pitch, per_yaw, total, peak = _calorimeter_projections(instance, iteration)
+    strided_pitch, downsampled = _stride(per_pitch)
+    strided_yaw, _ = _stride(per_yaw)
+    return {
+        "n_pitch": int(instance.detector_params["N_pitch"]),
+        "n_yaw": int(instance.detector_params["N_yaw"]),
+        "n_energy": instance.detector_params["N_energy"],
+        "energy_keV": energy_kev,
+        "per_pitch_J": strided_pitch,
+        "per_yaw_J": strided_yaw,
+        "total_energy_J": total,
+        "max_energy_J": peak,
+        "iteration": iteration,
+        "downsampled": downsampled,
+    }
+
+
+def _build_png(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+) -> dict[str, Any]:
+    """Describe a ``PNGData`` image without shipping pixels.
+
+    The wire budget cannot carry a full image, and the openPMD thumbnail path
+    already exists for mesh data, so the PNG reader returns metadata only
+    (dimensions, iteration, path).  The image itself is fetched through
+    ``export``; the summary says so via ``image_via="export"``.
+
+    Returns:
+        Image dimensions, selector and the relative path.
+
+    """
+    species, axis, slice_point = groups["species"], groups["axis"], float(groups["slice_point"])
+    image = _as_nested(
+        instance.get(
+            iteration=iteration,
+            species=species,
+            species_filter=groups.get("filter", "all"),
+            axis=axis,
+            slice_point=slice_point,
+        ),
+    )
+    shape = _nested_shape(image)
+    height, width = (*shape, 0, 0)[:_NDIM_2D]
+    channels = shape[_NDIM_2D] if len(shape) == _NDIM_3D else 1
+    return {
+        "species": species,
+        "axis": axis,
+        "slice_point": slice_point,
+        "width_px": int(width),
+        "height_px": int(height),
+        "channels": int(channels),
+        "path": target.name,
+        "image_via": "export",
+        "iteration": iteration,
+        "downsampled": False,
+    }
+
+
+def _build_energy_histogram(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+) -> dict[str, Any]:
     """Reduce an ``EnergyHistogramData`` result to a bounded summary.
 
     Returns:
         Bins (keV), counts, the count in the default window and scalars.
 
     """
+    _ = target
+    species, species_filter = groups["species"], groups["filter"]
     counts, bins, _iteration, _dt = instance.get(
         iteration=iteration,
         species=species,
@@ -1223,13 +1748,20 @@ def _build_energy_histogram(instance: Any, species: str, species_filter: str, it
     }
 
 
-def _build_emittance(instance: Any, species: str, species_filter: str, iteration: int) -> dict[str, Any]:
+def _build_emittance(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+) -> dict[str, Any]:
     """Reduce an ``EmittanceData`` result to a bounded summary.
 
     Returns:
         Slice positions (m), slice emittances (m rad) and scalars.
 
     """
+    _ = target
+    species, species_filter = groups["species"], groups["filter"]
     raw, y_slices, _iteration, _dt = instance.get(
         iteration=iteration,
         species=species,
@@ -1257,7 +1789,12 @@ def _build_emittance(instance: Any, species: str, species_filter: str, iteration
     }
 
 
-def _build_transition_radiation(instance: Any, species: str, species_filter: str, iteration: int) -> dict[str, Any]:
+def _build_transition_radiation(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+) -> dict[str, Any]:
     """Reduce a ``TransitionRadiationData`` result to a bounded summary.
 
     The reader's ``spectrum`` view (the brightest angles) is a bounded 1D
@@ -1267,7 +1804,8 @@ def _build_transition_radiation(instance: Any, species: str, species_filter: str
         Frequency (SI 1/s), intensity and scalars.
 
     """
-    _ = species_filter
+    _ = target
+    species = groups["species"]
     omegas, spectrum = instance.get(
         iteration=iteration,
         species=species,
@@ -1292,11 +1830,17 @@ def _build_transition_radiation(instance: Any, species: str, species_filter: str
     }
 
 
-#: Reader name -> the summary builder that calls the reader instance.
-_PLUGIN_BUILDERS: dict[str, Callable[[Any, str, str, int], dict[str, Any]]] = {
+#: Reader name -> the summary builder that calls the reader instance.  Every
+#: builder shares the signature ``(instance, groups, iteration, target)`` so the
+#: openPMD/image readers can reach their extra selector components.
+_PLUGIN_BUILDERS: dict[str, Callable[[Any, dict[str, str], int, Path], dict[str, Any]]] = {
     "energy_histogram": _build_energy_histogram,
     "emittance": _build_emittance,
     "transition_radiation": _build_transition_radiation,
+    "phase_space": _build_phase_space,
+    "radiation": _build_radiation,
+    "calorimeter": _build_calorimeter,
+    "png": _build_png,
 }
 
 
@@ -1348,7 +1892,7 @@ def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean 
     if not output.is_dir():
         return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
     target = _plugin_target(output, params, spec)
-    if target is None or not target.is_file():
+    if target is None or not (target.is_file() or (spec.kind == _KIND_OPENPMD and target.is_dir())):
         return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
     try:
         summary = _plugin_result(reader, spec, output, params, target)
@@ -1356,6 +1900,9 @@ def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean 
         return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
     except _PLUGIN_SOFT_ERRORS as exc:
         log.debug("plugin reader %r failed: %s", reader, exc)
+        return _error(SimulationErrorCode.NO_RESULTS, str(exc))
+    except Exception as exc:  # ruff: ignore[blind-except] - a reader crash is ack data, never a 500
+        log.debug("plugin reader %r crashed: %s", reader, exc)
         return _error(SimulationErrorCode.NO_RESULTS, str(exc))
     bounded = _bound_plugin(summary)
     if bounded is None:
