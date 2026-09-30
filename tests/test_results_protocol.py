@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from pic_agentic.protocol.simulation import (
     MAX_RESULT_BYTES,
+    PLUGIN_READER_NAMES,
     RESULT_TEXT_MAX_BYTES,
     SLICE_MAX_POINTS,
     ResultManifest,
@@ -70,6 +71,33 @@ def test_result_params_rejects_unknown_stream(stream: str) -> None:
 def test_result_params_allows_stdout_stderr_streams() -> None:
     assert ResultParams(sim_id=SIM, op=ResultOp.READ, stream="stdout").stream == "stdout"
     assert ResultParams(sim_id=SIM, op=ResultOp.READ, stream="stderr").stream == "stderr"
+
+
+@pytest.mark.parametrize("reader", ["bogus", "EnergyHistogram", "openpmd", ""])
+def test_result_params_rejects_unknown_reader(reader: str) -> None:
+    with pytest.raises(ValidationError):
+        ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader=reader)
+
+
+def test_result_params_accepts_registered_readers() -> None:
+    for reader in PLUGIN_READER_NAMES:
+        assert ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader=reader).reader == reader
+
+
+@pytest.mark.parametrize("name", ["../e", "a/b", "e;rm", "e f", "ü"])
+def test_result_params_rejects_unsafe_species(name: str) -> None:
+    with pytest.raises(ValidationError):
+        ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, species=name)
+
+
+def test_result_params_plugin_defaults_and_round_trip() -> None:
+    params = ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="energy_histogram", species="e")
+    assert params.species_filter == "all"
+    assert params.iteration is None
+    command = build_result_command(sim=SIM, seq=1, params=params, cmd_id=CMD_ID)
+    assert command.payload["reader"] == "energy_histogram"
+    assert command.payload["species"] == "e"
+    assert command.payload["species_filter"] == "all"
 
 
 def test_result_params_forbids_extra_fields() -> None:

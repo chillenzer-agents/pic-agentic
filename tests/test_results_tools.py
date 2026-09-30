@@ -201,9 +201,12 @@ async def test_tool_registration_shape() -> None:
         "describe_results",
         "get_result_slice",
         "read_result",
+        "read_plugin_result",
         "export_results",
     }
     assert expected <= set(tools)
+    # The frozen tool surface the LLM sees: one new tool must not go missing.
+    assert len(tools) == 33
     for name in (
         "checkpoint_simulation",
         "stop_simulation",
@@ -220,7 +223,7 @@ async def test_tool_registration_shape() -> None:
     assert cancel is not None
     assert cancel.read_only_hint is False
     assert cancel.destructive_hint is True
-    for name in ("describe_results", "get_result_slice", "read_result", "export_results"):
+    for name in ("describe_results", "get_result_slice", "read_result", "read_plugin_result", "export_results"):
         annotations = tools[name].annotations
         assert annotations is not None
         assert annotations.read_only_hint is True
@@ -236,6 +239,14 @@ async def test_tool_registration_shape() -> None:
         "downsample",
     }
     assert set(tools["read_result"].input_schema["properties"]) == {"sim_id", "path", "stream", "tail"}
+    assert set(tools["read_plugin_result"].input_schema["properties"]) == {
+        "sim_id",
+        "reader",
+        "species",
+        "species_filter",
+        "iteration",
+        "path",
+    }
 
 
 async def test_direct_service_control_round_trip() -> None:

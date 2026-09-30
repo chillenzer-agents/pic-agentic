@@ -1002,6 +1002,39 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
         return await _result_tool(runtime, ResultOp.READ, sim_id=sim_id, path=path, stream=stream, tail=tail)
 
     @server.tool(
+        title="Read a PIConGPU plugin result",
+        description=(
+            "Run one of PIConGPU's shipped text-plugin readers over a "
+            "simulation's simOutput and return a bounded numeric summary. "
+            "`reader` is one of 'energy_histogram', 'emittance' or "
+            "'transition_radiation'; `species` and `species_filter` select the "
+            "output, and `iteration` picks a step ('last' by default). Use "
+            "`describe_results` to see which plugin files exist. Requires the "
+            "picongpu readers on the cluster."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def read_plugin_result(
+        sim_id: str,
+        reader: str,
+        *,
+        species: str | None = None,
+        species_filter: str = "all",
+        iteration: int | str | None = None,
+        path: str | None = None,
+    ) -> dict[str, Any]:
+        return await _result_tool(
+            runtime,
+            ResultOp.PLUGIN,
+            sim_id=sim_id,
+            reader=reader,
+            species=species,
+            species_filter=species_filter,
+            iteration=iteration,
+            path=path,
+        )
+
+    @server.tool(
         title="Export simulation results",
         description=(
             "Return a transfer ticket (a ResultRef plus an rsync command, or a "
