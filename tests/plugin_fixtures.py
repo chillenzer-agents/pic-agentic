@@ -111,3 +111,55 @@ def emittance_dat(
     path = sim_output / f"{species}_emittance_{species_filter}.dat"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def transrad_dat(
+    run_dir: Path,
+    *,
+    species: str = "e",
+    iteration: int = 0,
+    n_omega: int = 4,
+    omega_min: float = 1e15,
+    omega_max: float = 4e15,
+    n_phi: int = 2,
+    n_theta: int = 3,
+    peak_row: int = 0,
+    peak_column: int = 3,
+    peak_intensity: float = 7.0,
+) -> Path:
+    r"""Write a ``<species>_transRad_<iteration>.dat`` the real reader parses.
+
+    Mirrors the ``TransitionRadiation.x.cpp`` writer: a ``# \\t`` header line of
+    ``mode n_omega omega_min omega_max n_phi phi_min phi_max n_theta theta_min
+    theta_max`` followed by ``n_theta * n_phi`` tab-separated rows of
+    ``n_omega`` intensities (row index ``theta * n_phi + phi``).
+
+    Returns:
+        The written data file's path.
+
+    """
+    sim_output = Path(run_dir) / "simOutput"
+    sim_output.mkdir(parents=True, exist_ok=True)
+    header = "# \t" + "\t".join(
+        [
+            "lin",
+            str(n_omega),
+            f"{omega_min:.10g}",
+            f"{omega_max:.10g}",
+            str(n_phi),
+            "0",
+            "6.28",
+            str(n_theta),
+            "0",
+            "3.14",
+        ],
+    )
+    lines = [header]
+    for row_index in range(n_theta * n_phi):
+        row = [0.0] * n_omega
+        if row_index == peak_row:
+            row[peak_column] = peak_intensity
+        lines.append("\t".join(f"{value:.10g}" for value in row))
+    path = sim_output / f"{species}_transRad_{iteration}.dat"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
