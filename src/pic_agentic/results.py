@@ -110,6 +110,14 @@ class _PluginReader:
 #: Registry of shipped text-plugin readers, keyed by the frozen wire name.  The
 #: filename patterns mirror the PIConGPU readers: energy histogram and emittance
 #: are per-species/file-name text files; transition radiation is per iteration.
+#:
+#: The ``species``/``species_filter`` components are arbitrary PIConGPU
+#: identifiers, so these patterns cannot be tightened to a known species list.
+#: They are therefore a *heuristic* for the manifest ``format`` only (see
+#: :func:`_sniff_format`): a filename that merely resembles plugin output (e.g.
+#: ``notes_emittance_x.dat``) may be labelled as one.  The reader remains the
+#: authority - it re-resolves the file from the species/filter and returns a
+#: clean ``no_results`` when the name does not correspond.
 _PLUGIN_READERS: dict[str, _PluginReader] = {
     "energy_histogram": _PluginReader(
         re.compile(r"^[A-Za-z0-9_]+_energyHistogram_[A-Za-z0-9_]+\.dat$"),
@@ -157,6 +165,13 @@ def _reader_name() -> str | None:
 
 def _sniff_format(name: str, *, is_dir: bool = False) -> str:
     """Classify an entry by its filename alone (never opens it).
+
+    The plugin formats are matched by a filename-shape *heuristic* only (the
+    species/filter components are arbitrary identifiers); a name that merely
+    resembles plugin output may be labelled as one.  This is safe precisely
+    because the classification drives no destructive action - ``read`` only
+    advertises the reader and the plugin path re-validates the file and returns
+    a clean ``no_results`` on a mismatch.
 
     Args:
         name: The entry's basename.

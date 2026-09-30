@@ -76,6 +76,28 @@ def test_scandir_names_the_plugin_reader(tmp_path: Path) -> None:
     assert formats["output"] == "binary"
 
 
+def test_sniff_format_is_a_documented_filename_heuristic(tmp_path: Path) -> None:
+    """A plugin-looking name is labelled by shape; the reader stays authoritative (N2).
+
+    The species/filter components are arbitrary identifiers, so the classifier
+    cannot require a known species list; it labels ``notes_emittance_x.dat`` as
+    ``emittance``.  That is harmless because a request against the file is still
+    resolved (and rejected) by the reader, never crashed on.
+    """
+    assert results._sniff_format("e_emittance_all.dat") == "emittance"
+    assert results._sniff_format("notes_emittance_x.dat") == "emittance"
+    assert results._sniff_format("notes.txt") == "text"
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "notes_emittance_x.dat").write_text("x\n", encoding="utf-8")
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="emittance", species="notes")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    # Either the reader is absent (clean reader_unavailable) or it rejects the
+    # mislabelled file (clean no_results); never a crash or generic failure.
+    assert payload.get("error_code") in {"reader_unavailable", "no_results"}
+
+
 def test_plugin_missing_output_is_no_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubReader)
     run = tmp_path / "run"
