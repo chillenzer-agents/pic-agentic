@@ -29,13 +29,11 @@ import json
 import math
 import os
 import re
-from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pic_agentic.protocol.simulation import (
     MAX_RESULT_BYTES,
-    PLUGIN_READER_NAMES,
     RESULT_TEXT_MAX_BYTES,
     SLICE_MAX_POINTS,
     ResultManifest,
@@ -47,6 +45,8 @@ from pic_agentic.rcp import encode_wire
 from pic_agentic.simclient.simulation import SimulationErrorCode, find_stdout_path
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pic_agentic.analysis_program import AnalysisProgram
 
 #: Maximum directory depth a scan descends.  PIConGPU output nests a handful of
@@ -99,28 +99,31 @@ class _PluginReader:
     Attributes:
         pattern: The ``simOutput`` filename glob the reader's output matches.
         module: The ``picongpu.extra.plugins.data`` class name to import.
-        required: The kwargs the reader entry point needs (beyond ``iteration``).
-        needs_iteration: Whether the reader requires an explicit iteration.
+        required: The reader-kwargs the entry point needs beyond ``iteration``.
 
     """
 
     pattern: re.Pattern[str]
     module: str
     required: tuple[str, ...] = ("species",)
-    needs_iteration: bool = False
 
 
 #: Registry of shipped text-plugin readers, keyed by the frozen wire name.  The
 #: filename patterns mirror the PIConGPU readers: energy histogram and emittance
 #: are per-species/file-name text files; transition radiation is per iteration.
 _PLUGIN_READERS: dict[str, _PluginReader] = {
-    "energy_histogram": _PluginReader(re.compile(r"^[A-Za-z0-9_]+_energyHistogram_[A-Za-z0-9_]+\.dat$"), "EnergyHistogramData"),
-    "emittance": _PluginReader(re.compile(r"^[A-Za-z0-9_]+_emittance_[A-Za-z0-9_]+\.dat$"), "EmittanceData"),
+    "energy_histogram": _PluginReader(
+        re.compile(r"^[A-Za-z0-9_]+_energyHistogram_[A-Za-z0-9_]+\.dat$"),
+        "EnergyHistogramData",
+    ),
+    "emittance": _PluginReader(
+        re.compile(r"^[A-Za-z0-9_]+_emittance_[A-Za-z0-9_]+\.dat$"),
+        "EmittanceData",
+    ),
     "transition_radiation": _PluginReader(
         re.compile(r"^[A-Za-z0-9_]+_transRad_[0-9]+\.dat$"),
         "TransitionRadiationData",
         required=("species", "iteration"),
-        needs_iteration=True,
     ),
 }
 
@@ -1080,7 +1083,13 @@ def _stride(values: list[float], max_points: int = _PLUGIN_MAX_POINTS) -> tuple[
     return values[::step], True
 
 
-def _plugin_summary(reader: str, instance: Any, species: str, species_filter: str, iteration: int | str | None) -> dict[str, Any]:
+def _plugin_summary(
+    reader: str,
+    instance: Any,
+    species: str,
+    species_filter: str,
+    iteration: int | str | None,
+) -> dict[str, Any]:
     """Call one plugin reader and shape a bounded numeric summary.
 
     Returns:
@@ -1110,7 +1119,7 @@ def _build_energy_histogram(instance: Any, species: str, species_filter: str, it
     counts = [float(value) for value in counts]
     bins = [float(value) for value in bins]
     low, high = _DEFAULT_WINDOW_KEV
-    in_window = sum(count for bin_kev, count in zip(bins, counts) if low <= bin_kev <= high)
+    in_window = sum(count for bin_kev, count in zip(bins, counts, strict=True) if low <= bin_kev <= high)
     peak = max(range(len(counts)), key=counts.__getitem__) if counts else 0
     strided_bins, downsampled = _stride(bins)
     strided_counts, _ = _stride(counts)
@@ -1219,7 +1228,11 @@ def _bound_plugin(summary: dict[str, Any]) -> dict[str, Any] | None:
     return bounded
 
 
-def _plugin(params: ResultParams, *, output: Path) -> dict[str, Any]:
+def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean error
+    params: ResultParams,
+    *,
+    output: Path,
+) -> dict[str, Any]:
     """Answer a ``PLUGIN`` request by running a shipped PIConGPU reader.
 
     The reader runs in-process on the cluster (the caller wraps this in
@@ -1504,7 +1517,7 @@ def _export(output: Path, *, sim_id: str, run_dir: Path, local_root: str) -> dic
     return {"result": ticket}
 
 
-def resolve_result(
+def resolve_result(  # ruff: ignore[too-many-return-statements] - one dispatch per op
     params: ResultParams,
     *,
     run_dir: Path | str,
