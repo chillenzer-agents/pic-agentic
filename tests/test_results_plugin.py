@@ -287,3 +287,33 @@ def test_real_transition_radiation_reader_ignores_other_dat_files(tmp_path: Path
     assert summary["omega_per_s"] == [1e15, 2e15, 3e15, 4e15]
     assert summary["peak_intensity"] == pytest.approx(7.0)
     assert summary["peak_omega_per_s"] == pytest.approx(4e15)
+
+
+def test_real_transition_radiation_reader_defaults_to_latest(tmp_path: Path) -> None:
+    """The real ``TransitionRadiationData`` picks the latest step by default (B3).
+
+    The files are written ``0``, ``50`` and ``100``; selecting the iteration
+    baked into the alphabetically first filename would choose ``0``.
+    """
+    pytest.importorskip("picongpu")
+    from plugin_fixtures import transrad_dat
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    for iteration in (0, 50, 100):
+        transrad_dat(run, iteration=iteration)
+
+    default = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="transition_radiation", species="e")
+    payload = results.resolve_result(default, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    assert payload["result"]["iteration"] == 100
+
+    explicit = default.model_copy(update={"iteration": "last"})
+    last = results.resolve_result(explicit, run_dir=run, sim_id=SIM_ID)
+    assert "result" in last, last
+    assert last["result"]["iteration"] == 100
+
+    first = default.model_copy(update={"iteration": 0})
+    zero = results.resolve_result(first, run_dir=run, sim_id=SIM_ID)
+    assert "result" in zero, zero
+    assert zero["result"]["iteration"] == 0
