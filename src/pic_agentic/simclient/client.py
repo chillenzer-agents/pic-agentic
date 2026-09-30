@@ -804,6 +804,10 @@ class SimClient:
             self._background_tasks.discard(finished)
             if self._submit_tasks.get(cmd_id) is finished:
                 del self._submit_tasks[cmd_id]
+            # ``execute_submit`` reports its own stage failures as events; any
+            # other exception is a bug and must not vanish with the task.
+            if not finished.cancelled() and (error := finished.exception()) is not None:
+                log.error("error running accepted submit %s", cmd_id, exc_info=error)
 
         task.add_done_callback(_reap)
 
