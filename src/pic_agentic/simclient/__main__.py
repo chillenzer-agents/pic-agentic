@@ -20,7 +20,12 @@ from pic_agentic.auth import MasTokenStore
 from pic_agentic.config import Config
 from pic_agentic.protocol.simulation import SimulationOp
 from pic_agentic.simclient import SimClient
-from pic_agentic.simclient.client import DEFAULT_POLL_INTERVAL_S, DEFAULT_POLL_MAX_INTERVAL_S
+from pic_agentic.simclient.client import (
+    BUILD_CONCURRENCY_ENV,
+    DEFAULT_POLL_INTERVAL_S,
+    DEFAULT_POLL_MAX_INTERVAL_S,
+    resolve_build_concurrency,
+)
 from pic_agentic.simclient.simulation import SubmitConfig
 from pic_agentic.slurm import SlurmClient
 from pic_agentic.transport.matrix import MatrixTransport
@@ -100,6 +105,7 @@ async def run() -> None:
         allowed_sender_user_id=os.environ.get("PIC_AGENTIC_ALLOWED_SENDER"),
         submit_config=submit_config,
         control_fn=_make_control_fn(slurm),
+        build_concurrency=resolve_build_concurrency(os.environ.get(BUILD_CONCURRENCY_ENV)),
     )
     try:
         await client.serve()

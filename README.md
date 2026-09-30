@@ -64,6 +64,46 @@ The pin points at the `chillenzer-agents/picongpu` fork stack head that
 provides lossless `Runner` round-tripping (`pyproject.toml` `[sim]`). Installing
 it requires `git`; the offline test suite does not need it.
 
+### Clean install for an agent host
+
+A host that exposes this MCP server to an LLM agent must install it as a
+**package**, never run it from a checkout. `scripts/install-mcp.sh` is the
+supported production path:
+
+```bash
+bash scripts/install-mcp.sh          # install + register + preflight
+bash scripts/install-mcp.sh --check  # read-only acceptance checks
+bash scripts/install-mcp.sh reset    # clear campaign/reuse state only
+```
+
+It installs `pic-agentic[sim]` non-editably from a pinned 40-hex commit into a
+dedicated venv, writes the 0600 config, registers the server under the
+`pic-agentic` key in `~/.config/opencode/opencode.json`, and runs preflights
+(tool surface, installed-revision/capability, plus a room/secret rendezvous
+check). The environment topology it assumes:
+
+- **The agent sees only the MCP tool surface.** The pic-agentic source, this
+  README, `AGENTS.md`, `docs/beta-test-prompts.md`, the tests and the git
+  history must not be reachable from the agent's workspace or home. The server
+  is a wheel in a venv; the installer fetches the one helper script it needs
+  from a pinned raw URL and deletes it, leaving no checkout behind.
+- **Secrets stay in the 0600 config** (`~/.config/pic-agentic/config.toml`) or
+  the MCP `environment` block — never in the workspace, logs, or tool output.
+- **The cluster-side simclient uses the same room, secret and pinned stack.**
+  The preflight fails loudly when the configured secret verifies none of the
+  room's RCP messages, which is the signature of a stale/mismatched secret. On
+  a fresh room with no traffic yet it only warns (there is nothing to verify
+  against), and it verifies either role's messages since both sign with the
+  same shared secret.
+- **A stale pin fails loudly.** The installer asserts the venv's installed
+  `pic-agentic` revision equals the pin and that its simclient carries the M3
+  result handling and non-blocking dispatch, both at install time and in
+  `--check`, so the old blocking control plane cannot be shipped silently.
+
+The end-to-end invariants and the beta acceptance checks are recorded in the
+beta-container handover; the installer's `--check` mode implements the
+machine-checkable ones.
+
 ## Authentication (MAS-fronted homeservers)
 
 Production homeservers such as `chat.academiccloud.de` are fronted by Matrix
