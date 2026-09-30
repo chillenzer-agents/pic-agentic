@@ -158,12 +158,24 @@ def test_result_params_rejects_extra_fields() -> None:
 def test_real_energy_histogram_reader_end_to_end(tmp_path: Path) -> None:
     """The real ``EnergyHistogramData`` runs through the tool path.
 
+    Builds the exact ``rcp.result_request`` the ``read_plugin_result`` tool sends,
+    parses it back into ``ResultParams`` (as the simclient does) and resolves it
+    through the engine, so the wire + engine path is covered with a real reader.
     Run with a PIConGPU venv (see the module docstring); skipped in the default
     suite where picongpu is absent.
     """
     pytest.importorskip("picongpu")
+    from pic_agentic.protocol.simulation import build_result_command
+
     run = _tree(tmp_path)
-    payload = results.resolve_result(_params(species="e", iteration=50), run_dir=run, sim_id=SIM_ID)
+    params = _params(species="e", iteration=50)
+    command = build_result_command(sim=SIM_ID, seq=1, params=params, cmd_id="cmd")
+    assert command.payload["op"] == "plugin"
+    assert command.payload["reader"] == "energy_histogram"
+    parsed = ResultParams.model_validate(
+        {key: command.payload[key] for key in ResultParams.model_fields if key in command.payload},
+    )
+    payload = results.resolve_result(parsed, run_dir=run, sim_id=SIM_ID)
     assert "result" in payload, payload
     summary = payload["result"]
     assert summary["iteration"] == 50
