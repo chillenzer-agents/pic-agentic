@@ -16,9 +16,10 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 import subprocess
+import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
@@ -323,15 +324,6 @@ def prepare_submit(
     )
 
 
-#: Captured stderr of the last workflow execution.  Single process-global slot:
-#: safe only because the simclient executes one submission at a time (the
-#: single-threaded event loop serialises ``execute_submit``, and the only
-#: concurrent caller is that one submission's ``asyncio.to_thread``).  It is
-#: reset at the start of every ``_run_workflow`` and read immediately after via
-#: ``_workflow_failure_detail``; do not introduce concurrent workflow runs
-#: without replacing it with a per-run return value.
-_LAST_WORKFLOW_STDERR = ""
-
 #: Cap on the captured error text sent in a failure event.
 _MAX_ERROR_DETAIL = 4000
 #: Files above this size are skipped by the cache scan (compiled binaries).
@@ -346,66 +338,191 @@ _ERROR_LINE_RE = re.compile(
 )
 
 
-def _run_workflow(runner: Any) -> None:
-    """Run the CWL workflow, capturing its stderr for failure reporting.
+#: Per-thread scratch buffer for :class:`_CapturingStderr`; set for the
+#: duration of one workflow run so concurrent runs never share a buffer.
+_CAPTURE_STATE = threading.local()
+
+#: Serialises the one-time ``RuntimeContext`` install.
+_CAPTURE_INSTALL_LOCK = threading.Lock()
+
+#: The shared capture proxy injected process-wide; per-run isolation comes from
+#: the thread-local buffer, not from the proxy identity.
+_CAPTURE_PROXY: _CapturingStderr | None = None
+
+
+class _CapturingStderr:
+    """A per-run ``stderr`` proxy that tees into the invoking thread's buffer.
+
+    cwltool passes ``RuntimeContext.default_stderr`` to every step subprocess
+    and, for its own messages, hands it to the ``cwltool`` logger.  Redirecting
+    *that* object (rather than process-wide file descriptor 2) makes the capture
+    per run: two workflows in different threads write to their own buffers,
+    since :class:`_CapturingStderr` resolves the current thread's buffer on
+    every write.  The real stderr is still written through, so operator logs
+    stay visible.
+    """
+
+    def __init__(self, real: Any) -> None:
+        """Wrap ``real`` (the process stderr) as the pass-through sink."""
+        self._real = real
+
+    def _target(self) -> Any:
+        """Return the thread's capture buffer, or fall back to the real sink.
+
+        Returns:
+            The active buffer for this thread, else the wrapped real stream.
+
+        """
+        return getattr(_CAPTURE_STATE, "buffer", None) or self._real
+
+    def write(self, text: str) -> int:
+        """Write ``text`` to the per-run buffer and the real stderr.
+
+        Returns:
+            The number of characters written (as reported by the sink).
+
+        """
+        return self._target().write(text)
+
+    def flush(self) -> None:
+        """Flush the current thread's sink."""
+        self._target().flush()
+
+    def fileno(self) -> int:
+        """Return the underlying file descriptor.
+
+        Returns:
+            The file descriptor of the current thread's sink.
+
+        """
+        return self._target().fileno()
+
+    def isatty(self) -> bool:
+        """Report whether the current thread's sink is a terminal.
+
+        Returns:
+            True when the sink is a terminal.
+
+        """
+        return self._target().isatty()
+
+    @staticmethod
+    def writable() -> bool:
+        """Report that the sink accepts writes.
+
+        Returns:
+            Always True.
+
+        """
+        return True
+
+    @property
+    def encoding(self) -> str:
+        """The sink's text encoding (used by subprocess)."""
+        return getattr(self._target(), "encoding", None) or "utf-8"
+
+    def close(self) -> None:
+        """No-op: the per-run buffer outlives the stream cwltool may close."""
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate any other attribute access to the real stderr.
+
+        Returns:
+            The named attribute of the wrapped real stream.
+
+        """
+        return getattr(self._real, name)
+
+
+def _capture_runtime_context(base: Any, proxy: _CapturingStderr) -> type:
+    """Build a ``RuntimeContext`` subclass that injects the capture proxy.
+
+    Returns:
+        A subclass forcing ``default_stderr`` to ``proxy``.
+
+    """
+
+    class _RuntimeContext(base):  # type: ignore[misc, valid-type]
+        def __init__(self, kwargs: Any = None) -> None:
+            merged = dict(kwargs or {})
+            merged.setdefault("default_stderr", proxy)
+            super().__init__(merged)
+
+    return _RuntimeContext
+
+
+def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
+    """Run the CWL workflow, returning its captured error lines.
 
     cwltool raises only ``Completed permanentFail``; the actual step command
-    error (e.g. ``cmake: command not found``) is written to file descriptor 2
-    by cwltool and the step subprocess, bypassing both the ``cwltool`` logger
-    and Python-level ``sys.stderr`` redirection.  Redirect fd 2 to a temporary
-    file for the duration of the run and retain the matching lines.
+    error (e.g. ``cmake: command not found``) is written to stderr by cwltool
+    and the step subprocess, bypassing the ``cwltool`` logger.  The capture is
+    per run (see :class:`_CapturingStderr`), so concurrent submissions never
+    observe each other's output.
 
     Args:
         runner: The ``pypicongpu.Runner`` to run.
+        capture: Optional single-element list receiving the captured lines even
+            when ``runner.run()`` raises (the failure path needs the detail).
+
+    Returns:
+        The matching stderr lines for *this* run, or ``""`` when the workflow
+        does not use the pinned runner (e.g. a test double).
 
     """
-    global _LAST_WORKFLOW_STDERR  # ruff: ignore[global-statement] - single-slot capture, one run at a time
-    # Reset the single-slot capture at the start of every run (see the module
-    # note on _LAST_WORKFLOW_STDERR); _workflow_failure_detail consumes it.
-    _LAST_WORKFLOW_STDERR = ""
-    saved = os.dup(2)
-    read_fd, write_fd = os.pipe()
-    chunks: list[bytes] = []
-
-    def reader() -> None:
-        # Tee: forward everything to the real stderr (so operator logs stay
-        # visible) and keep a copy for the failure event.
-        with os.fdopen(read_fd, "rb", closefd=True) as stream:
-            for chunk in iter(lambda: stream.read(4096), b""):
-                os.write(saved, chunk)
-                chunks.append(chunk)
-
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-    os.dup2(write_fd, 2)
-    os.close(write_fd)
+    buffer = tempfile.TemporaryFile(mode="w+", encoding="utf-8")  # ruff: ignore[open-file-with-context-handler]
+    _install_capture_context()
+    _CAPTURE_STATE.buffer = buffer
     try:
         runner.run()
     finally:
-        # Restore fd 2 first so the pipe's write end closes and the reader sees
-        # EOF; only then join (and do NOT close ``saved`` before the join, the
-        # reader still writes to it).  Parse here, not after the try/finally:
-        # ``runner.run()`` raises ``Completed permanentFail``, which would
-        # otherwise skip the capture assignment.
-        os.dup2(saved, 2)
-        thread.join(timeout=10)
-        os.close(saved)
-        text = b"".join(chunks).decode("utf-8", errors="replace")
-        lines = [line.rstrip() for line in text.splitlines() if _ERROR_LINE_RE.search(line)]
-        _LAST_WORKFLOW_STDERR = "\n".join(lines)
+        _CAPTURE_STATE.buffer = None
+        text = ""
+        try:
+            buffer.seek(0)
+            text = buffer.read()
+        finally:
+            buffer.close()
+        lines = "\n".join(line.rstrip() for line in text.splitlines() if _ERROR_LINE_RE.search(line))
+        if capture is not None:
+            capture.append(lines)
+    return lines
 
 
-def _workflow_failure_detail(run_dir: Path) -> str:
+def _install_capture_context() -> None:
+    """Install the capture ``RuntimeContext`` once, process-wide.
+
+    ``pypicongpu.Runner.run`` constructs its own ``RuntimeContext`` at call
+    time, so the class it imports must be replaced to inject the capture proxy.
+    Installing once (under a lock) is safe under concurrency: the process-wide
+    class is shared, while :data:`_CAPTURE_STATE` keeps each run's buffer
+    thread-local, so concurrent runs cannot observe one another's output.
+    """
+    global _CAPTURE_PROXY  # ruff: ignore[global-statement] - one-time process-wide install
+    with _CAPTURE_INSTALL_LOCK:
+        if _CAPTURE_PROXY is not None:
+            return
+        try:
+            from picongpu.pypicongpu import runner as runner_module  # ruff: ignore[import-outside-top-level] - optional dependency
+        except ImportError:
+            return
+        proxy = _CapturingStderr(sys.stderr)
+        runner_module.RuntimeContext = _capture_runtime_context(runner_module.RuntimeContext, proxy)
+        _CAPTURE_PROXY = proxy
+
+
+def _workflow_failure_detail(run_dir: Path, captured: str = "") -> str:
     """Return the captured workflow stderr plus any retained step log.
 
     Args:
         run_dir: The run directory (for the .cwl_cache fallback scan).
+        captured: This run's captured stderr lines (empty for a test double).
 
     Returns:
         A truncated, redaction-ready error string (possibly empty).
 
     """
-    detail = _LAST_WORKFLOW_STDERR.strip()
+    detail = captured.strip()
     if not detail:
         detail = _scan_retained_step_logs(run_dir)
     return detail[-_MAX_ERROR_DETAIL:]
@@ -564,11 +681,13 @@ async def execute_submit(
     # Submit stage: run the workflow; job id from submission_information.txt.
     # cwltool raises a generic ``Completed permanentFail`` and logs the actual
     # step error at ERROR level, so capture its log for the failure event;
-    # otherwise the event is undiagnosable from the room.
+    # otherwise the event is undiagnosable from the room.  ``capture`` receives
+    # this run's lines even on the exception path.
+    capture: list[str] = []
     try:
-        await asyncio.to_thread(_run_workflow, runner)
+        await asyncio.to_thread(_run_workflow, runner, capture)
     except Exception as exc:
-        detail = _workflow_failure_detail(runner.run_dir)
+        detail = _workflow_failure_detail(runner.run_dir, capture[0] if capture else "")
         msg = f"workflow failed: {exc}"
         if detail:
             msg = f"{msg}\n{detail}"
