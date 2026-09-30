@@ -194,6 +194,18 @@ class ResultOp(StrEnum):
     #: (selectors + expression AST + reductions) on the cluster.  No code is
     #: executed; see :mod:`pic_agentic.analysis_program`.
     COMPUTE = "compute"
+    #: G1: run one of PIConGPU's shipped text-plugin readers on the cluster and
+    #: return a bounded numeric summary.  The reader is selected by name from
+    #: :data:`PLUGIN_READER_NAMES`.
+    PLUGIN = "plugin"
+
+
+#: Registered PIConGPU text-plugin readers, by the name carried in
+#: :attr:`ResultParams.reader`.  The full registry (filename pattern, reader
+#: class, allowed kwargs) lives in :mod:`pic_agentic.results`; the names are
+#: frozen here so the wire model can validate ``reader`` without importing the
+#: optional engine.
+PLUGIN_READER_NAMES = ("energy_histogram", "emittance", "transition_radiation")
 
 
 #: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
@@ -214,6 +226,11 @@ RESULT_TEXT_MAX_BYTES = 48 * 1024
 #: The strict charset excludes absolute paths, ``..`` and shell
 #: metacharacters; the client additionally refuses escapes from its base.
 _RESULT_REL_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+#: ``species`` filter argument: a PIConGPU species or particle-filter name, a
+#: bare identifier.  Kept stricter than ``path`` (no ``/``: a species never
+#: contains a directory separator) so a plugin request cannot name a file.
+_RESULT_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 class SimulationStage(StrEnum):
@@ -887,6 +904,15 @@ class ResultParams(BaseModel):
     #: The declarative analysis program for ``COMPUTE`` (validated by
     #: :class:`~pic_agentic.analysis_program.AnalysisProgram` before evaluation).
     program: dict[str, Any] | None = None
+    #: The registered PIConGPU text-plugin reader for ``PLUGIN`` (one of
+    #: :data:`PLUGIN_READER_NAMES`).
+    reader: str | None = None
+    #: The particle species whose plugin output is read (``PLUGIN``).
+    species: str | None = None
+    #: The particle-filter name (``PLUGIN``).  ``None`` means "unspecified" and
+    #: is normalized to PIConGPU's default ``"all"`` filter by the reader path;
+    #: leaving it unset keeps it off the wire for non-plugin result ops.
+    species_filter: str | None = None
 
     @field_validator("path")
     @classmethod
@@ -923,6 +949,47 @@ class ResultParams(BaseModel):
             return None
         if value not in {"stdout", "stderr"}:
             msg = f"unknown result stream {value!r}; expected 'stdout' or 'stderr'"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("reader")
+    @classmethod
+    def _validate_reader(cls, value: str | None) -> str | None:
+        """Restrict a ``PLUGIN`` request to a registered reader name.
+
+        Returns:
+            The validated reader name, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the name is not in :data:`PLUGIN_READER_NAMES`.
+
+        """
+        if value is None:
+            return None
+        if value not in PLUGIN_READER_NAMES:
+            msg = f"unknown plugin reader {value!r}; expected one of {PLUGIN_READER_NAMES}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("species", "species_filter")
+    @classmethod
+    def _validate_species_name(cls, value: str | None) -> str | None:
+        """Reject a species/filter name outside the safe identifier charset.
+
+        The value is interpolated into the output filename, so it must never
+        carry a path separator or shell metacharacter.
+
+        Returns:
+            The validated name, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the name contains an unsafe character.
+
+        """
+        if value is None:
+            return None
+        if not _RESULT_NAME_RE.match(value):
+            msg = f"unsafe species name: {value!r}"
             raise ValueError(msg)
         return value
 
@@ -1105,6 +1172,9 @@ def build_result_command(
             stream=params.stream,
             tail=params.tail,
             program=params.program,
+            reader=params.reader,
+            species=params.species,
+            species_filter=params.species_filter,
         ),
     )
     return RcpMessage(

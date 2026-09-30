@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from pic_agentic.protocol.simulation import (
     MAX_RESULT_BYTES,
+    PLUGIN_READER_NAMES,
     RESULT_TEXT_MAX_BYTES,
     SLICE_MAX_POINTS,
     ResultManifest,
@@ -70,6 +71,47 @@ def test_result_params_rejects_unknown_stream(stream: str) -> None:
 def test_result_params_allows_stdout_stderr_streams() -> None:
     assert ResultParams(sim_id=SIM, op=ResultOp.READ, stream="stdout").stream == "stdout"
     assert ResultParams(sim_id=SIM, op=ResultOp.READ, stream="stderr").stream == "stderr"
+
+
+@pytest.mark.parametrize("reader", ["bogus", "EnergyHistogram", "openpmd", ""])
+def test_result_params_rejects_unknown_reader(reader: str) -> None:
+    with pytest.raises(ValidationError):
+        ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader=reader)
+
+
+def test_result_params_accepts_registered_readers() -> None:
+    for reader in PLUGIN_READER_NAMES:
+        assert ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader=reader).reader == reader
+
+
+@pytest.mark.parametrize("name", ["../e", "a/b", "e;rm", "e f", "ü"])
+def test_result_params_rejects_unsafe_species(name: str) -> None:
+    with pytest.raises(ValidationError):
+        ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, species=name)
+
+
+def test_result_params_plugin_defaults_and_round_trip() -> None:
+    params = ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="energy_histogram", species="e")
+    # Unset means "unspecified" and is normalized by the reader path; it must
+    # not be serialized for every result op (N1).
+    assert params.species_filter is None
+    assert params.iteration is None
+    command = build_result_command(sim=SIM, seq=1, params=params, cmd_id=CMD_ID)
+    assert command.payload["reader"] == "energy_histogram"
+    assert command.payload["species"] == "e"
+    assert "species_filter" not in command.payload
+
+
+def test_result_params_explicit_species_filter_is_forwarded() -> None:
+    params = ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="emittance", species="e", species_filter="openPMD")
+    command = build_result_command(sim=SIM, seq=1, params=params, cmd_id=CMD_ID)
+    assert command.payload["species_filter"] == "openPMD"
+
+
+def test_result_params_non_plugin_ops_omit_species_filter() -> None:
+    for op in (ResultOp.DESCRIBE, ResultOp.READ, ResultOp.EXPORT):
+        command = build_result_command(sim=SIM, seq=1, params=ResultParams(sim_id=SIM, op=op), cmd_id=CMD_ID)
+        assert "species_filter" not in command.payload
 
 
 def test_result_params_forbids_extra_fields() -> None:
