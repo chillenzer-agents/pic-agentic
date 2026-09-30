@@ -944,8 +944,12 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
         title="Describe a simulation's results",
         description=(
             "Return the light manifest (files, formats, sizes, records) of a "
-            "simulation's linked simOutput directory. Uses a scandir-level scan "
-            "and needs no openPMD reader."
+            "simulation's linked simOutput directory. `format` names the likely "
+            "reader for each file: `openpmd-adios2`/`openpmd-hdf5` for field "
+            "series, a plugin reader name (`energy_histogram`, `emittance`, "
+            "`transition_radiation`, `phase_space`, `radiation`, `calorimeter`, "
+            "`png`) for plugin output, or `text`/`dir`/`binary`. The scan never "
+            "opens a file and needs no openPMD reader."
         ),
         annotations=_READ_ONLY,
     )
@@ -1005,15 +1009,46 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
         return await _result_tool(runtime, ResultOp.READ, sim_id=sim_id, path=path, stream=stream, tail=tail)
 
     @server.tool(
+        title="Render a result image",
+        description=(
+            "Render one openPMD record/component of a simulation as a bounded "
+            "base64 PNG thumbnail (iteration 'last' by default). The openPMD "
+            "series is discovered under the run's simOutput (optionally narrowed "
+            "by `path`). Requires the openPMD and Pillow readers on the cluster."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def get_result_image(
+        sim_id: str,
+        record: str,
+        *,
+        path: str | None = None,
+        component: str | None = None,
+        iteration: int | str = "last",
+    ) -> dict[str, Any]:
+        return await _result_tool(
+            runtime,
+            ResultOp.IMAGE,
+            sim_id=sim_id,
+            path=path,
+            record=record,
+            component=component,
+            iteration=iteration,
+        )
+
+    @server.tool(
         title="Read a PIConGPU plugin result",
         description=(
-            "Run one of PIConGPU's shipped text-plugin readers over a "
-            "simulation's simOutput and return a bounded numeric summary. "
-            "`reader` is one of 'energy_histogram', 'emittance' or "
-            "'transition_radiation'; `species` and `species_filter` select the "
-            "output, and `iteration` picks a step ('last' by default). Use "
-            "`describe_results` to see which plugin files exist. Requires the "
-            "picongpu readers on the cluster."
+            "Run one of PIConGPU's shipped plugin readers over a simulation's "
+            "simOutput and return a bounded numeric summary. `reader` is one of "
+            "'energy_histogram', 'emittance', 'transition_radiation', "
+            "'phase_space', 'radiation', 'calorimeter' or 'png'; `species` and "
+            "`species_filter` select the output, and `iteration` picks a step "
+            "('last' by default). The PNG reader returns image metadata only "
+            "(dimensions, iteration, path); fetch the image with "
+            "`export_results`. Use `describe_results` to see which plugin files "
+            "exist. Requires the picongpu readers (and, for the openPMD/image "
+            "readers, openpmd_api/imageio) on the cluster."
         ),
         annotations=_READ_ONLY,
     )
