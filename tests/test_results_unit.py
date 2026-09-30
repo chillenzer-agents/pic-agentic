@@ -73,7 +73,9 @@ def test_scan_output_is_sorted_and_total_bytes_matches(tmp_path) -> None:
     [
         ("fields.bp", "openpmd-adios2"),
         ("fields.h5", "openpmd-hdf5"),
-        ("fields.hdf5", "openpmd-hdf5"),
+        # The pinned openpmd_api 0.17.1 rejects ``.hdf5`` ("Unknown file
+        # format"); it is not advertised as an openPMD series suffix (M1).
+        ("fields.hdf5", "binary"),
         ("foo.txt", "text"),
         ("bar.csv", "text"),
         ("run.log", "text"),

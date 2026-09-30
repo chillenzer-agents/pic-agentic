@@ -69,8 +69,10 @@ _DEFAULT_READ_TAIL = 200
 #: the optional openPMD reader.
 _TEXT_SUFFIXES = frozenset({".txt", ".csv", ".log"})
 
-#: Filename suffix -> manifest ``format`` for the openPMD backends.
-_OPENPMD_SUFFIXES = {".bp": "openpmd-adios2", ".bp5": "openpmd-adios2", ".h5": "openpmd-hdf5", ".hdf5": "openpmd-hdf5"}
+#: Filename suffix -> manifest ``format`` for the openPMD backends.  The pinned
+#: ``openpmd_api`` 0.17.1 recognises ``.h5``/``.bp``/``.bp5`` by suffix but
+#: rejects ``.hdf5`` outright ("Unknown file format"), so it is not advertised.
+_OPENPMD_SUFFIXES = {".bp": "openpmd-adios2", ".bp5": "openpmd-adios2", ".h5": "openpmd-hdf5"}
 
 #: Iteration selectors that mean "the newest available iteration".
 _LAST_ITERATIONS = frozenset({None, "last"})
@@ -175,7 +177,7 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
     "phase_space": _PluginReader(
         re.compile(
             r"^PhaseSpace_(?P<species>[A-Za-z0-9_]+)_(?P<filter>[A-Za-z0-9_]+)_(?P<ps>[A-Za-z0-9]+)_(?P<iteration>[0-9]+)"
-            r"\.(?:h5|hdf5|bp|bp5)$",
+            r"\.(?:h5|bp|bp5)$",
         ),
         "PhaseSpaceData",
         "phase_space",
@@ -185,7 +187,7 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
     # ``<species>_radAmplitudes_<iteration>_0_0_0.h5`` (openPMD).  The trailing
     # ``_0_0_0`` is PIConGPU's radiation-plugin filename suffix.
     "radiation": _PluginReader(
-        re.compile(r"^(?P<species>[A-Za-z0-9_]+)_radAmplitudes_(?P<iteration>[0-9]+)(?:_[0-9]+)*\.(?:h5|hdf5|bp|bp5)$"),
+        re.compile(r"^(?P<species>[A-Za-z0-9_]+)_radAmplitudes_(?P<iteration>[0-9]+)(?:_[0-9]+)*\.(?:h5|bp|bp5)$"),
         "RadiationData",
         "radiation",
         _KIND_OPENPMD,
@@ -194,7 +196,7 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
     # ``<species>_calorimeter_<filter>_<iteration>.h5`` (openPMD).
     "calorimeter": _PluginReader(
         re.compile(
-            r"^(?P<species>[A-Za-z0-9_]+)_calorimeter_(?P<filter>[A-Za-z0-9_]+)_(?P<iteration>[0-9]+)\.(?:h5|hdf5|bp|bp5)$",
+            r"^(?P<species>[A-Za-z0-9_]+)_calorimeter_(?P<filter>[A-Za-z0-9_]+)_(?P<iteration>[0-9]+)\.(?:h5|bp|bp5)$",
         ),
         "particleCalorimeter",
         "calorimeter",
@@ -489,7 +491,7 @@ def _is_series_name(path: Path) -> bool:
     """Whether a filename suffix marks an openPMD series.
 
     Returns:
-        True for a ``.bp``/``.bp5``/``.h5``/``.hdf5`` name or directory.
+        True for a ``.bp``/``.bp5``/``.h5`` name or directory.
 
     """
     return path.suffix.lower() in _OPENPMD_SUFFIXES
@@ -1526,16 +1528,20 @@ def _build_phase_space(
     location.  That answers "how many particles, over what ranges, peaked
     where" without shipping the plane.
 
+    ``PhaseSpaceData.get`` defaults to the HDF5 suffix (``h5``) and would miss
+    an ADIOS2 series, so the concrete suffix of the resolved target is passed
+    through explicitly (M1).
+
     Returns:
         Axis ranges, strided projections and scalars.
 
     """
-    _ = target
     plane, meta = instance.get(
         iteration=iteration,
         species=groups["species"],
         species_filter=groups["filter"],
         ps=groups["ps"],
+        file_ext=target.suffix.lstrip("."),
     )
     plane = _as_nested(plane)
     n_r, n_p, projected_r, projected_p, peak_r, peak_p, max_count = _phase_space_reduce(plane)
@@ -1894,6 +1900,14 @@ def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean 
     if reader is None or reader not in _PLUGIN_READERS:
         return _error(SimulationErrorCode.UNSUPPORTED, f"unknown plugin reader {reader!r}")
     spec = _PLUGIN_READERS[reader]
+    # The radiation reader's filename carries no species-filter component, so a
+    # requested non-default filter cannot be honoured; reject it cleanly rather
+    # than silently returning the "all" series (m3).
+    if reader == "radiation" and params.species_filter not in {None, "all"}:
+        return _error(
+            SimulationErrorCode.UNSUPPORTED,
+            "the radiation reader does not support species_filter; its output has no filter component",
+        )
     if not output.is_dir():
         return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
     target = _plugin_target(output, params, spec)

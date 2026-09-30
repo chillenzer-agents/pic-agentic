@@ -211,14 +211,16 @@ def phase_space_h5(
     ps: str = "ypy",
     iterations: tuple[int, ...] = (0, 50, 100),
     shape: tuple[int, int] = (4, 3),
+    ext: str = "h5",
 ) -> Path:
-    """Write a ``PhaseSpace_<species>_<filter>_<ps>_<iteration>.h5`` series.
+    """Write a ``PhaseSpace_<species>_<filter>_<ps>_<iteration>.<ext>`` series.
 
     Reproduces the real layout the shipped ``PhaseSpaceData`` reads: a scalar
     mesh named ``<species>_<filter>_<ps>`` carrying the ``dV``/``dr_unit``/
     ``sim_unit``/``p_unit``/``p_min``/``p_max``/``movingWindowOffset``/
     ``movingWindowSize``/``_global_start``/``dr`` attributes.  Each iteration
     adds ``iteration`` to a fixed ramp so a reader can tell steps apart.
+    ``ext`` may be ``h5`` or ``bp``/``bp5`` (giving an ADIOS2 directory series).
 
     Returns:
         The openPMD pattern path (with ``%T``).
@@ -229,7 +231,7 @@ def phase_space_h5(
     _warm_reader("phase_space")
     out = Path(run_dir) / "simOutput" / "phaseSpace"
     out.mkdir(parents=True, exist_ok=True)
-    pattern = out / f"PhaseSpace_{species}_{species_filter}_{ps}_%T.h5"
+    pattern = out / f"PhaseSpace_{species}_{species_filter}_{ps}_%T.{ext}"
     series = opmd.Series(str(pattern), opmd.Access.create)
     # openPMD does not copy the buffer handed to ``store_chunk``; keeping the
     # arrays alive until close (and flushing per step) makes the on-disk data
