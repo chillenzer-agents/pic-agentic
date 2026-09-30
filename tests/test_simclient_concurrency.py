@@ -625,6 +625,55 @@ async def test_shutdown_grace_expiry_cancels_without_hanging(tmp_path, monkeypat
     assert any("shutdown grace" in record.message for record in caplog.records)
 
 
+async def test_start_follower_cancel_previous_is_atomic(tmp_path, monkeypatch) -> None:
+    """m2: two concurrent completions for one sim_id never leave two watchers."""
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    client = _client(tmp_path, sim_t)
+    client._serving = True
+    cancelled: list[int] = []
+    release = asyncio.Event()
+
+    class _SlowFollower:
+        def __init__(self, **_kw: object) -> None:
+            self._n = len(cancelled)
+
+        async def run(self) -> None:
+            cancelled.append(self._n)
+            await release.wait()
+
+    monkeypatch.setattr(client_mod, "JobFollower", _SlowFollower)
+    try:
+        await client._start_follower(
+            cmd_id="a" * 32,
+            sim_id="samesim",
+            job_id=1,
+            run_dir="/tmp/x",
+            stdout_path=None,
+            submit_system="sbatch",
+        )
+        first = client._follow_tasks["samesim"]
+        # Two more completions for the same sim_id run concurrently; both must
+        # serialise on the per-sim lock and leave exactly one live watcher.
+        await asyncio.gather(
+            client._start_follower(
+                cmd_id="b" * 32, sim_id="samesim", job_id=2, run_dir="/tmp/x", stdout_path=None, submit_system="sbatch"
+            ),
+            client._start_follower(
+                cmd_id="c" * 32, sim_id="samesim", job_id=3, run_dir="/tmp/x", stdout_path=None, submit_system="sbatch"
+            ),
+        )
+        assert first.cancelled()
+        current = client._follow_tasks["samesim"]
+        live = {task for task in client._follow_tasks_all if not task.done()}
+        assert current in live
+        assert len(live) == 1, "exactly one watcher may be live per sim_id"
+    finally:
+        release.set()
+        await client._cancel_followers()
+        await sim_t.close()
+        await mcp_t.close()
+
+
 async def test_build_gate_serialises_by_default(tmp_path, monkeypatch, fake_runner) -> None:
     """Default concurrency 1 admits one build at a time (the explicit gate)."""
     mcp_t, sim_t = MemoryTransport.create_pair()

@@ -298,6 +298,11 @@ class SimClient:
         #: Every live watcher task, including a superseded one still winding
         #: down, so shutdown reaps orphans the dict slot no longer points at.
         self._follow_tasks_all: set[asyncio.Task[None]] = set()
+        #: Per-``sim_id`` lock serialising the cancel-previous/replace sequence
+        #: in :meth:`_start_follower`, so two concurrent completions for one
+        #: ``sim_id`` (possible with build concurrency > 1) cannot interleave
+        #: at the cancel ``await`` and leave two live watchers for one sim.
+        self._follow_locks: dict[str, asyncio.Lock] = {}
         #: Explicit gate on concurrent build/run workflows (see
         #: :data:`DEFAULT_BUILD_CONCURRENCY`); acquired in :meth:`_run_submit`.
         self.build_concurrency = resolve_build_concurrency(
@@ -974,35 +979,48 @@ class SimClient:
         # it, so it cannot keep polling and emitting under its stale ``cmd_id``;
         # keep it in ``_follow_tasks_all`` until it has actually finished so
         # shutdown reaps it even after the dict slot is reused.
-        previous = self._follow_tasks.pop(sim_id, None)
-        if previous is not None:
-            previous.cancel()
-            self._follow_tasks_all.add(previous)
-            previous.add_done_callback(self._follow_tasks_all.discard)
-            # Await it so the cancelled watcher's in-flight ``scontrol``
-            # subprocess is reaped before the replacement starts (the follower
-            # shields its poll for exactly this reason).
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await previous
-        self._tracked[sim_id] = tracked
+        #
+        # The whole cancel/await/replace sequence is guarded by a per-``sim_id``
+        # lock: the cancel ``await`` below suspends this coroutine, so without
+        # the guard a second completion for the same ``sim_id`` (reachable with
+        # build concurrency > 1) could pop the (already popped) slot, install
+        # its watcher, and then be overwritten by this one -- leaving two live
+        # followers emitting for one sim.
+        async with self._follow_locks.setdefault(sim_id, asyncio.Lock()):
+            previous = self._follow_tasks.pop(sim_id, None)
+            if previous is not None:
+                previous.cancel()
+                self._follow_tasks_all.add(previous)
+                previous.add_done_callback(self._follow_tasks_all.discard)
+                # Await it so the cancelled watcher's in-flight ``scontrol``
+                # subprocess is reaped before the replacement starts (the
+                # follower shields its poll for exactly this reason).
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await previous
+            self._tracked[sim_id] = tracked
 
-        async def emit(state: SimulationState, *, job_id: int | None = None, **fields: object) -> None:
-            event = self._build_submit_event(cmd_id=cmd_id, sim_id=sim_id, state=state, job_id=job_id, **fields)
-            await self.transport.send(event)
+            async def emit(
+                state: SimulationState,
+                *,
+                job_id: int | None = None,
+                **fields: object,
+            ) -> None:
+                event = self._build_submit_event(cmd_id=cmd_id, sim_id=sim_id, state=state, job_id=job_id, **fields)
+                await self.transport.send(event)
 
-        follower = JobFollower(
-            sim=self.sim,
-            emit=emit,
-            tracked=tracked,
-            job_info=self.slurm.job_info,
-            initial_interval_s=self.poll_interval_s,
-            max_interval_s=self.poll_max_interval_s,
-            job_accounting=self.slurm.job_accounting,
-        )
-        task = asyncio.create_task(follower.run())
-        self._follow_tasks[sim_id] = task
-        self._follow_tasks_all.add(task)
-        task.add_done_callback(self._follow_tasks_all.discard)
+            follower = JobFollower(
+                sim=self.sim,
+                emit=emit,
+                tracked=tracked,
+                job_info=self.slurm.job_info,
+                initial_interval_s=self.poll_interval_s,
+                max_interval_s=self.poll_max_interval_s,
+                job_accounting=self.slurm.job_accounting,
+            )
+            task = asyncio.create_task(follower.run())
+            self._follow_tasks[sim_id] = task
+            self._follow_tasks_all.add(task)
+            task.add_done_callback(self._follow_tasks_all.discard)
 
     async def _cancel_followers(self) -> None:
         """Stop and await every detached watcher task (idempotent).
