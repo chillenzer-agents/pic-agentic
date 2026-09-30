@@ -604,9 +604,20 @@ def test_real_phase_space_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["ps"] == "ypy"
     assert summary["n_r"] == 4
     assert summary["n_p"] == 3
+    assert summary["r_min_m"] == pytest.approx(0.0)
+    assert summary["r_max_m"] == pytest.approx(4e-6)
+    assert summary["p_min"] == pytest.approx(-1.0)
+    assert summary["p_max"] == pytest.approx(1.0)
     assert summary["downsampled"] is False
-    # The ramp is 0..11 plus the iteration; the row-major sum is exact.
+    # The ramp is 0..11 plus the iteration; assert the exact projections and
+    # peak so a scrambled/NaN on-disk series (B1) fails rather than passing by
+    # write-order accident.
     assert summary["total_count"] == pytest.approx(66.0 + 100 * 12)
+    assert summary["projection_r"] == pytest.approx([303.0, 312.0, 321.0, 330.0])
+    assert summary["projection_p"] == pytest.approx([418.0, 422.0, 426.0])
+    assert summary["max_count"] == pytest.approx(111.0)
+    assert summary["max_r_m"] == pytest.approx(3e-6)
+    assert summary["max_p"] == pytest.approx(1.0 / 3.0)
 
 
 def test_real_calorimeter_reader_end_to_end(tmp_path: Path) -> None:
@@ -627,8 +638,13 @@ def test_real_calorimeter_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["n_pitch"] == 3
     assert summary["n_yaw"] == 4
     assert summary["energy_keV"] == [10.0, 1000.0]
-    # Sum of 0..23 plus 50 per cell over 24 cells.
+    # Sum of 0..23 plus 50 per cell over 24 cells.  Assert the marginals and
+    # peak so a scrambled/NaN on-disk series (B1) fails rather than passing on
+    # the one iteration whose garbage happens to match.
     assert summary["total_energy_J"] == pytest.approx(276.0 + 50 * 24)
+    assert summary["per_pitch_J"] == pytest.approx([460.0, 492.0, 524.0])
+    assert summary["per_yaw_J"] == pytest.approx([360.0, 366.0, 372.0, 378.0])
+    assert summary["max_energy_J"] == pytest.approx(73.0)
 
 
 def test_real_radiation_reader_end_to_end(tmp_path: Path) -> None:
@@ -648,6 +664,14 @@ def test_real_radiation_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["n_directions"] == 2
     assert summary["n_frequencies"] == 5
     assert summary["omega_per_s"] == [1e14, 2e14, 3e14, 4e14, 5e14]
+    # Re(A) = component + iteration (x/y/z => 101/102/103 at step 100), Im = 0,
+    # so each cell's spectrum is 101^2 + 102^2 + 103^2 = 31214; two observation
+    # directions share every frequency bin, giving 62428 per bin.
+    per_frequency = 2 * (101.0**2 + 102.0**2 + 103.0**2)
+    assert summary["spectrum"] == pytest.approx([per_frequency] * 5)
+    assert summary["total_energy_J"] == pytest.approx(5 * per_frequency)
+    assert summary["peak_spectrum_Js"] == pytest.approx(per_frequency)
+    assert summary["peak_omega_per_s"] == pytest.approx(1e14)
 
 
 def test_real_png_reader_returns_metadata(tmp_path: Path) -> None:
