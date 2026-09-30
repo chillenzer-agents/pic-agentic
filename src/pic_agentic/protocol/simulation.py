@@ -909,9 +909,10 @@ class ResultParams(BaseModel):
     reader: str | None = None
     #: The particle species whose plugin output is read (``PLUGIN``).
     species: str | None = None
-    #: The particle-filter name (``PLUGIN``); ``"all"`` matches the default
-    #: filter the PIConGPU plugins write.
-    species_filter: str = "all"
+    #: The particle-filter name (``PLUGIN``).  ``None`` means "unspecified" and
+    #: is normalized to PIConGPU's default ``"all"`` filter by the reader path;
+    #: leaving it unset keeps it off the wire for non-plugin result ops.
+    species_filter: str | None = None
 
     @field_validator("path")
     @classmethod
