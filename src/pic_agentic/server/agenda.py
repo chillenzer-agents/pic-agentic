@@ -23,16 +23,22 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
 from pic_agentic.agenda.engine import ActualUsage, AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
-from pic_agentic.agenda.model import AgendaSim
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.refine import summary as refine_summary
 from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
-from pic_agentic.protocol.simulation import SimulationOp
+from pic_agentic.protocol.simulation import (
+    MAX_INLINE_PAYLOAD_BYTES,
+    SimulationOp,
+    UnsupportedPayloadError,
+    payload_wire_size,
+)
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
 
@@ -44,6 +50,28 @@ if TYPE_CHECKING:
     from pic_agentic.server.simulation import SubmitService
 
 log = logging.getLogger(__name__)
+
+
+#: Actionable text attached to every ``no_campaign`` soft error, naming the tool
+#: that creates a campaign so the caller knows how to recover.
+NO_CAMPAIGN_MESSAGE = "no campaign is persisted; create a campaign first, e.g. with create_campaign, then retry."
+
+#: A dotted patch-path segment that indexes a list rather than a dict key.
+_LIST_INDEX_RE = re.compile(r"-?\d+")
+
+
+def no_campaign_error() -> dict[str, Any]:
+    """Return the actionable ``no_campaign`` soft error.
+
+    Every campaign-scoped operation that finds no persisted campaign returns
+    this, so the error carries a recovery hint (``message``) alongside the
+    stable machine-readable ``error`` code.
+
+    Returns:
+        ``{"ok": False, "error": "no_campaign", "message": <actionable text>}``.
+
+    """
+    return {"ok": False, "error": "no_campaign", "message": NO_CAMPAIGN_MESSAGE}
 
 
 def _store_for(config: Config) -> AgendaStore:
@@ -137,7 +165,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         engine = self._build_engine(send)
         async with self._lock:
             try:
@@ -220,7 +248,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         engine = AgendaEngine(store=self.store, submit=_never_submit, observe=dict, policy=self.policy)
         try:
             return engine.status()
@@ -243,7 +271,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 return self._approve_leaf(path)
@@ -335,7 +363,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         try:
             campaign = self.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
@@ -351,7 +379,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -371,7 +399,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -406,7 +434,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -446,7 +474,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
@@ -483,7 +511,7 @@ class AgendaService:
 
         """
         if not self.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         async with self._lock:
             try:
                 return self._add_leaf(name, spec, point=point, depends_on=depends_on)
@@ -510,6 +538,138 @@ class AgendaService:
         except Exception:  # ruff: ignore[blind-except] - classification must never mask the error
             return "invalid_leaf"
 
+    async def create_campaign(
+        self,
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        """Create and persist a campaign with one leaf per sweep value.
+
+        The server-side equivalent of the driver's ``--agenda-init``: a fresh
+        campaign is created with one leaf per entry in ``values``, each holding
+        a deep copy of ``base_spec`` with the dotted Runner-spec path
+        ``patch_path`` set to that value.  Each leaf records
+        ``point={parameter: value}`` (the last path segment) exactly as
+        :meth:`AgendaSim` and the driver do, so the refinement engine can score
+        the sweep.  The campaign is written through the same
+        :class:`~pic_agentic.agenda.store.AgendaStore` the other agenda tools
+        read, so ``advance_agenda`` picks it up on the next tick.
+
+        Creating over an existing campaign would clobber its state, so it is
+        refused rather than overwritten.
+
+        Every patched leaf is built and validated through
+        :meth:`SubmitService.prepare_spec` and :func:`payload_wire_size` -- the
+        *same* allow-list and escaped inline-size checks a submission runs -- so
+        a campaign that could never be submitted is refused at creation time
+        rather than surfacing a bare error at ``advance_agenda``.  Duplicate
+        patched specs (e.g. ``values=[4, 4]``) are rejected up front too: they
+        map to one ``sim_id`` and the engine would later refuse the tick.
+        Nothing is persisted unless every leaf validates.
+
+        Args:
+            name: The campaign's display name.
+            base_spec: The base Runner spec (a wire spec carrying ``sim``).
+            patch_path: A dotted path into ``base_spec`` (e.g.
+                ``sim.time_steps``); the final segment must already exist.
+            values: One value per leaf; each patches ``patch_path``.
+
+        Returns:
+            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
+            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
+            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
+            ``duplicate_campaign_spec``).
+
+        """
+        async with self._lock:
+            try:
+                return self._create_campaign(name, base_spec, patch_path, values)
+            except (TypeError, ValueError, IndexError) as exc:
+                # A bad patch path (including an out-of-range list index) or an
+                # invalid leaf name/value is a model-level error: report it as
+                # data, not a tool exception.
+                return {"ok": False, "error": "invalid_campaign", "detail": self.config.redact(str(exc))}
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda create_campaign failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+
+    def _create_campaign(
+        self,
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        """Build the campaign and save it (may raise).
+
+        Returns:
+            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
+            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
+            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
+            ``duplicate_campaign_spec``).  No file is written on any error.
+
+        """
+        if self.store.exists():
+            return {"ok": False, "error": "campaign_exists"}
+        if not values:
+            return {"ok": False, "error": "no_values"}
+        parameter = _parameter_for(patch_path)
+        if not _leaf_target_exists(base_spec, patch_path):
+            return {
+                "ok": False,
+                "error": "invalid_campaign",
+                "detail": (
+                    f"patch path {patch_path!r} does not address an existing field; "
+                    "refusing to create it (check the Runner-spec field name)"
+                ),
+            }
+        patched: list[dict[str, Any]] = [_patch_spec(base_spec, patch_path, value) for value in values]
+        for spec in patched:
+            invalid = self._validate_leaf_spec(spec)
+            if invalid is not None:
+                return invalid
+        collision = _duplicate_leaf_error(patched)
+        if collision is not None:
+            return collision
+
+        agenda = AgendaGroup(name="campaign")
+        leaves: list[str] = []
+        for index, spec in enumerate(patched):
+            leaf_name = f"leaf{index:03d}"
+            leaf = AgendaSim(name=leaf_name, spec=spec, point=_point_for(parameter, values[index]))
+            agenda = agenda.add(**{leaf_name: leaf})
+            leaves.append(leaf_name)
+        self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
+        return {"ok": True, "name": name, "leaves": leaves}
+
+    def _validate_leaf_spec(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Validate one patched leaf through the submission path.
+
+        Runs the same allow-list check and escaped inline-size cap a
+        ``submit_spec`` would, so a leaf that could never be submitted is
+        rejected at creation.
+
+        Returns:
+            ``None`` when the leaf is a valid, in-cap wire spec, else the soft
+            error dict to return.
+
+        """
+        try:
+            payload = self.submit_service.prepare_spec(spec)
+        except UnsupportedPayloadError as exc:
+            return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(str(exc))}
+        size = payload_wire_size(payload)
+        if size > MAX_INLINE_PAYLOAD_BYTES:
+            return {
+                "ok": False,
+                "error": "spec_exceeds_inline_limit",
+                "wire_bytes": size,
+                "inline_limit_bytes": MAX_INLINE_PAYLOAD_BYTES,
+            }
+        return None
+
     def _add_leaf(
         self,
         name: str,
@@ -534,6 +694,195 @@ class AgendaService:
         agenda = campaign.agenda.add(**{name: leaf})
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": name}
+
+
+def _parameter_for(patch_path: str) -> str:
+    """Return the sweep parameter name encoded in a dotted patch path.
+
+    Mirrors the driver: the leaf's ``point`` key is the last segment of the
+    dotted Runner-spec path (``sim.time_steps`` -> ``time_steps``).
+
+    Returns:
+        The final path segment.
+
+    """
+    return patch_path.rsplit(".", 1)[-1]
+
+
+def _patch_spec(spec: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
+    r"""Return a deep copy of ``spec`` with the dotted JSON path set to ``value``.
+
+    Behaviourally equivalent to the driver's ``_patch_spec``
+    (``scripts/local_mcp_check.py``): the two agree on every valid path.  They
+    deliberately diverge only in *error convention* -- the server raises
+    ``TypeError``/``IndexError`` (surfaced as the ``invalid_campaign`` soft
+    error) while the CLI raises ``SystemExit`` -- so they are not byte-identical
+    and need not be.
+
+    The rule for a segment is decided by the *current node*, not by the
+    segment's spelling: a dict node is indexed by its key (so a numeric-looking
+    dict key such as a boundary-condition map ``{"0": "periodic"}`` is
+    reachable via ``sim.bc.0``), and a list node is indexed by the integer the
+    segment spells (negative indices count from the end).  This is the
+    least-surprising rule and fixes the ``sim.bc.0`` ambiguity; list-shaped
+    Runner specs (``sim.laser.0.focus_pos_si.1.component``) still work because
+    the nodes there really are lists.
+
+    Args:
+        spec: The base Runner spec (a deep copy is patched, the base is not
+            mutated).
+        dotted: A dotted path such as ``sim.time_steps``.
+        value: The JSON value to set.
+
+    Returns:
+        The patched deep copy.
+
+    Raises:
+        TypeError: If a dict segment is missing, or when a list node is
+            addressed by a non-numeric segment.
+
+    A list index out of range raises ``IndexError`` implicitly; both it and the
+    ``TypeError`` surface as the ``invalid_campaign`` soft error.
+
+    """
+    patched = json.loads(json.dumps(spec))
+    node: Any = patched
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        node = _patch_child(node, dotted, part)
+    last = parts[-1]
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(last):
+            msg = f"patch path {dotted!r} has no numeric index at {last!r}"
+            raise TypeError(msg)
+        node[int(last)] = value
+    elif isinstance(node, dict):
+        node[last] = value
+    else:
+        msg = f"patch path {dotted!r} has no object at {last!r}"
+        raise TypeError(msg)
+    return patched
+
+
+def _patch_child(node: Any, dotted: str, part: str) -> Any:
+    """Return the child of ``node`` addressed by one intermediate path segment.
+
+    A dict node is indexed by ``part`` as a key; a list node is indexed by the
+    integer ``part`` spells (Python indexing, so ``-1`` is the last element).
+    Mirrors the driver's ``_patch_child`` behaviourally for valid paths.
+
+    Args:
+        node: The current dict or list node.
+        dotted: The whole dotted path, used in the error message.
+        part: The segment to descend through.
+
+    Returns:
+        The addressed child node (dict or list).
+
+    Raises:
+        TypeError: If a dict segment is missing, a list node is addressed by a
+            non-numeric segment, or an intermediate node is neither.
+
+    """
+    if isinstance(node, dict):
+        child = node.get(part)
+        if not isinstance(child, (dict, list)):
+            msg = f"patch path {dotted!r} has no object at {part!r}"
+            raise TypeError(msg)
+        return child
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(part):
+            msg = f"patch path {dotted!r} has no numeric index at {part!r}"
+            raise TypeError(msg)
+        return node[int(part)]
+    msg = f"patch path {dotted!r} has no object at {part!r}"
+    raise TypeError(msg)
+
+
+def _leaf_target_exists(spec: dict[str, Any], dotted: str) -> bool:
+    """Whether the final segment of ``dotted`` already addresses a real field.
+
+    ``create_campaign`` uses this to reject a typo (``sim.time_step`` for
+    ``sim.time_steps``) instead of silently adding an unknown key that the
+    Runner ignores.  The walk follows the same dict-key/list-index rule as
+    :func:`_patch_spec`; a dict key must be present (any value, including
+    ``None``) and a list index must be in range.
+
+    Returns:
+        True when the final segment addresses an existing dict key or an
+        in-range list index, else False.
+
+    """
+    node: Any = spec
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        if isinstance(node, dict):
+            child = node.get(part)
+        elif isinstance(node, list) and _LIST_INDEX_RE.fullmatch(part):
+            index = int(part)
+            child = node[index] if -len(node) <= index < len(node) else None
+        else:
+            return False
+        if not isinstance(child, (dict, list)):
+            return False
+        node = child
+    last = parts[-1]
+    if isinstance(node, dict):
+        return last in node
+    if isinstance(node, list):
+        if not _LIST_INDEX_RE.fullmatch(last):
+            return False
+        index = int(last)
+        return -len(node) <= index < len(node)
+    return False
+
+
+def _duplicate_leaf_error(specs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return a soft error when two patched leaves share a wire payload.
+
+    Identical specs map to one ``sim_id`` and the engine later refuses the whole
+    tick (``duplicate payload ...``), so the collision is caught here, at
+    creation.  The comparison uses the ``{"sim": ...}`` wire form, the same
+    bytes :func:`~pic_agentic.agenda.engine._wire_hash` hashes.
+
+    Returns:
+        ``{"ok": False, "error": "duplicate_campaign_spec", ...}`` on the first
+        colliding pair, else None.
+
+    """
+    seen: dict[str, int] = {}
+    for index, spec in enumerate(specs):
+        sim = spec.get("sim") if isinstance(spec, dict) else None
+        key = json.dumps({"sim": sim}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if key in seen:
+            return {
+                "ok": False,
+                "error": "duplicate_campaign_spec",
+                "detail": (
+                    f"leaves leaf{seen[key]:03d} and leaf{index:03d} have identical specs; "
+                    "identical simulations map to the same sim_id and would collapse into one job; "
+                    "make the values distinct"
+                ),
+            }
+        seen[key] = index
+    return None
+
+
+def _point_for(parameter: str, value: Any) -> dict[str, float | int | str] | None:
+    """Return the leaf ``point`` for one sweep value, or None when unusable.
+
+    ``AgendaSim.point`` accepts only ``float | int | str`` (and rejects bools via
+    pydantic).  A value that is not one of those (a list/dict/null, or a bool)
+    cannot be a valid point, so it is omitted rather than aborting the whole
+    creation.  Identical to the driver's ``_point_for``.
+
+    Returns:
+        ``{parameter: value}`` when the value is a valid point, else None.
+
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    return {parameter: value}
 
 
 def _analysis_points(campaign: Campaign) -> dict[str, float | None]:
@@ -597,4 +946,4 @@ async def _never_submit(_spec: dict[str, Any], _key: str) -> str:  # ruff: ignor
     raise RuntimeError(msg)
 
 
-__all__ = ["AgendaService"]
+__all__ = ["NO_CAMPAIGN_MESSAGE", "AgendaService", "no_campaign_error"]

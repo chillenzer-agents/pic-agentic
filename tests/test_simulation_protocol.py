@@ -44,7 +44,7 @@ def _runner_dump() -> dict:
 def _payload() -> SimulationPayload:
     return SimulationPayload.build(
         picongpu_version="0.9.0-dev",
-        picongpu_revision="91c3ee5fb4c9425b00d4673d9608f4370593cacf",
+        picongpu_revision="667c537620e685486aceeaa77deb6550ac9972cf",
         schema_hash=PINNED_SCHEMA_HASH,
         runner_dump=_runner_dump(),
     )
@@ -133,7 +133,7 @@ def test_provenance_mismatches() -> None:
     payload = _payload()
     local = {
         "picongpu_version": "0.9.0-dev",
-        "picongpu_revision": "91c3ee5fb4c9425b00d4673d9608f4370593cacf",
+        "picongpu_revision": "667c537620e685486aceeaa77deb6550ac9972cf",
         "schema_hash": PINNED_SCHEMA_HASH,
     }
     assert provenance_mismatches(payload, local) == []

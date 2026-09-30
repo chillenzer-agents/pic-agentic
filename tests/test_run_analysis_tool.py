@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
+from pic_agentic.analysis_program import AnalysisProgram
 from pic_agentic.config import Config
 from pic_agentic.protocol.simulation import ResultOp, SimulationType, build_result_ack
 from pic_agentic.rcp import new_secret_hex
@@ -92,6 +94,37 @@ async def test_run_analysis_tool_is_registered() -> None:
     assert annotations is not None
     assert annotations.read_only_hint is False
     assert annotations.destructive_hint is False
+
+
+async def test_run_analysis_description_documents_the_program() -> None:
+    server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    description = tools["run_analysis"].description or ""
+    for keyword in ("kind: 'var'", "kind: 'binop'", "kind: 'unop'", "kind: 'reduce'", "selectors", "output"):
+        assert keyword in description, keyword
+    assert '"op": "histogram"' in description
+    assert description.index("Worked example") < description.index('"selectors"')
+
+
+async def test_run_analysis_worked_example_is_valid_and_parses() -> None:
+    """The documented example must be copy-pasteable: valid JSON that validates.
+
+    The example is extracted verbatim from the live tool description, parsed
+    with ``json`` and checked against the real ``AnalysisProgram`` model -- a
+    substring grep cannot catch a missing brace.
+    """
+    server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    description = tools["run_analysis"].description or ""
+    fragment = description[description.index("Worked example") :]
+    start = fragment.index("{")
+    end = fragment.rindex("}") + 1
+    example = fragment[start:end]
+
+    parsed = json.loads(example)
+    program = AnalysisProgram.model_validate(parsed)
+    # The parsed program round-trips through the wire form the tool accepts.
+    assert program.model_dump(mode="json", exclude_none=True)["output"]["kind"] == "reduce"
 
 
 async def test_run_analysis_returns_the_spectrum() -> None:

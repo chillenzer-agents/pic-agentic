@@ -11,6 +11,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 _DRIVER = Path(__file__).resolve().parent.parent / "scripts" / "local_mcp_check.py"
 _SPEC = importlib.util.spec_from_file_location("local_mcp_check", _DRIVER)
 if _SPEC is None or _SPEC.loader is None:  # pragma: no cover - loader always present
@@ -75,6 +77,72 @@ def test_agenda_init_records_sweep_points(tmp_path: Path) -> None:
     # The patched spec still carries the value, so spec and point agree.
     for leaf in campaign["agenda"]["entries"].values():
         assert leaf["spec"]["sim"]["time_steps"] == leaf["point"]["time_steps"]
+
+
+def test_patch_spec_indexes_lists_by_decimal_segment() -> None:
+    """A numeric segment descends a list; a non-numeric segment descends a dict."""
+    base = {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}, {"component": 4.6e-5}]}]}}
+    patched = local_mcp_check._patch_spec(base, "sim.laser.0.focus_pos_si.1.component", 4.4e-5)
+    assert patched["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(4.4e-5)
+    assert patched["sim"]["laser"][0]["focus_pos_si"][0]["component"] == pytest.approx(0.0)
+    # A negative index counts from the end (Python list indexing).
+    tail = local_mcp_check._patch_spec(base, "sim.laser.-1.focus_pos_si.0.component", 9.9)
+    assert tail["sim"]["laser"][0]["focus_pos_si"][0]["component"] == pytest.approx(9.9)
+    # The base spec is not mutated.
+    assert base["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(4.6e-5)
+
+
+def test_patch_spec_rejects_an_out_of_range_list_index() -> None:
+    """A decimal segment beyond the list length is a soft ``SystemExit``."""
+    base = {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}]}]}}
+    with pytest.raises(SystemExit):
+        local_mcp_check._patch_spec(base, "sim.laser.3.focus_pos_si.0.component", 1.0)
+
+
+#: ``(base, path, value)`` cases run through BOTH patchers; the shared truth
+#: table catches drift between the server copy (``pic_agentic.server.agenda``)
+#: and the driver copy.  ``expected`` is the patched ``base`` on success, or
+#: ``None`` for a rejected path.
+_PATCH_TRUTH_TABLE = [
+    ({"a": [1, 2, 3]}, "a.0", 9, {"a": [9, 2, 3]}),
+    ({"a": [1, 2, 3]}, "a.-1", 9, {"a": [1, 2, 9]}),
+    ({"a": [1, 2, 3]}, "a.3", 9, None),
+    ({"a": [1, 2, 3]}, "a.-4", 9, None),
+    ({"a": {"b": {"c": 1}}}, "a.b.c", 9, {"a": {"b": {"c": 9}}}),
+    ({"a": {"b": {"c": 1}}}, "a.b.d", 9, {"a": {"b": {"c": 1, "d": 9}}}),
+    ({"a": [{"b": [{"c": 1}]}]}, "a.0.b.0.c", 9, {"a": [{"b": [{"c": 9}]}]}),
+    ({"a": [{"b": [{"c": 1}]}]}, "a.0.b.1.c", 9, None),
+    # A numeric-looking dict key is reached as a key, not mis-indexed as a list.
+    ({"sim": {"bc": {"0": "periodic"}}}, "sim.bc.0", "open", {"sim": {"bc": {"0": "open"}}}),
+    # A real list node still indexes numerically.
+    ({"a": [[1, 2]]}, "a.0.1", 9, {"a": [[1, 9]]}),
+    ({"a": [1, 2]}, "a.1", {"x": 1}, {"a": [1, {"x": 1}]}),
+    ({"a": [1, 2]}, "a.x", 9, None),
+]
+
+
+def test_patch_spec_driver_and_server_agree_on_the_truth_table() -> None:
+    """Both patchers produce the same valid output and reject the same paths."""
+    from pic_agentic.server.agenda import _patch_spec as server_patch
+
+    for base, path, value, expected in _PATCH_TRUTH_TABLE:
+        original = json.loads(json.dumps(base))
+        driver_view: object
+        try:
+            driver_view = local_mcp_check._patch_spec(json.loads(json.dumps(base)), path, value)
+        except SystemExit:
+            driver_view = None
+        server_view: object
+        try:
+            server_view = server_patch(json.loads(json.dumps(base)), path, value)
+        except (TypeError, IndexError, ValueError):
+            server_view = None
+
+        assert driver_view == expected, (path, driver_view)
+        assert server_view == expected, (path, server_view)
+        assert driver_view == server_view, path
+        # Neither patcher mutates the base spec.
+        assert base == original, path
 
 
 def test_agenda_init_omits_invalid_points() -> None:

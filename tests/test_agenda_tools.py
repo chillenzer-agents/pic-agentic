@@ -14,18 +14,24 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.store import AgendaStore
 from pic_agentic.config import Config
 from pic_agentic.protocol.simulation import SimulationState, SimulationType, build_submit_ack
 from pic_agentic.rcp import new_secret_hex
+from pic_agentic.server.agenda import NO_CAMPAIGN_MESSAGE
 from pic_agentic.server.app import build_server
 from pic_agentic.server.simulation import SubmitService
 from pic_agentic.transport.memory import MemoryTransport
 
 SECRET = new_secret_hex()
 SIM = "7f3a2b1c"
+
+#: The actionable ``no_campaign`` soft error every campaign tool returns.
+NO_CAMPAIGN = {"ok": False, "error": "no_campaign", "message": NO_CAMPAIGN_MESSAGE}
 
 #: A minimal (allow-list-clean) Runner spec: the wire payload is ``{"sim": ...}``.
 _SPEC = {"sim": {"time_steps": 4}}
@@ -97,7 +103,20 @@ async def test_tool_registration_and_annotations() -> None:
         "approve_agenda_leaf",
         "take_agenda_callbacks",
         "add_agenda_leaf",
+        "create_campaign",
     } <= set(tools)
+
+    create = tools["create_campaign"].annotations
+    assert create is not None
+    assert create.read_only_hint is False
+    assert create.destructive_hint is False
+    # The frozen signature the LLM sees.
+    assert set(tools["create_campaign"].input_schema["properties"]) == {
+        "name",
+        "base_spec",
+        "patch_path",
+        "values",
+    }
 
     advance = tools["advance_agenda"].annotations
     assert advance is not None
@@ -146,9 +165,26 @@ async def test_agenda_status_shape(tmp_path) -> None:
 async def test_no_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     advance = await _call(config, "advance_agenda", {})
-    assert advance == {"ok": False, "error": "no_campaign"}
+    assert advance == NO_CAMPAIGN
     status = await _call(config, "agenda_status", {})
-    assert status == {"ok": False, "error": "no_campaign"}
+    assert status == NO_CAMPAIGN
+
+
+async def test_no_campaign_error_is_actionable(tmp_path) -> None:
+    """Every campaign tool's ``no_campaign`` error tells the caller how to recover."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
+    for tool, arguments in (
+        ("advance_agenda", {}),
+        ("agenda_status", {}),
+        ("pause_agenda", {}),
+        ("add_agenda_leaf", {"name": "x", "spec": {"sim": {"replica": 0}}}),
+        ("take_agenda_callbacks", {}),
+    ):
+        result = await _call(config, tool, arguments)
+        assert result["error"] == "no_campaign", tool
+        assert result["message"] == NO_CAMPAIGN_MESSAGE, tool
+        assert "create_campaign" in result["message"], tool
+        assert "create a campaign first" in result["message"], tool
 
 
 async def test_agenda_status_redacts_secrets(tmp_path) -> None:
@@ -203,7 +239,7 @@ async def test_approve_unknown_leaf_is_a_soft_error(tmp_path) -> None:
 async def test_approve_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     result = await _call(config, "approve_agenda_leaf", {"path": "leaf0"})
-    assert result == {"ok": False, "error": "no_campaign"}
+    assert result == NO_CAMPAIGN
 
 
 async def test_agenda_status_reports_approval_flags(tmp_path) -> None:
@@ -288,7 +324,7 @@ async def test_add_duplicate_leaf_is_a_soft_error(tmp_path) -> None:
 async def test_add_leaf_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     result = await _call(config, "add_agenda_leaf", {"name": "x", "spec": {"sim": {"replica": 0}}})
-    assert result == {"ok": False, "error": "no_campaign"}
+    assert result == NO_CAMPAIGN
 
 
 async def test_pause_and_resume_tools(tmp_path) -> None:
@@ -307,4 +343,244 @@ async def test_pause_and_resume_tools(tmp_path) -> None:
 
 async def test_pause_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
-    assert await _call(config, "pause_agenda", {}) == {"ok": False, "error": "no_campaign"}
+    assert await _call(config, "pause_agenda", {}) == NO_CAMPAIGN
+
+
+async def test_create_campaign_builds_leaves_with_points_and_values(tmp_path) -> None:
+    """create_campaign mirrors the driver: one patched leaf + point per value."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = {"sim": {"time_steps": 4, "grid": {"cell_cnt": 8}}}
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec": base, "patch_path": "sim.time_steps", "values": [50, 100, 200]},
+    )
+    assert result == {"ok": True, "name": "scan", "leaves": ["leaf000", "leaf001", "leaf002"]}
+
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.name == "scan"
+    assert campaign.created_ts is not None
+    points = {name: leaf.point for name, leaf in campaign.agenda.entries.items()}
+    assert points == {
+        "leaf000": {"time_steps": 50},
+        "leaf001": {"time_steps": 100},
+        "leaf002": {"time_steps": 200},
+    }
+    for leaf in campaign.agenda.entries.values():
+        # The nested siblings survive and the patch path value agrees with point.
+        assert leaf.spec["sim"]["time_steps"] == leaf.point["time_steps"]
+        assert leaf.spec["sim"]["grid"] == {"cell_cnt": 8}
+    # The base spec is not mutated by the per-leaf patch.
+    assert base["sim"]["time_steps"] == 4
+
+
+async def test_create_campaign_creates_a_loadable_campaign_the_tick_submits(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = {"sim": {"time_steps": 4}}
+    await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec": base, "patch_path": "sim.time_steps", "values": [50, 100]},
+    )
+    tick = await _call(config, "advance_agenda", {})
+    assert tick["submitted"] == ["leaf000", "leaf001"]
+    status = await _call(config, "agenda_status", {})
+    assert status["name"] == "scan"
+    assert {leaf["path"] for leaf in status["leaves"]} == {"leaf000", "leaf001"}
+
+
+async def test_create_campaign_without_values_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": []},
+    )
+    assert result == {"ok": False, "error": "no_values"}
+
+
+async def test_create_campaign_refuses_to_clobber_an_existing_campaign(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "other", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": [1]},
+    )
+    assert result == {"ok": False, "error": "campaign_exists"}
+
+
+async def test_create_campaign_patches_a_list_indexed_path(tmp_path) -> None:
+    """A numeric patch-path segment indexes a list (real specs are list-shaped).
+
+    The focal-position sweep patches ``sim.laser.0.focus_pos_si.1.component``:
+    ``sim.laser`` and ``focus_pos_si`` are lists, so the patcher must descend
+    through list indices and leave the nested siblings intact.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}, {"component": 4.6e-5}, {"component": 0.0}]}]}}
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "focal",
+            "base_spec": base,
+            "patch_path": "sim.laser.0.focus_pos_si.1.component",
+            "values": [4.4e-5, 4.8e-5],
+        },
+    )
+    assert result == {"ok": True, "name": "focal", "leaves": ["leaf000", "leaf001"]}
+
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    expected = {"leaf000": 4.4e-5, "leaf001": 4.8e-5}
+    for name, value in expected.items():
+        leaf = campaign.agenda.entries[name]
+        focus = leaf.spec["sim"]["laser"][0]["focus_pos_si"]
+        assert focus[1]["component"] == pytest.approx(value)
+        # The point names the last path segment and agrees with the patched spec.
+        assert leaf.point == {"component": value}
+        # The nested siblings survive untouched.
+        assert focus[0]["component"] == pytest.approx(0.0)
+        assert focus[2]["component"] == pytest.approx(0.0)
+    # The base spec is not mutated by the per-leaf patch.
+    assert base["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(4.6e-5)
+
+
+async def test_create_campaign_bad_patch_path_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.missing.deeper", "values": [1]},
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign"
+    # The failed creation persisted nothing.
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_out_of_range_list_index_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "scan",
+            "base_spec": {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}]}]}},
+            "patch_path": "sim.laser.3.focus_pos_si.0.component",
+            "values": [1.0],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign"
+    # The failed creation persisted nothing.
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_omits_non_scalar_points(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "scan",
+            "base_spec": {"sim": {"grid": None}},
+            "patch_path": "sim.grid",
+            "values": [[1, 2], 7],
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    # A list value is still applied to the spec, but cannot be a point.
+    assert campaign.agenda.entries["leaf000"].point is None
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["grid"] == [1, 2]
+    assert campaign.agenda.entries["leaf001"].point == {"grid": 7}
+
+
+async def test_create_campaign_rejects_duplicate_values(tmp_path) -> None:
+    """Identical patched specs are refused up front (B2).
+
+    They would map to one ``sim_id`` and the engine would later abort the whole
+    tick with ``duplicate payload ...``; the agent must not be able to wedge a
+    campaign that can never advance.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "d", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": [4, 4]},
+    )
+    assert result["ok"] is False
+    assert result["error"] == "duplicate_campaign_spec"
+    # Nothing was persisted, so the agent can retry with distinct values.
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_rejects_a_non_wire_spec(tmp_path) -> None:
+    """A base_spec that is not an allow-listed ``{"sim": ...}`` wire is refused (B2)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "bad",
+            "base_spec": {"not_sim": {"time_steps": 4}},
+            "patch_path": "not_sim.time_steps",
+            "values": [1, 2],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_rejects_an_over_cap_spec(tmp_path) -> None:
+    """A leaf over the escaped inline cap is refused at creation (B2)."""
+    from pic_agentic.protocol.simulation import MAX_INLINE_PAYLOAD_BYTES
+
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = {"sim": {"blob": "a" * (MAX_INLINE_PAYLOAD_BYTES * 2), "time_steps": 4}}
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "big", "base_spec": base, "patch_path": "sim.time_steps", "values": [5]},
+    )
+    assert result["ok"] is False
+    assert result["error"] == "spec_exceeds_inline_limit"
+    assert result["wire_bytes"] > MAX_INLINE_PAYLOAD_BYTES
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_reaches_a_numeric_dict_key(tmp_path) -> None:
+    """A numeric-looking dict key is addressed as a key, not as a list index (M2)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "bc",
+            "base_spec": {"sim": {"bc": {"0": "periodic"}}},
+            "patch_path": "sim.bc.0",
+            "values": ["open"],
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["bc"] == {"0": "open"}
+
+
+async def test_create_campaign_rejects_a_typo_field(tmp_path) -> None:
+    """A path whose final segment does not exist is refused, not silently added (M3)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "typo",
+            "base_spec": {"sim": {"time_steps": 4}},
+            "patch_path": "sim.time_step",
+            "values": [50],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign"
+    assert not (tmp_path / "campaign.json").exists()

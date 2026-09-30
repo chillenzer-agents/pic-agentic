@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, computed_field
 
 from pic_agentic.protocol.simulation import (
     LOG_STREAMS,
+    MAX_INLINE_PAYLOAD_BYTES,
     ControlParams,
     ResultOp,
     ResultParams,
@@ -40,6 +41,7 @@ from pic_agentic.protocol.simulation import (
     build_result_command,
     build_status_command,
     build_submit_command,
+    payload_wire_size,
 )
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 from pic_agentic.server.hello import AckTimeoutError, SendFn
@@ -200,6 +202,35 @@ class SubmitOutcome(BaseModel):
         return not self.error
 
 
+class BuiltSpec(BaseModel):
+    """A dry-run build result: a Runner spec plus the size it would occupy.
+
+    Plain data (no runtime resources), so the pydantic model carries both the
+    wire spec an agenda leaf needs and the provenance/size fields that make the
+    48 KiB inline limit visible to the caller before any job is submitted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The wire spec (``{"sim": <pypicongpu Simulation dump>}``) for a leaf.
+    spec: dict[str, Any]
+    picongpu_version: str = ""
+    picongpu_revision: str = ""
+    schema_hash: str = ""
+    #: Escaped homeserver-facing size of the payload built from ``spec``.
+    wire_bytes: int
+    #: The inline submission budget ``wire_bytes`` is measured against.
+    inline_limit_bytes: int = MAX_INLINE_PAYLOAD_BYTES
+    #: Whether ``wire_bytes`` fits the inline cap and can be submitted as-is.
+    within_inline_limit: bool
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        """Whether the spec was built (the build itself never fails here)."""
+        return True
+
+
 class SubmitService:
     """Turn PICMI scripts into commands and await their acks."""
 
@@ -289,6 +320,42 @@ class SubmitService:
             cmd_id=command_id,
         ).sign(self.secret)
         return command_id, payload, command
+
+    async def build_spec(self, script_path: Path) -> BuiltSpec:
+        """Build the wire spec for a PICMI script **without** submitting it.
+
+        Runs the same disposable-subprocess builder and payload validation as
+        :meth:`build_payload`, then returns the inline wire spec (``{"sim":
+        ...}``) an agenda leaf or a later ``submit_spec`` call needs.  The
+        payload is fully validated here (allow-list and the 48 KiB inline cap)
+        so the caller learns the failure mode up front rather than at submit
+        time; ``payload_wire_size`` reports the escaped size the homeserver
+        would see, and ``within_inline_limit`` is False when it would not fit.
+
+        Args:
+            script_path: Path to the PICMI script (already resolved).
+
+        Returns:
+            The built wire spec plus its provenance and wire size.
+
+        """
+        built = await self.runner_dump_builder(script_path=script_path, interpreter=self.picongpu_python)
+        payload = SimulationPayload.build(
+            picongpu_version=built.picongpu_version,
+            picongpu_revision=self.picongpu_revision or built.picongpu_revision,
+            schema_hash=built.schema_hash,
+            runner_dump=built.runner,
+        )
+        payload.check_allowlist()
+        size = payload_wire_size(payload)
+        return BuiltSpec(
+            spec=payload.simulation,
+            picongpu_version=payload.picongpu_version,
+            picongpu_revision=payload.picongpu_revision,
+            schema_hash=payload.schema_hash,
+            wire_bytes=size,
+            within_inline_limit=size <= MAX_INLINE_PAYLOAD_BYTES,
+        )
 
     def on_message(self, message: RcpMessage) -> None:
         """Feed an inbound message; resolve pending futures and project events.
@@ -567,6 +634,34 @@ class SubmitService:
         cmd_id, _payload, command = self._build_spec_payload(runner_dump, params=params, cmd_id=cmd_id)
         return await self._dispatch(send, cmd_id, command)
 
+    def prepare_spec(self, runner_dump: dict[str, Any]) -> SimulationPayload:
+        """Build and allow-list a Runner spec exactly as a submission would.
+
+        The shared validation front-end for every path that turns an existing
+        spec into a submit command: :meth:`_build_spec_payload` (submission) and
+        the agenda's ``create_campaign`` (campaign creation) both call this, so
+        a leaf is validated by the same allow-list check it will meet at submit
+        time -- and rejected at creation rather than at the next tick.  No
+        command is signed and no sequence is consumed.
+
+        Args:
+            runner_dump: A full runner dump (or a wire spec carrying ``sim``).
+
+        Returns:
+            The validated payload; an allow-list failure propagates from
+            ``SimulationPayload.check_allowlist``.
+
+        """
+        provenance = _spec_provenance(runner_dump, self.picongpu_revision)
+        payload = SimulationPayload.build(
+            picongpu_version=provenance["picongpu_version"],
+            picongpu_revision=provenance["picongpu_revision"],
+            schema_hash=provenance["schema_hash"],
+            runner_dump=runner_dump,
+        )
+        payload.check_allowlist()
+        return payload
+
     def _build_spec_payload(
         self,
         runner_dump: dict[str, Any],
@@ -586,14 +681,7 @@ class SubmitService:
 
         """
         command_id = cmd_id or new_cmd_id()
-        provenance = _spec_provenance(runner_dump, self.picongpu_revision)
-        payload = SimulationPayload.build(
-            picongpu_version=provenance["picongpu_version"],
-            picongpu_revision=provenance["picongpu_revision"],
-            schema_hash=provenance["schema_hash"],
-            runner_dump=runner_dump,
-        )
-        payload.check_allowlist()
+        payload = self.prepare_spec(runner_dump)
         seq = self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER)
         command = build_submit_command(
             sim=self.sim,
@@ -895,6 +983,7 @@ __all__ = [
     "MAX_EVENT_PAGE",
     "TERMINAL_STATES",
     "AckTimeoutError",
+    "BuiltSpec",
     "SimRecord",
     "SimulationBuildError",
     "SubmitOutcome",

@@ -43,9 +43,10 @@ from pic_agentic.protocol.simulation import (
     SubmitParams,
     UnsupportedPayloadError,
 )
-from pic_agentic.server.agenda import AgendaService
+from pic_agentic.server.agenda import AgendaService, no_campaign_error
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
 from pic_agentic.server.simulation import (
+    BuiltSpec,
     SimRecord,
     SubmitOutcome,
     SubmitService,
@@ -371,6 +372,19 @@ class HelloRuntime:
         script_path = resolve_script(picmi_script, workdir=Path(tempfile.gettempdir()) / "pic-agentic")
         return await self.submit_service.submit(self._transport.send, script_path, params=params)
 
+    async def build_spec(self, picmi_script: str) -> BuiltSpec:
+        """Build one PICMI script into a Runner spec without submitting it.
+
+        Args:
+            picmi_script: A path to a PICMI script or inline PICMI code.
+
+        Returns:
+            The built wire spec plus its provenance and inline wire size.
+
+        """
+        script_path = resolve_script(picmi_script, workdir=Path(tempfile.gettempdir()) / "pic-agentic")
+        return await self.submit_service.build_spec(script_path)
+
     def registry(self) -> dict[str, SimRecord]:
         """Return the submit service's sim_id-keyed registry.
 
@@ -501,6 +515,21 @@ class HelloRuntime:
         """
         return await self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
 
+    async def create_campaign(
+        self,
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        """Create and persist a campaign with one leaf per sweep value.
+
+        Returns:
+            ``{"ok": True, "name": name, "leaves": [...]}``, or a soft error.
+
+        """
+        return await self.agenda_service.create_campaign(name, base_spec, patch_path, values)
+
     async def record_analysis(self, path: str, analysis: dict[str, Any]) -> dict[str, Any]:
         """Record one leaf's analysis on the campaign.
 
@@ -541,7 +570,7 @@ class HelloRuntime:
 
         """
         if not self.agenda_service.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         try:
             campaign = self.agenda_service.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
@@ -586,12 +615,13 @@ class HelloRuntime:
         """Return the campaign's RO-Crate provenance document.
 
         Returns:
-            The ``ro-crate-metadata.json`` dict, or ``{"ok": False, "error":
-            "no_campaign"}`` when no campaign is persisted.
+            The ``ro-crate-metadata.json`` dict, or the actionable
+            ``{"ok": False, "error": "no_campaign", "message": <recovery hint>}``
+            soft error when no campaign is persisted.
 
         """
         if not self.agenda_service.store.exists():
-            return {"ok": False, "error": "no_campaign"}
+            return no_campaign_error()
         try:
             campaign = self.agenda_service.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
@@ -627,6 +657,27 @@ class HelloRuntime:
             await self._transport.close()
 
 
+#: Seeded MCP instructions.  They point the agent at the PIConGPU documentation
+#: and examples that ship with the pinned ``picongpu`` package, so an agent that
+#: does not know PICMI/PyPIConGPU can find how to define a simulation and how to
+#: scan parameters without us bundling an example script.
+SERVER_INSTRUCTIONS = (
+    "Submit and follow PIConGPU simulations on a remote SLURM cluster. "
+    "The 'hello' tool performs an end-to-end connectivity check. "
+    "A simulation is defined either as a PICMI Python script (submit_simulation) "
+    "or, for parameter studies, as a pypicongpu Runner spec "
+    "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
+    "a spec field across values). "
+    "For how to write a PICMI input file and how to define or scan multiple "
+    "simulations, see the PyPIConGPU documentation: the page 'Defining Your "
+    "Simulation' under python_package/foundations/defining_simulation "
+    "(published at https://picongpu.readthedocs.io/en/latest/python_package/foundations/) "
+    "covers simulation definition and static/dynamic parameter scans; the "
+    "tutorial and the examples under lib/python/examples/ in the picongpu "
+    "source tree show complete setups."
+)
+
+
 def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
     """Create the MCP server and its runtime, wired together via lifespan.
 
@@ -646,10 +697,7 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
 
     server = MCPServer(
         "pic-agentic",
-        instructions=(
-            "Submit and follow PIConGPU simulations on a remote SLURM cluster. "
-            "The 'hello' tool performs an end-to-end connectivity check."
-        ),
+        instructions=SERVER_INSTRUCTIONS,
         lifespan=lifespan,
     )
 
@@ -708,6 +756,26 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         except _SUBMIT_TOOL_ERRORS as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
         return _submit_outcome_dict(runtime, outcome)
+
+    @server.tool(
+        title="Build a simulation spec without submitting",
+        description=(
+            "Build a PICMI simulation script into a PyPIConGPU Runner spec and "
+            "return it without sending anything to the cluster. Use it to obtain "
+            "a base spec for create_campaign or add_agenda_leaf. The returned "
+            "`spec` is the inline `{sim: ...}` wire object accepted by those "
+            "tools; the result also reports the encoded wire size and whether it "
+            "fits the 48 KiB inline submission limit."
+        ),
+        # read-tier: it builds locally and starts no cluster work.
+        annotations=_READ_ONLY,
+    )
+    async def build_spec(picmi_script: str) -> dict[str, Any]:
+        try:
+            built = await runtime.build_spec(picmi_script)
+        except _SUBMIT_TOOL_ERRORS as exc:
+            return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
+        return _built_spec_dict(runtime, built)
 
     _register_reporting_tools(server, runtime)
     _register_control_result_tools(server, runtime)
@@ -1031,6 +1099,29 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         return _redact_dict(runtime, await runtime.take_agenda_callbacks())
 
     @server.tool(
+        title="Create a simulation campaign",
+        description=(
+            "Create and persist a campaign with one leaf per value: each leaf is "
+            "`base_spec` with the dotted Runner-spec path `patch_path` set to "
+            "that value (e.g. patch_path='sim.time_steps'), and records "
+            "point={last path segment: value}. This is the entry point for the "
+            "research loop -- call build_spec first to get base_spec, then "
+            "advance_agenda. Refuses to overwrite an existing campaign."
+        ),
+        # write/resource tier: it creates persisted campaign state but starts no
+        # cluster work itself; it is not destructive.
+        annotations=_CONTROL_ANNOTATIONS,
+    )
+    async def create_campaign(
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+    ) -> dict[str, Any]:
+        result = await runtime.create_campaign(name, base_spec, patch_path, values)
+        return _redact_dict(runtime, result)
+
+    @server.tool(
         title="Add a simulation leaf to the campaign",
         description=(
             "Add one simulation leaf to the persisted campaign's root group, so "
@@ -1115,7 +1206,32 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "abs/sqrt/log/exp/sin/cos/tanh and reductions such as sum/mean/std/"
             "min/max/median/quantile/histogram/fft_peak). Returns a scalar, a "
             "bounded numeric array, or a histogram/spectrum. Invalid or oversized "
-            "programs are rejected; the output is capped to the ack budget."
+            "programs are rejected; the output is capped to the ack budget.\n"
+            "The program is a fully validated expression tree (never eval'd, "
+            "never a serialised sympy object); unknown fields are rejected. "
+            "Schema:\n"
+            "  program = {selectors?: [var, ...], output: expr, points?: expr}\n"
+            "  var     = {kind: 'var', name: str, record?: str, component?: str, iteration?: int|str}\n"
+            "  expr    = const | var | binop | unop | reduce\n"
+            "    const  = {kind: 'const', value: number}\n"
+            "    binop  = {kind: 'binop', op: 'add'|'sub'|'mul'|'div'|'pow', left: expr, right: expr}\n"
+            "    unop   = {kind: 'unop', op: 'neg'|'abs'|'sqrt'|'log'|'exp'|'sin'|'cos'|'tanh'|'sign', operand: expr}\n"
+            "    reduce = {kind: 'reduce', op: 'sum'|'mean'|'std'|'min'|'max'|'median'|"
+            "'argmax'|'argmin'|'quantile'|'histogram'|'fft_peak'|'fft_freq', operand: expr, "
+            "q?: 0..1, bins?: int}\n"
+            "The optional `selectors` list documents the `var` inputs (a `var` may "
+            "also appear bare, with its `name` resolved to an openPMD record/"
+            "component). `output` is the returned expression; `points` is an "
+            "optional parallel expression (e.g. an FFT frequency axis).\n"
+            "Worked example - the transverse energy spectrum of the E field:\n"
+            '{"selectors": [{"kind": "var", "name": "px", "record": "E", "component": "x"}, '
+            '{"kind": "var", "name": "py", "record": "E", "component": "y"}], '
+            '"output": {"kind": "reduce", "op": "histogram", "bins": 4, "operand": '
+            '{"kind": "binop", "op": "add", '
+            '"left": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "px"}, '
+            '"right": {"kind": "var", "name": "px"}}, '
+            '"right": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "py"}, '
+            '"right": {"kind": "var", "name": "py"}}}}}'
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
@@ -1418,6 +1534,49 @@ def _redact_dict(runtime: HelloRuntime, payload: Any, _depth: int = 0) -> Any:
     if isinstance(payload, list):
         return [_redact_dict(runtime, value, _depth + 1) for value in payload]
     return payload
+
+
+def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
+    """Shape a dry-run build result for the ``build_spec`` tool.
+
+    The spec is returned when it fits the 48 KiB inline submission cap (the only
+    transport M2 has).  An over-cap spec is *not* returned: it could be stored on
+    a campaign leaf but never submitted, so the failure mode is made explicit
+    instead of handing the agent a spec that would fail later at
+    ``advance_agenda``.
+
+    The built spec is trusted builder output (it passed ``check_allowlist``),
+    not untrusted free text, so it is returned **verbatim**: routing it through
+    :func:`_redact_dict` would hit the ``_REDACT_MAX_DEPTH`` structural cap on
+    any legitimate spec whose ``sim`` nests deeply (the shipped
+    rotation/frequency config does), silently replacing real config with a
+    ``"[REDACTED: nesting too deep]"`` marker while still reporting ``ok=True``.
+    The scalar metadata (version/revision/schema hash) is redacted individually,
+    matching the submit path, and the cap path is the same shape (no structural
+    redaction on either branch).
+
+    Returns:
+        ``{"ok": True, "spec", "wire_bytes", ...}``, or a soft error naming the
+        over-cap condition.
+
+    """
+    redact = runtime.config.redact
+    if not built.within_inline_limit:
+        return {
+            "ok": False,
+            "error": "spec_exceeds_inline_limit",
+            "wire_bytes": built.wire_bytes,
+            "inline_limit_bytes": built.inline_limit_bytes,
+        }
+    return {
+        "ok": True,
+        "spec": built.spec,
+        "wire_bytes": built.wire_bytes,
+        "inline_limit_bytes": built.inline_limit_bytes,
+        "picongpu_version": redact(built.picongpu_version),
+        "picongpu_revision": redact(built.picongpu_revision),
+        "schema_hash": built.schema_hash,
+    }
 
 
 def _submit_outcome_dict(runtime: HelloRuntime, outcome: SubmitOutcome) -> dict[str, Any]:

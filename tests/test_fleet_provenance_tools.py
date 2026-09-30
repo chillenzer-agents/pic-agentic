@@ -15,6 +15,7 @@ from pic_agentic.agenda.provenance import RO_CRATE_METADATA_FILE
 from pic_agentic.agenda.store import AgendaStore
 from pic_agentic.config import Config
 from pic_agentic.rcp import new_secret_hex
+from pic_agentic.server.agenda import NO_CAMPAIGN_MESSAGE
 from pic_agentic.server.app import build_server
 
 SECRET = new_secret_hex()
@@ -87,4 +88,4 @@ async def test_campaign_provenance_without_campaign_is_soft_error(tmp_path) -> N
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     server, _runtime = build_server(config, SIM)
     payload = (await server.call_tool("campaign_provenance", {})).structured_content
-    assert payload == {"ok": False, "error": "no_campaign"}
+    assert payload == {"ok": False, "error": "no_campaign", "message": NO_CAMPAIGN_MESSAGE}
