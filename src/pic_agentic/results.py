@@ -1080,12 +1080,41 @@ def _stride(values: list[float], max_points: int = _PLUGIN_MAX_POINTS) -> tuple[
     return values[::step], True
 
 
-def _plugin_summary(
+def _plugin_iterations(output: Path, spec: _PluginReader, species: str, species_filter: str) -> list[int]:
+    """List the iterations a plugin's matching files on disk provide.
+
+    Used for the transition-radiation reader, whose per-iteration filenames
+    (``<species>_transRad_<iteration>.dat``) carry the step.  The shipped
+    ``TransitionRadiationData.get_iterations`` ignores ``species`` and globs
+    *every* ``*.dat`` in ``simOutput``, so a coexisting ``_energyHistogram_`` /
+    ``_emittance_`` file makes it raise ``ValueError``; enumerating the matching
+    filenames here avoids that entirely.
+
+    Returns:
+        The sorted, de-duplicated iterations of the matching files.
+
+    """
+    iterations: set[int] = set()
+    for path, is_dir in _collect_entries(output):
+        if is_dir or not spec.pattern.fullmatch(path.name):
+            continue
+        if species and not path.name.startswith(f"{species}_"):
+            continue
+        if species_filter != "all" and not path.name.endswith(f"_{species_filter}.dat"):
+            continue
+        match = re.fullmatch(r".+_transRad_(?P<iteration>\d+)\.dat", path.name)
+        if match is not None:
+            iterations.add(int(match.group("iteration")))
+    return sorted(iterations)
+
+
+def _plugin_summary(  # ruff: ignore[too-many-positional-arguments] - reader inputs stay explicit
     reader: str,
     instance: Any,
     species: str,
     species_filter: str,
     iteration: int | str | None,
+    available: list[int],
 ) -> dict[str, Any]:
     """Call one plugin reader and shape a bounded numeric summary.
 
@@ -1093,12 +1122,34 @@ def _plugin_summary(
         The reader-specific summary dict.
 
     """
-    if reader == "transition_radiation":
-        available = [int(step) for step in instance.get_iterations(species)]
-    else:
-        available = [int(step) for step in instance.get_iterations(species, species_filter)]
     selected = _resolve_plugin_iteration(available, iteration)
     return _PLUGIN_BUILDERS[reader](instance, species, species_filter, selected)
+
+
+def _plugin_result(
+    reader: str,
+    spec: _PluginReader,
+    output: Path,
+    params: ResultParams,
+    target: Path,
+) -> dict[str, Any]:
+    """Resolve and run one plugin reader for a discovered target file.
+
+    Returns:
+        The reader-specific summary dict.
+
+    """
+    species, species_filter, derived_iteration = _derive_plugin_names(reader, target.name)
+    iteration = params.iteration if params.iteration is not None else derived_iteration
+    instance = _import_plugin_reader(reader)(str(output.parent))
+    if reader == "transition_radiation":
+        # The shipped ``get_iterations`` globs every ``*.dat`` and chokes on a
+        # coexisting histogram/emittance file, so enumerate the matching
+        # ``_transRad_<int>.dat`` names ourselves.
+        available = _plugin_iterations(output, spec, species, species_filter)
+    else:
+        available = [int(step) for step in instance.get_iterations(species, species_filter)]
+    return _plugin_summary(reader, instance, species, species_filter, iteration, available)
 
 
 def _build_energy_histogram(instance: Any, species: str, species_filter: str, iteration: int) -> dict[str, Any]:
@@ -1256,11 +1307,7 @@ def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean 
     if target is None or not target.is_file():
         return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
     try:
-        species, species_filter, derived_iteration = _derive_plugin_names(reader, target.name)
-        iteration = params.iteration if params.iteration is not None else derived_iteration
-        reader_class = _import_plugin_reader(reader)
-        instance = reader_class(str(output.parent))
-        summary = _plugin_summary(reader, instance, species, species_filter, iteration)
+        summary = _plugin_result(reader, spec, output, params, target)
     except ResultsUnavailable as exc:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
     except (ResultsReaderError, KeyError, OSError, ValueError, IndexError) as exc:

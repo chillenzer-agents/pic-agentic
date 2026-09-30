@@ -253,3 +253,37 @@ def test_real_emittance_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["max_emit_mrad"] == pytest.approx(9.0)
     assert summary["max_y_slice_m"] == pytest.approx(3.0)
     assert summary["iteration"] == 50
+
+
+def test_real_transition_radiation_reader_ignores_other_dat_files(tmp_path: Path) -> None:
+    """A coexisting histogram file must not break transRad (B2).
+
+    The shipped ``TransitionRadiationData.get_iterations`` globs *every* ``*.dat``
+    and int-parses the name, so ``e_energyHistogram_all.dat`` made it raise
+    ``ValueError`` and the request degrade to ``no_results``.  Enumerating the
+    matching ``_transRad_<int>.dat`` names fixes that.
+    """
+    pytest.importorskip("picongpu")
+    from plugin_fixtures import energy_histogram_dat, transrad_dat
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    for iteration in (0, 50, 100):
+        transrad_dat(run, iteration=iteration)
+    # The documented LWFA case: a histogram output coexists in simOutput.
+    energy_histogram_dat(run)
+
+    params = ResultParams(
+        sim_id=SIM_ID,
+        op=ResultOp.PLUGIN,
+        reader="transition_radiation",
+        species="e",
+        iteration=100,
+    )
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 100
+    assert summary["omega_per_s"] == [1e15, 2e15, 3e15, 4e15]
+    assert summary["peak_intensity"] == pytest.approx(7.0)
+    assert summary["peak_omega_per_s"] == pytest.approx(4e15)
