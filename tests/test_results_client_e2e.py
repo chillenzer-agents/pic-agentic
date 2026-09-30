@@ -100,6 +100,33 @@ async def test_describe_and_read_without_openpmd(tmp_path) -> None:
         await sim_t.close()
 
 
+async def test_plugin_request_routes_to_the_engine(tmp_path) -> None:
+    """A PLUGIN request reaches ``resolve_result`` through ``_handle_result``.
+
+    Offline (no picongpu) this is a clean ``reader_unavailable``; the point is
+    that the new op is not refused as an unsupported/invalid params request.
+    """
+    import importlib.util
+
+    run = tmp_path / "run"
+    (run / "simOutput").mkdir(parents=True)
+    (run / "simOutput" / "e_energyHistogram_all.dat").write_text("x\n", encoding="utf-8")
+    sim_t, client = _client(tmp_path)
+    try:
+        _track_sim(client, run)
+        ack = await client.handle(
+            _request("res12345", ResultOp.PLUGIN, reader="energy_histogram", species="e"),
+        )
+        assert ack is not None
+        assert ack.type == SimulationType.RESULT_ACK
+        if importlib.util.find_spec("picongpu") is None:
+            assert ack.payload.get("error_code") == "reader_unavailable"
+        else:
+            assert "error" not in ack.payload
+    finally:
+        await sim_t.close()
+
+
 async def test_result_unknown_sim_and_bad_path(tmp_path) -> None:
     sim_t, client = _client(tmp_path)
     try:
