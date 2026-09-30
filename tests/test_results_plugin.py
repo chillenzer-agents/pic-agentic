@@ -2,12 +2,14 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Tests for the G1 PIConGPU text-plugin result readers.
+"""Tests for the G1 PIConGPU plugin result readers.
 
 The offline tests use a stub reader injected in place of the optional PIConGPU
-package, so the default suite (no picongpu) still passes.  The final test runs
-the *real* ``EnergyHistogramData`` reader and is skipped unless PIConGPU is
-importable; run it with a PIConGPU venv, e.g.::
+package, so the default suite (no picongpu) still passes.  The final tests run
+the *real* readers (``EnergyHistogramData``, ``EmittanceData``,
+``TransitionRadiationData``, ``PhaseSpaceData``, ``particleCalorimeter``,
+``RadiationData``, ``PNGData``) and are skipped unless PIConGPU is importable;
+run them with a PIConGPU venv, e.g.::
 
     PYTHONPATH=<repo>/src /tmp/opencode/pic-stack-venv/bin/python -m pytest tests/test_results_plugin.py -q
 
@@ -17,9 +19,17 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
-from plugin_fixtures import energy_histogram_dat, write_output_unit
+from plugin_fixtures import (
+    calorimeter_h5,
+    energy_histogram_dat,
+    phase_space_h5,
+    png_file,
+    radiation_h5,
+    write_output_unit,
+)
 
 from pic_agentic import results
 from pic_agentic.protocol.simulation import ResultOp, ResultParams
@@ -421,3 +431,243 @@ def test_real_transition_radiation_reader_defaults_to_latest(tmp_path: Path) -> 
     zero = results.resolve_result(first, run_dir=run, sim_id=SIM_ID)
     assert "result" in zero, zero
     assert zero["result"]["iteration"] == 0
+
+
+# --- openPMD / image readers (slice 2) -------------------------------------
+
+
+def _openpmd_tree(tmp_path: Path) -> Path:
+    """Build a run with a phase-space series on disk (no openpmd needed)."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "phaseSpace").mkdir(parents=True, exist_ok=True)
+    for iteration in (0, 50, 100):
+        (run / "simOutput" / "phaseSpace" / f"PhaseSpace_e_all_ypy_{iteration}.h5").write_bytes(b"x")
+    return run
+
+
+def test_registry_matches_the_wire_names_including_openpmd() -> None:
+    from pic_agentic.protocol.simulation import PLUGIN_READER_NAMES
+
+    assert set(results._PLUGIN_READERS) == set(PLUGIN_READER_NAMES)
+    assert set(results._PLUGIN_BUILDERS) == set(PLUGIN_READER_NAMES)
+    assert {"phase_space", "radiation", "calorimeter", "png"} <= set(PLUGIN_READER_NAMES)
+
+
+def test_sniff_format_names_the_openpmd_and_image_readers(tmp_path: Path) -> None:
+    assert results._sniff_format("PhaseSpace_e_all_ypy_100.h5") == "phase_space"
+    assert results._sniff_format("e_radAmplitudes_100_0_0_0.h5") == "radiation"
+    assert results._sniff_format("e_calorimeter_all_100.h5") == "calorimeter"
+    assert results._sniff_format("e_png_yx_0.5_000100.png") == "png"
+    # A plain field series is still reported by its backend, not a plugin.
+    assert results._sniff_format("fields_100.h5") == "openpmd-hdf5"
+    assert results._sniff_format("fields.bp") == "openpmd-adios2"
+
+    run = _openpmd_tree(tmp_path)
+    manifest = results.scan_output(run / "simOutput", sim_id=SIM_ID, run_dir=str(run))
+    formats = {ref.path: ref.format for ref in manifest.files}
+    assert formats["phaseSpace/PhaseSpace_e_all_ypy_100.h5"] == "phase_space"
+
+
+class _StubPhaseSpace:
+    """Stand-in for ``PhaseSpaceData`` (returns a 2D plane + metadata)."""
+
+    class _Meta:
+        r_edges: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0)
+        p_edges: tuple[float, ...] = (-1.0, 0.0, 1.0)
+
+    def __init__(self, run_directory: str) -> None:
+        self.run_directory = run_directory
+
+    @staticmethod
+    def get(iteration: int, ps: str, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+        _ = (ps, species, species_filter, kwargs)
+        return [[float(iteration), 1.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]], _StubPhaseSpace._Meta
+
+
+def test_phase_space_stub_summary_and_iteration_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubPhaseSpace)
+    run = _openpmd_tree(tmp_path)
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="phase_space", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    # The files are 0/50/100; the default must be the newest.
+    assert summary["iteration"] == 100
+    assert summary["n_r"] == 3
+    assert summary["n_p"] == 3
+    assert summary["r_min_m"] == pytest.approx(0.0)
+    assert summary["r_max_m"] == pytest.approx(3.0)
+    assert summary["p_min"] == pytest.approx(-1.0)
+    assert summary["p_max"] == pytest.approx(1.0)
+    assert summary["total_count"] == pytest.approx(103.0)
+    assert summary["downsampled"] is False
+
+
+def test_phase_space_stub_explicit_and_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubPhaseSpace)
+    run = _openpmd_tree(tmp_path)
+    explicit = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="phase_space", species="e", iteration=50)
+    payload = results.resolve_result(explicit, run_dir=run, sim_id=SIM_ID)
+    assert payload["result"]["iteration"] == 50
+
+    missing = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="phase_space", species="positron")
+    none = results.resolve_result(missing, run_dir=run, sim_id=SIM_ID)
+    assert none["error_code"] == "no_results"
+
+
+class _StubCalorimeter:
+    """Stand-in for ``particleCalorimeter`` (2D and 3D data shapes)."""
+
+    detector_params: ClassVar[dict[str, int]] = {"N_yaw": 4, "N_pitch": 3, "N_energy": 2}
+
+    def __init__(self, series_filename: str) -> None:
+        self.series_filename = series_filename
+
+    @staticmethod
+    def getEnergy() -> list[float]:
+        return [10.0, 1000.0]
+
+    @staticmethod
+    def getData(iteration: int) -> list:
+        _ = iteration
+        return [[float(p * 4 + y) for y in range(4)] for p in range(3)]
+
+
+def test_calorimeter_stub_projects_both_shapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubCalorimeter)
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "cal").mkdir(parents=True, exist_ok=True)
+    (run / "simOutput" / "cal" / "e_calorimeter_all_100.h5").write_bytes(b"x")
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="calorimeter", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 100
+    assert summary["n_pitch"] == 3
+    assert summary["n_yaw"] == 4
+    # The 2D shape has no energy axis; pitch is the outer axis.
+    assert summary["energy_keV"] is None
+    assert summary["per_pitch_J"] == [6.0, 22.0, 38.0]
+    assert summary["per_yaw_J"] == [12.0, 15.0, 18.0, 21.0]
+    assert summary["total_energy_J"] == pytest.approx(66.0)
+
+
+def test_openpmd_reader_missing_dependency_is_reader_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _openpmd_tree(tmp_path)
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str, *args: object, **kwargs: object) -> object:
+        if name == "openpmd_api":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(results.importlib.util, "find_spec", fake_find_spec)
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="phase_space", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert payload["error_code"] == "reader_unavailable"
+
+
+def test_unknown_reader_names_are_rejected_by_the_wire() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="unknown plugin reader"):
+        ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="openpmd")
+
+
+# --- real readers (skipped without PIConGPU) --------------------------------
+
+
+def test_real_phase_space_reader_end_to_end(tmp_path: Path) -> None:
+    """The real ``PhaseSpaceData`` opens the generated openPMD series (slice 2).
+
+    The fixture is written with the pinned ``openpmd_api`` in the layout the
+    reader expects; this exercises the real class (and ``openpmd_api``) through
+    the engine, not a stub.  Skipped unless PIConGPU + openpmd_api are present.
+    """
+    pytest.importorskip("picongpu")
+    pytest.importorskip("openpmd_api")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    phase_space_h5(run, shape=(4, 3))
+
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="phase_space", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    # Default is the latest iteration (100), not the alphabetically first (0).
+    assert summary["iteration"] == 100
+    assert summary["ps"] == "ypy"
+    assert summary["n_r"] == 4
+    assert summary["n_p"] == 3
+    assert summary["downsampled"] is False
+    # The ramp is 0..11 plus the iteration; the row-major sum is exact.
+    assert summary["total_count"] == pytest.approx(66.0 + 100 * 12)
+
+
+def test_real_calorimeter_reader_end_to_end(tmp_path: Path) -> None:
+    """The real ``particleCalorimeter`` opens the generated series (slice 2)."""
+    pytest.importorskip("picongpu")
+    pytest.importorskip("openpmd_api")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    calorimeter_h5(run, shape=(2, 3, 4))
+
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="calorimeter", species="e", iteration=50)
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 50
+    assert summary["n_energy"] == 2
+    assert summary["n_pitch"] == 3
+    assert summary["n_yaw"] == 4
+    assert summary["energy_keV"] == [10.0, 1000.0]
+    # Sum of 0..23 plus 50 per cell over 24 cells.
+    assert summary["total_energy_J"] == pytest.approx(276.0 + 50 * 24)
+
+
+def test_real_radiation_reader_end_to_end(tmp_path: Path) -> None:
+    """The real ``RadiationData`` opens the generated series (slice 2)."""
+    pytest.importorskip("picongpu")
+    pytest.importorskip("openpmd_api")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    radiation_h5(run, n_directions=2, n_frequencies=5)
+
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="radiation", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 100
+    assert summary["n_directions"] == 2
+    assert summary["n_frequencies"] == 5
+    assert summary["omega_per_s"] == [1e14, 2e14, 3e14, 4e14, 5e14]
+
+
+def test_real_png_reader_returns_metadata(tmp_path: Path) -> None:
+    """The real ``PNGData`` returns dimensions, not pixels (slice 2)."""
+    pytest.importorskip("picongpu")
+    pytest.importorskip("imageio")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    for iteration in (0, 50, 100):
+        png_file(run, iteration=iteration, height=8, width=12)
+
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="png", species="e")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["iteration"] == 100
+    assert summary["height_px"] == 8
+    assert summary["width_px"] == 12
+    assert summary["channels"] == 3
+    assert summary["image_via"] == "export"
+    # No pixel data travels on the wire.
+    assert "data" not in summary
