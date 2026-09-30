@@ -188,6 +188,31 @@ def test_bound_plugin_strides_to_fit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert results._escaped_size(bounded) <= 512
 
 
+def test_stride_keeps_the_last_element() -> None:
+    """``_stride`` must not drop the array tail it claims to keep (M1)."""
+    values = [float(i) for i in range(1024)]
+    strided, downsampled = results._stride(values, 256)
+    assert downsampled is True
+    assert strided[0] == pytest.approx(0.0)
+    assert strided[-1] == pytest.approx(1023.0)
+    assert len(strided) <= 257  # 256 strided points plus the appended last
+
+
+def test_bound_plugin_keeps_the_strided_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The over-budget striding path also keeps each array's last element (M1)."""
+    monkeypatch.setattr(results, "MAX_RESULT_BYTES", 256)
+    summary = {
+        "bins_kev": [float(i) for i in range(50)],
+        "counts": [1000.0 + i for i in range(50)],
+        "downsampled": False,
+    }
+    bounded = results._bound_plugin(summary)
+    assert bounded is not None
+    assert bounded["downsampled"] is True
+    assert bounded["bins_kev"][-1] == pytest.approx(49.0)
+    assert bounded["counts"][-1] == pytest.approx(1049.0)
+
+
 def test_result_params_rejects_extra_fields() -> None:
     from pydantic import ValidationError
 

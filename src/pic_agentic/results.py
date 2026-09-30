@@ -1070,6 +1070,11 @@ def _resolve_plugin_iteration(available: list[int], iteration: int | str | None)
 def _stride(values: list[float], max_points: int = _PLUGIN_MAX_POINTS) -> tuple[list[float], bool]:
     """Stride a numeric array down to ``max_points``.
 
+    The first and last elements are always kept: a plain ``values[::step]``
+    only guarantees the first, and the dropped tail is exactly the high-energy
+    overflow bin (histograms) or the last slice, which the summary must not
+    silently lose.  Appending the last element at most adds one point.
+
     Returns:
         ``(values, downsampled)``; striding keeps the endpoints.
 
@@ -1077,7 +1082,10 @@ def _stride(values: list[float], max_points: int = _PLUGIN_MAX_POINTS) -> tuple[
     if len(values) <= max_points:
         return values, False
     step = math.ceil(len(values) / max_points)
-    return values[::step], True
+    strided = values[::step]
+    if strided[-1] != values[-1]:
+        strided = [*strided, values[-1]]
+    return strided, True
 
 
 def _plugin_iterations(output: Path, spec: _PluginReader, species: str, species_filter: str) -> list[int]:
@@ -1281,7 +1289,10 @@ def _bound_plugin(summary: dict[str, Any]) -> dict[str, Any] | None:
         if not arrays:
             return None
         for key in arrays:
-            bounded[key] = bounded[key][::2]
+            values = bounded[key][::2]
+            if values[-1] != bounded[key][-1]:
+                values = [*values, bounded[key][-1]]
+            bounded[key] = values
     return bounded
 
 
