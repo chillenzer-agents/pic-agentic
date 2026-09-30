@@ -99,13 +99,11 @@ class _PluginReader:
     Attributes:
         pattern: The ``simOutput`` filename glob the reader's output matches.
         module: The ``picongpu.extra.plugins.data`` class name to import.
-        required: The reader-kwargs the entry point needs beyond ``iteration``.
 
     """
 
     pattern: re.Pattern[str]
     module: str
-    required: tuple[str, ...] = ("species",)
 
 
 #: Registry of shipped text-plugin readers, keyed by the frozen wire name.  The
@@ -123,7 +121,6 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
     "transition_radiation": _PluginReader(
         re.compile(r"^[A-Za-z0-9_]+_transRad_[0-9]+\.dat$"),
         "TransitionRadiationData",
-        required=("species", "iteration"),
     ),
 }
 
