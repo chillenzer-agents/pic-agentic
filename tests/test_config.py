@@ -109,3 +109,10 @@ def test_agenda_policy_fields_from_env(tmp_path, monkeypatch) -> None:
     assert cfg.agenda_file == "/shared/campaign.json"
     assert cfg.agenda_require_approval is True
     assert cfg.agenda_approve_over_est_core_hours == pytest.approx(120.5)
+
+
+def test_spec_dir_from_env_and_toml(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PIC_AGENTIC_SPEC_DIR", "/shared/specs")
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.spec_dir == "/shared/specs"
+    assert not Config(spec_dir="").spec_dir
