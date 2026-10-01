@@ -27,6 +27,7 @@ _HAS_PICONGPU = importlib.util.find_spec("picongpu") is not None
 
 CAMPAIGN_SPECS = Path(__file__).parent / "fixtures" / "campaign_specs.json"
 RUNNER_FIXTURE = Path(__file__).parent / "fixtures" / "pypicongpu_runner.json"
+BETA_BAD_SPEC = Path(__file__).parent / "fixtures" / "beta3_bad_spec.json"
 
 
 def _campaign_spec(index: int) -> dict:
@@ -69,3 +70,35 @@ def test_fallback_is_documented_best_effort_for_unknown_fields() -> None:
     # No pin importable here, so the curated detector passes it; the exact check
     # (integration test) rejects it.  This pins the documented degradation.
     assert check_spec_round_trip({"sim": sim}) is None
+
+
+@pytest.mark.skipif(not _HAS_PICONGPU, reason="needs the pinned pypicongpu schema")
+def test_validation_failure_is_rejected_with_the_offending_field() -> None:
+    """A spec the pin cannot validate is refused, naming the field (beta-3).
+
+    The beta-3 defect was that ``check_spec_round_trip`` swallowed the
+    ``Runner.model_validate`` failure and returned ``None``; the simclient then
+    rejected every leaf as ``payload_invalid``.  The check must now reject and
+    paraphrase the pydantic error concisely.
+    """
+    dump = _runner_dump()
+    dump["sim"]["species"] = ""
+    detail = check_spec_round_trip(dump)
+    assert detail is not None
+    assert detail.startswith("spec does not validate against the pinned pypicongpu schema")
+    assert "sim.species Input should be a valid list (got str '')" in detail
+    # A field the pin is happy with is still accepted.
+    assert check_spec_round_trip({"sim": _runner_dump()["sim"]}) is None
+
+
+@pytest.mark.skipif(not _HAS_PICONGPU, reason="needs the pinned pypicongpu schema")
+def test_beta3_bad_spec_is_rejected_by_the_check() -> None:
+    """The exact LLM-typed beta-3 spec is refused at the round-trip gate."""
+    bad = json.loads(BETA_BAD_SPEC.read_text(encoding="utf-8"))
+    detail = check_spec_round_trip(bad)
+    assert detail is not None
+    assert detail.startswith("spec does not validate against the pinned pypicongpu schema")
+    assert "sim.customuserinput Input should be a valid list" in detail
+    assert "sim.moving_window" in detail
+    # The message is bounded even for a many-error spec.
+    assert "more error(s)" in detail

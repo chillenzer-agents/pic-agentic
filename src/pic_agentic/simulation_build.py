@@ -45,6 +45,8 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
+from pydantic import ValidationError
+
 #: Child script: run the PICMI script, convert and print the runner dump plus
 #: the provenance of *this* interpreter (not the server's), so the payload
 #: header describes the exact tree that produced the dump.
@@ -214,6 +216,20 @@ _KNOWN_COMPUTED_FIELDS = {"num_tmp_field_slots": "collisional_physics"}
 _CHECK_SETUP_DIR = "/__pic_agentic_spec_check__/input"
 _CHECK_RUN_DIR = "/__pic_agentic_spec_check__/run"
 
+#: Bounds on the paraphrased pydantic-validation message.  A pathological spec
+#: can produce hundreds of errors; the message stays a short, actionable list of
+#: distinct offending fields plus a count of the rest.
+_MAX_VALIDATION_ERRORS = 5
+_MAX_VALUE_CHARS = 40
+
+#: Substring of pydantic's internal union-branch location segments (e.g.
+#: ``function-after[check(), Grid3D]``).  A union emits one alternation per
+#: branch, so the same real field would otherwise be reported twice.
+_INTERNAL_LOC_MARKER = "function-"
+
+#: Distinguishes "no input recorded" from a recorded ``None``.
+_MISSING = object()
+
 
 def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
     """Check that ``sim`` reproduces itself through the pinned ``Runner``.
@@ -221,34 +237,37 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
     This mirrors the simclient's gate *exactly*: the simclient rebuilds a
     ``Runner`` from a **reduced** dump -- ``{"sim": <sim>, "setup_dir": ...,
     "run_dir": ...}`` plus ``template_dir`` only when it is configured -- and
-    rejects the payload as ``unsupported`` when
-    ``Runner.model_validate(dump).sim.model_dump(mode="json") != <sim>``.  It
-    never validates the caller's sibling keys, so this check must not either
-    (doing so would reject a valid spec over an unrelated ``template_dir`` or
+    rejects the payload when either (a) ``Runner.model_validate`` fails, which
+    the simclient reports as ``payload_invalid``, or (b) the re-validated
+    ``sim`` differs from ``<sim>``, reported as ``unsupported``.  It never
+    validates the caller's sibling keys, so this check must not either (doing
+    so would reject a valid spec over an unrelated ``template_dir`` or
     ``setup_dir`` shape the simclient drops).  Running the same check at
     campaign-creation time turns a later catastrophic leaf failure into an
     immediate, precise error.
 
-    The check only *rejects* when a requested value is genuinely lost: if the
-    re-validated ``sim`` differs but every leaf the caller supplied survives
-    (the pin may add computed metadata such as ``precision_overrides``), or if
-    the ``sim`` does not validate at all (the simclient answers the same
-    payload with an equally explicit ``payload_invalid`` at submit time), the
-    spec is accepted rather than over-rejected.  Only a nested field that is
-    silently dropped is reported.
+    A validation failure is *rejected* (never swallowed): the simclient would
+    refuse the same leaf with ``payload_invalid`` at submit time, so treating it
+    as a pass would let ``create_campaign`` persist a campaign whose every leaf
+    fails -- the beta-3 defect.  A spec that validates but re-serialises
+    differently is only rejected when a caller-supplied leaf path is genuinely
+    dropped: if every leaf survives (the pin may add computed metadata such as
+    ``precision_overrides``) the spec is accepted rather than over-rejected.
 
     When PIConGPU is not importable (a server without the pin) the check degrades
     to a curated, **best-effort** detector of known computed-field shapes rather
-    than skipping entirely.  It cannot catch an arbitrary unknown field (that
-    needs the pin), so the create-time guarantee is exact only where the pin is
-    importable.
+    than skipping entirely.  It cannot catch an arbitrary unknown field or a
+    type-invalid value (those need the pin), so the create-time guarantee is
+    exact only where the pin is importable -- and deliberately never
+    over-rejects, since a pin-less server cannot reproduce the pin's schema.
 
     Args:
         runner_dump: A wire spec carrying ``sim`` (a ``Runner`` dump).
 
     Returns:
-        An actionable message when a requested field would be silently dropped,
-        else ``None`` (including when there is no ``sim`` mapping to check).
+        An actionable message when the spec fails to validate or a requested
+        field would be silently dropped, else ``None`` (including when there is
+        no ``sim`` mapping to check).
 
     """
     sim_dump = runner_dump.get("sim")
@@ -276,17 +295,19 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             runner = Runner.model_validate(reduced)
-    except Exception:  # ruff: ignore[blind-except] - the simclient reports this as payload_invalid; do not over-reject
-        return None
+    except ValidationError as exc:
+        # The simclient rejects the same leaf as ``payload_invalid``; accepting
+        # it here would persist a campaign whose every leaf fails (beta-3).  The
+        # bounded, paraphrased errors name the offending fields actionably.
+        return _validation_error_message(exc)
+    except Exception as exc:  # ruff: ignore[blind-except] - any other failure is an unusable spec
+        return f"spec does not validate against the pinned pypicongpu schema: {exc}"
     dumped = runner.sim.model_dump(mode="json")
-    if dumped == sim_dump:
-        return None
-    if not _dropped_leaf_paths(sim_dump, dumped):
-        # Nothing the caller asked for was dropped: the difference is metadata
-        # the pin normalised or added on re-validation (e.g. a recomputed
-        # ``precision_overrides`` or computed defaults a minimal test spec
-        # leaves out).  There is no lost field and no actionable path to name,
-        # so accept it rather than over-rejecting a genuinely valid spec.
+    # Accept when nothing the caller asked for was lost: either the dump is
+    # identical, or it differs only by metadata the pin normalised/added (e.g. a
+    # recomputed ``precision_overrides`` or computed defaults a minimal test spec
+    # leaves out).  Only a silently dropped caller leaf is rejected.
+    if dumped == sim_dump or not _dropped_leaf_paths(sim_dump, dumped):
         return None
     return _round_trip_diff_message(sim_dump, dumped)
 
@@ -331,6 +352,95 @@ def _round_trip_diff_message(before: object, after: object) -> str:
             )
         return f"{path} is not part of the pinned pypicongpu schema and would be silently dropped"
     return "spec does not reproduce itself under the pinned pypicongpu schema"
+
+
+def _validation_error_message(exc: ValidationError) -> str:
+    """Return a concise, actionable message for a ``Runner`` validation failure.
+
+    ``str(ValidationError)`` dumps every error with its full input, which for a
+    large spec is pages of noise.  This paraphrases the errors into one line per
+    distinct offending field, naming the field and its expected shape so the
+    caller can fix the spec, and bounds the output for a pathological spec.
+
+    Args:
+        exc: The pydantic error raised by the pinned ``Runner``.
+
+    Returns:
+        A message of the form ``sim.species Input should be a valid list (got
+        str '')``.
+
+    """
+    specific: list[str] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for error in exc.errors():
+        location = _validation_error_location(error.get("loc", ()))
+        if not location or location in seen:
+            continue
+        seen.add(location)
+        line = f"{location} {_validation_error_clause(error)}"
+        # A type-invalid value is the informative error for its field; the same
+        # field can additionally surface as ``missing`` because a failed union
+        # branch discards the whole object.  Report the informative kind first.
+        (missing if error.get("type") == "missing" else specific).append(line)
+    lines = [*specific, *missing]
+    if not lines:
+        return "spec does not validate against the pinned pypicongpu schema"
+    if len(lines) > _MAX_VALIDATION_ERRORS:
+        hidden = len(lines) - _MAX_VALIDATION_ERRORS
+        lines = [*lines[:_MAX_VALIDATION_ERRORS], f"... and {hidden} more error(s)"]
+    return "spec does not validate against the pinned pypicongpu schema: " + "; ".join(lines)
+
+
+def _validation_error_location(location: object) -> str:
+    """Render a pydantic ``loc`` as a dotted field path, dropping union internals.
+
+    A tagged union reports each branch as an extra ``function-after[...]``
+    segment; those are pydantic implementation detail, not addressable fields,
+    so they are dropped and the two branches collapse to one path (which also
+    lets callers de-duplicate the field).
+
+    Returns:
+        The dotted location, or ``""`` when nothing meaningful remains.
+
+    """
+    if not isinstance(location, (list, tuple)):
+        return ""
+    parts = [str(part) for part in location]
+    collapsed = [part for part in parts if _INTERNAL_LOC_MARKER not in part]
+    return ".".join(collapsed)
+
+
+def _validation_error_clause(error: dict[str, object]) -> str:
+    """Return the expected-shape clause plus a short ``(got ...)`` note.
+
+    Args:
+        error: One entry from ``ValidationError.errors()``.
+
+    Returns:
+        ``Input should be a valid list (got str '')``.  A missing field records
+        the whole enclosing object as its pydantic ``input``, which is not a
+        useful value, so the ``(got ...)`` note is omitted for ``type=missing``.
+
+    """
+    clause = str(error.get("msg", "is invalid")).removeprefix("Value error, ")
+    value = error.get("input", _MISSING)
+    if error.get("type") == "missing" or value is _MISSING:
+        return clause
+    return f"{clause} (got {_describe_value(value)})"
+
+
+def _describe_value(value: object) -> str:
+    """Summarise a JSON value as ``type repr``, bounded in length.
+
+    Returns:
+        e.g. ``str ''`` or ``dict {...}``.
+
+    """
+    rendered = repr(value)
+    if len(rendered) > _MAX_VALUE_CHARS:
+        rendered = rendered[:_MAX_VALUE_CHARS] + "..."
+    return f"{type(value).__name__} {rendered}"
 
 
 def _detect_misplaced_computed_field(sim_dump: dict[str, object]) -> str | None:
