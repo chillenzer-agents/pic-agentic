@@ -59,6 +59,19 @@ from picongpu import picmi
 from picongpu.pypicongpu.runner import Runner
 
 
+def _noop(*_args, **_kwargs):
+    return None
+
+
+# The tool only needs the ``picmi.Simulation`` object, but the documented PICMI
+# examples end with ``sim.run(...)``.  Neutralise the build/submit entry points
+# so a trailing run() (or write_input_file) does not compile or touch the
+# cluster; the script's simulation object is still fully constructed by then.
+picmi.Simulation.run = _noop
+picmi.Simulation.picongpu_run = _noop
+picmi.Simulation.write_input_file = _noop
+
+
 def _canonical_bytes(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
@@ -305,7 +318,10 @@ async def build_runner_dump(
         shutil.rmtree(scratch_home, ignore_errors=True)
     if process.returncode != 0:
         detail = _bounded_stderr(stderr, stdout)
-        msg = f"PICMI script failed (rc={process.returncode})"
+        msg = (
+            f"PICMI script failed (rc={process.returncode}); the script must define exactly one "
+            "picmi.Simulation object and does not need to run it (a trailing sim.run() is ignored)"
+        )
         if detail:
             msg = f"{msg}: {detail}"
         raise SimulationBuildError(msg)
