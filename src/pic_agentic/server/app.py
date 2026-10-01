@@ -152,6 +152,9 @@ class HelloRuntime:
         backfilled = await self._transport.backfill()
         for message in backfilled:
             self.service.on_message(message)
+        # A replayed ``hello_ack`` re-establishes the capability handshake across
+        # a server restart.
+        self.submit_service.set_client_capabilities(self.service.capabilities)
         self.submit_service.ingest_backfill(backfilled)
         # With a human room configured, one pump loop serves both the signed RCP
         # room and the human chat (they share the sync position); otherwise the
@@ -163,6 +166,10 @@ class HelloRuntime:
         # Both services filter by envelope kind/type/sim/signature, so feeding
         # every message to both is safe and keeps the routing trivial.
         self.service.on_message(message)
+        # Propagate the capability handshake learned from a ``hello`` ack so the
+        # submit service can warn about a version drift before sending an op the
+        # older client cannot handle.
+        self.submit_service.set_client_capabilities(self.service.capabilities)
         self.submit_service.on_message(message)
 
     async def _pump_forever(self) -> None:
@@ -1680,6 +1687,11 @@ def _outcome_dict(runtime: HelloRuntime, outcome: HelloOutcome) -> dict[str, Any
         "acked": outcome.acked,
         "cluster_output": redact(outcome.cluster_output) if outcome.cluster_output else None,
     }
+    if outcome.capabilities is not None:
+        # Surface the handshake so a version drift is visible to the agent up
+        # front: an old client advertises fewer ops, or none at all.
+        payload["client_version"] = redact(outcome.capabilities.client_version)
+        payload["client_result_ops"] = sorted(outcome.capabilities.result_ops)
     if outcome.error:
         payload["error"] = redact(outcome.error)
     return payload
