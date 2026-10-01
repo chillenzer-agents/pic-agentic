@@ -104,8 +104,30 @@ def test_main_mints_room_with_stubbed_http(tmp_path, monkeypatch, capsys) -> Non
     assert state["room_id"] == "!fresh:hs"
     out = capsys.readouterr().out
     assert "export PIC_AGENTIC_ROOM_ID='!fresh:hs'" in out
-    assert "export PIC_AGENTIC_RCP_SECRET='" in out
+    assert "export PIC_AGENTIC_RCP_SECRET=" in out
     assert str(state_path) in out
+
+
+def test_build_export_quotes_hostile_values(tmp_path: Path) -> None:
+    # A server-provided room_id must not break out of the export line when the
+    # block is sourced in a shell: the value survives verbatim but stays data.
+    import subprocess
+
+    hostile = "!x'; touch /tmp/PWNED; echo '"
+    export = setup_mod.build_export(hostile, hostile, "deadbeef", "cluster", "/scratch/shared")
+    marker = tmp_path / "pwned"
+    script = export + f"\ntest -e {marker} && echo LEAKED || echo SAFE\n"
+    result = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, check=False)
+    assert "SAFE" in result.stdout
+    assert "LEAKED" not in result.stdout
+    # and the value is preserved verbatim
+    check = subprocess.run(
+        ["/bin/sh", "-c", export + '\nprintf "%s" "$PIC_AGENTIC_ROOM_ID"'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.stdout == hostile
 
 
 def test_main_rejects_missing_message_dir(tmp_path, monkeypatch) -> None:
