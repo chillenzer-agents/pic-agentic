@@ -217,6 +217,99 @@ PLUGIN_READER_NAMES = (
 )
 
 
+class ClientCapabilities(BaseModel):
+    """What one deployed cluster client can handle.
+
+    Advertised by the simclient in its ``hello`` ack so the server can tell a
+    version drift *before* sending an op the older client cannot handle.  The
+    sets are the enum member values compiled into the client, so a client that
+    predates a new op simply does not list it; an absent advertisement means
+    "unknown" (an old client) and never triggers a false positive.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The client's package version, for a drift message that names both sides.
+    client_version: str = ""
+    #: ``ResultOp`` values the client recognises.
+    result_ops: frozenset[str] = frozenset()
+    #: ``SimulationOp`` values the client recognises.
+    control_ops: frozenset[str] = frozenset()
+    #: Request ``type`` values (``rcp.*``) whose handler is compiled in.
+    supported_types: frozenset[str] = frozenset()
+
+    @classmethod
+    def current(cls, *, client_version: str = "") -> ClientCapabilities:
+        """Return the capabilities of this (running) client code.
+
+        Returns:
+            The capability set derived from the compiled enums and the enabled
+            handlers.
+
+        """
+        return cls(
+            client_version=client_version,
+            result_ops=frozenset(op.value for op in ResultOp),
+            control_ops=frozenset(op.value for op in SimulationOp),
+            supported_types=frozenset(
+                {
+                    SimulationType.COMMAND.value,
+                    SimulationType.STATUS_COMMAND.value,
+                    SimulationType.LOGS_COMMAND.value,
+                    SimulationType.CONTROL_COMMAND.value,
+                    SimulationType.RESULT_COMMAND.value,
+                }
+            ),
+        )
+
+    def unsupported(self, *, op: ResultOp | SimulationOp | None = None, request_type: str = "") -> str | None:
+        """Return the capability label this client cannot handle, if any.
+
+        Args:
+            op: The requested result/control op, when the request carries one.
+            request_type: The request ``type`` value.
+
+        Returns:
+            A human-readable label such as ``plugin``, ``control op 'stop'`` or
+            the request type, or None when the client supports the request.
+
+        """
+        if request_type and request_type not in self.supported_types:
+            return request_type
+        if isinstance(op, ResultOp) and op.value not in self.result_ops:
+            return op.value
+        if isinstance(op, SimulationOp) and op.value not in self.control_ops:
+            return op.value
+        return None
+
+
+def client_capability_mismatch(capabilities: ClientCapabilities, *, op: str = "", request_type: str = "") -> str:
+    """Compose the actionable version-drift message for an unsupported request.
+
+    Args:
+        capabilities: The client's advertised capabilities.
+        op: The unknown op name (``ResultOp``/``SimulationOp`` value).
+        request_type: The unknown request ``type`` value.
+
+    Returns:
+        A user-facing message naming the missing capability and the client's
+        version, so the agent can tell the deployed client is older rather than
+        guessing.
+
+    """
+    if op:
+        missing = f"operation {op!r}"
+    elif request_type:
+        missing = f"request type {request_type!r}"
+    else:
+        missing = "this request"
+    version = f" (client version {capabilities.client_version})" if capabilities.client_version else ""
+    return (
+        f"cluster client does not support {missing}{version}: "
+        "the deployed simclient is older than the MCP server; update the client on the cluster"
+    )
+
+
 #: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
 #: text tails or a thumbnail).  Deliberately the same 48 KiB budget as
 #: :data:`MAX_INLINE_PAYLOAD_BYTES`: Synapse rejects event content above its
