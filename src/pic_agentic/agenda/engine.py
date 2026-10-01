@@ -864,13 +864,16 @@ def _compact_failures(result: TickResult) -> None:
         result: The tick result, updated in place.
 
     """
-    order: list[tuple[str | None, str]] = []
-    groups: dict[tuple[str | None, str], FailureGroup] = {}
+    order: list[tuple[str | None, str | None, str]] = []
+    groups: dict[tuple[str | None, str | None, str], FailureGroup] = {}
     for callback in result.callbacks:
         if callback.kind != "failed":
             continue
         reason = callback.error or "the failure reason was not reported"
-        key = (callback.error_code, reason)
+        # ``stage`` is part of the key so two leaves failing with the same
+        # code/message at different pipeline stages (e.g. build vs run) stay
+        # distinct groups, matching the advertised grouping semantics.
+        key = (callback.error_code, callback.stage, reason)
         group = groups.get(key)
         if group is None:
             group = FailureGroup(error_code=callback.error_code, stage=callback.stage, message=_truncate(reason))
