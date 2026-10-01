@@ -53,7 +53,15 @@ class TokenProvider(Protocol):
         ...
 
 
-async def api(homeserver: str, method: str, path: str, token: str, data: dict | None = None) -> dict:
+async def api(
+    homeserver: str,
+    method: str,
+    path: str,
+    token: str,
+    data: dict | None = None,
+    *,
+    timeout_s: float = 40.0,
+) -> dict:
     """Call one Matrix client-server endpoint and return the JSON body.
 
     Uses ``aiohttp`` (as the MAS token store already does) so the underlying
@@ -61,18 +69,26 @@ async def api(homeserver: str, method: str, path: str, token: str, data: dict | 
     record first but has no IPv6 route, it races the IPv4 address instead of
     blackholing on IPv6 as ``urllib`` would.
 
+    Args:
+        homeserver: Matrix homeserver base URL (http/https).
+        method: HTTP method.
+        path: Endpoint path (appended to ``homeserver``).
+        token: Bearer token.
+        data: Optional JSON body.
+        timeout_s: Total request timeout in seconds.
+
     Returns:
         The decoded response body.
 
     Raises:
-        SystemExit: On an HTTP error, with the server's message.
+        SystemExit: On an HTTP error or timeout, with the server's message.
 
     """
     if urllib.parse.urlparse(homeserver).scheme not in {"http", "https"}:
         msg = f"homeserver must be an http(s) URL: {homeserver!r}"
         raise SystemExit(msg)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    timeout = aiohttp.ClientTimeout(total=40)
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
         async with (
             aiohttp.ClientSession() as session,
@@ -83,7 +99,7 @@ async def api(homeserver: str, method: str, path: str, token: str, data: dict | 
                 msg = f"{method} {path} failed ({response.status}): {detail}"
                 raise SystemExit(msg)
             return await response.json(content_type=None)
-    except aiohttp.ClientError as exc:
+    except (aiohttp.ClientError, TimeoutError) as exc:
         msg = f"{method} {path} failed: {exc}"
         raise SystemExit(msg) from exc
 

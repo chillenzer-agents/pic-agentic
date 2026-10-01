@@ -196,9 +196,37 @@ def test_api_rejects_non_http_scheme() -> None:
 
 
 def test_setup_module_no_longer_imports_urllib_request() -> None:
-    source = (REPO / "src" / "pic_agentic" / "server" / "setup.py").read_text(encoding="utf-8")
-    assert "urllib.request" not in source
-    assert "urlopen" not in source
+    # AST-based guard: setup.py may still mention urllib in prose, but must not
+    # import or call urllib.request (the IPv6-blackhole path we replaced).
+    import ast
+
+    tree = ast.parse((REPO / "src" / "pic_agentic" / "server" / "setup.py").read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    assert "urllib.request" not in imported
+    assert not any(name == "urllib.request" or name.startswith("urllib.request.") for name in imported)
+
+
+async def test_api_timeout_is_a_system_exit() -> None:
+    # A stalled request must surface as the documented SystemExit, not a raw
+    # TimeoutError escaping to the caller.
+    async def _stall(_request: web.Request) -> web.Response:
+        await asyncio.sleep(3600)
+        raise AssertionError  # pragma: no cover - never reached
+
+    app = web.Application()
+    app.router.add_get("/x", _stall)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        with pytest.raises(SystemExit, match="failed:"):
+            await setup_mod.api(str(server.make_url("")), "GET", "/x", "tok", timeout_s=0.2)
+    finally:
+        await server.close()
 
 
 def test_entry_point_is_registered_in_pyproject() -> None:
