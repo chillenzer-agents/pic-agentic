@@ -10,12 +10,15 @@ and the MAS token provider are stubbed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 import tomllib
 from pathlib import Path
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from pic_agentic.config import Config
 from pic_agentic.server import setup as setup_mod
@@ -27,7 +30,7 @@ class _ApiStub:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict | None]] = []
 
-    def __call__(self, _homeserver: str, method: str, path: str, _token: str, data: dict | None = None) -> dict:
+    async def __call__(self, _homeserver: str, method: str, path: str, _token: str, data: dict | None = None) -> dict:
         self.calls.append((method, path, data))
         if path.endswith("/account/whoami"):
             return {"user_id": "@bot:hs"}
@@ -45,12 +48,14 @@ def test_create_room_and_secret_writes_0600_state(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(setup_mod, "api", stub)
     state_path = tmp_path / "nested" / "cluster-check.json"
 
-    state = setup_mod.create_room_and_secret(
-        homeserver="https://hs",
-        access_token_provider=_token,
-        sim="cluster",
-        message_dir="/scratch/user/pic-agentic/shared",
-        state_path=state_path,
+    state = asyncio.run(
+        setup_mod.create_room_and_secret(
+            homeserver="https://hs",
+            access_token_provider=_token,
+            sim="cluster",
+            message_dir="/scratch/user/pic-agentic/shared",
+            state_path=state_path,
+        ),
     )
 
     assert state["homeserver"] == "https://hs"
@@ -72,12 +77,14 @@ def test_create_room_and_secret_writes_0600_state(tmp_path, monkeypatch) -> None
 def test_create_room_and_secret_rejects_relative_message_dir(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(setup_mod, "api", _ApiStub())
     with pytest.raises(SystemExit):
-        setup_mod.create_room_and_secret(
-            homeserver="https://hs",
-            access_token_provider=_token,
-            sim="cluster",
-            message_dir="relative/dir",
-            state_path=tmp_path / "state.json",
+        asyncio.run(
+            setup_mod.create_room_and_secret(
+                homeserver="https://hs",
+                access_token_provider=_token,
+                sim="cluster",
+                message_dir="relative/dir",
+                state_path=tmp_path / "state.json",
+            ),
         )
     assert not (tmp_path / "state.json").exists()
 
@@ -140,6 +147,58 @@ def test_main_rejects_missing_message_dir(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(Config, "load", classmethod(lambda _cls, _path=None: config))
     with pytest.raises(SystemExit):
         setup_mod.main(["--state", str(tmp_path / "state.json")])
+
+
+async def _echo_whoami(request: web.Request) -> web.Response:
+    return web.json_response({"user_id": "@bot:hs"})
+
+
+async def test_api_uses_aiohttp_not_urllib(monkeypatch) -> None:
+    # Regression guard for the IPv6 blackhole: setup.api must speak HTTP through
+    # aiohttp (Happy Eyeballs connector), never urllib.request.urlopen.  The
+    # request is served by a real local aiohttp server; urllib is forbidden.
+    def _forbid(*_args: object, **_kwargs: object) -> None:
+        msg = "urllib.request.urlopen must not be used"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(setup_mod.urllib.request, "urlopen", _forbid)
+
+    app = web.Application()
+    app.router.add_get("/_matrix/client/v3/account/whoami", _echo_whoami)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        who = await setup_mod.api(str(server.make_url("")), "GET", "/_matrix/client/v3/account/whoami", "tok")
+    finally:
+        await server.close()
+
+    assert who == {"user_id": "@bot:hs"}
+
+
+async def test_api_surfaces_http_error(monkeypatch) -> None:
+    async def _boom(_request: web.Request) -> web.Response:
+        return web.Response(status=403, text="forbidden detail")
+
+    app = web.Application()
+    app.router.add_get("/_matrix/client/v3/account/whoami", _boom)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        with pytest.raises(SystemExit, match=r"failed \(403\): forbidden detail"):
+            await setup_mod.api(str(server.make_url("")), "GET", "/_matrix/client/v3/account/whoami", "tok")
+    finally:
+        await server.close()
+
+
+def test_api_rejects_non_http_scheme() -> None:
+    with pytest.raises(SystemExit, match="must be an http"):
+        asyncio.run(setup_mod.api("ftp://hs", "GET", "/x", "tok"))
+
+
+def test_setup_module_no_longer_imports_urllib_request() -> None:
+    source = (REPO / "src" / "pic_agentic" / "server" / "setup.py").read_text(encoding="utf-8")
+    assert "urllib.request" not in source
+    assert "urlopen" not in source
 
 
 def test_entry_point_is_registered_in_pyproject() -> None:
