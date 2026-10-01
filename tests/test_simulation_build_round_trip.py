@@ -12,10 +12,18 @@ behaviour is covered by ``test_submit_integration.py`` (B1).
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 from pic_agentic.simulation_build import check_spec_round_trip
+
+#: Whether the pinned PIConGPU is importable in this interpreter.  The fallback
+#: tests only describe the no-pin behaviour; the exact check is covered by the
+#: integration suite.
+_HAS_PICONGPU = importlib.util.find_spec("picongpu") is not None
 
 CAMPAIGN_SPECS = Path(__file__).parent / "fixtures" / "campaign_specs.json"
 RUNNER_FIXTURE = Path(__file__).parent / "fixtures" / "pypicongpu_runner.json"
@@ -54,6 +62,7 @@ def test_valid_spec_with_sibling_keys_is_not_rejected() -> None:
     assert check_spec_round_trip({"sim": dump["sim"], "setup_dir": 123}) is None
 
 
+@pytest.mark.skipif(_HAS_PICONGPU, reason="behaviour is about the no-pin fallback")
 def test_fallback_is_documented_best_effort_for_unknown_fields() -> None:
     """Offline the fallback cannot see arbitrary unknown fields (documented)."""
     sim = {**_runner_dump()["sim"], "totally_unknown_key": 1}
