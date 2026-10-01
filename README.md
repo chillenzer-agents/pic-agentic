@@ -80,7 +80,22 @@ It installs `pic-agentic[sim]` non-editably from a pinned 40-hex commit into a
 dedicated venv, writes the 0600 config, registers the server under the
 `pic-agentic` key in `~/.config/opencode/opencode.json`, and runs preflights
 (tool surface, installed-revision/capability, plus a room/secret rendezvous
-check). The environment topology it assumes:
+check).
+
+A fresh beta run needs a new room + shared RCP secret. The shipped
+`pic-agentic-setup` console script mints both from the installed package (no
+repo checkout): it uses the config's MAS refresh chain to create the room,
+generates a 32-byte hex secret, writes the 0600 state file, and prints the
+cluster-side exports:
+
+```bash
+pic-agentic-setup --state ~/.config/pic-agentic/cluster-check.json \
+  --sim cluster --message-dir /scratch/<user>/pic-agentic/shared
+```
+
+This is the same implementation the developer driver
+`scripts/local_mcp_check.py --setup` calls, so the two cannot drift. The
+environment topology it assumes:
 
 - **The agent sees only the MCP tool surface.** The pic-agentic source, this
   README, `AGENTS.md`, `docs/beta-test-prompts.md`, the tests and the git
