@@ -78,6 +78,39 @@ async def test_child_reports_the_same_provenance_as_version_py(tmp_path: Path) -
 
 
 @pytest.mark.integration
+async def test_trailing_sim_run_builds_without_compiling(tmp_path: Path) -> None:
+    """The documented trailing ``sim.run(...)`` must not trigger a build.
+
+    Regression (live beta run): ``sim.run()`` fell through to a real
+    ``cwltool`` compile in the child and surfaced as a raw ``permanentFail``.
+    ``build_spec`` only wants the ``Simulation``, so the child neutralises
+    ``run``/``write_input_file``; the spec must come back and no compile dirs
+    may be created.
+    """
+    import asyncio
+
+    from pic_agentic.simulation_build import build_runner_dump
+
+    script = tmp_path / "sim.py"
+    script.write_text(
+        "from picongpu import picmi\n"
+        "grid = picmi.Cartesian3DGrid(number_of_cells=[8, 8, 8], lower_bound=[0, 0, 0], "
+        "upper_bound=[1e-6, 1e-6, 1e-6], lower_boundary_conditions=['periodic'] * 3, "
+        "upper_boundary_conditions=['periodic'] * 3)\n"
+        "solver = picmi.ElectromagneticSolver(method='Yee', grid=grid)\n"
+        "sim = picmi.Simulation(time_step_size=1e-15, max_steps=2, solver=solver)\n"
+        "sim.run(setup_dir=str(__import__('pathlib').Path(__file__).with_name('setup')), "
+        "run_dir=str(__import__('pathlib').Path(__file__).with_name('run')))\n",
+        encoding="utf-8",
+    )
+    built = await asyncio.wait_for(build_runner_dump(script_path=script), timeout=120)
+    assert built.runner["sim"]
+    assert not (tmp_path / "setup").exists()
+    assert not (tmp_path / "run").exists()
+    assert built.schema_hash == runner_schema_hash()
+
+
+@pytest.mark.integration
 def test_schema_hash_is_path_independent() -> None:
     """The schema hash must not depend on the install prefix.
 
