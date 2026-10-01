@@ -102,6 +102,17 @@ _DEFAULT_WINDOW_KEV = (100.0, 1000.0)
 #: down further if it still exceeds :data:`MAX_RESULT_BYTES`.
 _PLUGIN_MAX_POINTS = 256
 
+#: Reader -> the summary arrays that carry *measured values* (as opposed to the
+#: coordinate axes such as ``bins_kev``/``y_slices_m``/``omega_per_s``, which are
+#: nonzero by construction).  An all-zero value array is a likely vacuous result.
+#: The openPMD and image readers have no such scalar (a phase-space plane or a
+#: PNG legitimately has zero-valued cells), so they are not annotated.
+_VACUOUS_VALUE_KEYS: dict[str, tuple[str, ...]] = {
+    "energy_histogram": ("counts",),
+    "emittance": ("slice_emit_mrad",),
+    "transition_radiation": ("intensity",),
+}
+
 #: Array-rank constants for the openPMD reader summaries.  The shipped readers
 #: return 2D phase-space planes and 2D radiation spectra, and a calorimeter cube
 #: that is 2D when no energy binning was configured; naming the ranks keeps the
@@ -1434,7 +1445,8 @@ def _plugin_result(
     available = _plugin_available_iterations(reader, spec, output, groups)
     selected = _resolve_plugin_iteration(available, params.iteration)
     instance = _build_plugin_instance(reader, spec, output, target, selected)
-    return _plugin_summary(reader, instance, groups, selected, available, target=target)
+    summary = _plugin_summary(reader, instance, groups, selected, available, target=target)
+    return _annotate_vacuous(reader, summary)
 
 
 def _as_nested(data: Any) -> Any:
@@ -1565,7 +1577,7 @@ def _build_phase_space(
         "max_count": max_count,
         "max_r_m": r_edges[peak_r] if peak_r < len(r_edges) else None,
         "max_p": p_edges[peak_p] if peak_p < len(p_edges) else None,
-        "iteration": iteration,
+        **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
 
@@ -1582,7 +1594,7 @@ def _build_radiation(
         Frequency (SI 1/s), the direction-summed spectrum and scalars.
 
     """
-    _ = (groups, target)
+    _ = groups
     spectra = _as_nested(instance.get_Spectra())
     omegas = [float(value) for value in instance.get_omega()]
     n_directions, n_frequencies = _nested_shape(spectra)
@@ -1603,7 +1615,7 @@ def _build_radiation(
         "total_energy_J": _nested_sum(spectra),
         "peak_spectrum_Js": max(total_spectrum) if total_spectrum else None,
         "peak_omega_per_s": omegas[peak] if peak < len(omegas) else None,
-        "iteration": iteration,
+        **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
 
@@ -1657,7 +1669,7 @@ def _build_calorimeter(
         Bin counts, energy edges, the yaw/pitch marginals and scalars.
 
     """
-    _ = (groups, target)
+    _ = groups
     energy_kev, per_pitch, per_yaw, total, peak = _calorimeter_projections(instance, iteration)
     strided_pitch, downsampled = _stride(per_pitch)
     strided_yaw, _ = _stride(per_yaw)
@@ -1670,7 +1682,7 @@ def _build_calorimeter(
         "per_yaw_J": strided_yaw,
         "total_energy_J": total,
         "max_energy_J": peak,
-        "iteration": iteration,
+        **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
 
@@ -1713,13 +1725,75 @@ def _build_png(
         "height_px": int(height),
         "channels": int(channels),
         "path": target.name,
+        "source_size_bytes": _entry_size(target),
         "image_via": "export",
         "iteration": iteration,
         "downsampled": False,
     }
 
 
-def _build_energy_histogram(
+def _plugin_source(target: Path, iteration: int) -> dict[str, Any]:
+    """Describe the file a plugin summary was read from.
+
+    A caller that sees suspicious numbers (e.g. all-zero counts) can sanity
+    check the named file's size and iteration instead of guessing which output
+    was read.
+
+    Returns:
+        ``{"source_path", "source_size_bytes", "iteration"}``.
+
+    """
+    return {
+        "source_path": target.name,
+        "source_size_bytes": _entry_size(target),
+        "iteration": iteration,
+    }
+
+
+def _has_nonzero_leaf(value: Any) -> bool:
+    """Whether a nested numeric structure holds any nonzero value.
+
+    Returns:
+        True when at least one leaf is not zero.
+
+    """
+    if isinstance(value, (list, tuple)):
+        return any(_has_nonzero_leaf(item) for item in value)
+    try:
+        return math.fabs(float(value)) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
+    """Add a ``warning`` when a numeric summary is entirely zero.
+
+    The reviewer of beta run 3 could not tell an empty (physically real) result
+    from a reader/units bug because the summary was silently all zeros.  An
+    all-zero ``energy_histogram`` is a legitimate outcome - e.g. the documented
+    focal example configures no plasma species, so no electrons are ionised -
+    so the fix is transparency, not an error: the summary carries an explicit
+    warning that the diagnostic may be empty or misconfigured.
+
+    Returns:
+        ``summary`` with a ``warning`` added when it is all zeros.
+
+    """
+    keys = _VACUOUS_VALUE_KEYS.get(reader)
+    if not keys:
+        return summary
+    values = [summary[key] for key in keys if key in summary]
+    if not values or any(_has_nonzero_leaf(value) for value in values):
+        return summary
+    return {
+        **summary,
+        "warning": (
+            f"{reader} is all zeros; the run may have no particles in range or the diagnostic may be misconfigured"
+        ),
+    }
+
+
+def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduction
     instance: Any,
     groups: dict[str, str],
     iteration: int,
@@ -1731,7 +1805,6 @@ def _build_energy_histogram(
         Bins (keV), counts, the count in the default window and scalars.
 
     """
-    _ = target
     species, species_filter = groups["species"], groups["filter"]
     counts, bins, _iteration, _dt = instance.get(
         iteration=iteration,
@@ -1740,13 +1813,20 @@ def _build_energy_histogram(
     )
     counts = [float(value) for value in counts]
     bins = [float(value) for value in bins]
+    # ``EnergyHistogramData`` returns one upper-edge per count; a header/data
+    # column mismatch can still leave the arrays ragged, so pair them
+    # positionally up to the common length.  This avoids the old
+    # ``zip(strict=True)`` crash on such a parse.
+    paired = min(len(bins), len(counts))
+    upper_edges = bins[:paired]
+    counts = counts[:paired]
     low, high = _DEFAULT_WINDOW_KEV
-    in_window = sum(count for bin_kev, count in zip(bins, counts, strict=True) if low <= bin_kev <= high)
+    in_window = sum(count for bin_kev, count in zip(upper_edges, counts, strict=True) if low <= bin_kev <= high)
     # ``max_energy_kev`` is the highest bin edge that actually holds particles,
     # not the modal (argmax-count) edge: the high-energy tail is the number the
     # caller is after.
-    populated = [bin_kev for bin_kev, count in zip(bins, counts, strict=True) if count > 0]
-    strided_bins, downsampled = _stride(bins)
+    populated = [bin_kev for bin_kev, count in zip(upper_edges, counts, strict=True) if count > 0]
+    strided_bins, downsampled = _stride(upper_edges)
     strided_counts, _ = _stride(counts)
     return {
         "bins_kev": strided_bins,
@@ -1754,7 +1834,7 @@ def _build_energy_histogram(
         "count_in_window": {"min_kev": low, "max_kev": high, "count": in_window},
         "total": sum(counts),
         "max_energy_kev": max(populated) if populated else None,
-        "iteration": iteration,
+        **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
 
@@ -1771,7 +1851,6 @@ def _build_emittance(
         Slice positions (m), slice emittances (m rad) and scalars.
 
     """
-    _ = target
     species, species_filter = groups["species"], groups["filter"]
     raw, y_slices, _iteration, _dt = instance.get(
         iteration=iteration,
@@ -1795,7 +1874,7 @@ def _build_emittance(
         "total_emit_mrad": total_emit,
         "max_emit_mrad": max(slice_emit) if slice_emit else None,
         "max_y_slice_m": y_slices[peak] if peak < len(y_slices) else None,
-        "iteration": iteration,
+        **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
 
@@ -1815,7 +1894,6 @@ def _build_transition_radiation(
         Frequency (SI 1/s), intensity and scalars.
 
     """
-    _ = target
     species = groups["species"]
     omegas, spectrum = instance.get(
         iteration=iteration,
@@ -1836,7 +1914,7 @@ def _build_transition_radiation(
         "total_intensity": sum(spectrum),
         "peak_intensity": max(spectrum) if spectrum else None,
         "peak_omega_per_s": omegas[peak] if omegas else None,
-        "iteration": iteration,
+        **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
 
