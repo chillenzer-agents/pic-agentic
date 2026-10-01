@@ -141,9 +141,11 @@ async def test_tool_registration_and_annotations() -> None:
     assert set(tools["create_campaign"].input_schema["properties"]) == {
         "name",
         "base_spec",
+        "base_spec_path",
         "patch_path",
         "values",
     }
+    assert set(tools["create_campaign"].input_schema["required"]) == {"name", "patch_path", "values"}
 
     advance = tools["advance_agenda"].annotations
     assert advance is not None

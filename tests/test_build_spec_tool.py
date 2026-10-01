@@ -69,7 +69,7 @@ async def test_build_spec_tool_registration_and_annotations() -> None:
     assert annotations is not None
     assert annotations.read_only_hint is True
     assert annotations.destructive_hint is False
-    assert set(tools["build_spec"].input_schema["properties"]) == {"picmi_script"}
+    assert set(tools["build_spec"].input_schema["properties"]) == {"picmi_script", "write_to"}
 
 
 async def test_build_spec_returns_the_runner_spec_without_submitting() -> None:

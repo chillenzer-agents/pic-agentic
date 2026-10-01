@@ -53,6 +53,7 @@ from pic_agentic.server.simulation import (
     condense_events,
     resolve_script,
 )
+from pic_agentic.server.spec_files import read_spec_file, write_spec_file
 from pic_agentic.simclient.safety import UnsafePathError
 from pic_agentic.simulation_build import SimulationBuildError
 from pic_agentic.transport.matrix import MatrixTransport
@@ -379,18 +380,24 @@ class HelloRuntime:
         script_path = resolve_script(picmi_script, workdir=Path(tempfile.gettempdir()) / "pic-agentic")
         return await self.submit_service.submit(self._transport.send, script_path, params=params)
 
-    async def build_spec(self, picmi_script: str) -> BuiltSpec:
+    async def build_spec(self, picmi_script: str, *, write_to: str | None = None) -> tuple[BuiltSpec, str | None]:
         """Build one PICMI script into a Runner spec without submitting it.
 
         Args:
             picmi_script: A path to a PICMI script or inline PICMI code.
+            write_to: Optional staging path; when set the built spec is written
+                there as JSON so a later tool can consume it by reference.
 
         Returns:
-            The built wire spec plus its provenance and inline wire size.
+            The built wire spec plus the absolute staged path (or ``None``).
 
         """
         script_path = resolve_script(picmi_script, workdir=Path(tempfile.gettempdir()) / "pic-agentic")
-        return await self.submit_service.build_spec(script_path)
+        built = await self.submit_service.build_spec(script_path)
+        staged: str | None = None
+        if write_to is not None:
+            staged = str(write_spec_file(self.config, write_to, built.spec))
+        return built, staged
 
     def registry(self) -> dict[str, SimRecord]:
         """Return the submit service's sim_id-keyed registry.
@@ -525,17 +532,53 @@ class HelloRuntime:
     async def create_campaign(
         self,
         name: str,
-        base_spec: dict[str, Any],
+        base_spec: dict[str, Any] | None,
         patch_path: str,
         values: list[Any],
+        *,
+        base_spec_path: str | None = None,
     ) -> dict[str, Any]:
         """Create and persist a campaign with one leaf per sweep value.
+
+        The base spec comes either inline (``base_spec``) or from a staged JSON
+        file (``base_spec_path``); exactly one must be given.
 
         Returns:
             ``{"ok": True, "name": name, "leaves": [...]}``, or a soft error.
 
         """
-        return await self.agenda_service.create_campaign(name, base_spec, patch_path, values)
+        resolved, error = self._resolve_base_spec(base_spec, base_spec_path)
+        if error is not None:
+            return error
+        return await self.agenda_service.create_campaign(name, resolved, patch_path, values)
+
+    def _resolve_base_spec(
+        self,
+        base_spec: dict[str, Any] | None,
+        base_spec_path: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Pick and load the base spec from the inline or path form.
+
+        Exactly one of the two forms is required.  A path is read only inside
+        the staging root (:mod:`~pic_agentic.server.spec_files`), so an
+        LLM-supplied path can never reach outside it.
+
+        Returns:
+            ``(spec, None)`` on success, else ``(None, soft_error)``.
+
+        """
+        if (base_spec is None) == (base_spec_path is None):
+            return None, {
+                "ok": False,
+                "error": "base_spec_required",
+                "detail": "provide exactly one of base_spec (inline) or base_spec_path (staged file)",
+            }
+        if base_spec_path is not None:
+            try:
+                return read_spec_file(self.config, base_spec_path), None
+            except UnsafePathError as exc:
+                return None, {"ok": False, "error": "invalid_spec_path", "detail": self.config.redact(str(exc))}
+        return base_spec, None
 
     async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
         """Remove the persisted campaign and its reuse registry (reset).
@@ -685,6 +728,9 @@ SERVER_INSTRUCTIONS = (
     "or, for parameter studies, as a pypicongpu Runner spec "
     "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
     "a spec field across values). "
+    "A large spec should be passed by reference, not re-typed: call "
+    "build_spec(picmi_script, write_to=...) and hand the returned spec_path to "
+    "create_campaign(base_spec_path=...). "
     "create_campaign refuses to overwrite an existing campaign; to start a fresh "
     "one, remove the old state first with delete_campaign (reset), optionally "
     "after stop_agenda to cancel in-flight jobs. "
@@ -787,19 +833,22 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "a base spec for create_campaign or add_agenda_leaf. The returned "
             "`spec` is the inline `{sim: ...}` wire object accepted by those "
             "tools; the result also reports the encoded wire size and whether it "
-            "fits the 48 KiB inline submission limit. The script should define "
-            "a single picmi.Simulation; a trailing sim.run(...) is tolerated "
-            "and ignored (the tool never runs it here)."
+            "fits the 48 KiB inline submission limit. Pass `write_to` to also "
+            "stage the spec as JSON under the server's spec directory: the "
+            "returned `spec_path` can then be handed to "
+            "create_campaign(base_spec_path=...) without re-typing the spec. The "
+            "script should define a single picmi.Simulation; a trailing "
+            "sim.run(...) is tolerated and ignored (the tool never runs it here)."
         ),
         # read-tier: it builds locally and starts no cluster work.
         annotations=_READ_ONLY,
     )
-    async def build_spec(picmi_script: str) -> dict[str, Any]:
+    async def build_spec(picmi_script: str, *, write_to: str | None = None) -> dict[str, Any]:
         try:
-            built = await runtime.build_spec(picmi_script)
+            built, spec_path = await runtime.build_spec(picmi_script, write_to=write_to)
         except _SUBMIT_TOOL_ERRORS as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
-        return _built_spec_dict(runtime, built)
+        return _built_spec_dict(runtime, built, spec_path=spec_path)
 
     _register_reporting_tools(server, runtime)
     _register_control_result_tools(server, runtime)
@@ -1201,11 +1250,15 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "that value (e.g. patch_path='sim.time_steps'), and records "
             "point={last path segment: value}. This is the entry point for the "
             "research loop -- call build_spec first to get base_spec, then "
-            "advance_agenda. Every patched leaf is validated against the pinned "
-            "pypicongpu schema before anything is persisted, so a malformed "
-            "base_spec is refused up front with an `invalid_campaign_spec` error "
-            "naming the offending field(s) instead of failing at each submission. "
-            "Refuses to overwrite an existing campaign."
+            "advance_agenda. Provide the base spec exactly one way: inline as "
+            "`base_spec`, or by reference as `base_spec_path` (the `spec_path` "
+            "build_spec(write_to=...) returned, a JSON file under the server's "
+            "spec directory) so the spec never has to be re-typed. Every patched "
+            "leaf is validated against the pinned pypicongpu schema before "
+            "anything is persisted, so a malformed base_spec is refused up front "
+            "with an `invalid_campaign_spec` error naming the offending field(s) "
+            "instead of failing at each submission. Refuses to overwrite an "
+            "existing campaign."
         ),
         # write/resource tier: it creates persisted campaign state but starts no
         # cluster work itself; it is not destructive.
@@ -1213,11 +1266,19 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     )
     async def create_campaign(
         name: str,
-        base_spec: dict[str, Any],
         patch_path: str,
         values: list[Any],
+        *,
+        base_spec: dict[str, Any] | None = None,
+        base_spec_path: str | None = None,
     ) -> dict[str, Any]:
-        result = await runtime.create_campaign(name, base_spec, patch_path, values)
+        result = await runtime.create_campaign(
+            name,
+            base_spec,
+            patch_path,
+            values,
+            base_spec_path=base_spec_path,
+        )
         return _redact_dict(runtime, result)
 
     @server.tool(
@@ -1654,7 +1715,7 @@ def _redact_dict(runtime: HelloRuntime, payload: Any, _depth: int = 0) -> Any:
     return payload
 
 
-def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
+def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec, *, spec_path: str | None = None) -> dict[str, Any]:
     """Shape a dry-run build result for the ``build_spec`` tool.
 
     The spec is returned when it fits the 48 KiB inline submission cap (the only
@@ -1673,6 +1734,11 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
     matching the submit path, and the cap path is the same shape (no structural
     redaction on either branch).
 
+    When ``spec_path`` is set the caller asked for ``write_to`` and the runtime
+    has already written the spec, so ``spec_path`` names the staged file (the
+    reference form of ``create_campaign``'s ``base_spec``).  The path is
+    server-controlled config output, not free text.
+
     Returns:
         ``{"ok": True, "spec", "wire_bytes", ...}``, or a soft error naming the
         over-cap condition.
@@ -1686,7 +1752,7 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
             "wire_bytes": built.wire_bytes,
             "inline_limit_bytes": built.inline_limit_bytes,
         }
-    return {
+    payload: dict[str, Any] = {
         "ok": True,
         "spec": built.spec,
         "wire_bytes": built.wire_bytes,
@@ -1695,6 +1761,9 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec) -> dict[str, Any]:
         "picongpu_revision": redact(built.picongpu_revision),
         "schema_hash": built.schema_hash,
     }
+    if spec_path is not None:
+        payload["spec_path"] = spec_path
+    return payload
 
 
 def _submit_outcome_dict(runtime: HelloRuntime, outcome: SubmitOutcome) -> dict[str, Any]:
