@@ -143,7 +143,13 @@ class HelloService:
                     future.set_result(message)
 
     def _record_capabilities(self, message: RcpMessage) -> None:
-        """Cache the capability set advertised by a ``hello`` ack.
+        """Refresh the cached capability set from a ``hello`` ack.
+
+        The cache is replaced on *every* ack, not only when an advertisement is
+        present: a missing or malformed advertisement (an older client, or a
+        forward-compatible one) means *unknown*, so it clears the cache rather
+        than leaving a stale set that could keep refusing a now-supported op.
+        ``None`` never blocks a request.
 
         Args:
             message: A verified ``rcp.hello_ack`` from the simclient.
@@ -151,13 +157,14 @@ class HelloService:
         """
         advertised = message.payload.get("capabilities")
         if not isinstance(advertised, dict):
+            self.capabilities = None
             return
         try:
             self.capabilities = ClientCapabilities.model_validate(advertised)
         except ValueError:
-            # A malformed advertisement is ignored, never fatal: it only
-            # disables the proactive drift check.
-            return
+            # A malformed advertisement disables the proactive drift check
+            # (unknown), never fatal.
+            self.capabilities = None
 
     async def hello(self, send: SendFn, message: str = "Hello World") -> HelloOutcome:
         """Send a ``hello`` command and wait for its ack.

@@ -335,11 +335,15 @@ class SubmitService:
         if self.client_capabilities is None:
             return None
         type_value = request_type.value if request_type is not None else ""
-        if type_value and type_value not in self.client_capabilities.supported_types:
+        missing = self.client_capabilities.unsupported(
+            op=op,
+            request_type=type_value,
+        )
+        if missing is None:
+            return None
+        if type_value and missing == type_value:
             return client_capability_mismatch(self.client_capabilities, request_type=type_value)
-        if op is not None and self.client_capabilities.unsupported(op=op) is not None:
-            return client_capability_mismatch(self.client_capabilities, op=op.value)
-        return None
+        return client_capability_mismatch(self.client_capabilities, op=op.value if op is not None else missing)
 
     async def build_payload(
         self,

@@ -223,20 +223,26 @@ class ClientCapabilities(BaseModel):
     Advertised by the simclient in its ``hello`` ack so the server can tell a
     version drift *before* sending an op the older client cannot handle.  The
     sets are the enum member values compiled into the client, so a client that
-    predates a new op simply does not list it; an absent advertisement means
-    "unknown" (an old client) and never triggers a false positive.
+    predates a new op simply does not list it.
+
+    Each set is ``None`` when the advertisement did not carry it.  ``None``
+    means *unknown*, not *empty*: a partial or forward-compatible advertisement
+    that omits a set must never be read as "supports nothing" and must never
+    block a request.  Only an explicitly advertised, non-``None`` set can
+    reject.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     #: The client's package version, for a drift message that names both sides.
     client_version: str = ""
-    #: ``ResultOp`` values the client recognises.
-    result_ops: frozenset[str] = frozenset()
-    #: ``SimulationOp`` values the client recognises.
-    control_ops: frozenset[str] = frozenset()
-    #: Request ``type`` values (``rcp.*``) whose handler is compiled in.
-    supported_types: frozenset[str] = frozenset()
+    #: ``ResultOp`` values the client recognises, or None when not advertised.
+    result_ops: frozenset[str] | None = None
+    #: ``SimulationOp`` values the client recognises, or None when not advertised.
+    control_ops: frozenset[str] | None = None
+    #: Request ``type`` values (``rcp.*``) whose handler is compiled in, or None
+    #: when not advertised.
+    supported_types: frozenset[str] | None = None
 
     @classmethod
     def current(cls, *, client_version: str = "") -> ClientCapabilities:
@@ -262,6 +268,36 @@ class ClientCapabilities(BaseModel):
             ),
         )
 
+    def supports_result_op(self, op: str) -> bool:
+        """Whether the client advertised support for a result op.
+
+        Returns:
+            True when the op is listed, or when ``result_ops`` was not
+            advertised (unknown, so never a blocker).
+
+        """
+        return self.result_ops is None or op in self.result_ops
+
+    def supports_control_op(self, op: str) -> bool:
+        """Whether the client advertised support for a control op.
+
+        Returns:
+            True when the op is listed, or when ``control_ops`` was not
+            advertised (unknown, so never a blocker).
+
+        """
+        return self.control_ops is None or op in self.control_ops
+
+    def supports_type(self, request_type: str) -> bool:
+        """Whether the client advertised a handler for a request type.
+
+        Returns:
+            True when the type is listed, or when ``supported_types`` was not
+            advertised (unknown, so never a blocker).
+
+        """
+        return not request_type or self.supported_types is None or request_type in self.supported_types
+
     def unsupported(self, *, op: ResultOp | SimulationOp | None = None, request_type: str = "") -> str | None:
         """Return the capability label this client cannot handle, if any.
 
@@ -271,14 +307,15 @@ class ClientCapabilities(BaseModel):
 
         Returns:
             A human-readable label such as ``plugin``, ``control op 'stop'`` or
-            the request type, or None when the client supports the request.
+            the request type, or None when the client supports the request or
+            did not advertise the relevant set (unknown is never a blocker).
 
         """
-        if request_type and request_type not in self.supported_types:
+        if request_type and not self.supports_type(request_type):
             return request_type
-        if isinstance(op, ResultOp) and op.value not in self.result_ops:
+        if isinstance(op, ResultOp) and not self.supports_result_op(op.value):
             return op.value
-        if isinstance(op, SimulationOp) and op.value not in self.control_ops:
+        if isinstance(op, SimulationOp) and not self.supports_control_op(op.value):
             return op.value
         return None
 
@@ -293,8 +330,8 @@ def client_capability_mismatch(capabilities: ClientCapabilities, *, op: str = ""
 
     Returns:
         A user-facing message naming the missing capability and the client's
-        version, so the agent can tell the deployed client is older rather than
-        guessing.
+        reported version, leaving it to the user to decide which side to update
+        (the client could be older *or* the server ahead of it).
 
     """
     if op:
@@ -306,7 +343,8 @@ def client_capability_mismatch(capabilities: ClientCapabilities, *, op: str = ""
     version = f" (client version {capabilities.client_version})" if capabilities.client_version else ""
     return (
         f"cluster client does not support {missing}{version}: "
-        "the deployed simclient is older than the MCP server; update the client on the cluster"
+        "the deployed simclient did not advertise this capability; "
+        "check for a version drift between the client and the MCP server and update the side that is behind"
     )
 
 

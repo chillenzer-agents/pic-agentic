@@ -1721,9 +1721,11 @@ def _outcome_dict(runtime: HelloRuntime, outcome: HelloOutcome) -> dict[str, Any
     }
     if outcome.capabilities is not None:
         # Surface the handshake so a version drift is visible to the agent up
-        # front: an old client advertises fewer ops, or none at all.
+        # front: an older client advertises fewer ops, and a partial advert
+        # leaves a set as ``None`` (unknown).
         payload["client_version"] = redact(outcome.capabilities.client_version)
-        payload["client_result_ops"] = sorted(outcome.capabilities.result_ops)
+        result_ops = outcome.capabilities.result_ops
+        payload["client_result_ops"] = sorted(result_ops) if result_ops is not None else None
     if outcome.error:
         payload["error"] = redact(outcome.error)
     return payload

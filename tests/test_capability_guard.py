@@ -76,16 +76,44 @@ def _plugin_command() -> RcpMessage:
 
 def test_client_capabilities_current_lists_the_plugin_op() -> None:
     caps = ClientCapabilities.current(client_version="x")
+    assert caps.result_ops is not None
     assert ResultOp.PLUGIN.value in caps.result_ops
+    assert caps.control_ops is not None
     assert SimulationOp.STOP.value in caps.control_ops
     assert caps.unsupported(op=ResultOp.PLUGIN) is None
 
 
+def test_partial_advertisement_is_unknown_not_empty() -> None:
+    """A partial advert must not be read as "supports nothing" (M1).
+
+    A forward-compatible advertisement that carries only ``client_version``
+    leaves every set as ``None`` (unknown), so nothing is blocked.
+    """
+    partial = ClientCapabilities.model_validate({"client_version": "0.0.3"})
+    assert partial.result_ops is None
+    assert partial.control_ops is None
+    assert partial.supported_types is None
+    assert partial.unsupported(op=ResultOp.PLUGIN) is None
+    assert partial.unsupported(op=SimulationOp.STOP) is None
+    assert partial.unsupported(request_type=SimulationType.RESULT_COMMAND.value) is None
+
+
+def test_explicitly_empty_set_blocks() -> None:
+    """An explicitly advertised empty set is a real (if odd) rejection."""
+    empty = ClientCapabilities.model_validate({"result_ops": []})
+    assert empty.unsupported(op=ResultOp.PLUGIN) == ResultOp.PLUGIN.value
+    assert empty.unsupported(op=SimulationOp.STOP) is None  # control unadvertised
+
+
 def test_capability_mismatch_message_names_the_capability_and_version() -> None:
+    """The drift message is factual and does not assert which side is older (M2)."""
     message = client_capability_mismatch(_old_client_capabilities(), op=ResultOp.PLUGIN.value)
     assert ResultOp.PLUGIN.value in message
     assert OLD_VERSION in message
-    assert "older" in message
+    # It names the drift and leaves the update decision open rather than
+    # claiming the client is behind (the server could be ahead).
+    assert "version drift" in message
+    assert "older" not in message
 
 
 async def test_unknown_result_op_returns_unsupported_by_client(tmp_path) -> None:
@@ -235,3 +263,59 @@ def test_hello_command_signature_is_unaffected_by_capabilities(tmp_path) -> None
 def test_supported_ops_are_not_flagged(op: ResultOp) -> None:
     caps = ClientCapabilities.current()
     assert caps.unsupported(op=op) is None
+
+
+async def test_hello_ack_without_advertisement_clears_a_stale_cache(tmp_path) -> None:
+    """A later ack with no advertisement clears the cache (M1).
+
+    After a client upgrade the server may still hold the *old* set; a re-hello
+    from a client that (for whatever reason) does not advertise must drop it so
+    a now-supported op is no longer blocked.
+    """
+    from pic_agentic.protocol.hello import build_hello_ack
+
+    service = HelloService(sim=SIM, secret=SECRET, message_dir=tmp_path, ack_timeout_s=5.0)
+    service.capabilities = _old_client_capabilities()
+
+    ack = build_hello_ack(
+        sim=SIM,
+        seq=1,
+        cmd_id="h-1",
+        in_reply_to=None,
+        job_id=None,
+        cluster_output=None,
+        capabilities=None,
+    ).sign(SECRET)
+    service.on_message(ack)
+
+    assert service.capabilities is None
+
+
+async def test_hello_ack_partial_advertisement_does_not_block(tmp_path) -> None:
+    """A partial advert validates and blocks nothing (M1)."""
+    from pic_agentic.protocol.hello import build_hello_ack
+
+    service = HelloService(sim=SIM, secret=SECRET, message_dir=tmp_path, ack_timeout_s=5.0)
+    ack = build_hello_ack(
+        sim=SIM,
+        seq=1,
+        cmd_id="h-2",
+        in_reply_to=None,
+        job_id=None,
+        cluster_output=None,
+        capabilities=ClientCapabilities.model_validate({"client_version": "0.0.3"}),
+    ).sign(SECRET)
+    service.on_message(ack)
+
+    assert service.capabilities is not None
+    assert service.capabilities.unsupported(op=ResultOp.PLUGIN) is None
+
+
+async def test_proactive_guard_partial_advert_does_not_block(tmp_path) -> None:
+    """:meth:`SubmitService.capability_mismatch` blocks nothing on a partial advert (M1)."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=1.0)
+    service.set_client_capabilities(ClientCapabilities.model_validate({"client_version": "0.0.3"}))
+
+    assert service.capability_mismatch(op=ResultOp.PLUGIN) is None
+    assert service.capability_mismatch(op=SimulationOp.STOP) is None
+    assert service.capability_mismatch(request_type=SimulationType.RESULT_COMMAND) is None

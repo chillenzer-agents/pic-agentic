@@ -1207,7 +1207,7 @@ class SimClient:
 
         """
         raw_op = str(message.payload.get("op", ""))
-        if raw_op and raw_op not in self.capabilities.control_ops:
+        if raw_op and not self.capabilities.supports_control_op(raw_op):
             error = client_capability_mismatch(self.capabilities, op=raw_op)
             return await self._send(
                 self._build_control_rejection(
@@ -1407,7 +1407,7 @@ class SimClient:
 
         """
         raw_op = str(message.payload.get("op", ""))
-        if raw_op and raw_op not in self.capabilities.result_ops:
+        if raw_op and not self.capabilities.supports_result_op(raw_op):
             # An op this client's enum does not know: a version drift, not a
             # malformed request.  Say so instead of a generic param error.
             error = client_capability_mismatch(self.capabilities, op=raw_op)

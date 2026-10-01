@@ -763,6 +763,11 @@ class AgendaService:
         would, so a leaf that could never be submitted is rejected at creation
         with an actionable reason.
 
+        This is synchronous and runs under the agenda lock.  With the pin
+        importable the round-trip is ~7 ms per leaf, so a 200-leaf campaign
+        blocks the event loop for ~1.5 s; acceptable for now, but if campaigns
+        grow this belongs on a worker thread (the same seam as the build).
+
         Returns:
             ``None`` when the leaf is a valid, in-cap wire spec, else the soft
             error dict to return.
