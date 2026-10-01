@@ -186,13 +186,28 @@ def test_annotate_vacuous_covers_the_numeric_readers() -> None:
     cases = {
         "energy_histogram": {"counts": [0.0, 0.0], "bins_kev": [1.0, 2.0]},
         "emittance": {"slice_emit_mrad": [0.0, 0.0], "y_slices_m": [0.0, 1.0]},
-        "transition_radiation": {"intensity": [0.0], "omega_per_s": [1e15]},
+        "transition_radiation": {"total_intensity": 0.0, "intensity": [0.0]},
     }
     for reader, summary in cases.items():
         annotated = results._annotate_vacuous(reader, summary)
         assert "all zeros" in annotated["warning"]
     nonzero = results._annotate_vacuous("energy_histogram", {"counts": [0.0, 3.0], "bins_kev": [1.0, 2.0]})
     assert "warning" not in nonzero
+
+
+def test_transition_radiation_vacuity_uses_the_total_not_the_stride() -> None:
+    """The all-zero warning keys on ``total_intensity``, not the strided view.
+
+    ``intensity`` is subsampled with ``[::step]``; a stride that happens to
+    select only zeros must not raise a false "all zeros", and a genuinely
+    nonzero total must not be masked by an all-zero strided view.
+    """
+    # Strided view is all zero but the measured total is nonzero: no warning.
+    live = {"total_intensity": 7.0, "intensity": [0.0, 0.0], "omega_per_s": [1e15, 2e15]}
+    assert "warning" not in results._annotate_vacuous("transition_radiation", live)
+    # A zero total warns even if the strided view is somehow nonzero.
+    dead = {"total_intensity": 0.0, "intensity": [1.0], "omega_per_s": [1e15]}
+    assert "all zeros" in results._annotate_vacuous("transition_radiation", dead)["warning"]
 
 
 def test_plugin_emittance_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

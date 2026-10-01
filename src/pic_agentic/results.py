@@ -110,7 +110,10 @@ _PLUGIN_MAX_POINTS = 256
 _VACUOUS_VALUE_KEYS: dict[str, tuple[str, ...]] = {
     "energy_histogram": ("counts",),
     "emittance": ("slice_emit_mrad",),
-    "transition_radiation": ("intensity",),
+    # ``intensity`` is the *strided* (brightest-angle subsampled) spectrum, so
+    # keying vacuity on it could warn -- or stay silent -- on the subsample
+    # while the measured total is nonzero.  The honest scalar is the total.
+    "transition_radiation": ("total_intensity",),
 }
 
 #: Array-rank constants for the openPMD reader summaries.  The shipped readers
