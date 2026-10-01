@@ -85,11 +85,14 @@ def energy_histogram_dat(
     max_kev: float = 1000.0,
     peak_bin: int = 4,
     peak_count: int = 42,
+    zero: bool = False,
 ) -> Path:
     """Write a ``<species>_energyHistogram_<filter>.dat`` the real reader parses.
 
     Every iteration puts ``peak_count`` into ``peak_bin`` and one count into the
-    first and last bin, so the default ``count_in_window`` is non-trivial.
+    first and last bin, so the default ``count_in_window`` is non-trivial.  Set
+    ``zero=True`` to write the all-zero spectrum an empty/plasma-free run
+    produces (the diagnostic path under test).
 
     Returns:
         The written data file's path.
@@ -104,9 +107,10 @@ def energy_histogram_dat(
     rows = []
     for iteration in iterations:
         counts = [0.0] * num_bins
-        counts[0] = 1.0
-        counts[peak_bin] = float(peak_count)
-        counts[-1] = 1.0
+        if not zero:
+            counts[0] = 1.0
+            counts[peak_bin] = float(peak_count)
+            counts[-1] = 1.0
         real = [str(int(count)) for count in counts]
         row = [str(iteration), "0", *real, "0", str(int(sum(counts)))]
         rows.append(" ".join(row))
