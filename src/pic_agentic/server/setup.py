@@ -22,8 +22,11 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import sys
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -61,11 +64,14 @@ def api(homeserver: str, method: str, path: str, token: str, data: dict | None =
 
     """
     body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(homeserver + path, data=body, method=method)  # ruff: ignore[suspicious-url-open-usage]
+    if urllib.parse.urlparse(homeserver).scheme not in {"http", "https"}:
+        msg = f"homeserver must be an http(s) URL: {homeserver!r}"
+        raise SystemExit(msg)
+    req = urllib.request.Request(homeserver + path, data=body, method=method)  # ruff: ignore[suspicious-url-open-usage] - scheme validated above
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=40) as response:  # ruff: ignore[suspicious-url-open-usage]
+        with urllib.request.urlopen(req, timeout=40) as response:  # ruff: ignore[suspicious-url-open-usage] - scheme validated above
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
@@ -142,10 +148,9 @@ def create_room_and_secret(
 def _write_state(state_path: Path, state: dict) -> None:
     """Write the state JSON to ``state_path`` atomically with mode 0600.
 
-    The file is created via ``os.open`` with ``O_CREAT|O_WRONLY|O_TRUNC`` and
-    ``0o600`` so the secret is never observable with looser permissions, then
-    the whole payload is written in one call and ``fsync``ed before the
-    directory entry is relied upon.
+    The payload is written to a same-directory temporary file created with mode
+    ``0600``, ``fsync``ed, then ``os.replace``d over the target, so a crash or a
+    failed write never leaves a truncated or world-readable secret behind.
 
     Args:
         state_path: Target path.
@@ -154,13 +159,14 @@ def _write_state(state_path: Path, state: dict) -> None:
     """
     payload = (json.dumps(state, indent=2) + "\n").encode("utf-8")
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp = tempfile.mkstemp(dir=str(state_path.parent), prefix=f".{state_path.name}.", suffix=".tmp")
     try:
+        os.fchmod(fd, 0o600)
         os.write(fd, payload)
         os.fsync(fd)
     finally:
         os.close(fd)
-    state_path.chmod(0o600)
+    Path(tmp).replace(state_path)
 
 
 def build_export(homeserver: str, room_id: str, rcp_secret: str, sim: str, message_dir: str) -> str:
@@ -171,11 +177,11 @@ def build_export(homeserver: str, room_id: str, rcp_secret: str, sim: str, messa
 
     """
     return (
-        f"export PIC_AGENTIC_HOMESERVER='{homeserver}'\n"
-        f"export PIC_AGENTIC_ROOM_ID='{room_id}'\n"
-        f"export PIC_AGENTIC_RCP_SECRET='{rcp_secret}'\n"
-        f"export PIC_AGENTIC_SIM='{sim}'\n"
-        f"export PIC_AGENTIC_MESSAGE_DIR='{message_dir}'\n"
+        f"export PIC_AGENTIC_HOMESERVER={shlex.quote(homeserver)}\n"
+        f"export PIC_AGENTIC_ROOM_ID={shlex.quote(room_id)}\n"
+        f"export PIC_AGENTIC_RCP_SECRET={shlex.quote(rcp_secret)}\n"
+        f"export PIC_AGENTIC_SIM={shlex.quote(sim)}\n"
+        f"export PIC_AGENTIC_MESSAGE_DIR={shlex.quote(message_dir)}\n"
     )
 
 
