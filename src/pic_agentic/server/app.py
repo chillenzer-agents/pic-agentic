@@ -726,7 +726,9 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "Build a PICMI simulation script into a PyPIConGPU runner, send it "
             "through the Matrix control channel to the simulation-side client "
             "and submit it to the remote SLURM cluster. Returns the simulation "
-            "id and the coarse accepted/submitted state."
+            "id and the coarse accepted/submitted state. The script should "
+            "define a single picmi.Simulation; a trailing sim.run(...) is "
+            "tolerated and ignored (the tool never runs it here)."
         ),
         # write/resource tier: consumes cluster resources, not destructive
         # (design section 6.2).  The server-side MCP client prompts for human
@@ -765,7 +767,9 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "a base spec for create_campaign or add_agenda_leaf. The returned "
             "`spec` is the inline `{sim: ...}` wire object accepted by those "
             "tools; the result also reports the encoded wire size and whether it "
-            "fits the 48 KiB inline submission limit."
+            "fits the 48 KiB inline submission limit. The script should define "
+            "a single picmi.Simulation; a trailing sim.run(...) is tolerated "
+            "and ignored (the tool never runs it here)."
         ),
         # read-tier: it builds locally and starts no cluster work.
         annotations=_READ_ONLY,
