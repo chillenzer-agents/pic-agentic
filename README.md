@@ -279,6 +279,22 @@ python scripts/local_mcp_check.py --submit --picmi-script ./my_simulation.py
 The MCP server needs the `[sim]` extra to build the payload (run the check in
 that venv, or point `--picongpu-python` at it).
 
+### Campaign specs by reference
+
+A Runner spec is tens of KiB, so an agent should never hand-copy one into the
+LLM. `build_spec(picmi_script, write_to="base.json")` builds and returns the
+spec inline **and** stages a JSON copy under the server's spec directory,
+returning its absolute `spec_path`; `create_campaign` then takes
+`base_spec_path=<spec_path>` instead of an inline `base_spec` (provide exactly
+one of the two). The staged file is ordinary JSON (`{"sim": ...}`) and the
+staging root is the configured `PIC_AGENTIC_SPEC_DIR`, or a `spec/`
+subdirectory of `PIC_AGENTIC_MESSAGE_DIR` when unset. `base_spec_path` is
+LLM-controlled, so it is resolved **strictly inside that root** (safe charset,
+symlinks resolved on both sides) and refused otherwise; a path such as
+`/etc/passwd` never reaches an open. Staged files are capped at 4 MiB
+(`MAX_SPEC_FILE_BYTES`) — larger than the 48 KiB inline cap because the bytes
+are server-local and never cross the homeserver.
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path
@@ -319,6 +335,7 @@ table is also read, with the environment taking precedence):
 | `PIC_AGENTIC_SIM_SETUP_ROOT` | Shared-FS root for generated setups (enables M2 submit) |
 | `PIC_AGENTIC_CLUSTER_TEMPLATE_DIR` | Cluster-local picongpu template directory |
 | `PIC_AGENTIC_CLUSTER_PRESET` | Cluster-local CMake preset name |
+| `PIC_AGENTIC_SPEC_DIR` | Staging dir for path-referenced campaign specs (default: `spec/` under `PIC_AGENTIC_MESSAGE_DIR`) |
 
 ## Results tools
 
