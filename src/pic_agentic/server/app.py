@@ -877,7 +877,9 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Report the lifecycle state of one simulation. For a known, "
             "non-terminal simulation a live scontrol view is fetched from the "
             "cluster and merged over the last-event projection; otherwise the "
-            "signed-room projection is returned."
+            "signed-room projection is returned. Progress (step, percent, "
+            "walltime, avg_per_step, eta_s) is populated from the run's "
+            "step_finished events while it is running, not only after it finishes."
         ),
         annotations=_READ_ONLY,
     )
