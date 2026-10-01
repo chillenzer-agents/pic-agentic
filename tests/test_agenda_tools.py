@@ -38,6 +38,23 @@ NO_CAMPAIGN = {"ok": False, "error": "no_campaign", "message": NO_CAMPAIGN_MESSA
 #: A minimal (allow-list-clean) Runner spec: the wire payload is ``{"sim": ...}``.
 _SPEC = {"sim": {"time_steps": 4}}
 
+#: Full ``Runner`` dumps a beta agent passed to ``create_campaign``: indices 0
+#: and 1 store the ``num_tmp_field_slots`` computed field one level too deep,
+#: index 2 is a known round-tripping (valid) spec.  ``create_campaign`` replays
+#: the simclient's round-trip gate, so a leaf must validate against the pinned
+#: schema; the minimal ``_SPEC`` above is allow-list-clean but not a valid
+#: ``Runner`` and is only for the store-level tests.
+CAMPAIGN_SPECS = Path(__file__).parent / "fixtures" / "campaign_specs.json"
+
+
+def _campaign_spec(index: int) -> dict:
+    return json.loads(CAMPAIGN_SPECS.read_text(encoding="utf-8"))[index]
+
+
+def _valid_spec() -> dict:
+    """Return a deep copy of the known round-tripping (valid) campaign spec."""
+    return _campaign_spec(2)
+
 
 def _campaign_file(tmp_path: Path, *, name: str = "campaign", leaves: int = 1) -> str:
     """Write a campaign file with ``leaves`` specs and return its path."""
@@ -414,7 +431,9 @@ async def test_pause_without_campaign_is_a_soft_error(tmp_path) -> None:
 async def test_create_campaign_builds_leaves_with_points_and_values(tmp_path) -> None:
     """create_campaign mirrors the driver: one patched leaf + point per value."""
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
-    base = {"sim": {"time_steps": 4, "grid": {"cell_cnt": 8}}}
+    base = _valid_spec()
+    grid = base["sim"]["grid"]
+    original_time_steps = base["sim"]["time_steps"]
     result = await _call(
         config,
         "create_campaign",
@@ -434,14 +453,14 @@ async def test_create_campaign_builds_leaves_with_points_and_values(tmp_path) ->
     for leaf in campaign.agenda.entries.values():
         # The nested siblings survive and the patch path value agrees with point.
         assert leaf.spec["sim"]["time_steps"] == leaf.point["time_steps"]
-        assert leaf.spec["sim"]["grid"] == {"cell_cnt": 8}
+        assert leaf.spec["sim"]["grid"] == grid
     # The base spec is not mutated by the per-leaf patch.
-    assert base["sim"]["time_steps"] == 4
+    assert base["sim"]["time_steps"] == original_time_steps
 
 
 async def test_create_campaign_creates_a_loadable_campaign_the_tick_submits(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
-    base = {"sim": {"time_steps": 4}}
+    base = _valid_spec()
     await _call(
         config,
         "create_campaign",
@@ -482,7 +501,10 @@ async def test_create_campaign_patches_a_list_indexed_path(tmp_path) -> None:
     through list indices and leave the nested siblings intact.
     """
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
-    base = {"sim": {"laser": [{"focus_pos_si": [{"component": 0.0}, {"component": 4.6e-5}, {"component": 0.0}]}]}}
+    base = _valid_spec()
+    focus = base["sim"]["laser"][0]["focus_pos_si"]
+    original = focus[1]["component"]
+    siblings = (focus[0]["component"], focus[2]["component"])
     result = await _call(
         config,
         "create_campaign",
@@ -504,10 +526,10 @@ async def test_create_campaign_patches_a_list_indexed_path(tmp_path) -> None:
         # The point names the last path segment and agrees with the patched spec.
         assert leaf.point == {"component": value}
         # The nested siblings survive untouched.
-        assert focus[0]["component"] == pytest.approx(0.0)
-        assert focus[2]["component"] == pytest.approx(0.0)
+        assert focus[0]["component"] == pytest.approx(siblings[0])
+        assert focus[2]["component"] == pytest.approx(siblings[1])
     # The base spec is not mutated by the per-leaf patch.
-    assert base["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(4.6e-5)
+    assert base["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(original)
 
 
 async def test_create_campaign_bad_patch_path_is_a_soft_error(tmp_path) -> None:
@@ -543,22 +565,26 @@ async def test_create_campaign_out_of_range_list_index_is_a_soft_error(tmp_path)
 
 async def test_create_campaign_omits_non_scalar_points(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    species = base["sim"]["species"]
+    # ``species`` is a list field, so both sweep values are non-scalar: they are
+    # still applied to the spec but cannot become leaf points.
     result = await _call(
         config,
         "create_campaign",
         {
             "name": "scan",
-            "base_spec": {"sim": {"grid": None}},
-            "patch_path": "sim.grid",
-            "values": [[1, 2], 7],
+            "base_spec": base,
+            "patch_path": "sim.species",
+            "values": [[species[0]], species],
         },
     )
     assert result["ok"] is True
     campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
-    # A list value is still applied to the spec, but cannot be a point.
     assert campaign.agenda.entries["leaf000"].point is None
-    assert campaign.agenda.entries["leaf000"].spec["sim"]["grid"] == [1, 2]
-    assert campaign.agenda.entries["leaf001"].point == {"grid": 7}
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["species"] == [species[0]]
+    assert campaign.agenda.entries["leaf001"].point is None
+    assert campaign.agenda.entries["leaf001"].spec["sim"]["species"] == species
 
 
 async def test_create_campaign_rejects_duplicate_values(tmp_path) -> None:
@@ -569,24 +595,17 @@ async def test_create_campaign_rejects_duplicate_values(tmp_path) -> None:
     campaign that can never advance.
     """
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    time_steps = base["sim"]["time_steps"]
     result = await _call(
         config,
         "create_campaign",
-        {"name": "d", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": [4, 4]},
+        {"name": "d", "base_spec": base, "patch_path": "sim.time_steps", "values": [time_steps, time_steps]},
     )
     assert result["ok"] is False
     assert result["error"] == "duplicate_campaign_spec"
     # Nothing was persisted, so the agent can retry with distinct values.
     assert not (tmp_path / "campaign.json").exists()
-
-
-#: The three ``base_spec`` a beta agent passed to ``create_campaign``; the first
-#: two store ``num_tmp_field_slots`` (a computed field) one level too deep.
-CAMPAIGN_SPECS = Path(__file__).parent / "fixtures" / "campaign_specs.json"
-
-
-def _campaign_spec(index: int) -> dict:
-    return json.loads(CAMPAIGN_SPECS.read_text(encoding="utf-8"))[index]
 
 
 async def test_create_campaign_rejects_a_misplaced_computed_field(tmp_path) -> None:
@@ -657,7 +676,8 @@ async def test_create_campaign_rejects_an_over_cap_spec(tmp_path) -> None:
     from pic_agentic.protocol.simulation import MAX_INLINE_PAYLOAD_BYTES
 
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
-    base = {"sim": {"blob": "a" * (MAX_INLINE_PAYLOAD_BYTES * 2), "time_steps": 4}}
+    base = _valid_spec()
+    base["sim"]["solver"]["name"] = "a" * (MAX_INLINE_PAYLOAD_BYTES * 2)
     result = await _call(
         config,
         "create_campaign",
@@ -672,19 +692,21 @@ async def test_create_campaign_rejects_an_over_cap_spec(tmp_path) -> None:
 async def test_create_campaign_reaches_a_numeric_dict_key(tmp_path) -> None:
     """A numeric-looking dict key is addressed as a key, not as a list index (M2)."""
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    base["sim"]["customuserinput"] = {"tags": ["t"], "0": "periodic"}
     result = await _call(
         config,
         "create_campaign",
         {
             "name": "bc",
-            "base_spec": {"sim": {"bc": {"0": "periodic"}}},
-            "patch_path": "sim.bc.0",
+            "base_spec": base,
+            "patch_path": "sim.customuserinput.0",
             "values": ["open"],
         },
     )
     assert result["ok"] is True
     campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
-    assert campaign.agenda.entries["leaf000"].spec["sim"]["bc"] == {"0": "open"}
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["customuserinput"]["0"] == "open"
 
 
 async def test_create_campaign_rejects_a_typo_field(tmp_path) -> None:

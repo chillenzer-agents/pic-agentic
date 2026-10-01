@@ -1201,7 +1201,11 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "that value (e.g. patch_path='sim.time_steps'), and records "
             "point={last path segment: value}. This is the entry point for the "
             "research loop -- call build_spec first to get base_spec, then "
-            "advance_agenda. Refuses to overwrite an existing campaign."
+            "advance_agenda. Every patched leaf is validated against the pinned "
+            "pypicongpu schema before anything is persisted, so a malformed "
+            "base_spec is refused up front with an `invalid_campaign_spec` error "
+            "naming the offending field(s) instead of failing at each submission. "
+            "Refuses to overwrite an existing campaign."
         ),
         # write/resource tier: it creates persisted campaign state but starts no
         # cluster work itself; it is not destructive.
