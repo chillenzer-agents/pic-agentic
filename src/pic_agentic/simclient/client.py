@@ -1607,21 +1607,42 @@ class SimClient:
         if tracked is None:
             # The sim may be known but not yet tracked: a build in flight has
             # persisted its ``sim_id`` but starts the follower only once the job
-            # is launched, so no log file exists yet.  Reporting this as
-            # ``unknown_sim`` reads like a bug; name the real state instead and
-            # keep ``unknown_sim`` for a sim that was never submitted.
-            known = any(record.sim_id == sim_id for record in self._processed.values() if record.sim_id)
-            if known:
-                ack = self._build_logs_ack(
-                    message,
-                    cmd_id=cmd_id,
-                    sim_id=sim_id,
-                    stream=stream,
-                    lines=[],
-                    total_lines=0,
-                    error="the simulation has not started yet; logs appear after submission",
-                    error_code="logs_not_available",
-                )
+            # is launched, so no log file exists yet.  A *rejected* submit also
+            # persists a record (``state="failed"``) before validation and is
+            # never tracked, so consult the record's state: reporting a
+            # terminally failed sim as "not started yet" would hide the real
+            # failure.  Keep ``unknown_sim`` for a sim that was never submitted.
+            latest = next(
+                (record for record in reversed(self._processed.values()) if record.sim_id == sim_id),
+                None,
+            )
+            if latest is not None:
+                failed = latest.state == SimulationState.FAILED.value or latest.error_code is not None
+                if failed:
+                    ack = self._build_logs_ack(
+                        message,
+                        cmd_id=cmd_id,
+                        sim_id=sim_id,
+                        stream=stream,
+                        lines=[],
+                        total_lines=0,
+                        error=(
+                            "the simulation failed before any log was written"
+                            f"{f': {latest.error}' if latest.error else ''}"
+                        ),
+                        error_code=latest.error_code or SimulationState.FAILED.value,
+                    )
+                else:
+                    ack = self._build_logs_ack(
+                        message,
+                        cmd_id=cmd_id,
+                        sim_id=sim_id,
+                        stream=stream,
+                        lines=[],
+                        total_lines=0,
+                        error="the simulation has not started yet; logs appear after submission",
+                        error_code="logs_not_available",
+                    )
             else:
                 ack = self._build_logs_ack(
                     message,
