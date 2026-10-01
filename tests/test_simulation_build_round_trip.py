@@ -4,10 +4,10 @@
 
 """Offline tests for :func:`pic_agentic.simulation_build.check_spec_round_trip`.
 
-These run without PIConGPU: they pin the best-effort fallback and, crucially,
-that the check never over-rejects a genuinely valid spec because of sibling
-keys the simclient drops or metadata the pin would recompute.  The exact-pin
-behaviour is covered by ``test_submit_integration.py`` (B1).
+These run without PIConGPU: they pin the best-effort fallback and that the check
+never over-rejects a valid spec over sibling keys the simclient drops.  The
+exact-pin behaviour (including the exact-parity rejections) is covered by
+``test_submit_integration.py``.
 """
 
 from __future__ import annotations
