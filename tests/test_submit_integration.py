@@ -260,6 +260,119 @@ def test_check_spec_round_trip_matches_the_simclient_gate() -> None:
 
 
 @pytest.mark.integration
+def test_check_spec_round_trip_is_exact_parity_with_the_simclient() -> None:
+    """The create gate accepts iff the simclient's round-trip gate would (A).
+
+    The beta-3 Major: the create gate used a lenient "no caller leaf dropped"
+    rule while the simclient rejects on *any* re-serialisation difference.  A
+    stripped computed ``precision_overrides`` or a retyped ``time_steps="4"``
+    was accepted at create time yet refused as ``unsupported`` at every leaf.
+    This pins the decisions together on the real pin for the exact repros.
+    """
+    import copy
+
+    from pic_agentic.rcp import new_secret_hex
+    from pic_agentic.simclient.simulation import (
+        SimulationErrorCode,
+        SimulationExecutionError,
+        SubmitConfig,
+        runner_from_payload,
+    )
+    from pic_agentic.simulation_build import check_spec_round_trip
+
+    def simclient_rejects(dump: dict) -> bool:
+        payload = SimulationPayload.build(
+            picongpu_version=picongpu_version(),
+            picongpu_revision=picongpu_revision(),
+            schema_hash=runner_schema_hash(),
+            runner_dump=dump,
+        )
+        try:
+            runner_from_payload(payload, SubmitConfig(setup_root=Path(new_secret_hex())), "deadbeef")
+        except SimulationExecutionError as exc:
+            assert exc.code is SimulationErrorCode.UNSUPPORTED, exc.code
+            return True
+        return False
+
+    base = json.loads(FIXTURE.read_text())
+    # A fresh, canonical spec is accepted by both.
+    assert check_spec_round_trip(base) is None
+    assert not simclient_rejects(base)
+
+    mutants = {
+        "stripped precision_overrides": lambda d: d["sim"].pop("precision_overrides"),
+        "time_steps int->str": lambda d: d["sim"].__setitem__("time_steps", str(d["sim"]["time_steps"])),
+        "unknown top-level sim field": lambda d: d["sim"].__setitem__("totally_unknown_key", 1),
+    }
+    for label, mutate in mutants.items():
+        dump = copy.deepcopy(base)
+        mutate(dump)
+        assert simclient_rejects(dump), f"{label}: simclient unexpectedly accepted"
+        detail = check_spec_round_trip(dump)
+        assert detail is not None, f"{label}: create gate accepted a spec the simclient rejects"
+        assert detail.startswith("spec does not reproduce itself") or "not part of the pinned" in detail
+
+
+@pytest.mark.integration
+def test_check_spec_round_trip_rejects_a_validation_failure() -> None:
+    """A spec the pin refuses to validate is rejected, not swallowed (beta-3).
+
+    The beta-3 agent fed ``create_campaign`` LLM-typed specs whose non-null
+    fields held ``""`` where a list/dict/tuple is expected.  ``Runner`` rejects
+    them (the simclient answers ``payload_invalid``), but the check used to
+    return ``None`` on any validation failure, so the campaign persisted and
+    every leaf then failed at submit time.  The check must name the offending
+    fields instead.
+    """
+    from pic_agentic.simulation_build import check_spec_round_trip
+
+    bad = json.loads((Path(__file__).parent / "fixtures" / "beta3_bad_spec.json").read_text())
+    detail = check_spec_round_trip(bad)
+    assert detail is not None
+    assert "sim.customuserinput Input should be a valid list" in detail
+    assert "sim.moving_window" in detail
+    # A single type-invalid nested leaf is named precisely.
+    dump = json.loads(FIXTURE.read_text())
+    dump["sim"]["species"] = ""
+    detail = check_spec_round_trip(dump)
+    assert detail is not None
+    assert "sim.species Input should be a valid list (got str '')" in detail
+
+
+@pytest.mark.integration
+async def test_create_campaign_rejects_the_beta_bad_spec_and_persists_nothing(tmp_path) -> None:
+    """The exact beta-3 spec is refused at creation with nothing persisted."""
+    from pic_agentic.config import Config
+    from pic_agentic.rcp import new_secret_hex
+    from pic_agentic.server.app import build_server
+    from pic_agentic.transport.memory import MemoryTransport
+
+    bad = json.loads((Path(__file__).parent / "fixtures" / "beta3_bad_spec.json").read_text())
+    campaign_file = tmp_path / "campaign.json"
+    config = Config(rcp_secret=new_secret_hex(), agenda_file=str(campaign_file))
+    mcp_transport, sim_transport = MemoryTransport.create_pair()
+    server, runtime = build_server(config, "7f3a2b1c")
+    runtime._transport = mcp_transport
+    try:
+        # create_campaign only validates and persists; it starts no cluster work,
+        # so no sim responder/pump is needed.
+        result = (
+            await server.call_tool(
+                "create_campaign",
+                {"name": "beta3", "base_spec": bad, "patch_path": "sim.time_steps", "values": [100, 200]},
+            )
+        ).structured_content
+    finally:
+        await mcp_transport.close()
+        await sim_transport.close()
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    assert str(result["detail"]).startswith("spec does not validate against the pinned pypicongpu schema")
+    assert "sim.customuserinput Input should be a valid list" in result["detail"]
+    assert not campaign_file.exists()
+
+
+@pytest.mark.integration
 def test_check_spec_round_trip_ignores_sibling_keys_like_the_simclient() -> None:
     """The check replays the simclient's *reduced* dump (B1).
 

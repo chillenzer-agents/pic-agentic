@@ -19,6 +19,11 @@ and at `lib/python/examples/` in the PIConGPU source tree. Prompt 1 relies on
 that pointer; prompt 2 is meant to test whether the agent can compose a new
 study from the documentation without a verbatim snippet to copy.
 
+Caveat for the pointer (picongpu upstream docs issue, not fixed here): the page's
+focal example defines no plasma species, so it produces an empty spectrum as
+written. The `instructions` now say the example needs the LWFA tutorial's plasma
+species folded in for a non-empty result.
+
 ## Prompt 1 — parameter scan from the documented LWFA example
 
 > I want to know how the laser focal position affects electron acceleration in

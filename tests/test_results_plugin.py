@@ -142,6 +142,72 @@ def test_plugin_stub_summary_and_window(tmp_path: Path, monkeypatch: pytest.Monk
     assert summary["count_in_window"]["count"] == pytest.approx(44.0)
     assert len(summary["bins_kev"]) == len(summary["counts"]) == 10
     assert summary["downsampled"] is False
+    assert summary["source_path"] == "e_energyHistogram_all.dat"
+    assert summary["source_size_bytes"] > 0
+    assert "warning" not in summary
+
+
+def test_plugin_all_zero_histogram_carries_a_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An all-zero histogram must never be returned silently (beta run 3).
+
+    The reviewer could not tell an empty (plasma-free) result from a reader bug
+    because the summary was plain zeros; the warning names the ambiguity and the
+    source fields let a caller sanity-check the file on disk.
+    """
+
+    class _ZeroReader:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            return [0.0] * 10, [1000.0 * (i + 1) / 10 for i in range(10)], [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _ZeroReader)
+    run = _tree(tmp_path)
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["total"] == pytest.approx(0.0)
+    assert summary["max_energy_kev"] is None
+    assert "warning" in summary
+    assert "all zeros" in summary["warning"]
+    assert summary["source_size_bytes"] > 0
+
+
+def test_annotate_vacuous_covers_the_numeric_readers() -> None:
+    """Each numeric text reader's value array drives the warning independently."""
+    cases = {
+        "energy_histogram": {"counts": [0.0, 0.0], "bins_kev": [1.0, 2.0]},
+        "emittance": {"slice_emit_mrad": [0.0, 0.0], "y_slices_m": [0.0, 1.0]},
+        "transition_radiation": {"total_intensity": 0.0, "intensity": [0.0]},
+    }
+    for reader, summary in cases.items():
+        annotated = results._annotate_vacuous(reader, summary)
+        assert "all zeros" in annotated["warning"]
+    nonzero = results._annotate_vacuous("energy_histogram", {"counts": [0.0, 3.0], "bins_kev": [1.0, 2.0]})
+    assert "warning" not in nonzero
+
+
+def test_transition_radiation_vacuity_uses_the_total_not_the_stride() -> None:
+    """The all-zero warning keys on ``total_intensity``, not the strided view.
+
+    ``intensity`` is subsampled with ``[::step]``; a stride that happens to
+    select only zeros must not raise a false "all zeros", and a genuinely
+    nonzero total must not be masked by an all-zero strided view.
+    """
+    # Strided view is all zero but the measured total is nonzero: no warning.
+    live = {"total_intensity": 7.0, "intensity": [0.0, 0.0], "omega_per_s": [1e15, 2e15]}
+    assert "warning" not in results._annotate_vacuous("transition_radiation", live)
+    # A zero total warns even if the strided view is somehow nonzero.
+    dead = {"total_intensity": 0.0, "intensity": [1.0], "omega_per_s": [1e15]}
+    assert "all zeros" in results._annotate_vacuous("transition_radiation", dead)["warning"]
 
 
 def test_plugin_emittance_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -307,6 +373,49 @@ def test_real_energy_histogram_reader_end_to_end(tmp_path: Path) -> None:
     assert summary["bins_kev"][-1] == pytest.approx(1000.0)
     # The highest populated bin is 1000 keV even though the modal bin is 500.
     assert summary["max_energy_kev"] == pytest.approx(1000.0)
+    assert summary["source_path"] == "e_energyHistogram_all.dat"
+    assert summary["source_size_bytes"] > 0
+    assert "warning" not in summary
+
+
+def test_real_all_zero_histogram_is_flagged(tmp_path: Path) -> None:
+    """The real reader on an empty spectrum still yields a warning, not silence.
+
+    This is the beta-run-3 shape: the file parses and reports a valid axis, but
+    every count is zero because the run had no particles in range.
+    """
+    pytest.importorskip("picongpu")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run, species="e", zero=True)
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["total"] == pytest.approx(0.0)
+    assert summary["max_energy_kev"] is None
+    assert "all zeros" in summary["warning"]
+
+
+def test_real_nonzero_histogram_survives_the_real_reader(tmp_path: Path) -> None:
+    """The faithful writer layout yields nonzero counts (the reader is not the bug).
+
+    The C++ writer terminates its header with a trailing space before ``>``; the
+    old synthetic fixture omitted that space and hid a real-reader bug where a
+    count could be paired with the lower-edge bin.  This drives the real reader
+    over the faithful layout and asserts the window count.
+    """
+    pytest.importorskip("picongpu")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run, species="e", peak_bin=4, peak_count=42)
+    payload = results.resolve_result(_params(species="e", iteration=50), run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["total"] == pytest.approx(44.0)
+    assert summary["count_in_window"]["count"] == pytest.approx(44.0)
+    assert "warning" not in summary
 
 
 def test_max_energy_is_the_highest_populated_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

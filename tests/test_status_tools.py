@@ -262,6 +262,56 @@ async def test_get_status_tool_merges_the_live_view() -> None:
     assert payload["since_last_event_s"] is not None
 
 
+async def test_get_status_reports_progress_from_step_finished_events() -> None:
+    """A running sim's projection carries step/percent/eta_s (mid-run progress).
+
+    The bounded ``step_finished`` events carry the progress, so the registry
+    projection (used without a live pull, and as the fallback when a live ack
+    omits a field) must expose it while the job runs, not only at completion.
+    """
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    service = runtime.submit_service
+    service.on_message(_event(SimulationState.JOB_RUNNING, ts="2026-09-25T10:00:00Z", seq=1, job_id=JOB_ID))
+    service.on_message(
+        _event(
+            SimulationState.STEP_FINISHED,
+            ts="2026-09-25T10:00:01Z",
+            seq=2,
+            step=250,
+            percent=25,
+            walltime="1min 0sec 0msec",
+            avg_per_step="4msec",
+            eta_s=750,
+        )
+    )
+    result = await server.call_tool("get_status", {"sim_id": SIM_ID})
+    payload = result.structured_content
+    assert payload["state"] == SimulationState.STEP_FINISHED.value
+    assert payload["step"] == 250
+    assert payload["percent"] == 25
+    assert payload["eta_s"] == 750
+    assert payload["walltime"] == "1min 0sec 0msec"
+
+
+def test_merge_status_keeps_projection_progress_the_ack_omits() -> None:
+    """A live ack that omits a progress field must not erase the projection."""
+    from pic_agentic.server.app import _merge_status
+
+    projection = {"step": 250, "percent": 25, "eta_s": 750, "walltime": "1min 0sec 0msec"}
+    _merge_status(projection, {"state": "simulation.job_running", "step": None, "percent": None, "eta_s": None})
+    assert projection["state"] == "simulation.job_running"
+    assert projection["step"] == 250
+    assert projection["percent"] == 25
+    assert projection["eta_s"] == 750
+    # A non-null ack value does override the projection.
+    _merge_status(projection, {"percent": 40})
+    assert projection["percent"] == 40
+
+
 async def test_get_status_redacts_secrets() -> None:
     from pic_agentic.config import Config
     from pic_agentic.server.app import build_server

@@ -398,3 +398,26 @@ def test_campaign_round_trip(tmp_path) -> None:
     store.save(campaign)
     loaded = store.load(Campaign)
     assert loaded.model_dump_json() == campaign.model_dump_json()
+
+
+def test_failure_grouping_key_separates_stages() -> None:
+    """Leaves failing identically at different stages stay distinct groups.
+
+    ``FailureGroup`` carries ``stage``, so the dedupe key must include it: a
+    ``build`` failure and a ``run`` failure with the same code/message are not
+    the same group.
+    """
+    from pic_agentic.agenda.campaign import Callback
+    from pic_agentic.agenda.engine import TickResult, _compact_failures
+
+    result = TickResult(
+        failed=["a", "b"],
+        callbacks=[
+            Callback(path="a", kind="failed", error="boom", error_code="unsupported", stage="build"),
+            Callback(path="b", kind="failed", error="boom", error_code="unsupported", stage="run"),
+        ],
+    )
+    _compact_failures(result)
+    assert len(result.failure_groups) == 2
+    assert {group.stage for group in result.failure_groups} == {"build", "run"}
+    assert [group.paths for group in result.failure_groups] == [["a"], ["b"]]

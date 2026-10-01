@@ -368,6 +368,77 @@ async def test_status_unknown_sim_is_ack_error(shared_dir, tmp_path, fake_runner
     assert logs_ack.payload["total_lines"] == 0
 
 
+async def test_logs_for_a_known_but_not_yet_tracked_sim(shared_dir, tmp_path, fake_runner) -> None:
+    """A submitted sim with no follower yet reports ``logs_not_available``.
+
+    Regression (live beta run): a build in flight has its ``sim_id`` persisted
+    but no ``TrackedSim``/log file, so ``get_logs`` answered ``unknown_sim`` --
+    which reads like a bug even though the sim was known to ``get_status``.
+    """
+    from pic_agentic.simclient.client import ProcessedCommand
+
+    shared, _state_dir = shared_dir
+    _mcp_t, sim_t = MemoryTransport.create_pair()
+    client = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared,
+        submit_config=SubmitConfig(setup_root=shared / "sims"),
+    )
+    client._persist_processed(ProcessedCommand(cmd_id="abc", sim_id="build123"))
+    logs_cmd = build_logs_command(sim=SIM, seq=1, sim_id="build123", cmd_id="l").sign(SECRET)
+    logs_ack = await client.handle(logs_cmd)
+    assert logs_ack is not None
+    assert logs_ack.payload["error_code"] == "logs_not_available"
+    assert "not started yet" in logs_ack.payload["error"]
+
+    # A genuinely unknown sim still reports ``unknown_sim``.
+    other = build_logs_command(sim=SIM, seq=2, sim_id="nope1234", cmd_id="m").sign(SECRET)
+    other_ack = await client.handle(other)
+    assert other_ack is not None
+    assert other_ack.payload["error_code"] == "unknown_sim"
+
+
+async def test_logs_for_a_persisted_failed_sim_reports_the_failure(shared_dir, tmp_path, fake_runner) -> None:
+    """A rejected submit is not "not started yet"; it reports its failure.
+
+    ``_prepare_or_reject`` persists a record with ``state="failed"`` (and an
+    ``error_code``) *before* validation and never starts a follower.  Treating
+    that ``sim_id`` as merely unstarted hid the terminal failure behind
+    ``logs_not_available`` -- worse than the old ``unknown_sim``.
+    """
+    from pic_agentic.simclient.client import ProcessedCommand
+
+    shared, _state_dir = shared_dir
+    _mcp_t, sim_t = MemoryTransport.create_pair()
+    client = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared,
+        submit_config=SubmitConfig(setup_root=shared / "sims"),
+    )
+    client._persist_processed(
+        ProcessedCommand(
+            cmd_id="rejected",
+            completed=True,
+            sim_id="fail1234",
+            state=SimulationState.FAILED.value,
+            error="simulation carries fields outside the pinned pypicongpu schema",
+            error_code="unsupported",
+        )
+    )
+    logs_cmd = build_logs_command(sim=SIM, seq=1, sim_id="fail1234", cmd_id="l").sign(SECRET)
+    logs_ack = await client.handle(logs_cmd)
+    assert logs_ack is not None
+    assert logs_ack.payload["error_code"] == "unsupported"
+    assert "failed before any log" in logs_ack.payload["error"]
+    assert "not started yet" not in logs_ack.payload["error"]
+
+
 async def test_pull_rejected_when_submit_disabled(shared_dir, tmp_path) -> None:
     shared, _state_dir = shared_dir
     _mcp_t, sim_t = MemoryTransport.create_pair()

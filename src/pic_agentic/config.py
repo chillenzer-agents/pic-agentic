@@ -46,6 +46,7 @@ ENV_MAP = {
     "cluster_preset": "PIC_AGENTIC_CLUSTER_PRESET",
     "sim_setup_root": "PIC_AGENTIC_SIM_SETUP_ROOT",
     "results_root": "PIC_AGENTIC_RESULTS_ROOT",
+    "spec_dir": "PIC_AGENTIC_SPEC_DIR",
     "agenda_file": "PIC_AGENTIC_AGENDA_FILE",
     "agenda_require_approval": "PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL",
     "agenda_approve_over_est_core_hours": "PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS",
@@ -110,6 +111,12 @@ class Config(BaseModel):
     #: ``readable``/``readable_local`` iff ``<results_root>/<sim_id>/simOutput``
     #: resolves there.  The server never moves data (design section 4).
     results_root: str = ""
+    #: Directory staging JSON wire-spec files the agent obtains by reference
+    #: (``build_spec(write_to=...)`` -> ``create_campaign(base_spec_path=...)``)
+    #: so tens-of-KiB specs never round-trip through the LLM.  Empty disables
+    #: path-based specs (only inline ``base_spec`` is accepted); a non-empty
+    #: value is the *only* root a ``base_spec_path`` may resolve under.
+    spec_dir: str = ""
     #: Path to the persisted campaign file the agenda tools advance.  Empty
     #: means the default ``campaign.json`` under the message directory.
     agenda_file: str = ""

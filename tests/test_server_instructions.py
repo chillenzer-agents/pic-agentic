@@ -29,3 +29,7 @@ def test_instructions_point_at_the_picongpu_documentation_and_examples() -> None
     assert "create_campaign" in SERVER_INSTRUCTIONS
     # The reset path for starting a fresh campaign is named too.
     assert "delete_campaign" in SERVER_INSTRUCTIONS
+    # The documented focal example is not runnable as written; the pointer warns
+    # that it needs the LWFA tutorial's plasma species for a non-empty spectrum.
+    assert "plasma species" in SERVER_INSTRUCTIONS
+    assert "empty spectrum" in SERVER_INSTRUCTIONS
