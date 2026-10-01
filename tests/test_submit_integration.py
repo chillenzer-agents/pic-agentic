@@ -78,6 +78,39 @@ async def test_child_reports_the_same_provenance_as_version_py(tmp_path: Path) -
 
 
 @pytest.mark.integration
+async def test_trailing_sim_run_builds_without_compiling(tmp_path: Path) -> None:
+    """The documented trailing ``sim.run(...)`` must not trigger a build.
+
+    Regression (live beta run): ``sim.run()`` fell through to a real
+    ``cwltool`` compile in the child and surfaced as a raw ``permanentFail``.
+    ``build_spec`` only wants the ``Simulation``, so the child neutralises
+    ``run``/``write_input_file``; the spec must come back and no compile dirs
+    may be created.
+    """
+    import asyncio
+
+    from pic_agentic.simulation_build import build_runner_dump
+
+    script = tmp_path / "sim.py"
+    script.write_text(
+        "from picongpu import picmi\n"
+        "grid = picmi.Cartesian3DGrid(number_of_cells=[8, 8, 8], lower_bound=[0, 0, 0], "
+        "upper_bound=[1e-6, 1e-6, 1e-6], lower_boundary_conditions=['periodic'] * 3, "
+        "upper_boundary_conditions=['periodic'] * 3)\n"
+        "solver = picmi.ElectromagneticSolver(method='Yee', grid=grid)\n"
+        "sim = picmi.Simulation(time_step_size=1e-15, max_steps=2, solver=solver)\n"
+        "sim.run(setup_dir=str(__import__('pathlib').Path(__file__).with_name('setup')), "
+        "run_dir=str(__import__('pathlib').Path(__file__).with_name('run')))\n",
+        encoding="utf-8",
+    )
+    built = await asyncio.wait_for(build_runner_dump(script_path=script), timeout=120)
+    assert built.runner["sim"]
+    assert not (tmp_path / "setup").exists()
+    assert not (tmp_path / "run").exists()
+    assert built.schema_hash == runner_schema_hash()
+
+
+@pytest.mark.integration
 def test_schema_hash_is_path_independent() -> None:
     """The schema hash must not depend on the install prefix.
 
@@ -209,6 +242,60 @@ def test_nested_unknown_field_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(SimulationExecutionError) as excinfo:
         runner_from_payload(payload, config, "deadbeef")
     assert excinfo.value.code is SimulationErrorCode.UNSUPPORTED
+
+
+@pytest.mark.integration
+def test_check_spec_round_trip_matches_the_simclient_gate() -> None:
+    """The create-time check agrees with the simclient's round-trip gate (P2b)."""
+    from pic_agentic.simulation_build import check_spec_round_trip
+
+    specs = json.loads((Path(__file__).parent / "fixtures" / "campaign_specs.json").read_text())
+    for index in (0, 1):
+        detail = check_spec_round_trip(specs[index])
+        assert detail is not None
+        assert "collisional_physics.numerics_config.num_tmp_field_slots" in detail
+        assert "collisional_physics.num_tmp_field_slots" in detail
+    # The correctly-shaped spec is accepted unchanged.
+    assert check_spec_round_trip(specs[2]) is None
+
+
+@pytest.mark.integration
+def test_check_spec_round_trip_ignores_sibling_keys_like_the_simclient() -> None:
+    """The check replays the simclient's *reduced* dump (B1).
+
+    The simclient validates only ``{sim, setup_dir, run_dir}`` (+template_dir)
+    and drops every other key, so a full ``build_spec`` dump -- or one whose
+    sibling ``template_dir``/``setup_dir`` has a shape ``Runner`` would reject --
+    must not be refused by the create-time check.
+    """
+    from pic_agentic.simulation_build import check_spec_round_trip
+
+    dump = json.loads(FIXTURE.read_text())
+    assert check_spec_round_trip(dump) is None
+    assert check_spec_round_trip({"sim": dump["sim"], "template_dir": "not-a-list"}) is None
+    assert check_spec_round_trip({"sim": dump["sim"], "setup_dir": 123}) is None
+
+
+@pytest.mark.integration
+async def test_check_spec_round_trip_accepts_a_fresh_build_spec_dump(tmp_path) -> None:
+    """A dump built from the real pin passes the create-time check (B1)."""
+    from pic_agentic.simulation_build import build_runner_dump, check_spec_round_trip
+
+    script = tmp_path / "sim.py"
+    script.write_text(
+        "from picongpu import picmi\n"
+        "grid = picmi.Cartesian3DGrid(number_of_cells=[8, 8, 8], lower_bound=[0, 0, 0], "
+        "upper_bound=[1e-6, 1e-6, 1e-6], lower_boundary_conditions=['periodic'] * 3, "
+        "upper_boundary_conditions=['periodic'] * 3)\n"
+        "solver = picmi.ElectromagneticSolver(method='Yee', grid=grid)\n"
+        "sim = picmi.Simulation(time_step_size=1e-15, max_steps=4, solver=solver)\n",
+        encoding="utf-8",
+    )
+    import sys
+
+    built = await build_runner_dump(script_path=script, interpreter=sys.executable)
+    assert check_spec_round_trip(built.runner) is None
+    assert check_spec_round_trip({"sim": built.runner["sim"]}) is None
 
 
 @pytest.mark.integration

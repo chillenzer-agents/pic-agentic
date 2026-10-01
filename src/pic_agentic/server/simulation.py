@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, computed_field
 from pic_agentic.protocol.simulation import (
     LOG_STREAMS,
     MAX_INLINE_PAYLOAD_BYTES,
+    ClientCapabilities,
     ControlParams,
     ResultOp,
     ResultParams,
@@ -41,6 +42,7 @@ from pic_agentic.protocol.simulation import (
     build_result_command,
     build_status_command,
     build_submit_command,
+    client_capability_mismatch,
     payload_wire_size,
 )
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
@@ -94,7 +96,14 @@ _RECORD_FIELDS = (
     "core_hours",
     "gpu_hours",
     "run_dir",
+    "error",
+    "error_code",
+    "stage",
 )
+
+#: The failure-reason subset of :data:`_RECORD_FIELDS`, projected from a submit
+#: ack as well (a rejection reports its reason on the ack, not as an event).
+_FAILURE_FIELDS = ("error", "error_code", "stage")
 
 
 class SimRecord(BaseModel):
@@ -122,6 +131,12 @@ class SimRecord(BaseModel):
     core_hours: float | None = None
     gpu_hours: float | None = None
     run_dir: str | None = None
+    #: Human-readable failure reason reported by the simclient (ack or event).
+    error: str | None = None
+    #: Stable machine-readable failure code (e.g. ``unsupported``).
+    error_code: str | None = None
+    #: Pipeline stage the failure occurred in, when the simclient reported one.
+    stage: str | None = None
     last_event_type: str | None = None
     last_event_ts: str | None = None
     active: bool = True
@@ -194,6 +209,8 @@ class SubmitOutcome(BaseModel):
     acked: bool = False
     error: str | None = None
     error_code: str | None = None
+    #: Pipeline stage the rejection occurred in, when the ack carries one.
+    stage: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -280,6 +297,53 @@ class SubmitService:
         #: ``get_events``/``condense_events`` read from.
         self.event_log: list[RcpMessage] = []
         self.registry: dict[str, SimRecord] = {}
+        #: Latest capability set the simclient advertised over the ``hello``
+        #: handshake; None until a hello runs or the client predates the probe.
+        self.client_capabilities: ClientCapabilities | None = None
+
+    def set_client_capabilities(self, capabilities: ClientCapabilities | None) -> None:
+        """Record the client capabilities learned from the ``hello`` handshake.
+
+        Args:
+            capabilities: The advertised set, or None to clear it.
+
+        """
+        self.client_capabilities = capabilities
+
+    def capability_mismatch(
+        self,
+        *,
+        op: ResultOp | SimulationOp | None = None,
+        request_type: SimulationType | None = None,
+    ) -> str | None:
+        """Return a version-drift message when the client cannot handle a request.
+
+        A proactive guard: when the client advertised its capabilities in the
+        ``hello`` handshake and the requested op/type is absent, name the drift
+        rather than sending a command the client answers opaquely.  An unknown
+        client (no advertisement yet) yields None, so the reactive per-ack guard
+        remains the backstop for a server that never ran a hello.
+
+        Args:
+            op: The result/control op about to be sent.
+            request_type: The request ``type`` value about to be sent.
+
+        Returns:
+            The actionable mismatch message, or None when the request is safe.
+
+        """
+        if self.client_capabilities is None:
+            return None
+        type_value = request_type.value if request_type is not None else ""
+        missing = self.client_capabilities.unsupported(
+            op=op,
+            request_type=type_value,
+        )
+        if missing is None:
+            return None
+        if type_value and missing == type_value:
+            return client_capability_mismatch(self.client_capabilities, request_type=type_value)
+        return client_capability_mismatch(self.client_capabilities, op=op.value if op is not None else missing)
 
     async def build_payload(
         self,
@@ -496,6 +560,12 @@ class SubmitService:
             record.active = state not in TERMINAL_STATES
         if payload.get("job_id") is not None:
             record.job_id = payload["job_id"]
+        # A rejected submission carries its reason on the ack (not an event), so
+        # project the failure fields here too.
+        for field in _FAILURE_FIELDS:
+            value = payload.get(field)
+            if value is not None:
+                setattr(record, field, value)
         if record.last_event_ts is None:
             record.last_event_ts = message.ts
         self.registry[sim_id] = record
@@ -573,6 +643,7 @@ class SubmitService:
             acked=True,
             error=ack.payload.get("error"),
             error_code=ack.payload.get("error_code"),
+            stage=ack.payload.get("stage"),
         )
 
     async def submit(
@@ -732,6 +803,14 @@ class SubmitService:
             The ``status_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
 
         """
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value="",
+            op=None,
+            request_type=SimulationType.STATUS_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
         return await self._fetch(
             send,
             sim_id,
@@ -770,6 +849,14 @@ class SubmitService:
         if stream not in LOG_STREAMS:
             msg = f"unknown log stream {stream!r}; expected one of {LOG_STREAMS}"
             raise ValueError(msg)
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value="",
+            op=None,
+            request_type=SimulationType.LOGS_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
         return await self._fetch(
             send,
             sim_id,
@@ -796,6 +883,14 @@ class SubmitService:
 
         """
         params = ControlParams(sim_id=sim_id, op=op)
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value=op.value,
+            op=op,
+            request_type=SimulationType.CONTROL_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
         return await self._fetch(
             send,
             sim_id,
@@ -806,6 +901,31 @@ class SubmitService:
                 cmd_id=cmd_id,
             ),
         )
+
+    def _capability_error(
+        self,
+        *,
+        sim_id: str,
+        op_value: str,
+        op: ResultOp | SimulationOp | None,
+        request_type: SimulationType,
+    ) -> dict[str, Any] | None:
+        """Return a soft error dict when the client cannot handle the request.
+
+        Returns:
+            The ``unsupported_by_client`` payload, or None when the request is
+            safe to send (or the client never advertised its capabilities).
+
+        """
+        mismatch = self.capability_mismatch(op=op, request_type=request_type)
+        if mismatch is None:
+            return None
+        return {
+            "sim_id": sim_id,
+            "op": op_value,
+            "error": mismatch,
+            "error_code": "unsupported_by_client",
+        }
 
     async def fetch_result(self, send: SendFn, params: ResultParams) -> dict[str, Any]:
         """Send a results request and await its ack.
@@ -819,6 +939,14 @@ class SubmitService:
 
         """
         sim_id = params.sim_id
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value=params.op.value,
+            op=params.op,
+            request_type=SimulationType.RESULT_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
         payload = await self._fetch(
             send,
             sim_id,

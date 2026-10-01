@@ -28,7 +28,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
-from pic_agentic.agenda.engine import ActualUsage, AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
+from pic_agentic.agenda.engine import (
+    ActualUsage,
+    AgendaEngine,
+    EnginePolicy,
+    FailureInfo,
+    SubmitFailureError,
+    TransientSubmitError,
+    leaf_at,
+)
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.refine import summary as refine_summary
 from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
@@ -41,6 +49,7 @@ from pic_agentic.protocol.simulation import (
 )
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
+from pic_agentic.simulation_build import check_spec_round_trip
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -55,6 +64,21 @@ log = logging.getLogger(__name__)
 #: Actionable text attached to every ``no_campaign`` soft error, naming the tool
 #: that creates a campaign so the caller knows how to recover.
 NO_CAMPAIGN_MESSAGE = "no campaign is persisted; create a campaign first, e.g. with create_campaign, then retry."
+
+#: Actionable text attached to the ``campaign_in_flight`` soft error returned when
+#: a reset is asked for while leaves may still have a live cluster job: it names
+#: the escape hatch (``force``) rather than silently leaving orphaned jobs.
+IN_FLIGHT_MESSAGE = (
+    "campaign has leaves still submitted/running (or a non-terminal leaf with a "
+    "sim_id, e.g. a lost-ack submission); stop or cancel them first, or pass "
+    "force=true to delete the campaign anyway."
+)
+
+#: Leaf statuses that are not terminal, so a leaf carrying one *and* a ``sim_id``
+#: may have a live job: a lost-ack submission stays ``planned`` but already
+#: stamped a ``sim_id`` (the engine submits before it flips the status), and
+#: deleting then would orphan that job exactly like a ``submitted`` leaf.
+_IN_FLIGHT_STATUSES = frozenset({"planned", "submitted", "running"})
 
 #: A dotted patch-path segment that indexes a list rather than a dict key.
 _LIST_INDEX_RE = re.compile(r"-?\d+")
@@ -199,6 +223,16 @@ class AgendaService:
                 if record.core_hours is not None
             }
 
+        def failures() -> Mapping[str, FailureInfo]:
+            # The registry carries the reason a run failed, projected from the
+            # submit ack or a lifecycle event; only records that have one are
+            # offered.  Redaction is applied at the tool boundary.
+            return {
+                sim_id: FailureInfo(error=record.error, error_code=record.error_code, stage=record.stage)
+                for sim_id, record in registry.items()
+                if record.error or record.error_code
+            }
+
         async def submit(spec: dict[str, Any], key: str) -> str:
             try:
                 outcome = await self.submit_service.submit_spec(send, spec, cmd_id=key)
@@ -209,7 +243,7 @@ class AgendaService:
                 raise TransientSubmitError(msg) from exc
             if not outcome.ok or not outcome.sim_id:
                 msg = outcome.error or "submit failed"
-                raise RuntimeError(msg)
+                raise SubmitFailureError(msg, error_code=outcome.error_code, stage=outcome.stage)
             return outcome.sim_id
 
         def reuse_key(spec: dict[str, Any]) -> str:
@@ -234,6 +268,7 @@ class AgendaService:
             observe=observe,
             policy=self.policy,
             actuals=actuals,
+            failures=failures,
             reuse_lookup=reuse_lookup,
             reuse_record=reuse_record,
             reuse_key=reuse_key,
@@ -644,12 +679,94 @@ class AgendaService:
         self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
         return {"ok": True, "name": name, "leaves": leaves}
 
+    async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
+        """Remove the persisted campaign and its sibling reuse registry.
+
+        This is the reset primitive: ``create_campaign`` refuses to overwrite an
+        existing campaign, so an agent that wants a fresh study must be able to
+        clear the old one through a tool rather than deleting files by hand.
+
+        Deleting while a leaf is still ``submitted``/``running`` would leave the
+        cluster job orphaned (no campaign state to observe or cancel it), so it
+        is refused by default with an actionable ``campaign_in_flight`` error;
+        ``force=True`` overrides the guard and deletes anyway.  The guard holds
+        the lock together with the delete, so a concurrent ``advance_agenda``
+        cannot submit between the check and the removal.
+
+        A campaign file that cannot be parsed is removed without the guard: the
+        reset primitive is the recovery path for broken state, so a corrupt
+        ``campaign.json`` must be clearable through a tool rather than trapping
+        the agent (``create_campaign`` refuses while the file exists).  The
+        in-flight guard can only run when the file parses; an unreadable file
+        has no observable live leaves.
+
+        Args:
+            force: Delete even when leaves may still have a live cluster job.
+
+        Returns:
+            ``{"ok": True, "deleted": [...paths...]}`` on success, the
+            actionable ``no_campaign`` soft error when there is nothing to
+            delete, or ``campaign_in_flight`` when the guard trips.
+
+        """
+        if not self.store.exists():
+            return no_campaign_error()
+        async with self._lock:
+            try:
+                campaign = self.store.load(Campaign)
+            except Exception as exc:  # ruff: ignore[blind-except] - unparseable state is removable
+                # Corrupt/old campaign: no live leaves can be observed, so drop
+                # the file(s) rather than blocking the only reset primitive.
+                log.warning("agenda delete_campaign: removing unparseable campaign: %s", exc)
+                campaign = None
+            try:
+                if campaign is not None:
+                    in_flight = [
+                        path
+                        for path, sim in campaign.agenda.simulations()
+                        if sim.status in _IN_FLIGHT_STATUSES and sim.sim_id
+                    ]
+                    if in_flight and not force:
+                        return {
+                            "ok": False,
+                            "error": "campaign_in_flight",
+                            "message": IN_FLIGHT_MESSAGE,
+                            "in_flight": in_flight,
+                        }
+                deleted = self._remove_campaign_files()
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda delete_campaign failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+        return {"ok": True, "deleted": deleted}
+
+    def _remove_campaign_files(self) -> list[str]:
+        """Delete the campaign file and its sibling reuse registry (may raise).
+
+        Returns:
+            The paths removed, campaign first then reuse registry (each only
+            when it existed).
+
+        """
+        removed: list[str] = []
+        for store in (self.store, self.reuse_store):
+            if store.exists():
+                store.path.unlink()
+                removed.append(str(store.path))
+        return removed
+
     def _validate_leaf_spec(self, spec: dict[str, Any]) -> dict[str, Any] | None:
         """Validate one patched leaf through the submission path.
 
-        Runs the same allow-list check and escaped inline-size cap a
-        ``submit_spec`` would, so a leaf that could never be submitted is
-        rejected at creation.
+        Runs the same allow-list check, the pinned-schema round-trip gate the
+        simclient applies (via :func:`~pic_agentic.simulation_build.
+        check_spec_round_trip`) and the escaped inline-size cap a ``submit_spec``
+        would, so a leaf that could never be submitted is rejected at creation
+        with an actionable reason.
+
+        This is synchronous and runs under the agenda lock.  With the pin
+        importable the round-trip is ~7 ms per leaf, so a 200-leaf campaign
+        blocks the event loop for ~1.5 s; acceptable for now, but if campaigns
+        grow this belongs on a worker thread (the same seam as the build).
 
         Returns:
             ``None`` when the leaf is a valid, in-cap wire spec, else the soft
@@ -660,6 +777,9 @@ class AgendaService:
             payload = self.submit_service.prepare_spec(spec)
         except UnsupportedPayloadError as exc:
             return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(str(exc))}
+        round_trip = check_spec_round_trip(spec)
+        if round_trip is not None:
+            return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(round_trip)}
         size = payload_wire_size(payload)
         if size > MAX_INLINE_PAYLOAD_BYTES:
             return {

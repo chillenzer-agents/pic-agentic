@@ -20,11 +20,13 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from pic_agentic import __version__ as _package_version
 from pic_agentic.protocol.hello import HelloType, build_hello_ack
 from pic_agentic.protocol.simulation import (
     CONTROL_REQUIRES_RUNNING,
     CONTROL_SIGNAL,
     PAYLOAD_KEY,
+    ClientCapabilities,
     ControlParams,
     ResultOp,
     ResultParams,
@@ -38,6 +40,7 @@ from pic_agentic.protocol.simulation import (
     build_status_ack,
     build_submit_ack,
     build_submit_event,
+    client_capability_mismatch,
 )
 from pic_agentic.rcp import DedupStore, Kind, RcpMessage, SenderRole, SequenceState
 from pic_agentic.simclient.follow import JobFollower, TrackedSim
@@ -291,6 +294,10 @@ class SimClient:
         self.control_fn = control_fn
         self.sequences = SequenceState()
         self.seen = DedupStore()
+        #: Capability set advertised in the ``hello`` ack (version handshake).
+        #: Derived from the compiled enums, so an older deployed client simply
+        #: omits a newly added op and the server can name the drift.
+        self.capabilities = ClientCapabilities.current(client_version=_package_version)
         #: Per-sim follow-state and detached watcher tasks, keyed by ``sim_id``.
         self._tracked: dict[str, TrackedSim] = {}
         #: Current watcher per ``sim_id`` (the latest run).
@@ -380,7 +387,8 @@ class SimClient:
             if self.submit_config is None:
                 return await self._reject_m2(message, error="rejected_by_policy")
             return await self._dispatch_m2(message)
-        return await self._ack(message, cmd_id=message.payload.get("cmd_id"), error="rejected_by_policy")
+        # Unknown request type: the deployed client predates this operation.
+        return await self._reject_unsupported(message, request_type=str(message.type))
 
     async def _dispatch_m2(self, message: RcpMessage) -> RcpMessage:
         """Dispatch one of the M2 commands to its handler.
@@ -397,9 +405,48 @@ class SimClient:
             return await self._handle_control(message)
         if message.type == SimulationType.RESULT_COMMAND:
             return await self._handle_result(message)
-        return await self._handle_logs(message)
+        if message.type == SimulationType.LOGS_COMMAND:
+            return await self._handle_logs(message)
+        # A member of ``_M2_COMMANDS`` with no handler: a newer server sent a
+        # command this client does not implement.
+        return await self._reject_unsupported(message, request_type=str(message.type))
 
-    async def _reject_m2(self, message: RcpMessage, *, error: str) -> RcpMessage:
+    async def _reject_unsupported(self, message: RcpMessage, *, op: str = "", request_type: str = "") -> RcpMessage:
+        """Answer a request whose op/type this client does not implement.
+
+        The cluster client is older than the MCP server: name the missing
+        capability and answer in the request's own ack shape so the server
+        reports the drift rather than an opaque policy rejection.
+
+        Returns:
+            The signed acknowledgement that was sent.
+
+        """
+        error = client_capability_mismatch(self.capabilities, op=op, request_type=request_type)
+        code = SimulationErrorCode.UNSUPPORTED_BY_CLIENT
+        if message.type == SimulationType.RESULT_COMMAND:
+            return await self._send(self._build_result_rejection(message, error=error, error_code=code))
+        if message.type == SimulationType.CONTROL_COMMAND:
+            return await self._send(self._build_control_rejection(message, error=error, error_code=code))
+        return await self._reject_pull(message, error=error, error_code=code)
+
+    async def _send(self, ack: RcpMessage) -> RcpMessage:
+        """Send one ack and return it.
+
+        Returns:
+            The ack that was sent.
+
+        """
+        await self.transport.send(ack)
+        return ack
+
+    async def _reject_m2(
+        self,
+        message: RcpMessage,
+        *,
+        error: str,
+        error_code: SimulationErrorCode = SimulationErrorCode.REJECTED,
+    ) -> RcpMessage:
         """Reject an M2 command when the cluster-local handler is disabled.
 
         Returns:
@@ -407,10 +454,16 @@ class SimClient:
 
         """
         if message.type == SimulationType.COMMAND:
-            return await self._reject_submit(message, error=error)
-        return await self._reject_pull(message, error=error)
+            return await self._reject_submit(message, error=error, error_code=error_code)
+        return await self._reject_pull(message, error=error, error_code=error_code)
 
-    async def _reject_pull(self, message: RcpMessage, *, error: str) -> RcpMessage:
+    async def _reject_pull(
+        self,
+        message: RcpMessage,
+        *,
+        error: str,
+        error_code: SimulationErrorCode = SimulationErrorCode.REJECTED,
+    ) -> RcpMessage:
         """Send a status/logs/control-shaped rejection.
 
         Returns:
@@ -426,12 +479,12 @@ class SimClient:
                 lines=[],
                 total_lines=0,
                 error=error,
-                error_code=SimulationErrorCode.REJECTED,
+                error_code=error_code,
             )
         elif message.type == SimulationType.CONTROL_COMMAND:
-            ack = self._build_control_rejection(message, error=error)
+            ack = self._build_control_rejection(message, error=error, error_code=error_code)
         elif message.type == SimulationType.RESULT_COMMAND:
-            ack = self._build_result_rejection(message, error=error)
+            ack = self._build_result_rejection(message, error=error, error_code=error_code)
         else:
             ack = self._build_status_ack(
                 message,
@@ -439,12 +492,18 @@ class SimClient:
                 sim_id=str(message.payload.get("sim_id", "")),
                 state=SimulationState.FAILED.value,
                 error=error,
-                error_code=SimulationErrorCode.REJECTED,
+                error_code=error_code,
             )
         await self.transport.send(ack)
         return ack
 
-    def _build_control_rejection(self, message: RcpMessage, *, error: str) -> RcpMessage:
+    def _build_control_rejection(
+        self,
+        message: RcpMessage,
+        *,
+        error: str,
+        error_code: SimulationErrorCode = SimulationErrorCode.REJECTED,
+    ) -> RcpMessage:
         """Build a control-shaped rejection from a (possibly invalid) payload.
 
         The payload may not parse as :class:`ControlParams`; the fields are read
@@ -466,10 +525,16 @@ class SimClient:
             op=op,
             ok=False,
             error=error,
-            error_code=SimulationErrorCode.REJECTED,
+            error_code=error_code,
         )
 
-    def _build_result_rejection(self, message: RcpMessage, *, error: str) -> RcpMessage:
+    def _build_result_rejection(
+        self,
+        message: RcpMessage,
+        *,
+        error: str,
+        error_code: SimulationErrorCode = SimulationErrorCode.REJECTED,
+    ) -> RcpMessage:
         """Build a result-shaped rejection from a (possibly invalid) payload.
 
         The payload may not parse as :class:`ResultParams`; the fields are read
@@ -490,7 +555,7 @@ class SimClient:
             sim_id=str(message.payload.get("sim_id", "")),
             op=op,
             error=error,
-            error_code=SimulationErrorCode.REJECTED,
+            error_code=error_code,
         )
 
     async def _reject_submit(
@@ -500,6 +565,7 @@ class SimClient:
         error: str,
         sim_id: str = "",
         cmd_id: str = "",
+        error_code: SimulationErrorCode = SimulationErrorCode.REJECTED,
     ) -> RcpMessage:
         """Send a submit-shaped rejection (never a ``hello_ack``).
 
@@ -516,7 +582,7 @@ class SimClient:
             state=SimulationState.FAILED.value,
             job_id=None,
             error=error,
-            error_code=SimulationErrorCode.REJECTED,
+            error_code=error_code,
         )
         await self.transport.send(ack)
         return ack
@@ -1129,6 +1195,36 @@ class SimClient:
             return None
         return info.state
 
+    async def _parse_control_or_reject(self, message: RcpMessage) -> ControlParams | RcpMessage:
+        """Parse a control request, or send and return a shaped rejection.
+
+        An op outside this client's compiled set is a version drift and is
+        answered with the actionable ``unsupported_by_client`` error; anything
+        else that fails validation is an ordinary invalid-params rejection.
+
+        Returns:
+            The parsed params, or the rejection ack that was sent.
+
+        """
+        raw_op = str(message.payload.get("op", ""))
+        if raw_op and not self.capabilities.supports_control_op(raw_op):
+            error = client_capability_mismatch(self.capabilities, op=raw_op)
+            return await self._send(
+                self._build_control_rejection(
+                    message,
+                    error=error,
+                    error_code=SimulationErrorCode.UNSUPPORTED_BY_CLIENT,
+                )
+            )
+        try:
+            return ControlParams.model_validate(
+                {"sim_id": message.payload.get("sim_id"), "op": message.payload.get("op")},
+            )
+        except ValueError as exc:
+            ack = self._build_control_rejection(message, error=f"invalid_control_params:{exc}")
+            await self.transport.send(ack)
+            return ack
+
     async def _handle_control(self, message: RcpMessage) -> RcpMessage:
         """Answer a ``control_request`` (M3).
 
@@ -1142,14 +1238,9 @@ class SimClient:
             The signed ``control_ack`` that was sent.
 
         """
-        try:
-            params = ControlParams.model_validate(
-                {"sim_id": message.payload.get("sim_id"), "op": message.payload.get("op")},
-            )
-        except ValueError as exc:
-            ack = self._build_control_rejection(message, error=f"invalid_control_params:{exc}")
-            await self.transport.send(ack)
-            return ack
+        params = await self._parse_control_or_reject(message)
+        if isinstance(params, RcpMessage):
+            return params
         cmd_id = str(message.payload.get("cmd_id", ""))
         cache_key = (cmd_id, params.sim_id, params.op.value)
         cached = self._control_acks.get(cache_key) if cmd_id else None
@@ -1315,6 +1406,18 @@ class SimClient:
             The signed ``result_ack`` that was sent.
 
         """
+        raw_op = str(message.payload.get("op", ""))
+        if raw_op and not self.capabilities.supports_result_op(raw_op):
+            # An op this client's enum does not know: a version drift, not a
+            # malformed request.  Say so instead of a generic param error.
+            error = client_capability_mismatch(self.capabilities, op=raw_op)
+            return await self._send(
+                self._build_result_rejection(
+                    message,
+                    error=error,
+                    error_code=SimulationErrorCode.UNSUPPORTED_BY_CLIENT,
+                )
+            )
         try:
             params = ResultParams.model_validate(
                 {key: message.payload.get(key) for key in ResultParams.model_fields if key in message.payload},
@@ -1771,15 +1874,6 @@ class SimClient:
             manifest=manifest,
         ).sign(self.secret)
 
-    async def _ack(self, message: RcpMessage, *, cmd_id: object, error: str) -> RcpMessage:
-        ack = self._build_ack(
-            message,
-            cmd_id=str(cmd_id or ""),
-            result=HelloResult(job_id=None, cluster_output=None, error=error),
-        )
-        await self.transport.send(ack)
-        return ack
-
     def _build_ack(self, message: RcpMessage, *, cmd_id: str, result: HelloResult) -> RcpMessage:
         return build_hello_ack(
             sim=self.sim,
@@ -1789,6 +1883,7 @@ class SimClient:
             job_id=result.job_id,
             cluster_output=result.cluster_output,
             error=result.error,
+            capabilities=self.capabilities,
         ).sign(self.secret)
 
     def _outfile_path(self, cmd_id: str) -> Path:

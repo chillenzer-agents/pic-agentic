@@ -12,12 +12,14 @@ the tools run the full durable engine path without a cluster.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
 from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
+from pic_agentic.agenda.reuse import ReuseRegistry
 from pic_agentic.agenda.store import AgendaStore
 from pic_agentic.config import Config
 from pic_agentic.protocol.simulation import SimulationState, SimulationType, build_submit_ack
@@ -104,7 +106,15 @@ async def test_tool_registration_and_annotations() -> None:
         "take_agenda_callbacks",
         "add_agenda_leaf",
         "create_campaign",
+        "delete_campaign",
     } <= set(tools)
+
+    delete = tools["delete_campaign"].annotations
+    assert delete is not None
+    assert delete.read_only_hint is False
+    assert delete.destructive_hint is True
+    assert delete.idempotent_hint is False
+    assert set(tools["delete_campaign"].input_schema["properties"]) == {"force"}
 
     create = tools["create_campaign"].annotations
     assert create is not None
@@ -269,6 +279,61 @@ async def test_concurrent_advance_does_not_duplicate_submissions(tmp_path) -> No
         )
         submitted = first.structured_content["submitted"] + second.structured_content["submitted"]
         assert len(submitted) == 2  # each leaf exactly once, not four
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_failed_leaf_surfaces_the_simclient_reason(tmp_path) -> None:
+    """A rejected submission exposes error/error_code in callbacks and status (P2a).
+
+    The offline responder rejects the submit with the simclient's
+    ``unsupported`` ack; the campaign must surface *why* the leaf failed, not a
+    bare ``failed`` with a null sim_id.
+    """
+    agenda = AgendaGroup(name="g")
+    agenda = agenda.add(leaf0=AgendaSim(name="leaf0", spec={"sim": {"replica": 0}}))
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+
+    async def rejecting() -> None:
+        counter = 0
+        async for command in sim_t.receive():
+            if command.type != SimulationType.COMMAND:
+                continue
+            counter += 1
+            ack = build_submit_ack(
+                sim=SIM,
+                seq=counter,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id="sim0001",
+                state=SimulationState.FAILED,
+                in_reply_to=command.transport_event_id,
+                error="simulation carries fields outside the pinned pypicongpu schema",
+                error_code="unsupported",
+            ).sign(SECRET)
+            await sim_t.send(ack)
+
+    tasks = [asyncio.create_task(rejecting()), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        tick = (await server.call_tool("advance_agenda", {})).structured_content
+        assert tick["failed"] == ["leaf0"]
+        (callback,) = tick["callbacks"]
+        assert callback["error"] == "simulation carries fields outside the pinned pypicongpu schema"
+        assert callback["error_code"] == "unsupported"
+
+        status = (await server.call_tool("agenda_status", {})).structured_content
+        leaf = next(item for item in status["leaves"] if item["path"] == "leaf0")
+        assert leaf["status"] == "failed"
+        assert leaf["error_code"] == "unsupported"
+
+        drained = (await server.call_tool("take_agenda_callbacks", {})).structured_content
+        assert drained["callbacks"][0]["error_code"] == "unsupported"
     finally:
         for task in tasks:
             task.cancel()
@@ -515,6 +580,60 @@ async def test_create_campaign_rejects_duplicate_values(tmp_path) -> None:
     assert not (tmp_path / "campaign.json").exists()
 
 
+#: The three ``base_spec`` a beta agent passed to ``create_campaign``; the first
+#: two store ``num_tmp_field_slots`` (a computed field) one level too deep.
+CAMPAIGN_SPECS = Path(__file__).parent / "fixtures" / "campaign_specs.json"
+
+
+def _campaign_spec(index: int) -> dict:
+    return json.loads(CAMPAIGN_SPECS.read_text(encoding="utf-8"))[index]
+
+
+async def test_create_campaign_rejects_a_misplaced_computed_field(tmp_path) -> None:
+    """A spec whose computed field is nested fails at creation, actionably (P2b).
+
+    ``num_tmp_field_slots`` is a ``@computed_field`` on ``collisional_physics``,
+    so storing it under ``numerics_config`` is dropped on re-validation and the
+    simclient rejects the leaf later as ``unsupported``.  The create-time gate
+    must name the offending path instead of letting the campaign fail silently.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "bad",
+            "base_spec": _campaign_spec(0),
+            "patch_path": "sim.time_steps",
+            "values": [100, 200],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    assert "collisional_physics.numerics_config.num_tmp_field_slots" in result["detail"]
+    assert "collisional_physics.num_tmp_field_slots" in result["detail"]
+    # The malformed campaign was not persisted.
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_accepts_a_build_spec_shaped_spec(tmp_path) -> None:
+    """A spec whose computed field is at the correct level works unchanged (P2b)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "good",
+            "base_spec": _campaign_spec(2),
+            "patch_path": "sim.time_steps",
+            "values": [100, 200],
+        },
+    )
+    assert result == {"ok": True, "name": "good", "leaves": ["leaf000", "leaf001"]}
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["time_steps"] == 100
+
+
 async def test_create_campaign_rejects_a_non_wire_spec(tmp_path) -> None:
     """A base_spec that is not an allow-listed ``{"sim": ...}`` wire is refused (B2)."""
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
@@ -584,3 +703,110 @@ async def test_create_campaign_rejects_a_typo_field(tmp_path) -> None:
     assert result["ok"] is False
     assert result["error"] == "invalid_campaign"
     assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_delete_campaign_removes_both_files_then_no_campaign(tmp_path) -> None:
+    campaign = Path(_campaign_file(tmp_path))
+    reuse = tmp_path / "reuse-registry.json"
+    AgendaStore(tmp_path, filename="reuse-registry.json").save(ReuseRegistry())
+    assert campaign.exists()
+    assert reuse.exists()
+
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+    result = await _call(config, "delete_campaign", {})
+    assert result["ok"] is True
+    assert set(result["deleted"]) == {str(campaign), str(reuse)}
+    assert not campaign.exists()
+    assert not reuse.exists()
+
+    # With the state gone, status reports the actionable no_campaign error.
+    status = await _call(config, "agenda_status", {})
+    assert status == NO_CAMPAIGN
+
+
+async def test_delete_campaign_without_a_campaign_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
+    result = await _call(config, "delete_campaign", {})
+    assert result["error"] == "no_campaign"
+    assert result["message"] == NO_CAMPAIGN_MESSAGE
+    assert "create_campaign" in result["message"]
+
+
+def _campaign_file_with_status(tmp_path: Path, status: str) -> str:
+    agenda = AgendaGroup(name="group").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, status=status, sim_id="sim0001")
+    )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    return str(tmp_path / "campaign.json")
+
+
+async def test_delete_campaign_refuses_while_a_leaf_is_in_flight(tmp_path) -> None:
+    campaign = Path(_campaign_file_with_status(tmp_path, "running"))
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    refused = await _call(config, "delete_campaign", {})
+    assert refused["ok"] is False
+    assert refused["error"] == "campaign_in_flight"
+    assert refused["in_flight"] == ["leaf"]
+    assert "force" in refused["message"]
+    assert campaign.exists()
+
+
+async def test_delete_campaign_force_overrides_the_in_flight_guard(tmp_path) -> None:
+    campaign = Path(_campaign_file_with_status(tmp_path, "submitted"))
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    result = await _call(config, "delete_campaign", {"force": True})
+    assert result["ok"] is True
+    assert not campaign.exists()
+
+    # A finished leaf is not in flight, so the default delete succeeds.
+    done = Path(_campaign_file_with_status(tmp_path, "done"))
+    done_result = await _call(config, "delete_campaign", {})
+    assert done_result["ok"] is True
+    assert not done.exists()
+
+
+async def test_delete_campaign_clears_a_corrupt_campaign(tmp_path) -> None:
+    """A corrupt campaign is removable: the reset primitive is the recovery path (B2).
+
+    ``create_campaign`` refuses while the file exists and the in-flight guard
+    loads the campaign, so without this the agent could never clear an
+    unparseable file through any tool.
+    """
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text("{ this is not json", encoding="utf-8")
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    # A fresh campaign is blocked while the file exists.
+    blocked = await _call(
+        config,
+        "create_campaign",
+        {"name": "x", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": [1]},
+    )
+    assert blocked == {"ok": False, "error": "campaign_exists"}
+
+    result = await _call(config, "delete_campaign", {})
+    assert result["ok"] is True
+    assert str(campaign) in result["deleted"]
+    assert not campaign.exists()
+
+    # With the broken state gone, status reports the actionable no_campaign.
+    status = await _call(config, "agenda_status", {})
+    assert status == NO_CAMPAIGN
+
+
+async def test_delete_campaign_guards_a_planned_leaf_with_a_sim_id(tmp_path) -> None:
+    """A lost-ack leaf (planned + sim_id) still counts as in flight (m1)."""
+    campaign = Path(_campaign_file_with_status(tmp_path, "planned"))
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    refused = await _call(config, "delete_campaign", {})
+    assert refused["ok"] is False
+    assert refused["error"] == "campaign_in_flight"
+    assert refused["in_flight"] == ["leaf"]
+    assert campaign.exists()
+
+    forced = await _call(config, "delete_campaign", {"force": True})
+    assert forced["ok"] is True
+    assert not campaign.exists()

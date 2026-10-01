@@ -27,3 +27,5 @@ def test_instructions_point_at_the_picongpu_documentation_and_examples() -> None
     # The campaign-entry tools the agent needs are named.
     assert "build_spec" in SERVER_INSTRUCTIONS
     assert "create_campaign" in SERVER_INSTRUCTIONS
+    # The reset path for starting a fresh campaign is named too.
+    assert "delete_campaign" in SERVER_INSTRUCTIONS

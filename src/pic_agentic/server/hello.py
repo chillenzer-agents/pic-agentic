@@ -18,6 +18,7 @@ from pathlib import Path
 from pydantic import BaseModel, computed_field
 
 from pic_agentic.protocol.hello import HelloType, build_hello_command
+from pic_agentic.protocol.simulation import ClientCapabilities
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 
 #: Async sender signature used to dispatch one RCP message.
@@ -33,6 +34,9 @@ class HelloOutcome(BaseModel):
     cluster_output: str | None
     acked: bool
     error: str | None = None
+    #: The client's advertised capability set, when the client is new enough to
+    #: send one.  ``None`` means an old client that predates the handshake.
+    capabilities: ClientCapabilities | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -74,6 +78,9 @@ class HelloService:
         self.resend_once = resend_once
         self.sequences = SequenceState()
         self._pending: dict[str, asyncio.Future[RcpMessage]] = {}
+        #: Latest capability set advertised by the simclient's ``hello`` ack
+        #: (the version handshake); None until a hello or capability probe runs.
+        self.capabilities: ClientCapabilities | None = None
 
     def message_path_for(self, cmd_id: str) -> str:
         """Return the server-generated path for a command's message file.
@@ -129,10 +136,35 @@ class HelloService:
                 sender_role=SenderRole.SIMCLIENT,
                 sim=self.sim,
             ) if message.verify(self.secret):
+                self._record_capabilities(message)
                 cmd_id = str(message.payload.get("cmd_id", ""))
                 future = self._pending.get(cmd_id)
                 if future is not None and not future.done():
                     future.set_result(message)
+
+    def _record_capabilities(self, message: RcpMessage) -> None:
+        """Refresh the cached capability set from a ``hello`` ack.
+
+        The cache is replaced on *every* ack, not only when an advertisement is
+        present: a missing or malformed advertisement (an older client, or a
+        forward-compatible one) means *unknown*, so it clears the cache rather
+        than leaving a stale set that could keep refusing a now-supported op.
+        ``None`` never blocks a request.
+
+        Args:
+            message: A verified ``rcp.hello_ack`` from the simclient.
+
+        """
+        advertised = message.payload.get("capabilities")
+        if not isinstance(advertised, dict):
+            self.capabilities = None
+            return
+        try:
+            self.capabilities = ClientCapabilities.model_validate(advertised)
+        except ValueError:
+            # A malformed advertisement disables the proactive drift check
+            # (unknown), never fatal.
+            self.capabilities = None
 
     async def hello(self, send: SendFn, message: str = "Hello World") -> HelloOutcome:
         """Send a ``hello`` command and wait for its ack.
@@ -178,6 +210,7 @@ class HelloService:
             cluster_output=ack.payload.get("cluster_output"),
             acked=True,
             error=ack.payload.get("error"),
+            capabilities=self.capabilities,
         )
 
 

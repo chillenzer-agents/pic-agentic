@@ -65,6 +65,11 @@ class SimulationErrorCode(StrEnum):
     READER_UNAVAILABLE = "reader_unavailable"
     NO_RESULTS = "no_results"
     RESULT_TOO_LARGE = "result_too_large"
+    #: The cluster client does not recognise the request's op/type (an unknown
+    #: enum member or a missing handler), i.e. the server and the deployed
+    #: client are on different versions.  Naming the unsupported capability
+    #: turns a silent opaque rejection into an actionable version-drift error.
+    UNSUPPORTED_BY_CLIENT = "unsupported_by_client"
 
 
 class SimulationExecutionError(RuntimeError):

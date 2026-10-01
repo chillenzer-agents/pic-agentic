@@ -12,8 +12,12 @@ simclient writes the message there, and the job body is ``cat '<path>'``.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, new_cmd_id
+
+if TYPE_CHECKING:
+    from pic_agentic.protocol.simulation import ClientCapabilities
 
 
 class HelloType(StrEnum):
@@ -65,8 +69,13 @@ def build_hello_ack(
     job_id: int | None,
     cluster_output: str | None,
     error: str | None = None,
+    capabilities: ClientCapabilities | None = None,
 ) -> RcpMessage:
     """Build the simclient-to-room acknowledgement of a ``hello`` command.
+
+    The ack doubles as the capability handshake: when ``capabilities`` is
+    given, the server caches it and can warn about a server/client version
+    drift before sending an op the older client cannot handle.
 
     Returns:
         The unsigned ``rcp.hello_ack`` message.
@@ -77,6 +86,8 @@ def build_hello_ack(
         "job_id": job_id,
         "cluster_output": cluster_output,
     }
+    if capabilities is not None:
+        payload["capabilities"] = capabilities.model_dump(mode="json")
     if error:
         payload["error"] = error
     return RcpMessage(

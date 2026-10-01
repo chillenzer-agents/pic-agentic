@@ -71,6 +71,9 @@ ReuseKeyFn = Callable[[Mapping[str, Any]], str]
 #: ``() -> {sim_id: ActualUsage}`` actual-cost observation callable (gap 4).
 ActualsFn = Callable[[], Mapping[str, "ActualUsage"]]
 
+#: ``() -> {sim_id: FailureInfo}`` observation callable for failure reasons.
+FailuresFn = Callable[[], Mapping[str, "FailureInfo"]]
+
 log = logging.getLogger(__name__)
 
 
@@ -82,6 +85,16 @@ class ActualUsage(BaseModel):
     core_hours: float
     gpu_hours: float = 0.0
     is_gpu: bool = False
+
+
+class FailureInfo(BaseModel):
+    """The reason a simulation failed, as reported by the simclient."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    error: str | None = None
+    error_code: str | None = None
+    stage: str | None = None
 
 
 #: A leaf status that still requires engine action.
@@ -116,6 +129,29 @@ class TransientSubmitError(RuntimeError):
     transient error, but marks it ``failed`` for any other submission error (a
     rejected payload, a build failure), which a retry would only repeat.
     """
+
+
+class SubmitFailureError(RuntimeError):
+    """A terminal submission rejection carrying the simclient's reason.
+
+    The submit callable raises this (instead of a bare ``RuntimeError``) when
+    the simclient rejected the spec: the ``error``/``error_code``/``stage`` are
+    persisted onto the leaf and its failed callback so the campaign can surface
+    *why* a leaf failed rather than only that it did.
+    """
+
+    def __init__(self, message: str, *, error_code: str | None = None, stage: str | None = None) -> None:
+        """Create the failure.
+
+        Args:
+            message: The human-readable rejection reason.
+            error_code: The simclient's stable machine-readable code, if any.
+            stage: The pipeline stage the failure occurred in, if reported.
+
+        """
+        super().__init__(message)
+        self.error_code = error_code
+        self.stage = stage
 
 
 class EnginePolicy(BaseModel):
@@ -170,6 +206,7 @@ class AgendaEngine:
         policy: EnginePolicy | None = None,
         approve: Callable[[str], bool] | None = None,
         actuals: ActualsFn | None = None,
+        failures: FailuresFn | None = None,
         reuse_lookup: ReuseLookupFn | None = None,
         reuse_record: ReuseRecordFn | None = None,
         reuse_key: ReuseKeyFn | None = None,
@@ -188,6 +225,10 @@ class AgendaEngine:
             actuals: Optional ``() -> {sim_id: ActualUsage}`` callable supplying
                 the cluster's actual cost for finished runs (gap 4); when given,
                 a finished leaf's usage estimate is corrected to the actual.
+            failures: Optional ``() -> {sim_id: FailureInfo}`` callable supplying
+                the simclient's reason for a failed run.  When given, a leaf that
+                reaches a failed state has the reason stamped onto its callback
+                and persisted status.
             reuse_lookup: Optional ``(key) -> ReuseRecord | None`` that returns
                 a completed run whose key matches, so the leaf is linked to it
                 instead of being submitted again.  Without it (and without
@@ -206,6 +247,7 @@ class AgendaEngine:
         self.policy = policy or EnginePolicy()
         self.approve = approve
         self.actuals = actuals
+        self.failures = failures
         self.reuse_lookup = reuse_lookup
         self.reuse_record = reuse_record
         self.reuse_key = reuse_key or _wire_hash
@@ -223,6 +265,7 @@ class AgendaEngine:
         before = {path: sim.status for path, sim in campaign.agenda.simulations()}
         budget = self.budget_override or campaign.budget
         observed = self.observe()
+        failures = self._observe_failures()
         campaign, steps, reused = self._plan(campaign, budget, observed)
         # Refuse a campaign whose submissions would collide *before* submitting
         # anything: a duplicate payload maps two leaves to one sim_id, so a
@@ -235,7 +278,7 @@ class AgendaEngine:
         # transition durable: if a later submit raises or the process crashes,
         # the callback is already on disk rather than lost (the next tick would
         # see the leaf already terminal and emit nothing).
-        campaign, emitted = self._emit_callbacks(campaign, before)
+        campaign, emitted = self._emit_callbacks(campaign, before, failures)
         result = TickResult(state=campaign.state, callbacks=list(emitted), reused=list(reused))
         self.store.save(campaign)
         campaign = await self._run_steps(campaign, steps, result, budget)
@@ -262,7 +305,7 @@ class AgendaEngine:
         concurrency_cap = budget.max_concurrent_jobs
         for path, step in steps:
             if step.action != "submit":
-                campaign, terminal = self._persist_terminal(campaign, path, step.action)
+                campaign, terminal = self._persist_terminal(campaign, path, step.action, reason=step.reason)
                 if terminal is not None:
                     result.callbacks.append(terminal)
                 _bucket(result, path, step.action)
@@ -360,7 +403,20 @@ class AgendaEngine:
             if leaf is None:
                 return campaign, None, False
             leaf.status = "failed"
-            callback = Callback(path=path, kind="failed", sim_id=leaf.sim_id, ts=utc_now_iso())
+            error_code = getattr(exc, "error_code", None)
+            stage = getattr(exc, "stage", None)
+            leaf.error = str(exc)
+            leaf.error_code = error_code
+            leaf.stage = stage
+            callback = Callback(
+                path=path,
+                kind="failed",
+                sim_id=leaf.sim_id,
+                ts=utc_now_iso(),
+                error=str(exc),
+                error_code=error_code,
+                stage=stage,
+            )
             updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
             return updated, callback, False
 
@@ -393,37 +449,82 @@ class AgendaEngine:
                 log.warning("reuse record failed for sim %s", sim.sim_id)
 
     @staticmethod
-    def _emit_callbacks(campaign: Campaign, before: Mapping[str, str]) -> tuple[Campaign, list[Callback]]:
+    def _emit_callbacks(
+        campaign: Campaign,
+        before: Mapping[str, str],
+        failures: Mapping[str, FailureInfo],
+    ) -> tuple[Campaign, list[Callback]]:
         """Append a callback for every leaf that newly reached done/failed.
 
         Edge-triggered against the *persisted* pre-tick statuses, so a restart
         between a transition and the agent's poll never re-emits: once the leaf
         is terminal on disk, a later tick sees no transition.  The callbacks are
         accumulated on the campaign (and drained by ``take_agenda_callbacks``),
-        so they survive the restart that follows the transition.
+        so they survive the restart that follows the transition.  A failed
+        transition also stamps the observed reason (``error``/``error_code``/
+        ``stage``) onto the leaf and its callback, so the campaign can report
+        *why* it failed.
 
         Returns:
             The campaign with the new callbacks appended, and the new callbacks.
 
         """
         emitted: list[Callback] = []
-        for path, sim in campaign.agenda.simulations():
+        agenda = campaign.agenda.model_copy(deep=True)
+        for path, sim in agenda.simulations():
             if sim.status not in {"done", "failed"} or before.get(path) == sim.status:
                 continue
-            emitted.append(Callback(path=path, kind=sim.status, sim_id=sim.sim_id, ts=utc_now_iso()))
+            failure = failures.get(sim.sim_id) if sim.sim_id else None
+            callback = Callback(path=path, kind=sim.status, sim_id=sim.sim_id, ts=utc_now_iso())
+            if sim.status == "failed" and failure is not None:
+                sim.error = failure.error
+                sim.error_code = failure.error_code
+                sim.stage = failure.stage
+                callback = callback.model_copy(
+                    update={"error": failure.error, "error_code": failure.error_code, "stage": failure.stage}
+                )
+            emitted.append(callback)
         if not emitted:
             return campaign, emitted
-        return campaign.model_copy(update={"callbacks": [*campaign.callbacks, *emitted]}), emitted
+        updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, *emitted]})
+        return updated, emitted
+
+    def _observe_failures(self) -> Mapping[str, FailureInfo]:
+        """Return sim_id -> failure reason for the campaign's known sims.
+
+        Best-effort: a lookup that raises yields no reason rather than breaking
+        the tick.  Returns an empty mapping when no ``failures`` callable was
+        injected.
+
+        Returns:
+            The observed failure reasons keyed by ``sim_id``.
+
+        """
+        if self.failures is None:
+            return {}
+        try:
+            return self.failures()
+        except Exception as exc:  # ruff: ignore[blind-except] - failure lookup must never break a tick
+            log.warning("agenda failures lookup failed: %s", exc)
+            return {}
 
     @staticmethod
-    def _persist_terminal(campaign: Campaign, path: str, action: str) -> tuple[Campaign, Callback | None]:
+    def _persist_terminal(
+        campaign: Campaign,
+        path: str,
+        action: str,
+        *,
+        reason: str | None = None,
+    ) -> tuple[Campaign, Callback | None]:
         """Persist a planner-terminal decision the observation did not cover.
 
         A leaf blocked by a failed dependency is reported ``failed`` by the
         planner but has no observed state of its own, so its folded status would
         stay ``planned`` and the campaign could never be ``complete``.  Writing
         the terminal status back closes that gap, and a callback is emitted for
-        the transition (it is a decision point like any other).
+        the transition (it is a decision point like any other).  The planner's
+        ``reason`` (e.g. which dependency failed) is stamped on the callback so
+        the campaign can report *why* the successor was failed.
 
         Returns:
             The campaign (with the leaf's status updated when terminal) and the
@@ -438,6 +539,9 @@ class AgendaEngine:
             return campaign, None
         leaf.status = action
         callback = Callback(path=path, kind=action, sim_id=leaf.sim_id, ts=utc_now_iso())
+        if action == "failed" and reason:
+            leaf.error = reason
+            callback = callback.model_copy(update={"error": reason})
         updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
         return updated, callback
 
@@ -627,6 +731,9 @@ class AgendaEngine:
                     "point": sim.point,
                     "requires_approval": sim.requires_approval,
                     "approved": sim.approved,
+                    "error": sim.error,
+                    "error_code": sim.error_code,
+                    "stage": sim.stage,
                 },
             )
         return {
@@ -654,6 +761,9 @@ class AgendaEngine:
                 "status": sim.status,
                 "point": sim.point,
                 "spec_hash": _spec_hash(sim.spec),
+                "error": sim.error,
+                "error_code": sim.error_code,
+                "stage": sim.stage,
                 "estimated_core_hours": sim.estimated_core_hours,
                 "actual_core_hours": sim.actual_core_hours,
                 "actual_gpu_hours": sim.actual_gpu_hours,
@@ -832,7 +942,10 @@ __all__ = [
     "AgendaEngine",
     "DuplicateSpecError",
     "EnginePolicy",
+    "FailureInfo",
+    "FailuresFn",
     "ObserveFn",
+    "SubmitFailureError",
     "SubmitFn",
     "TickResult",
     "leaf_at",

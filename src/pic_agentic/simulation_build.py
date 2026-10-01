@@ -41,6 +41,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +58,19 @@ import sys
 from picongpu import __version__
 from picongpu import picmi
 from picongpu.pypicongpu.runner import Runner
+
+
+def _noop(*_args, **_kwargs):
+    return None
+
+
+# The tool only needs the ``picmi.Simulation`` object, but the documented PICMI
+# examples end with ``sim.run(...)``.  Neutralise the build/submit entry points
+# so a trailing run() (or write_input_file) does not compile or touch the
+# cluster; the script's simulation object is still fully constructed by then.
+picmi.Simulation.run = _noop
+picmi.Simulation.picongpu_run = _noop
+picmi.Simulation.write_input_file = _noop
 
 
 def _canonical_bytes(obj):
@@ -185,6 +199,186 @@ class BuiltSimulation:
     schema_hash: str
 
 
+#: Curated ``pypicongpu`` ``@computed_field`` placements (field -> the ``sim``
+#: sub-path it belongs on).  A caller copying a dump around may store such a
+#: field one level too deep; that dump fails the simclient's round-trip gate as
+#: ``unsupported``.  Naming the expected parent here lets a server without
+#: PIConGPU still produce the actionable create-time error (the exact check runs
+#: when the pin is importable).  Extend as further computed fields surface.
+_KNOWN_COMPUTED_FIELDS = {"num_tmp_field_slots": "collisional_physics"}
+
+#: Sentinel paths created by :func:`check_spec_round_trip` when it replays the
+#: simclient gate.  They are deliberately outside any real spec (a leading
+#: double underscore is not a pypicongpu field) and only serve to satisfy
+#: ``Runner``'s required ``setup_dir``/``run_dir``.
+_CHECK_SETUP_DIR = "/__pic_agentic_spec_check__/input"
+_CHECK_RUN_DIR = "/__pic_agentic_spec_check__/run"
+
+
+def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
+    """Check that ``sim`` reproduces itself through the pinned ``Runner``.
+
+    This mirrors the simclient's gate *exactly*: the simclient rebuilds a
+    ``Runner`` from a **reduced** dump -- ``{"sim": <sim>, "setup_dir": ...,
+    "run_dir": ...}`` plus ``template_dir`` only when it is configured -- and
+    rejects the payload as ``unsupported`` when
+    ``Runner.model_validate(dump).sim.model_dump(mode="json") != <sim>``.  It
+    never validates the caller's sibling keys, so this check must not either
+    (doing so would reject a valid spec over an unrelated ``template_dir`` or
+    ``setup_dir`` shape the simclient drops).  Running the same check at
+    campaign-creation time turns a later catastrophic leaf failure into an
+    immediate, precise error.
+
+    The check only *rejects* when a requested value is genuinely lost: if the
+    re-validated ``sim`` differs but every leaf the caller supplied survives
+    (the pin may add computed metadata such as ``precision_overrides``), or if
+    the ``sim`` does not validate at all (the simclient answers the same
+    payload with an equally explicit ``payload_invalid`` at submit time), the
+    spec is accepted rather than over-rejected.  Only a nested field that is
+    silently dropped is reported.
+
+    When PIConGPU is not importable (a server without the pin) the check degrades
+    to a curated, **best-effort** detector of known computed-field shapes rather
+    than skipping entirely.  It cannot catch an arbitrary unknown field (that
+    needs the pin), so the create-time guarantee is exact only where the pin is
+    importable.
+
+    Args:
+        runner_dump: A wire spec carrying ``sim`` (a ``Runner`` dump).
+
+    Returns:
+        An actionable message when a requested field would be silently dropped,
+        else ``None`` (including when there is no ``sim`` mapping to check).
+
+    """
+    sim_dump = runner_dump.get("sim")
+    if not isinstance(sim_dump, dict):
+        return None
+    try:
+        from picongpu.pypicongpu.runner import (  # ruff: ignore[import-outside-top-level] - optional dependency
+            Runner,
+        )
+    except ImportError:
+        return _detect_misplaced_computed_field(sim_dump)
+    # Build the same reduced dump the simclient builds.  The caller's sibling
+    # keys (run_dir/setup_dir/template_dir/provenance/...) are dropped, exactly
+    # as the simclient drops them; the sentinel directories satisfy Runner's
+    # required fields without claiming any caller value.
+    reduced: dict[str, object] = {
+        "sim": sim_dump,
+        "setup_dir": _CHECK_SETUP_DIR,
+        "run_dir": _CHECK_RUN_DIR,
+    }
+    try:
+        # A validation warning (e.g. a laser pulse truncated by a too-short run)
+        # is not a schema violation; the simclient validates without ``error``
+        # filters, so suppress warnings here to match its semantics.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            runner = Runner.model_validate(reduced)
+    except Exception:  # ruff: ignore[blind-except] - the simclient reports this as payload_invalid; do not over-reject
+        return None
+    dumped = runner.sim.model_dump(mode="json")
+    if dumped == sim_dump:
+        return None
+    if not _dropped_leaf_paths(sim_dump, dumped):
+        # Nothing the caller asked for was dropped: the difference is metadata
+        # the pin normalised or added on re-validation (e.g. a recomputed
+        # ``precision_overrides`` or computed defaults a minimal test spec
+        # leaves out).  There is no lost field and no actionable path to name,
+        # so accept it rather than over-rejecting a genuinely valid spec.
+        return None
+    return _round_trip_diff_message(sim_dump, dumped)
+
+
+def _dropped_leaf_paths(before: object, after: object) -> list[str]:
+    """Return the caller-supplied leaf paths absent from the round-tripped dump.
+
+    These are the fields the schema silently dropped.  A computed field the
+    caller stored at the wrong level also shows up here, so
+    :func:`_round_trip_diff_message` can name the move; re-serialisation that
+    only changes or adds values (not paths) contributes nothing.
+
+    Returns:
+        The dropped paths, in the input's deterministic order.
+
+    """
+    to_paths = set(_leaf_paths(after))
+    return [path for path in _leaf_paths(before) if path not in to_paths]
+
+
+def _round_trip_diff_message(before: object, after: object) -> str:
+    """Return an actionable message for a spec that changed under re-validation.
+
+    A leaf path present in the input but absent from the round-tripped dump was
+    dropped by the schema.  When the same final segment reappears elsewhere in
+    the dump, the field was misplaced (a common copy-through-the-wrong-level
+    mistake) and the message names the correct path.
+
+    Returns:
+        The message naming the offending path.
+
+    """
+    from_paths = _leaf_paths(before)
+    to_paths = _leaf_paths(after)
+    dropped = [path for path in from_paths if path not in to_paths]
+    for path in dropped:
+        segment = path.rsplit(".", 1)[-1]
+        suggestion = next((other for other in to_paths if other.rsplit(".", 1)[-1] == segment), None)
+        if suggestion is not None:
+            return (
+                f"{path} is not part of the pinned pypicongpu schema at this path; move it to {suggestion} and resubmit"
+            )
+        return f"{path} is not part of the pinned pypicongpu schema and would be silently dropped"
+    return "spec does not reproduce itself under the pinned pypicongpu schema"
+
+
+def _detect_misplaced_computed_field(sim_dump: dict[str, object]) -> str | None:
+    """Best-effort detection of a computed field stored one level too deep.
+
+    Used when PIConGPU is not importable server-side.  A known ``@computed_field``
+    under a sub-model is reported with its likely correct parent path.
+
+    Returns:
+        The actionable message, or ``None`` when nothing matches.
+
+    """
+    for path in _leaf_paths(sim_dump):
+        segment = path.rsplit(".", 1)[-1]
+        expected_parent = _KNOWN_COMPUTED_FIELDS.get(segment)
+        if expected_parent is None:
+            continue
+        container, _, _ = path.rpartition(".")
+        if container == expected_parent:
+            # Already at its correct level.
+            continue
+        return (
+            f"{path} is not part of the pinned pypicongpu schema at this path; "
+            f"move the computed field {segment!r} to {expected_parent}.{segment} and resubmit"
+        )
+    return None
+
+
+def _leaf_paths(value: object, prefix: str = "") -> list[str]:
+    """Return the dotted paths of every scalar leaf in a nested JSON value.
+
+    Returns:
+        The leaf paths, in deterministic (insertion/ascending) order.
+
+    """
+    paths: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(_leaf_paths(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            paths.extend(_leaf_paths(item, f"{prefix}[{index}]"))
+    else:
+        paths.append(prefix)
+    return paths
+
+
 #: Maximum number of stderr characters echoed back in a build error.  The
 #: child is untrusted, so its stderr is treated as hostile input: only a
 #: bounded tail is kept, and the message labels it as untrusted.
@@ -305,7 +499,10 @@ async def build_runner_dump(
         shutil.rmtree(scratch_home, ignore_errors=True)
     if process.returncode != 0:
         detail = _bounded_stderr(stderr, stdout)
-        msg = f"PICMI script failed (rc={process.returncode})"
+        msg = (
+            f"PICMI script failed (rc={process.returncode}); the script must define exactly one "
+            "picmi.Simulation object and does not need to run it (a trailing sim.run() is ignored)"
+        )
         if detail:
             msg = f"{msg}: {detail}"
         raise SimulationBuildError(msg)

@@ -152,6 +152,9 @@ class HelloRuntime:
         backfilled = await self._transport.backfill()
         for message in backfilled:
             self.service.on_message(message)
+        # A replayed ``hello_ack`` re-establishes the capability handshake across
+        # a server restart.
+        self.submit_service.set_client_capabilities(self.service.capabilities)
         self.submit_service.ingest_backfill(backfilled)
         # With a human room configured, one pump loop serves both the signed RCP
         # room and the human chat (they share the sync position); otherwise the
@@ -163,6 +166,10 @@ class HelloRuntime:
         # Both services filter by envelope kind/type/sim/signature, so feeding
         # every message to both is safe and keeps the routing trivial.
         self.service.on_message(message)
+        # Propagate the capability handshake learned from a ``hello`` ack so the
+        # submit service can warn about a version drift before sending an op the
+        # older client cannot handle.
+        self.submit_service.set_client_capabilities(self.service.capabilities)
         self.submit_service.on_message(message)
 
     async def _pump_forever(self) -> None:
@@ -530,6 +537,16 @@ class HelloRuntime:
         """
         return await self.agenda_service.create_campaign(name, base_spec, patch_path, values)
 
+    async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
+        """Remove the persisted campaign and its reuse registry (reset).
+
+        Returns:
+            ``{"ok": True, "deleted": [...]}``, or a soft error
+            (``no_campaign``, ``campaign_in_flight``).
+
+        """
+        return await self.agenda_service.delete_campaign(force=force)
+
     async def record_analysis(self, path: str, analysis: dict[str, Any]) -> dict[str, Any]:
         """Record one leaf's analysis on the campaign.
 
@@ -668,6 +685,9 @@ SERVER_INSTRUCTIONS = (
     "or, for parameter studies, as a pypicongpu Runner spec "
     "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
     "a spec field across values). "
+    "create_campaign refuses to overwrite an existing campaign; to start a fresh "
+    "one, remove the old state first with delete_campaign (reset), optionally "
+    "after stop_agenda to cancel in-flight jobs. "
     "For how to write a PICMI input file and how to define or scan multiple "
     "simulations, see the PyPIConGPU documentation: the page 'Defining Your "
     "Simulation' under python_package/foundations/defining_simulation "
@@ -726,7 +746,9 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "Build a PICMI simulation script into a PyPIConGPU runner, send it "
             "through the Matrix control channel to the simulation-side client "
             "and submit it to the remote SLURM cluster. Returns the simulation "
-            "id and the coarse accepted/submitted state."
+            "id and the coarse accepted/submitted state. The script should "
+            "define a single picmi.Simulation; a trailing sim.run(...) is "
+            "tolerated and ignored (the tool never runs it here)."
         ),
         # write/resource tier: consumes cluster resources, not destructive
         # (design section 6.2).  The server-side MCP client prompts for human
@@ -765,7 +787,9 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "a base spec for create_campaign or add_agenda_leaf. The returned "
             "`spec` is the inline `{sim: ...}` wire object accepted by those "
             "tools; the result also reports the encoded wire size and whether it "
-            "fits the 48 KiB inline submission limit."
+            "fits the 48 KiB inline submission limit. The script should define "
+            "a single picmi.Simulation; a trailing sim.run(...) is tolerated "
+            "and ignored (the tool never runs it here)."
         ),
         # read-tier: it builds locally and starts no cluster work.
         annotations=_READ_ONLY,
@@ -1190,6 +1214,25 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         values: list[Any],
     ) -> dict[str, Any]:
         result = await runtime.create_campaign(name, base_spec, patch_path, values)
+        return _redact_dict(runtime, result)
+
+    @server.tool(
+        title="Delete/reset the campaign",
+        description=(
+            "Remove the persisted campaign and its sibling reuse registry, so a "
+            "fresh campaign can be created (create_campaign refuses to overwrite "
+            "an existing one). Refused with an actionable `campaign_in_flight` "
+            "error while any leaf may still have a live cluster job (submitted/"
+            "running, or a non-terminal leaf carrying a sim_id such as a lost-ack "
+            "submission), since deleting then would orphan the jobs; pass "
+            "force=true to delete anyway, or stop_agenda first to cancel them. A "
+            "corrupt campaign file is removed without the guard."
+        ),
+        # destructive: it irreversibly removes the persisted campaign state.
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+    )
+    async def delete_campaign(*, force: bool = False) -> dict[str, Any]:
+        result = await runtime.delete_campaign(force=force)
         return _redact_dict(runtime, result)
 
     @server.tool(
@@ -1676,6 +1719,13 @@ def _outcome_dict(runtime: HelloRuntime, outcome: HelloOutcome) -> dict[str, Any
         "acked": outcome.acked,
         "cluster_output": redact(outcome.cluster_output) if outcome.cluster_output else None,
     }
+    if outcome.capabilities is not None:
+        # Surface the handshake so a version drift is visible to the agent up
+        # front: an older client advertises fewer ops, and a partial advert
+        # leaves a set as ``None`` (unknown).
+        payload["client_version"] = redact(outcome.capabilities.client_version)
+        result_ops = outcome.capabilities.result_ops
+        payload["client_result_ops"] = sorted(result_ops) if result_ops is not None else None
     if outcome.error:
         payload["error"] = redact(outcome.error)
     return payload
