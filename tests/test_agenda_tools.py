@@ -765,3 +765,48 @@ async def test_delete_campaign_force_overrides_the_in_flight_guard(tmp_path) -> 
     done_result = await _call(config, "delete_campaign", {})
     assert done_result["ok"] is True
     assert not done.exists()
+
+
+async def test_delete_campaign_clears_a_corrupt_campaign(tmp_path) -> None:
+    """A corrupt campaign is removable: the reset primitive is the recovery path (B2).
+
+    ``create_campaign`` refuses while the file exists and the in-flight guard
+    loads the campaign, so without this the agent could never clear an
+    unparseable file through any tool.
+    """
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text("{ this is not json", encoding="utf-8")
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    # A fresh campaign is blocked while the file exists.
+    blocked = await _call(
+        config,
+        "create_campaign",
+        {"name": "x", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": [1]},
+    )
+    assert blocked == {"ok": False, "error": "campaign_exists"}
+
+    result = await _call(config, "delete_campaign", {})
+    assert result["ok"] is True
+    assert str(campaign) in result["deleted"]
+    assert not campaign.exists()
+
+    # With the broken state gone, status reports the actionable no_campaign.
+    status = await _call(config, "agenda_status", {})
+    assert status == NO_CAMPAIGN
+
+
+async def test_delete_campaign_guards_a_planned_leaf_with_a_sim_id(tmp_path) -> None:
+    """A lost-ack leaf (planned + sim_id) still counts as in flight (m1)."""
+    campaign = Path(_campaign_file_with_status(tmp_path, "planned"))
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    refused = await _call(config, "delete_campaign", {})
+    assert refused["ok"] is False
+    assert refused["error"] == "campaign_in_flight"
+    assert refused["in_flight"] == ["leaf"]
+    assert campaign.exists()
+
+    forced = await _call(config, "delete_campaign", {"force": True})
+    assert forced["ok"] is True
+    assert not campaign.exists()

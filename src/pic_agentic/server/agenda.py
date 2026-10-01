@@ -66,15 +66,19 @@ log = logging.getLogger(__name__)
 NO_CAMPAIGN_MESSAGE = "no campaign is persisted; create a campaign first, e.g. with create_campaign, then retry."
 
 #: Actionable text attached to the ``campaign_in_flight`` soft error returned when
-#: a reset is asked for while leaves are still submitted/running: it names the
-#: escape hatch (``force``) rather than silently leaving orphaned cluster jobs.
+#: a reset is asked for while leaves may still have a live cluster job: it names
+#: the escape hatch (``force``) rather than silently leaving orphaned jobs.
 IN_FLIGHT_MESSAGE = (
-    "campaign has leaves still submitted/running; stop or cancel them first, "
-    "or pass force=true to delete the campaign anyway."
+    "campaign has leaves still submitted/running (or a non-terminal leaf with a "
+    "sim_id, e.g. a lost-ack submission); stop or cancel them first, or pass "
+    "force=true to delete the campaign anyway."
 )
 
-#: Leaf statuses that mean a cluster job may still be live for this campaign.
-_IN_FLIGHT_STATUSES = frozenset({"submitted", "running"})
+#: Leaf statuses that are not terminal, so a leaf carrying one *and* a ``sim_id``
+#: may have a live job: a lost-ack submission stays ``planned`` but already
+#: stamped a ``sim_id`` (the engine submits before it flips the status), and
+#: deleting then would orphan that job exactly like a ``submitted`` leaf.
+_IN_FLIGHT_STATUSES = frozenset({"planned", "submitted", "running"})
 
 #: A dotted patch-path segment that indexes a list rather than a dict key.
 _LIST_INDEX_RE = re.compile(r"-?\d+")
@@ -689,8 +693,15 @@ class AgendaService:
         the lock together with the delete, so a concurrent ``advance_agenda``
         cannot submit between the check and the removal.
 
+        A campaign file that cannot be parsed is removed without the guard: the
+        reset primitive is the recovery path for broken state, so a corrupt
+        ``campaign.json`` must be clearable through a tool rather than trapping
+        the agent (``create_campaign`` refuses while the file exists).  The
+        in-flight guard can only run when the file parses; an unreadable file
+        has no observable live leaves.
+
         Args:
-            force: Delete even when leaves are still submitted/running.
+            force: Delete even when leaves may still have a live cluster job.
 
         Returns:
             ``{"ok": True, "deleted": [...paths...]}`` on success, the
@@ -703,18 +714,25 @@ class AgendaService:
         async with self._lock:
             try:
                 campaign = self.store.load(Campaign)
-                in_flight = [
-                    path
-                    for path, sim in campaign.agenda.simulations()
-                    if sim.status in _IN_FLIGHT_STATUSES and sim.sim_id
-                ]
-                if in_flight and not force:
-                    return {
-                        "ok": False,
-                        "error": "campaign_in_flight",
-                        "message": IN_FLIGHT_MESSAGE,
-                        "in_flight": in_flight,
-                    }
+            except Exception as exc:  # ruff: ignore[blind-except] - unparseable state is removable
+                # Corrupt/old campaign: no live leaves can be observed, so drop
+                # the file(s) rather than blocking the only reset primitive.
+                log.warning("agenda delete_campaign: removing unparseable campaign: %s", exc)
+                campaign = None
+            try:
+                if campaign is not None:
+                    in_flight = [
+                        path
+                        for path, sim in campaign.agenda.simulations()
+                        if sim.status in _IN_FLIGHT_STATUSES and sim.sim_id
+                    ]
+                    if in_flight and not force:
+                        return {
+                            "ok": False,
+                            "error": "campaign_in_flight",
+                            "message": IN_FLIGHT_MESSAGE,
+                            "in_flight": in_flight,
+                        }
                 deleted = self._remove_campaign_files()
             except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
                 log.warning("agenda delete_campaign failed: %s", exc)

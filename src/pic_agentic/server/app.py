@@ -1222,9 +1222,11 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Remove the persisted campaign and its sibling reuse registry, so a "
             "fresh campaign can be created (create_campaign refuses to overwrite "
             "an existing one). Refused with an actionable `campaign_in_flight` "
-            "error while leaves are still submitted/running, since deleting then "
-            "would orphan the cluster jobs; pass force=true to delete anyway, or "
-            "stop_agenda first to cancel them."
+            "error while any leaf may still have a live cluster job (submitted/"
+            "running, or a non-terminal leaf carrying a sim_id such as a lost-ack "
+            "submission), since deleting then would orphan the jobs; pass "
+            "force=true to delete anyway, or stop_agenda first to cancel them. A "
+            "corrupt campaign file is removed without the guard."
         ),
         # destructive: it irreversibly removes the persisted campaign state.
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
