@@ -59,6 +59,7 @@ sim = [
 [project.scripts]
 pic-agentic-mcp = "pic_agentic.server.__main__:main"
 pic-agentic-simclient = "pic_agentic.simclient.__main__:main"
+pic-agentic-setup = "pic_agentic.server.setup:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pic_agentic"]
