@@ -740,7 +740,10 @@ async def test_create_campaign_rejects_an_over_cap_spec(tmp_path) -> None:
 
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
     base = _valid_spec()
-    base["sim"]["solver"]["name"] = "a" * (MAX_INLINE_PAYLOAD_BYTES * 2)
+    # A field the pin preserves verbatim; ``solver.name``/``species[].name``
+    # are normalised and would (correctly) trip the exact round-trip gate
+    # before the size cap is reached.
+    base["sim"]["customuserinput"] = {"tags": ["a" * (MAX_INLINE_PAYLOAD_BYTES * 2)]}
     result = await _call(
         config,
         "create_campaign",

@@ -246,28 +246,30 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
     campaign-creation time turns a later catastrophic leaf failure into an
     immediate, precise error.
 
-    A validation failure is *rejected* (never swallowed): the simclient would
-    refuse the same leaf with ``payload_invalid`` at submit time, so treating it
-    as a pass would let ``create_campaign`` persist a campaign whose every leaf
-    fails -- the beta-3 defect.  A spec that validates but re-serialises
-    differently is only rejected when a caller-supplied leaf path is genuinely
-    dropped: if every leaf survives (the pin may add computed metadata such as
-    ``precision_overrides``) the spec is accepted rather than over-rejected.
+    A validation failure is *rejected* (never swallowed), and a validated spec
+    is rejected on **any** re-serialisation difference -- exactly the
+    simclient's ``runner.sim.model_dump(mode="json") != sim_dump`` rule.  The
+    earlier leniency (accept unless a caller-supplied *leaf path* was dropped)
+    diverged from the simclient: it accepted a spec whose computed
+    ``precision_overrides`` had been stripped, or whose ``time_steps`` was the
+    string ``"4"``, both of which the simclient refuses as ``unsupported``.
+    Accepting them at create time persists a campaign every leaf of which then
+    fails -- the beta-3 defect this gate exists to prevent.  A spec that the
+    simclient would reject must therefore be rejected here too.
 
     When PIConGPU is not importable (a server without the pin) the check degrades
     to a curated, **best-effort** detector of known computed-field shapes rather
     than skipping entirely.  It cannot catch an arbitrary unknown field or a
     type-invalid value (those need the pin), so the create-time guarantee is
-    exact only where the pin is importable -- and deliberately never
-    over-rejects, since a pin-less server cannot reproduce the pin's schema.
+    exact only where the pin is importable.
 
     Args:
         runner_dump: A wire spec carrying ``sim`` (a ``Runner`` dump).
 
     Returns:
-        An actionable message when the spec fails to validate or a requested
-        field would be silently dropped, else ``None`` (including when there is
-        no ``sim`` mapping to check).
+        An actionable message when the spec fails to validate or does not
+        reproduce itself exactly, else ``None`` (including when there is no
+        ``sim`` mapping to check).
 
     """
     sim_dump = runner_dump.get("sim")
@@ -303,29 +305,13 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
     except Exception as exc:  # ruff: ignore[blind-except] - any other failure is an unusable spec
         return f"spec does not validate against the pinned pypicongpu schema: {exc}"
     dumped = runner.sim.model_dump(mode="json")
-    # Accept when nothing the caller asked for was lost: either the dump is
-    # identical, or it differs only by metadata the pin normalised/added (e.g. a
-    # recomputed ``precision_overrides`` or computed defaults a minimal test spec
-    # leaves out).  Only a silently dropped caller leaf is rejected.
-    if dumped == sim_dump or not _dropped_leaf_paths(sim_dump, dumped):
+    # Exact parity with the simclient's gate: any re-serialisation difference is
+    # ``unsupported``, so reject on inequality rather than only when a
+    # caller-supplied leaf is dropped.  The message still names the offending
+    # path when the difference is a dropped/misplaced leaf.
+    if dumped == sim_dump:
         return None
     return _round_trip_diff_message(sim_dump, dumped)
-
-
-def _dropped_leaf_paths(before: object, after: object) -> list[str]:
-    """Return the caller-supplied leaf paths absent from the round-tripped dump.
-
-    These are the fields the schema silently dropped.  A computed field the
-    caller stored at the wrong level also shows up here, so
-    :func:`_round_trip_diff_message` can name the move; re-serialisation that
-    only changes or adds values (not paths) contributes nothing.
-
-    Returns:
-        The dropped paths, in the input's deterministic order.
-
-    """
-    to_paths = set(_leaf_paths(after))
-    return [path for path in _leaf_paths(before) if path not in to_paths]
 
 
 def _round_trip_diff_message(before: object, after: object) -> str:
