@@ -360,6 +360,67 @@ async def test_failed_leaf_surfaces_the_simclient_reason(tmp_path) -> None:
         await sim_t.close()
 
 
+async def test_identical_leaf_failures_are_grouped_and_truncated(tmp_path) -> None:
+    """Several leaves failing the same way yield one bounded group + digest.
+
+    The regression: three leaves each carried an identical multi-KB validation
+    dump inline.  The tick must name the shared reason once (bounded) and list
+    the affected paths, while the full text stays on the persisted callback.
+    """
+    agenda = AgendaGroup(name="g")
+    for index in range(3):
+        leaf = f"leaf{index}"
+        agenda = agenda.add(**{leaf: AgendaSim(name=leaf, spec={"sim": {"replica": index}})})
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    long_reason = "rejected field: " + "x" * 4000
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+
+    async def rejecting() -> None:
+        counter = 0
+        async for command in sim_t.receive():
+            if command.type != SimulationType.COMMAND:
+                continue
+            counter += 1
+            ack = build_submit_ack(
+                sim=SIM,
+                seq=counter,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id=f"sim{counter:04d}",
+                state=SimulationState.FAILED,
+                in_reply_to=command.transport_event_id,
+                error=long_reason,
+                error_code="unsupported",
+            ).sign(SECRET)
+            await sim_t.send(ack)
+
+    tasks = [asyncio.create_task(rejecting()), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        tick = (await server.call_tool("advance_agenda", {})).structured_content
+        assert tick["failed"] == ["leaf0", "leaf1", "leaf2"]
+        assert len(tick["callbacks"]) == 3
+        expected = long_reason[:500] + "...(truncated)"
+        for callback in tick["callbacks"]:
+            assert callback["error"] == expected
+        (group,) = tick["failure_groups"]
+        assert group["error_code"] == "unsupported"
+        assert group["paths"] == ["leaf0", "leaf1", "leaf2"]
+        assert group["message"].endswith("...(truncated)")
+        assert len(group["message"]) <= 500 + len("...(truncated)")
+        assert tick["failure_summary"].startswith("3 leaves failed: unsupported: rejected field:")
+
+        # The full reason survives on the persisted callback, not just the tick.
+        drained = (await server.call_tool("take_agenda_callbacks", {})).structured_content
+        assert drained["callbacks"][0]["error"] == long_reason
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
 async def test_take_callbacks_drains_durably(tmp_path) -> None:
     """Callbacks emitted by a tick are returned once, then cleared on disk."""
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))

@@ -1192,7 +1192,10 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Run one durable tick of the campaign engine stored on the server: "
             "observe the known simulations, plan the next actions and submit "
             "what the budget and the policy allow. Returns the tick result "
-            "(submitted/waiting/done/failed paths and usage)."
+            "(submitted/waiting/done/failed paths and usage). Failures are "
+            "summarised in `failure_summary` and grouped by identical reason in "
+            "`failure_groups` (with the full, untruncated text available via "
+            "take_agenda_callbacks)."
         ),
         # write/resource tier: a tick may submit new cluster jobs, so it is not
         # read-only and not idempotent, but it is not destructive.

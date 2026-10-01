@@ -108,6 +108,14 @@ _RUNNING_STATUSES = frozenset({"submitted", "running"})
 #: guarantees ``run_dir/simOutput`` exists (``job_finished`` alone may not).
 _REUSABLE_OBSERVED_STATES = frozenset({"results.ready"})
 
+#: A failed leaf's reason is truncated to this many characters in the
+#: ``advance_agenda`` tick result.  Several leaves failing identically would
+#: otherwise replay the same multi-KB validation dump once per leaf; the full
+#: text stays on the persisted callback (``take_agenda_callbacks``) and in
+#: ``agenda_status``.
+FAILURE_MESSAGE_MAX_CHARS = 500
+FAILURE_TRUNCATION_MARKER = "...(truncated)"
+
 
 class DuplicateSpecError(RuntimeError):
     """Raised when two leaves carry identical specs (they would collide).
@@ -167,6 +175,26 @@ class EnginePolicy(BaseModel):
     approve_over_est_core_hours: float | None = None
 
 
+class FailureGroup(BaseModel):
+    """Failed leaves of one tick sharing an identical reason.
+
+    Several leaves failing the same way (e.g. one rejected field) would
+    otherwise repeat the same multi-KB validation dump once per leaf.  The group
+    names the reason once and lists every affected leaf path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    error_code: str | None = None
+    stage: str | None = None
+    #: The shared reason, bounded to
+    #: :data:`FAILURE_MESSAGE_MAX_CHARS` characters (the full text stays on the
+    #: persisted callback drained by ``take_agenda_callbacks``).
+    message: str
+    #: Every failed leaf path sharing this reason (in first-seen order).
+    paths: list[str] = Field(default_factory=list)
+
+
 class TickResult(BaseModel):
     """The outcome of one engine tick."""
 
@@ -183,7 +211,17 @@ class TickResult(BaseModel):
     complete: bool = False
     usage: BudgetUsage = BudgetUsage()
     #: Decision-point callbacks emitted this tick (newly done/failed leaves).
+    #: A failed callback's ``error`` is truncated to
+    #: :data:`FAILURE_MESSAGE_MAX_CHARS`; the full reason remains on the
+    #: persisted callback and in ``agenda_status``.
     callbacks: list[Callback] = Field(default_factory=list)
+    #: This tick's failures grouped by identical reason, so a repeated dump is
+    #: emitted once with the affected paths rather than once per leaf.
+    failure_groups: list[FailureGroup] = Field(default_factory=list)
+    #: A one-line digest of this tick's failures (one clause per distinct
+    #: reason), so the common "N leaves failed identically" case reads as a
+    #: sentence rather than N repeated payloads.  None when nothing failed.
+    failure_summary: str | None = None
     #: The campaign's lifecycle state after this tick.
     state: CampaignState = "running"
     #: Leaves the planner would have submitted but the lifecycle held back.
@@ -286,6 +324,7 @@ class AgendaEngine:
         result.usage = campaign.usage
         self._record_reuse(campaign, observed, before)
         self.store.save(campaign)
+        _compact_failures(result)
         return result
 
     async def _run_steps(
@@ -799,6 +838,69 @@ def leaf_at(agenda: AgendaGroup, path: str) -> AgendaSim | None:
     return leaf if isinstance(leaf, AgendaSim) else None
 
 
+def _truncate(text: str, limit: int = FAILURE_MESSAGE_MAX_CHARS) -> str:
+    """Bound ``text`` to ``limit`` characters, marking a cut tail.
+
+    Returns:
+        The text unchanged when short enough, else its head plus
+        :data:`FAILURE_TRUNCATION_MARKER`.
+
+    """
+    if len(text) <= limit:
+        return text
+    return text[:limit] + FAILURE_TRUNCATION_MARKER
+
+
+def _compact_failures(result: TickResult) -> None:
+    """Deduplicate and bound the failed callbacks of one tick, in place.
+
+    The per-leaf callbacks stay (so each affected path remains addressable) but
+    their ``error`` is truncated, and identical reasons are collapsed into
+    :attr:`TickResult.failure_groups` so a repeated validation dump is spelled
+    out once.  The full reason is preserved on the persisted campaign callback
+    and in ``agenda_status``.
+
+    Args:
+        result: The tick result, updated in place.
+
+    """
+    order: list[tuple[str | None, str]] = []
+    groups: dict[tuple[str | None, str], FailureGroup] = {}
+    for callback in result.callbacks:
+        if callback.kind != "failed":
+            continue
+        reason = callback.error or "the failure reason was not reported"
+        key = (callback.error_code, reason)
+        group = groups.get(key)
+        if group is None:
+            group = FailureGroup(error_code=callback.error_code, stage=callback.stage, message=_truncate(reason))
+            groups[key] = group
+            order.append(key)
+        group.paths.append(callback.path)
+        if callback.error is not None:
+            callback.error = _truncate(callback.error)
+    result.failure_groups = [groups[key] for key in order]
+    result.failure_summary = _failure_summary(result.failure_groups)
+
+
+def _failure_summary(groups: list[FailureGroup]) -> str | None:
+    """Compose the one-line failure digest for a tick result.
+
+    Returns:
+        ``"N leaf/leaves failed: <code>: <message>; ..."``, or None when there
+        are no failure groups.
+
+    """
+    if not groups:
+        return None
+    total = sum(len(group.paths) for group in groups)
+    noun = "leaf" if total == 1 else "leaves"
+    clauses = ", ".join(
+        f"{group.error_code}: {group.message}" if group.error_code else group.message for group in groups
+    )
+    return f"{total} {noun} failed: {clauses}"
+
+
 def _bucket(result: TickResult, path: str, action: str) -> None:
     """Append ``path`` to the result bucket matching ``action``.
 
@@ -942,6 +1044,7 @@ __all__ = [
     "AgendaEngine",
     "DuplicateSpecError",
     "EnginePolicy",
+    "FailureGroup",
     "FailureInfo",
     "FailuresFn",
     "ObserveFn",
