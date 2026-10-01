@@ -838,7 +838,12 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "returned `spec_path` can then be handed to "
             "create_campaign(base_spec_path=...) without re-typing the spec. The "
             "script should define a single picmi.Simulation; a trailing "
-            "sim.run(...) is tolerated and ignored (the tool never runs it here)."
+            "sim.run(...) is tolerated and ignored (the tool never runs it here). "
+            "Note: the pinned pypicongpu always adds a default `type_radiation` "
+            "output block (empty species/period) even when the script requests no "
+            "radiation; this is the schema's own default and is required for the "
+            "spec to validate, so forward the `spec` verbatim rather than editing "
+            "it out."
         ),
         # read-tier: it builds locally and starts no cluster work.
         annotations=_READ_ONLY,
