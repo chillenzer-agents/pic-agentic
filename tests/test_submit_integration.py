@@ -245,6 +245,21 @@ def test_nested_unknown_field_is_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+def test_check_spec_round_trip_matches_the_simclient_gate() -> None:
+    """The create-time check agrees with the simclient's round-trip gate (P2b)."""
+    from pic_agentic.simulation_build import check_spec_round_trip
+
+    specs = json.loads((Path(__file__).parent / "fixtures" / "campaign_specs.json").read_text())
+    for index in (0, 1):
+        detail = check_spec_round_trip(specs[index])
+        assert detail is not None
+        assert "collisional_physics.numerics_config.num_tmp_field_slots" in detail
+        assert "collisional_physics.num_tmp_field_slots" in detail
+    # The correctly-shaped spec is accepted unchanged.
+    assert check_spec_round_trip(specs[2]) is None
+
+
+@pytest.mark.integration
 def test_fixture_validates_against_real_runner() -> None:
     from picongpu.pypicongpu.runner import Runner
 

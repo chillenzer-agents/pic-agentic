@@ -41,6 +41,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -196,6 +197,136 @@ class BuiltSimulation:
     picongpu_version: str
     picongpu_revision: str
     schema_hash: str
+
+
+#: Curated ``pypicongpu`` ``@computed_field`` placements (field -> the ``sim``
+#: sub-path it belongs on).  A caller copying a dump around may store such a
+#: field one level too deep; that dump fails the simclient's round-trip gate as
+#: ``unsupported``.  Naming the expected parent here lets a server without
+#: PIConGPU still produce the actionable create-time error (the exact check runs
+#: when the pin is importable).  Extend as further computed fields surface.
+_KNOWN_COMPUTED_FIELDS = {"num_tmp_field_slots": "collisional_physics"}
+
+
+class SpecRoundTripError(ValueError):
+    """Raised when a wire spec does not reproduce itself under the pinned schema."""
+
+
+def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
+    """Check that ``sim`` reproduces itself through the pinned ``Runner``.
+
+    The simclient rejects any payload whose ``sim`` does not equal its own
+    ``Runner.model_validate(...).sim.model_dump(mode="json")`` as ``unsupported``
+    (a field outside the pinned schema was silently dropped).  Running the same
+    check at campaign-creation time turns a later catastrophic leaf failure into
+    an immediate, precise error.
+
+    When PIConGPU is not importable (a server without the pin) the check degrades
+    to detecting the one known computed-field shape rather than skipping
+    entirely, so the common malformed-spec case is still caught.
+
+    Args:
+        runner_dump: A wire spec carrying ``sim`` (a ``Runner`` dump).
+
+    Returns:
+        An actionable message when the spec does not round-trip, else ``None``
+        (including when there is no ``sim`` mapping to check).
+
+    """
+    sim_dump = runner_dump.get("sim")
+    if not isinstance(sim_dump, dict):
+        return None
+    try:
+        from picongpu.pypicongpu.runner import (  # ruff: ignore[import-outside-top-level] - optional dependency
+            Runner,
+        )
+    except ImportError:
+        return _detect_misplaced_computed_field(sim_dump)
+    try:
+        # A validation warning (e.g. a laser pulse truncated by a too-short run)
+        # is not a schema violation; the simclient validates without ``error``
+        # filters, so suppress warnings here to match its semantics.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            runner = Runner.model_validate(runner_dump)
+    except Exception as exc:  # ruff: ignore[blind-except] - any validation failure is a bad spec
+        return f"spec does not validate against the pinned pypicongpu schema: {exc}"
+    dumped = runner.sim.model_dump(mode="json")
+    if dumped == sim_dump:
+        return None
+    return _round_trip_diff_message(sim_dump, dumped)
+
+
+def _round_trip_diff_message(before: object, after: object) -> str:
+    """Return an actionable message for a spec that changed under re-validation.
+
+    A leaf path present in the input but absent from the round-tripped dump was
+    dropped by the schema.  When the same final segment reappears elsewhere in
+    the dump, the field was misplaced (a common copy-through-the-wrong-level
+    mistake) and the message names the correct path.
+
+    Returns:
+        The message naming the offending path.
+
+    """
+    from_paths = _leaf_paths(before)
+    to_paths = _leaf_paths(after)
+    dropped = [path for path in from_paths if path not in to_paths]
+    for path in dropped:
+        segment = path.rsplit(".", 1)[-1]
+        suggestion = next((other for other in to_paths if other.rsplit(".", 1)[-1] == segment), None)
+        if suggestion is not None:
+            return (
+                f"{path} is not part of the pinned pypicongpu schema at this path; move it to {suggestion} and resubmit"
+            )
+        return f"{path} is not part of the pinned pypicongpu schema and would be silently dropped"
+    return "spec does not reproduce itself under the pinned pypicongpu schema"
+
+
+def _detect_misplaced_computed_field(sim_dump: dict[str, object]) -> str | None:
+    """Best-effort detection of a computed field stored one level too deep.
+
+    Used when PIConGPU is not importable server-side.  A known ``@computed_field``
+    under a sub-model is reported with its likely correct parent path.
+
+    Returns:
+        The actionable message, or ``None`` when nothing matches.
+
+    """
+    for path in _leaf_paths(sim_dump):
+        segment = path.rsplit(".", 1)[-1]
+        expected_parent = _KNOWN_COMPUTED_FIELDS.get(segment)
+        if expected_parent is None:
+            continue
+        container, _, _ = path.rpartition(".")
+        if container == expected_parent:
+            # Already at its correct level.
+            continue
+        return (
+            f"{path} is not part of the pinned pypicongpu schema at this path; "
+            f"move the computed field {segment!r} to {expected_parent}.{segment} and resubmit"
+        )
+    return None
+
+
+def _leaf_paths(value: object, prefix: str = "") -> list[str]:
+    """Return the dotted paths of every scalar leaf in a nested JSON value.
+
+    Returns:
+        The leaf paths, in deterministic (insertion/ascending) order.
+
+    """
+    paths: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(_leaf_paths(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            paths.extend(_leaf_paths(item, f"{prefix}[{index}]"))
+    else:
+        paths.append(prefix)
+    return paths
 
 
 #: Maximum number of stderr characters echoed back in a build error.  The

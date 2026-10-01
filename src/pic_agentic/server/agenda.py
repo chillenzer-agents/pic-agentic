@@ -49,6 +49,7 @@ from pic_agentic.protocol.simulation import (
 )
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
+from pic_agentic.simulation_build import check_spec_round_trip
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -666,9 +667,11 @@ class AgendaService:
     def _validate_leaf_spec(self, spec: dict[str, Any]) -> dict[str, Any] | None:
         """Validate one patched leaf through the submission path.
 
-        Runs the same allow-list check and escaped inline-size cap a
-        ``submit_spec`` would, so a leaf that could never be submitted is
-        rejected at creation.
+        Runs the same allow-list check, the pinned-schema round-trip gate the
+        simclient applies (via :func:`~pic_agentic.simulation_build.
+        check_spec_round_trip`) and the escaped inline-size cap a ``submit_spec``
+        would, so a leaf that could never be submitted is rejected at creation
+        with an actionable reason.
 
         Returns:
             ``None`` when the leaf is a valid, in-cap wire spec, else the soft
@@ -679,6 +682,9 @@ class AgendaService:
             payload = self.submit_service.prepare_spec(spec)
         except UnsupportedPayloadError as exc:
             return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(str(exc))}
+        round_trip = check_spec_round_trip(spec)
+        if round_trip is not None:
+            return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(round_trip)}
         size = payload_wire_size(payload)
         if size > MAX_INLINE_PAYLOAD_BYTES:
             return {

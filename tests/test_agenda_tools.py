@@ -12,6 +12,7 @@ the tools run the full durable engine path without a cluster.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -568,6 +569,60 @@ async def test_create_campaign_rejects_duplicate_values(tmp_path) -> None:
     assert result["error"] == "duplicate_campaign_spec"
     # Nothing was persisted, so the agent can retry with distinct values.
     assert not (tmp_path / "campaign.json").exists()
+
+
+#: The three ``base_spec`` a beta agent passed to ``create_campaign``; the first
+#: two store ``num_tmp_field_slots`` (a computed field) one level too deep.
+CAMPAIGN_SPECS = Path(__file__).parent / "fixtures" / "campaign_specs.json"
+
+
+def _campaign_spec(index: int) -> dict:
+    return json.loads(CAMPAIGN_SPECS.read_text(encoding="utf-8"))[index]
+
+
+async def test_create_campaign_rejects_a_misplaced_computed_field(tmp_path) -> None:
+    """A spec whose computed field is nested fails at creation, actionably (P2b).
+
+    ``num_tmp_field_slots`` is a ``@computed_field`` on ``collisional_physics``,
+    so storing it under ``numerics_config`` is dropped on re-validation and the
+    simclient rejects the leaf later as ``unsupported``.  The create-time gate
+    must name the offending path instead of letting the campaign fail silently.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "bad",
+            "base_spec": _campaign_spec(0),
+            "patch_path": "sim.time_steps",
+            "values": [100, 200],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    assert "collisional_physics.numerics_config.num_tmp_field_slots" in result["detail"]
+    assert "collisional_physics.num_tmp_field_slots" in result["detail"]
+    # The malformed campaign was not persisted.
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_accepts_a_build_spec_shaped_spec(tmp_path) -> None:
+    """A spec whose computed field is at the correct level works unchanged (P2b)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "good",
+            "base_spec": _campaign_spec(2),
+            "patch_path": "sim.time_steps",
+            "values": [100, 200],
+        },
+    )
+    assert result == {"ok": True, "name": "good", "leaves": ["leaf000", "leaf001"]}
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["time_steps"] == 100
 
 
 async def test_create_campaign_rejects_a_non_wire_spec(tmp_path) -> None:
