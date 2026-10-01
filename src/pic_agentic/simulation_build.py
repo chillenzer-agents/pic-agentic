@@ -222,6 +222,11 @@ _CHECK_RUN_DIR = "/__pic_agentic_spec_check__/run"
 _MAX_VALIDATION_ERRORS = 5
 _MAX_VALUE_CHARS = 40
 
+#: Cap on the text echoed from a non-``ValidationError`` pinned failure.  Kept
+#: short so an unexpected exception carrying a spec value cannot dump it
+#: unbounded; the paraphrased pydantic path is bounded by design.
+_MAX_EXCEPTION_CHARS = 500
+
 #: Substring of pydantic's internal union-branch location segments (e.g.
 #: ``function-after[check(), Grid3D]``).  A union emits one alternation per
 #: branch, so the same real field would otherwise be reported twice.
@@ -303,7 +308,11 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
         # bounded, paraphrased errors name the offending fields actionably.
         return _validation_error_message(exc)
     except Exception as exc:  # ruff: ignore[blind-except] - any other failure is an unusable spec
-        return f"spec does not validate against the pinned pypicongpu schema: {exc}"
+        # Route through the same bounded path as the validation message: an
+        # arbitrary exception can carry spec values, so truncate the echoed text
+        # rather than dumping it whole.
+        detail = str(exc)[:_MAX_EXCEPTION_CHARS]
+        return f"spec does not validate against the pinned pypicongpu schema: {detail}"
     dumped = runner.sim.model_dump(mode="json")
     # Exact parity with the simclient's gate: any re-serialisation difference is
     # ``unsupported``, so reject on inequality rather than only when a
