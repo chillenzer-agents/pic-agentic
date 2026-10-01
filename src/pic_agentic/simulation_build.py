@@ -207,30 +207,48 @@ class BuiltSimulation:
 #: when the pin is importable).  Extend as further computed fields surface.
 _KNOWN_COMPUTED_FIELDS = {"num_tmp_field_slots": "collisional_physics"}
 
-
-class SpecRoundTripError(ValueError):
-    """Raised when a wire spec does not reproduce itself under the pinned schema."""
+#: Sentinel paths created by :func:`check_spec_round_trip` when it replays the
+#: simclient gate.  They are deliberately outside any real spec (a leading
+#: double underscore is not a pypicongpu field) and only serve to satisfy
+#: ``Runner``'s required ``setup_dir``/``run_dir``.
+_CHECK_SETUP_DIR = "/__pic_agentic_spec_check__/input"
+_CHECK_RUN_DIR = "/__pic_agentic_spec_check__/run"
 
 
 def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
     """Check that ``sim`` reproduces itself through the pinned ``Runner``.
 
-    The simclient rejects any payload whose ``sim`` does not equal its own
-    ``Runner.model_validate(...).sim.model_dump(mode="json")`` as ``unsupported``
-    (a field outside the pinned schema was silently dropped).  Running the same
-    check at campaign-creation time turns a later catastrophic leaf failure into
-    an immediate, precise error.
+    This mirrors the simclient's gate *exactly*: the simclient rebuilds a
+    ``Runner`` from a **reduced** dump -- ``{"sim": <sim>, "setup_dir": ...,
+    "run_dir": ...}`` plus ``template_dir`` only when it is configured -- and
+    rejects the payload as ``unsupported`` when
+    ``Runner.model_validate(dump).sim.model_dump(mode="json") != <sim>``.  It
+    never validates the caller's sibling keys, so this check must not either
+    (doing so would reject a valid spec over an unrelated ``template_dir`` or
+    ``setup_dir`` shape the simclient drops).  Running the same check at
+    campaign-creation time turns a later catastrophic leaf failure into an
+    immediate, precise error.
+
+    The check only *rejects* when a requested value is genuinely lost: if the
+    re-validated ``sim`` differs but every leaf the caller supplied survives
+    (the pin may add computed metadata such as ``precision_overrides``), or if
+    the ``sim`` does not validate at all (the simclient answers the same
+    payload with an equally explicit ``payload_invalid`` at submit time), the
+    spec is accepted rather than over-rejected.  Only a nested field that is
+    silently dropped is reported.
 
     When PIConGPU is not importable (a server without the pin) the check degrades
-    to detecting the one known computed-field shape rather than skipping
-    entirely, so the common malformed-spec case is still caught.
+    to a curated, **best-effort** detector of known computed-field shapes rather
+    than skipping entirely.  It cannot catch an arbitrary unknown field (that
+    needs the pin), so the create-time guarantee is exact only where the pin is
+    importable.
 
     Args:
         runner_dump: A wire spec carrying ``sim`` (a ``Runner`` dump).
 
     Returns:
-        An actionable message when the spec does not round-trip, else ``None``
-        (including when there is no ``sim`` mapping to check).
+        An actionable message when a requested field would be silently dropped,
+        else ``None`` (including when there is no ``sim`` mapping to check).
 
     """
     sim_dump = runner_dump.get("sim")
@@ -242,19 +260,51 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
         )
     except ImportError:
         return _detect_misplaced_computed_field(sim_dump)
+    # Build the same reduced dump the simclient builds.  The caller's sibling
+    # keys (run_dir/setup_dir/template_dir/provenance/...) are dropped, exactly
+    # as the simclient drops them; the sentinel directories satisfy Runner's
+    # required fields without claiming any caller value.
+    reduced: dict[str, object] = {
+        "sim": sim_dump,
+        "setup_dir": _CHECK_SETUP_DIR,
+        "run_dir": _CHECK_RUN_DIR,
+    }
     try:
         # A validation warning (e.g. a laser pulse truncated by a too-short run)
         # is not a schema violation; the simclient validates without ``error``
         # filters, so suppress warnings here to match its semantics.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            runner = Runner.model_validate(runner_dump)
-    except Exception as exc:  # ruff: ignore[blind-except] - any validation failure is a bad spec
-        return f"spec does not validate against the pinned pypicongpu schema: {exc}"
+            runner = Runner.model_validate(reduced)
+    except Exception:  # ruff: ignore[blind-except] - the simclient reports this as payload_invalid; do not over-reject
+        return None
     dumped = runner.sim.model_dump(mode="json")
     if dumped == sim_dump:
         return None
+    if not _dropped_leaf_paths(sim_dump, dumped):
+        # Nothing the caller asked for was dropped: the difference is metadata
+        # the pin normalised or added on re-validation (e.g. a recomputed
+        # ``precision_overrides`` or computed defaults a minimal test spec
+        # leaves out).  There is no lost field and no actionable path to name,
+        # so accept it rather than over-rejecting a genuinely valid spec.
+        return None
     return _round_trip_diff_message(sim_dump, dumped)
+
+
+def _dropped_leaf_paths(before: object, after: object) -> list[str]:
+    """Return the caller-supplied leaf paths absent from the round-tripped dump.
+
+    These are the fields the schema silently dropped.  A computed field the
+    caller stored at the wrong level also shows up here, so
+    :func:`_round_trip_diff_message` can name the move; re-serialisation that
+    only changes or adds values (not paths) contributes nothing.
+
+    Returns:
+        The dropped paths, in the input's deterministic order.
+
+    """
+    to_paths = set(_leaf_paths(after))
+    return [path for path in _leaf_paths(before) if path not in to_paths]
 
 
 def _round_trip_diff_message(before: object, after: object) -> str:
