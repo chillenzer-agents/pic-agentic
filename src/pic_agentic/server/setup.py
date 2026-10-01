@@ -25,11 +25,11 @@ import os
 import shlex
 import sys
 import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
+
+import aiohttp
 
 from pic_agentic.auth import MasTokenStore
 from pic_agentic.config import Config
@@ -53,8 +53,13 @@ class TokenProvider(Protocol):
         ...
 
 
-def api(homeserver: str, method: str, path: str, token: str, data: dict | None = None) -> dict:
+async def api(homeserver: str, method: str, path: str, token: str, data: dict | None = None) -> dict:
     """Call one Matrix client-server endpoint and return the JSON body.
+
+    Uses ``aiohttp`` (as the MAS token store already does) so the underlying
+    connector performs Happy Eyeballs: on a host whose DNS returns an AAAA
+    record first but has no IPv6 route, it races the IPv4 address instead of
+    blackholing on IPv6 as ``urllib`` would.
 
     Returns:
         The decoded response body.
@@ -63,23 +68,27 @@ def api(homeserver: str, method: str, path: str, token: str, data: dict | None =
         SystemExit: On an HTTP error, with the server's message.
 
     """
-    body = json.dumps(data).encode() if data is not None else None
     if urllib.parse.urlparse(homeserver).scheme not in {"http", "https"}:
         msg = f"homeserver must be an http(s) URL: {homeserver!r}"
         raise SystemExit(msg)
-    req = urllib.request.Request(homeserver + path, data=body, method=method)  # ruff: ignore[suspicious-url-open-usage] - scheme validated above
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    timeout = aiohttp.ClientTimeout(total=40)
     try:
-        with urllib.request.urlopen(req, timeout=40) as response:  # ruff: ignore[suspicious-url-open-usage] - scheme validated above
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:300]
-        msg = f"{method} {path} failed ({exc.code}): {detail}"
+        async with (
+            aiohttp.ClientSession() as session,
+            session.request(method, homeserver + path, json=data, headers=headers, timeout=timeout) as response,
+        ):
+            if not response.ok:
+                detail = (await response.text(errors="replace"))[:300]
+                msg = f"{method} {path} failed ({response.status}): {detail}"
+                raise SystemExit(msg)
+            return await response.json(content_type=None)
+    except aiohttp.ClientError as exc:
+        msg = f"{method} {path} failed: {exc}"
         raise SystemExit(msg) from exc
 
 
-def resolve_room_user(
+async def resolve_room_user(
     *,
     homeserver: str,
     access_token_provider: TokenProvider,
@@ -90,13 +99,13 @@ def resolve_room_user(
         The ``(access_token, user_id)`` pair.
 
     """
-    access = asyncio.run(access_token_provider())
-    who = api(homeserver, "GET", "/_matrix/client/v3/account/whoami", access)
+    access = await access_token_provider()
+    who = await api(homeserver, "GET", "/_matrix/client/v3/account/whoami", access)
     user = who["user_id"]
     return access, user
 
 
-def create_room_and_secret(
+async def create_room_and_secret(
     *,
     homeserver: str,
     access_token_provider: TokenProvider,
@@ -125,8 +134,8 @@ def create_room_and_secret(
         msg = f"message_dir must be an absolute path: {message_dir!r}"
         raise SystemExit(msg)
 
-    access, user = resolve_room_user(homeserver=homeserver, access_token_provider=access_token_provider)
-    room = api(
+    access, user = await resolve_room_user(homeserver=homeserver, access_token_provider=access_token_provider)
+    room = await api(
         homeserver,
         "POST",
         "/_matrix/client/v3/createRoom",
@@ -245,12 +254,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         raise SystemExit(msg)
     homeserver = args.homeserver or config.homeserver
-    state = create_room_and_secret(
-        homeserver=homeserver,
-        access_token_provider=_config_token_provider(config),
-        sim=args.sim,
-        message_dir=args.message_dir,
-        state_path=args.state,
+    state = asyncio.run(
+        create_room_and_secret(
+            homeserver=homeserver,
+            access_token_provider=_config_token_provider(config),
+            sim=args.sim,
+            message_dir=args.message_dir,
+            state_path=args.state,
+        ),
     )
     export = build_export(
         state["homeserver"],

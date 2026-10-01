@@ -141,12 +141,14 @@ def cmd_setup(args: argparse.Namespace) -> int:
     async def token() -> str:
         return await MasTokenStore.from_config(config).access_token()
 
-    state = create_room_and_secret(
-        homeserver=config.homeserver,
-        access_token_provider=token,
-        sim=args.sim,
-        message_dir=args.message_dir,
-        state_path=args.state,
+    state = asyncio.run(
+        create_room_and_secret(
+            homeserver=config.homeserver,
+            access_token_provider=token,
+            sim=args.sim,
+            message_dir=args.message_dir,
+            state_path=args.state,
+        ),
     )
     export = build_export(
         state["homeserver"],
