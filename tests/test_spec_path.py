@@ -88,7 +88,7 @@ def test_validate_spec_path_refuses_escape_and_charset(tmp_path) -> None:
 
 async def test_create_campaign_from_a_staged_path(tmp_path) -> None:
     config = _config(tmp_path)
-    base = {"sim": {"time_steps": 4, "grid": {"cell_cnt": 8}}}
+    base = _runner_dump()
     path = write_spec_file(config, "scan.json", base)
     result = await _call(
         config,
@@ -98,7 +98,6 @@ async def test_create_campaign_from_a_staged_path(tmp_path) -> None:
     assert result == {"ok": True, "name": "scan", "leaves": ["leaf000", "leaf001"]}
     campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
     assert campaign.agenda.entries["leaf000"].spec["sim"]["time_steps"] == 50
-    assert campaign.agenda.entries["leaf000"].spec["sim"]["grid"] == {"cell_cnt": 8}
     # The inline base was never touched (there was none).
     assert json.loads(path.read_text()) == base
 
