@@ -51,7 +51,7 @@ def spec_root(config: Config) -> Path:
     if config.spec_dir:
         return Path(config.spec_dir).expanduser().absolute()
     message_dir = config.message_dir or "."
-    return (Path(message_dir).expanduser().absolute() / DEFAULT_SPEC_SUBDIR)
+    return Path(message_dir).expanduser().absolute() / DEFAULT_SPEC_SUBDIR
 
 
 def validate_spec_path(config: Config, path: str) -> Path:
