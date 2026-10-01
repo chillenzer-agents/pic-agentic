@@ -1605,16 +1605,34 @@ class SimClient:
         tail = max(0, min(tail, 10_000))
         tracked = self._tracked.get(sim_id)
         if tracked is None:
-            ack = self._build_logs_ack(
-                message,
-                cmd_id=cmd_id,
-                sim_id=sim_id,
-                stream=stream,
-                lines=[],
-                total_lines=0,
-                error="unknown_sim",
-                error_code="unknown_sim",
-            )
+            # The sim may be known but not yet tracked: a build in flight has
+            # persisted its ``sim_id`` but starts the follower only once the job
+            # is launched, so no log file exists yet.  Reporting this as
+            # ``unknown_sim`` reads like a bug; name the real state instead and
+            # keep ``unknown_sim`` for a sim that was never submitted.
+            known = any(record.sim_id == sim_id for record in self._processed.values() if record.sim_id)
+            if known:
+                ack = self._build_logs_ack(
+                    message,
+                    cmd_id=cmd_id,
+                    sim_id=sim_id,
+                    stream=stream,
+                    lines=[],
+                    total_lines=0,
+                    error="the simulation has not started yet; logs appear after submission",
+                    error_code="logs_not_available",
+                )
+            else:
+                ack = self._build_logs_ack(
+                    message,
+                    cmd_id=cmd_id,
+                    sim_id=sim_id,
+                    stream=stream,
+                    lines=[],
+                    total_lines=0,
+                    error="unknown_sim",
+                    error_code="unknown_sim",
+                )
             await self.transport.send(ack)
             return ack
         lines: list[str] = []
