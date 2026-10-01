@@ -740,7 +740,10 @@ SERVER_INSTRUCTIONS = (
     "(published at https://picongpu.readthedocs.io/en/latest/python_package/foundations/) "
     "covers simulation definition and static/dynamic parameter scans; the "
     "tutorial and the examples under lib/python/examples/ in the picongpu "
-    "source tree show complete setups."
+    "source tree show complete setups. Note: the focal example on the "
+    "'Defining Your Simulation' page defines no plasma species, so it yields an "
+    "empty spectrum as written; fold in the LWFA tutorial's plasma species for "
+    "a non-empty result."
 )
 
 
