@@ -65,6 +65,17 @@ log = logging.getLogger(__name__)
 #: that creates a campaign so the caller knows how to recover.
 NO_CAMPAIGN_MESSAGE = "no campaign is persisted; create a campaign first, e.g. with create_campaign, then retry."
 
+#: Actionable text attached to the ``campaign_in_flight`` soft error returned when
+#: a reset is asked for while leaves are still submitted/running: it names the
+#: escape hatch (``force``) rather than silently leaving orphaned cluster jobs.
+IN_FLIGHT_MESSAGE = (
+    "campaign has leaves still submitted/running; stop or cancel them first, "
+    "or pass force=true to delete the campaign anyway."
+)
+
+#: Leaf statuses that mean a cluster job may still be live for this campaign.
+_IN_FLIGHT_STATUSES = frozenset({"submitted", "running"})
+
 #: A dotted patch-path segment that indexes a list rather than a dict key.
 _LIST_INDEX_RE = re.compile(r"-?\d+")
 
@@ -663,6 +674,67 @@ class AgendaService:
             leaves.append(leaf_name)
         self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
         return {"ok": True, "name": name, "leaves": leaves}
+
+    async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
+        """Remove the persisted campaign and its sibling reuse registry.
+
+        This is the reset primitive: ``create_campaign`` refuses to overwrite an
+        existing campaign, so an agent that wants a fresh study must be able to
+        clear the old one through a tool rather than deleting files by hand.
+
+        Deleting while a leaf is still ``submitted``/``running`` would leave the
+        cluster job orphaned (no campaign state to observe or cancel it), so it
+        is refused by default with an actionable ``campaign_in_flight`` error;
+        ``force=True`` overrides the guard and deletes anyway.  The guard holds
+        the lock together with the delete, so a concurrent ``advance_agenda``
+        cannot submit between the check and the removal.
+
+        Args:
+            force: Delete even when leaves are still submitted/running.
+
+        Returns:
+            ``{"ok": True, "deleted": [...paths...]}`` on success, the
+            actionable ``no_campaign`` soft error when there is nothing to
+            delete, or ``campaign_in_flight`` when the guard trips.
+
+        """
+        if not self.store.exists():
+            return no_campaign_error()
+        async with self._lock:
+            try:
+                campaign = self.store.load(Campaign)
+                in_flight = [
+                    path
+                    for path, sim in campaign.agenda.simulations()
+                    if sim.status in _IN_FLIGHT_STATUSES and sim.sim_id
+                ]
+                if in_flight and not force:
+                    return {
+                        "ok": False,
+                        "error": "campaign_in_flight",
+                        "message": IN_FLIGHT_MESSAGE,
+                        "in_flight": in_flight,
+                    }
+                deleted = self._remove_campaign_files()
+            except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
+                log.warning("agenda delete_campaign failed: %s", exc)
+                return {"ok": False, "error": self.config.redact(str(exc))}
+        return {"ok": True, "deleted": deleted}
+
+    def _remove_campaign_files(self) -> list[str]:
+        """Delete the campaign file and its sibling reuse registry (may raise).
+
+        Returns:
+            The paths removed, campaign first then reuse registry (each only
+            when it existed).
+
+        """
+        removed: list[str] = []
+        for store in (self.store, self.reuse_store):
+            if store.exists():
+                store.path.unlink()
+                removed.append(str(store.path))
+        return removed
 
     def _validate_leaf_spec(self, spec: dict[str, Any]) -> dict[str, Any] | None:
         """Validate one patched leaf through the submission path.
