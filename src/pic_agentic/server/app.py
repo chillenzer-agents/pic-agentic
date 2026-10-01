@@ -537,6 +537,16 @@ class HelloRuntime:
         """
         return await self.agenda_service.create_campaign(name, base_spec, patch_path, values)
 
+    async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
+        """Remove the persisted campaign and its reuse registry (reset).
+
+        Returns:
+            ``{"ok": True, "deleted": [...]}``, or a soft error
+            (``no_campaign``, ``campaign_in_flight``).
+
+        """
+        return await self.agenda_service.delete_campaign(force=force)
+
     async def record_analysis(self, path: str, analysis: dict[str, Any]) -> dict[str, Any]:
         """Record one leaf's analysis on the campaign.
 
@@ -675,6 +685,9 @@ SERVER_INSTRUCTIONS = (
     "or, for parameter studies, as a pypicongpu Runner spec "
     "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
     "a spec field across values). "
+    "create_campaign refuses to overwrite an existing campaign; to start a fresh "
+    "one, remove the old state first with delete_campaign (reset), optionally "
+    "after stop_agenda to cancel in-flight jobs. "
     "For how to write a PICMI input file and how to define or scan multiple "
     "simulations, see the PyPIConGPU documentation: the page 'Defining Your "
     "Simulation' under python_package/foundations/defining_simulation "
@@ -1201,6 +1214,23 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         values: list[Any],
     ) -> dict[str, Any]:
         result = await runtime.create_campaign(name, base_spec, patch_path, values)
+        return _redact_dict(runtime, result)
+
+    @server.tool(
+        title="Delete/reset the campaign",
+        description=(
+            "Remove the persisted campaign and its sibling reuse registry, so a "
+            "fresh campaign can be created (create_campaign refuses to overwrite "
+            "an existing one). Refused with an actionable `campaign_in_flight` "
+            "error while leaves are still submitted/running, since deleting then "
+            "would orphan the cluster jobs; pass force=true to delete anyway, or "
+            "stop_agenda first to cancel them."
+        ),
+        # destructive: it irreversibly removes the persisted campaign state.
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+    )
+    async def delete_campaign(*, force: bool = False) -> dict[str, Any]:
+        result = await runtime.delete_campaign(force=force)
         return _redact_dict(runtime, result)
 
     @server.tool(
