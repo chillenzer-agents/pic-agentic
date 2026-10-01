@@ -276,6 +276,61 @@ async def test_concurrent_advance_does_not_duplicate_submissions(tmp_path) -> No
         await sim_t.close()
 
 
+async def test_failed_leaf_surfaces_the_simclient_reason(tmp_path) -> None:
+    """A rejected submission exposes error/error_code in callbacks and status (P2a).
+
+    The offline responder rejects the submit with the simclient's
+    ``unsupported`` ack; the campaign must surface *why* the leaf failed, not a
+    bare ``failed`` with a null sim_id.
+    """
+    agenda = AgendaGroup(name="g")
+    agenda = agenda.add(leaf0=AgendaSim(name="leaf0", spec={"sim": {"replica": 0}}))
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+
+    async def rejecting() -> None:
+        counter = 0
+        async for command in sim_t.receive():
+            if command.type != SimulationType.COMMAND:
+                continue
+            counter += 1
+            ack = build_submit_ack(
+                sim=SIM,
+                seq=counter,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id="sim0001",
+                state=SimulationState.FAILED,
+                in_reply_to=command.transport_event_id,
+                error="simulation carries fields outside the pinned pypicongpu schema",
+                error_code="unsupported",
+            ).sign(SECRET)
+            await sim_t.send(ack)
+
+    tasks = [asyncio.create_task(rejecting()), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        tick = (await server.call_tool("advance_agenda", {})).structured_content
+        assert tick["failed"] == ["leaf0"]
+        (callback,) = tick["callbacks"]
+        assert callback["error"] == "simulation carries fields outside the pinned pypicongpu schema"
+        assert callback["error_code"] == "unsupported"
+
+        status = (await server.call_tool("agenda_status", {})).structured_content
+        leaf = next(item for item in status["leaves"] if item["path"] == "leaf0")
+        assert leaf["status"] == "failed"
+        assert leaf["error_code"] == "unsupported"
+
+        drained = (await server.call_tool("take_agenda_callbacks", {})).structured_content
+        assert drained["callbacks"][0]["error_code"] == "unsupported"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
 async def test_take_callbacks_drains_durably(tmp_path) -> None:
     """Callbacks emitted by a tick are returned once, then cleared on disk."""
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))

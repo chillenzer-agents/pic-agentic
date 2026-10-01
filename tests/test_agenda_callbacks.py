@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pic_agentic.agenda.campaign import Campaign
-from pic_agentic.agenda.engine import AgendaEngine
+from pic_agentic.agenda.engine import AgendaEngine, FailureInfo
 from pic_agentic.agenda.model import AgendaGroup
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
 
@@ -96,6 +96,58 @@ async def test_pending_callbacks_survive_a_restart(tmp_path) -> None:
     assert [c.kind for c in store.load(Campaign).callbacks] == ["done"]
 
 
+async def test_failed_leaf_callback_carries_the_observed_reason(tmp_path) -> None:
+    """A failed transition stamps the simclient's reason onto leaf and callback."""
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+    state: dict[str, str] = {}
+    engine = AgendaEngine(store=store, submit=_Runner(state), observe=lambda: dict(state))
+    await engine.tick()
+    sim_id = next(iter(state))
+    state[sim_id] = "simulation.failed"
+    failures = {sim_id: FailureInfo(error="bad field", error_code="unsupported", stage="prepare")}
+    engine = AgendaEngine(
+        store=store,
+        submit=_Runner(state),
+        observe=lambda: dict(state),
+        failures=lambda: failures,
+    )
+    result = await engine.tick()
+    (callback,) = result.callbacks
+    assert (callback.path, callback.kind) == ("a0", "failed")
+    assert callback.error == "bad field"
+    assert callback.error_code == "unsupported"
+    assert callback.stage == "prepare"
+    # The reason is persisted on the leaf and surfaced by status.
+    leaf = store.load(Campaign).agenda.entries["a0"]
+    assert (leaf.error, leaf.error_code, leaf.stage) == ("bad field", "unsupported", "prepare")
+    status_leaf = next(leaf for leaf in engine.status()["leaves"] if leaf["path"] == "a0")
+    assert status_leaf["error"] == "bad field"
+    assert status_leaf["error_code"] == "unsupported"
+
+
+async def test_submit_rejection_reason_flows_onto_the_leaf(tmp_path) -> None:
+    """A submit callable raising SubmitFailureError surfaces the reason."""
+    from pic_agentic.agenda.engine import SubmitFailureError
+
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+
+    async def rejecting(_spec: dict, _key: str) -> str:
+        msg = "payload malformed"
+        raise SubmitFailureError(msg, error_code="payload_invalid", stage="prepare")
+
+    engine = AgendaEngine(store=store, submit=rejecting, observe=dict)
+    result = await engine.tick()
+    (callback,) = result.callbacks
+    assert callback.kind == "failed"
+    assert callback.error == "payload malformed"
+    assert callback.error_code == "payload_invalid"
+    assert callback.stage == "prepare"
+    leaf = store.load(Campaign).agenda.entries["a0"]
+    assert leaf.error_code == "payload_invalid"
+
+
 async def test_dependency_failed_callback_for_blocked_successor(tmp_path) -> None:
     """A blocked successor terminal-persisted by the planner also emits."""
     store = _store(tmp_path)
@@ -109,6 +161,10 @@ async def test_dependency_failed_callback_for_blocked_successor(tmp_path) -> Non
         state[sim_id] = "simulation.job_failed"
     result = await engine.tick()
     assert sorted((c.path, c.kind) for c in result.callbacks) == [("a0", "failed"), ("a1", "failed")]
+    # The blocked successor names the dependency that failed it.
+    blocked = next(c for c in result.callbacks if c.path == "a1")
+    assert blocked.error is not None
+    assert "a0" in blocked.error
 
 
 async def test_end_to_end_refine_loop(tmp_path) -> None:

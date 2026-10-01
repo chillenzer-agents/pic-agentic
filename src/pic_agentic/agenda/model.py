@@ -205,6 +205,14 @@ class AgendaSim(BaseModel):
     #: estimated usage and is exempt from actual-cost reconciliation (the cost
     #: was accounted by the campaign that first ran it).
     reused: bool = False
+    #: Human-readable reason this leaf failed, when known (e.g. the simclient's
+    #: rejection message).  None for a failure whose cause was not observed.
+    error: str | None = None
+    #: Machine-readable failure code from the simclient (e.g. ``unsupported``).
+    error_code: str | None = None
+    #: Pipeline stage the failure occurred in (``build``/``prepare``/``submit``/
+    #: ``run``), when the simclient reported one.
+    stage: str | None = None
 
     @field_validator("name")
     @classmethod

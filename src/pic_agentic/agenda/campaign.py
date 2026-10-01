@@ -53,6 +53,13 @@ class Callback(BaseModel):
     kind: Literal["done", "failed"]
     sim_id: str | None = None
     ts: str | None = None
+    #: Human-readable reason a ``failed`` callback fired, when known.  None for
+    #: a ``done`` callback or a failure whose cause was not observed.
+    error: str | None = None
+    #: Machine-readable failure code from the simclient (e.g. ``unsupported``).
+    error_code: str | None = None
+    #: Pipeline stage the failure occurred in, when the simclient reported one.
+    stage: str | None = None
 
 
 class Campaign(BaseModel):

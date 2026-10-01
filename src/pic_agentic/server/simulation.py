@@ -94,7 +94,14 @@ _RECORD_FIELDS = (
     "core_hours",
     "gpu_hours",
     "run_dir",
+    "error",
+    "error_code",
+    "stage",
 )
+
+#: The failure-reason subset of :data:`_RECORD_FIELDS`, projected from a submit
+#: ack as well (a rejection reports its reason on the ack, not as an event).
+_FAILURE_FIELDS = ("error", "error_code", "stage")
 
 
 class SimRecord(BaseModel):
@@ -122,6 +129,12 @@ class SimRecord(BaseModel):
     core_hours: float | None = None
     gpu_hours: float | None = None
     run_dir: str | None = None
+    #: Human-readable failure reason reported by the simclient (ack or event).
+    error: str | None = None
+    #: Stable machine-readable failure code (e.g. ``unsupported``).
+    error_code: str | None = None
+    #: Pipeline stage the failure occurred in, when the simclient reported one.
+    stage: str | None = None
     last_event_type: str | None = None
     last_event_ts: str | None = None
     active: bool = True
@@ -194,6 +207,8 @@ class SubmitOutcome(BaseModel):
     acked: bool = False
     error: str | None = None
     error_code: str | None = None
+    #: Pipeline stage the rejection occurred in, when the ack carries one.
+    stage: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -496,6 +511,12 @@ class SubmitService:
             record.active = state not in TERMINAL_STATES
         if payload.get("job_id") is not None:
             record.job_id = payload["job_id"]
+        # A rejected submission carries its reason on the ack (not an event), so
+        # project the failure fields here too.
+        for field in _FAILURE_FIELDS:
+            value = payload.get(field)
+            if value is not None:
+                setattr(record, field, value)
         if record.last_event_ts is None:
             record.last_event_ts = message.ts
         self.registry[sim_id] = record
@@ -573,6 +594,7 @@ class SubmitService:
             acked=True,
             error=ack.payload.get("error"),
             error_code=ack.payload.get("error_code"),
+            stage=ack.payload.get("stage"),
         )
 
     async def submit(

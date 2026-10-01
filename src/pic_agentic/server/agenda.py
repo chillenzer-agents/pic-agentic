@@ -28,7 +28,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
-from pic_agentic.agenda.engine import ActualUsage, AgendaEngine, EnginePolicy, TransientSubmitError, leaf_at
+from pic_agentic.agenda.engine import (
+    ActualUsage,
+    AgendaEngine,
+    EnginePolicy,
+    FailureInfo,
+    SubmitFailureError,
+    TransientSubmitError,
+    leaf_at,
+)
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.refine import summary as refine_summary
 from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
@@ -199,6 +207,16 @@ class AgendaService:
                 if record.core_hours is not None
             }
 
+        def failures() -> Mapping[str, FailureInfo]:
+            # The registry carries the reason a run failed, projected from the
+            # submit ack or a lifecycle event; only records that have one are
+            # offered.  Redaction is applied at the tool boundary.
+            return {
+                sim_id: FailureInfo(error=record.error, error_code=record.error_code, stage=record.stage)
+                for sim_id, record in registry.items()
+                if record.error or record.error_code
+            }
+
         async def submit(spec: dict[str, Any], key: str) -> str:
             try:
                 outcome = await self.submit_service.submit_spec(send, spec, cmd_id=key)
@@ -209,7 +227,7 @@ class AgendaService:
                 raise TransientSubmitError(msg) from exc
             if not outcome.ok or not outcome.sim_id:
                 msg = outcome.error or "submit failed"
-                raise RuntimeError(msg)
+                raise SubmitFailureError(msg, error_code=outcome.error_code, stage=outcome.stage)
             return outcome.sim_id
 
         def reuse_key(spec: dict[str, Any]) -> str:
@@ -234,6 +252,7 @@ class AgendaService:
             observe=observe,
             policy=self.policy,
             actuals=actuals,
+            failures=failures,
             reuse_lookup=reuse_lookup,
             reuse_record=reuse_record,
             reuse_key=reuse_key,
