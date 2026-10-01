@@ -19,6 +19,7 @@ import pytest
 
 from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
+from pic_agentic.agenda.reuse import ReuseRegistry
 from pic_agentic.agenda.store import AgendaStore
 from pic_agentic.config import Config
 from pic_agentic.protocol.simulation import SimulationState, SimulationType, build_submit_ack
@@ -105,7 +106,15 @@ async def test_tool_registration_and_annotations() -> None:
         "take_agenda_callbacks",
         "add_agenda_leaf",
         "create_campaign",
+        "delete_campaign",
     } <= set(tools)
+
+    delete = tools["delete_campaign"].annotations
+    assert delete is not None
+    assert delete.read_only_hint is False
+    assert delete.destructive_hint is True
+    assert delete.idempotent_hint is False
+    assert set(tools["delete_campaign"].input_schema["properties"]) == {"force"}
 
     create = tools["create_campaign"].annotations
     assert create is not None
@@ -694,3 +703,65 @@ async def test_create_campaign_rejects_a_typo_field(tmp_path) -> None:
     assert result["ok"] is False
     assert result["error"] == "invalid_campaign"
     assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_delete_campaign_removes_both_files_then_no_campaign(tmp_path) -> None:
+    campaign = Path(_campaign_file(tmp_path))
+    reuse = tmp_path / "reuse-registry.json"
+    AgendaStore(tmp_path, filename="reuse-registry.json").save(ReuseRegistry())
+    assert campaign.exists()
+    assert reuse.exists()
+
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+    result = await _call(config, "delete_campaign", {})
+    assert result["ok"] is True
+    assert set(result["deleted"]) == {str(campaign), str(reuse)}
+    assert not campaign.exists()
+    assert not reuse.exists()
+
+    # With the state gone, status reports the actionable no_campaign error.
+    status = await _call(config, "agenda_status", {})
+    assert status == NO_CAMPAIGN
+
+
+async def test_delete_campaign_without_a_campaign_is_a_soft_error(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
+    result = await _call(config, "delete_campaign", {})
+    assert result["error"] == "no_campaign"
+    assert result["message"] == NO_CAMPAIGN_MESSAGE
+    assert "create_campaign" in result["message"]
+
+
+def _campaign_file_with_status(tmp_path: Path, status: str) -> str:
+    agenda = AgendaGroup(name="group").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, status=status, sim_id="sim0001")
+    )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    return str(tmp_path / "campaign.json")
+
+
+async def test_delete_campaign_refuses_while_a_leaf_is_in_flight(tmp_path) -> None:
+    campaign = Path(_campaign_file_with_status(tmp_path, "running"))
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    refused = await _call(config, "delete_campaign", {})
+    assert refused["ok"] is False
+    assert refused["error"] == "campaign_in_flight"
+    assert refused["in_flight"] == ["leaf"]
+    assert "force" in refused["message"]
+    assert campaign.exists()
+
+
+async def test_delete_campaign_force_overrides_the_in_flight_guard(tmp_path) -> None:
+    campaign = Path(_campaign_file_with_status(tmp_path, "submitted"))
+    config = Config(rcp_secret=SECRET, agenda_file=str(campaign))
+
+    result = await _call(config, "delete_campaign", {"force": True})
+    assert result["ok"] is True
+    assert not campaign.exists()
+
+    # A finished leaf is not in flight, so the default delete succeeds.
+    done = Path(_campaign_file_with_status(tmp_path, "done"))
+    done_result = await _call(config, "delete_campaign", {})
+    assert done_result["ok"] is True
+    assert not done.exists()

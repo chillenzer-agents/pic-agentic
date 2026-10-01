@@ -219,7 +219,7 @@ async def test_tool_registration_shape() -> None:
     }
     assert expected <= set(tools)
     # The frozen tool surface the LLM sees: one new tool must not go missing.
-    assert len(tools) == 34
+    assert len(tools) == 35
     for name in (
         "checkpoint_simulation",
         "stop_simulation",
