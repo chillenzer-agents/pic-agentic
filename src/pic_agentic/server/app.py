@@ -128,6 +128,13 @@ class HelloRuntime:
             results_root=config.results_root,
         )
         self.agenda_service = AgendaService(config, self.submit_service)
+        # H7: a bare submit_simulation is invisible to the campaign engine, so
+        # its completed result would never enter the reuse registry and a later
+        # identical campaign leaf would re-run it.  Record it (pending) on
+        # acceptance and promote it to reusable when its results.ready event
+        # arrives, mirroring the engine's results.ready-only rule.
+        self.submit_service.on_direct_submission = self.agenda_service.remember_direct_spec
+        self.submit_service.on_run_ready = self.agenda_service.promote_reuse
         self._transport: MatrixTransport | None = None
         self._pump: asyncio.Task | None = None
 
@@ -948,6 +955,7 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             {
                 "sim_id": record.sim_id,
                 "cmd_id": record.cmd_id,
+                "run_id": record.cmd_id,
                 "state": record.state,
                 "job_id": record.job_id,
                 "suspect": record.suspect,
@@ -1762,6 +1770,7 @@ def _status_dict(record: SimRecord) -> dict[str, Any]:
     """
     return {
         "sim_id": record.sim_id,
+        "run_id": record.cmd_id,
         "state": record.state,
         "slurm_state": record.slurm_state,
         "job_id": record.job_id,
@@ -1924,6 +1933,7 @@ def _submit_outcome_dict(runtime: HelloRuntime, outcome: SubmitOutcome) -> dict[
         "ok": outcome.ok,
         "sim": outcome.sim,
         "sim_id": outcome.sim_id,
+        "run_id": outcome.run_id,
         "state": outcome.state,
         "job_id": outcome.job_id,
         "acked": outcome.acked,

@@ -119,6 +119,17 @@ def test_format_leaves_marks_suspect() -> None:
     assert "a: done [sim1] SUSPECT" in format_leaves(status)
 
 
+def test_format_leaves_marks_reused() -> None:
+    """A reused leaf is labelled, so "no new job" is visible in the human view."""
+    status = {
+        "name": "study",
+        "leaves": [{"path": "a", "status": "done", "sim_id": "sim1", "reused": True}],
+    }
+    text = format_leaves(status)
+    assert "REUSED" in text
+    assert "a: done [sim1] REUSED" in text
+
+
 def test_notification_text_mentions_suspicious_runs() -> None:
     text = notification_text([{"kind": "done", "suspect": "all zeros"}], [])
     assert text is not None

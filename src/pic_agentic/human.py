@@ -209,6 +209,8 @@ def format_leaves(status: dict) -> str:
         elif point:
             point_text = f" {point}"
         marker = " SUSPECT" if leaf.get("suspect") else ""
+        if leaf.get("reused"):
+            marker += " REUSED"
         lines.append(f"  {leaf.get('path')}: {leaf.get('status')} [{sim_id}]{point_text}{marker}")
     return "\n".join(lines)
 

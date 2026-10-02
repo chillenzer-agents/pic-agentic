@@ -40,7 +40,7 @@ from pic_agentic.agenda.engine import (
 )
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim, readable_label
 from pic_agentic.agenda.refine import summary as refine_summary
-from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
+from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, PENDING_STATE, ReuseRecord, ReuseRegistry
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
 from pic_agentic.protocol.simulation import (
     MAX_INLINE_PAYLOAD_BYTES,
@@ -173,6 +173,75 @@ class AgendaService:
             log.warning("ignoring unreadable reuse registry: %s", exc)
             return ReuseRegistry()
 
+    def remember_direct_spec(self, spec: dict[str, Any], *, sim_id: str, run_id: str) -> None:
+        """Record an accepted direct ``submit_simulation`` as a pending reuse.
+
+        A bare ``submit_simulation`` never went through the campaign engine, so
+        its completed result was invisible to the registry and a later identical
+        campaign leaf re-ran it (H7).  This stores a ``pending`` entry the
+        moment the simclient accepts the submission; the result is not ready
+        yet, so it is not reusable, and the entry is attributed by ``run_id``
+        (the submission's stable command id) so the later ``results.ready``
+        event can promote it **even across a server restart** (the signed-room
+        replay carries the command id, not the spec).  Best-effort: registry
+        bookkeeping must never fail a submission.
+
+        Args:
+            spec: The submitted wire spec (``{"sim": ...}``).
+            sim_id: The spec's payload label.
+            run_id: The submission's stable command id (the run identity).
+
+        """
+        try:
+            record = self._direct_reuse_record(spec, sim_id=sim_id, run_id=run_id)
+        except Exception as exc:  # ruff: ignore[blind-except] - registry bookkeeping is best-effort
+            log.warning("reuse remember failed for sim %s: %s", sim_id, exc)
+            return
+        try:
+            self.reuse_store.save(self._load_reuse().remember(record))
+        except Exception as exc:  # ruff: ignore[blind-except] - registry bookkeeping is best-effort
+            log.warning("reuse remember failed for sim %s: %s", sim_id, exc)
+
+    def _direct_reuse_record(self, spec: dict[str, Any], *, sim_id: str, run_id: str) -> ReuseRecord:
+        """Build the registry entry for an accepted direct submission.
+
+        Returns:
+            The entry: ``pending`` normally, or ``done`` when the run's
+            ``results.ready`` was already projected (the ack and the event can
+            arrive back to back, so the result may beat this bookkeeping).
+
+        """
+        key = _reuse_key(spec, self.submit_service.picongpu_revision)
+        existing = self._load_reuse().records.get(key)
+        # A replayed submission (e.g. ingest_backfill after a restart) must not
+        # demote an already-promoted record back to pending.
+        state = existing.state if existing is not None and existing.state != PENDING_STATE else PENDING_STATE
+        run = self.submit_service.registry.get(sim_id)
+        if state == PENDING_STATE and run is not None and run.cmd_id == run_id and run.state == "results.ready":
+            state = "done"
+        return ReuseRecord(wire_hash=key, sim_id=sim_id, state=state, run_id=run_id)
+
+    def promote_reuse(self, run_id: str) -> None:
+        """Promote the pending direct-submission record accepted by ``run_id``.
+
+        Called when the simclient reports a run's results are ready: it is the
+        one event that guarantees ``run_dir/simOutput`` exists, so it is the
+        point at which the run becomes reusable (matching the engine's own
+        ``results.ready``-only rule).  The event carries the command id, so the
+        record is found by identity even after a restart.  Best-effort.
+
+        Args:
+            run_id: The submission's stable command id.
+
+        """
+        try:
+            registry = self._load_reuse()
+            promoted = registry.promote(run_id)
+            if promoted is not registry:
+                self.reuse_store.save(promoted)
+        except Exception as exc:  # ruff: ignore[blind-except] - registry bookkeeping is best-effort
+            log.warning("reuse promote failed for run %s: %s", run_id, exc)
+
     async def advance(self, send: SendFn) -> dict[str, Any]:
         """Run one durable engine tick over the persisted campaign.
 
@@ -248,19 +317,15 @@ class AgendaService:
             return outcome.sim_id
 
         def reuse_key(spec: dict[str, Any]) -> str:
-            # Fold the provenance tuple into the reuse key, so identical physics
-            # authored for a different PIConGPU revision/schema is *not* reused
-            # (the result would not be attributable to the campaign's revision).
-            provenance = _spec_provenance(spec, self.submit_service.picongpu_revision)
-            payload = {"sim": spec.get("sim"), "provenance": provenance}
-            canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-            return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+            return _reuse_key(spec, self.submit_service.picongpu_revision)
 
         def reuse_lookup(key: str) -> ReuseRecord | None:
             return self._load_reuse().lookup(key)
 
-        def reuse_record(key: str, sim_id: str, state: str) -> None:
-            updated = self._load_reuse().remember(ReuseRecord(wire_hash=key, sim_id=sim_id, state=state))
+        def reuse_record(key: str, sim_id: str, state: str, run_id: str | None) -> None:
+            updated = self._load_reuse().remember(
+                ReuseRecord(wire_hash=key, sim_id=sim_id, state=state, run_id=run_id),
+            )
             self.reuse_store.save(updated)
 
         return AgendaEngine(
@@ -1179,6 +1244,30 @@ def _policy_from_config(config: Config) -> EnginePolicy:
         require_approval=config.agenda_require_approval,
         approve_over_est_core_hours=config.agenda_approve_over_est_core_hours,
     )
+
+
+def _reuse_key(spec: dict[str, Any], fallback_revision: str) -> str:
+    """Return the content key under which a spec's completed result is reused.
+
+    The key folds the provenance tuple in with the wire payload, so identical
+    physics authored for a different PIConGPU revision/schema is *not* reused
+    (the result would not be attributable to the campaign's revision).  Shared
+    by the campaign engine's lookup/record hooks and by the direct
+    ``submit_simulation`` record path, so a direct run and a later identical
+    campaign leaf agree on the key.
+
+    Args:
+        spec: A wire spec (``{"sim": ...}``, optionally carrying ``provenance``).
+        fallback_revision: The server's configured ``picongpu_revision``.
+
+    Returns:
+        The sha256 hex digest of the canonical ``{sim, provenance}`` payload.
+
+    """
+    provenance = _spec_provenance(spec, fallback_revision)
+    payload = {"sim": spec.get("sim"), "provenance": provenance}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
 
 async def _never_submit(_spec: dict[str, Any], _key: str) -> str:  # ruff: ignore[unused-async] - matches SubmitFn

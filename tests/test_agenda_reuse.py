@@ -6,12 +6,32 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from pathlib import Path
+
 from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.engine import AgendaEngine
 from pic_agentic.agenda.engine import _wire_hash as engine_key
-from pic_agentic.agenda.model import AgendaGroup
-from pic_agentic.agenda.reuse import ReuseRecord, ReuseRegistry
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim
+from pic_agentic.agenda.reuse import PENDING_STATE, ReuseRecord, ReuseRegistry
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
+from pic_agentic.config import Config
+from pic_agentic.protocol.simulation import (
+    SimulationState,
+    SimulationType,
+    build_submit_ack,
+    build_submit_event,
+)
+from pic_agentic.rcp import new_secret_hex
+from pic_agentic.server.agenda import AgendaService
+from pic_agentic.server.simulation import SubmitService
+from pic_agentic.simulation_build import BuiltSimulation
+from pic_agentic.transport.memory import MemoryTransport
+
+_SECRET = new_secret_hex()
+_SIM = "7f3a2b1c"
+_RUNNER = Path(__file__).parent / "fixtures" / "pypicongpu_runner.json"
 
 
 def _store(tmp_path) -> AgendaStore:
@@ -60,8 +80,8 @@ def _engine(store: AgendaStore, submit: _Submitter, registry: dict[str, ReuseRec
         record = registry.get(key)
         return record if record is not None and record.state == "done" else None
 
-    def record(key: str, sim_id: str, state: str) -> None:
-        registry[key] = ReuseRecord(wire_hash=key, sim_id=sim_id, state=state)
+    def record(key: str, sim_id: str, state: str, run_id: str | None = None) -> None:
+        registry[key] = ReuseRecord(wire_hash=key, sim_id=sim_id, state=state, run_id=run_id)
 
     return AgendaEngine(
         store=store,
@@ -238,3 +258,241 @@ async def test_engine_without_reuse_callables_behaves_as_before(tmp_path) -> Non
     tick = await engine.tick()
     assert tick.submitted == ["a0"]
     assert tick.reused == []
+
+
+def test_registry_promote_flips_a_pending_run_to_reusable() -> None:
+    """A pending run (recorded on acceptance) becomes reusable on results.ready."""
+    key = engine_key({"replica": 0})
+    registry = ReuseRegistry().remember(
+        ReuseRecord(wire_hash=key, sim_id="s1", state=PENDING_STATE, run_id="run-1"),
+    )
+    assert registry.lookup(key) is None  # a pending run is not reusable
+    promoted = registry.promote("run-1")
+    assert promoted.lookup(key) is not None
+    assert promoted.lookup(key).run_id == "run-1"  # type: ignore[union-attr]
+    # A replayed results.ready (or a non-matching run id) is idempotent.
+    assert promoted.promote("run-1").lookup(key).state == "done"  # type: ignore[union-attr]
+    assert promoted.promote("other").lookup(key) is not None  # already done, unchanged
+    assert registry.promote("unknown") is registry  # no match: self returned unchanged
+
+
+async def test_direct_submission_run_is_recorded_with_its_run_batch(tmp_path) -> None:
+    """A completed engine run records the run batch alongside the spec label.
+
+    The registry must carry the run-batch identity (the engine's stable command
+    id) so a reused leaf can name the run it linked to, distinct from the spec
+    label ``sim_id``.
+    """
+    store = _store(tmp_path)
+    spec = {"replica": 7}
+    store.save(_campaign([spec]))
+    registry: dict[str, ReuseRecord] = {}
+    observed: dict[str, str] = {}
+    submit = _Submitter()
+    engine = _engine(store, submit, registry, observed)
+    await engine.tick()
+    observed["sim001"] = "results.ready"
+    await engine.tick()
+    record = registry[engine_key(spec)]
+    assert record.sim_id == "sim001"
+    assert record.run_id  # the run-batch identity was recorded
+    assert record.state == "done"
+
+
+# --- server wiring: a bare submit_simulation feeds the registry (H7) ---------
+
+
+class _DirectResponder:
+    """Ack each submit command; never emit lifecycle events (tests drive those)."""
+
+    def __init__(self, transport: MemoryTransport, sim_id: str = "abcd1234") -> None:
+        self.transport = transport
+        self.sim_id = sim_id
+        self.commands: list[str] = []
+
+    async def run(self) -> None:
+        counter = 0
+        async for command in self.transport.receive():
+            if command.type != SimulationType.COMMAND:
+                continue
+            counter += 1
+            cmd_id = str(command.payload.get("cmd_id", ""))
+            self.commands.append(cmd_id)
+            ack = build_submit_ack(
+                sim=_SIM,
+                seq=counter,
+                cmd_id=cmd_id,
+                sim_id=self.sim_id,
+                state=SimulationState.ACCEPTED,
+                in_reply_to=command.transport_event_id,
+            ).sign(_SECRET)
+            await self.transport.send(ack)
+
+
+async def _pump_into(transport: MemoryTransport, service: SubmitService) -> asyncio.Task:
+    async def pump() -> None:
+        async for message in transport.receive():
+            service.on_message(message)
+
+    return asyncio.create_task(pump())
+
+
+def _direct_service(
+    tmp_path: Path, *, picongpu_revision: str = "rev-test"
+) -> tuple[AgendaService, SubmitService, BuiltSimulation]:
+    runner = json.loads(_RUNNER.read_text())
+    built = BuiltSimulation(
+        runner=runner,
+        picongpu_version="0.9.0-dev",
+        picongpu_revision=picongpu_revision,
+        schema_hash="schema-test",
+    )
+    service = SubmitService(sim=_SIM, secret=_SECRET, picongpu_revision=picongpu_revision)
+
+    async def builder(*, script_path, **_kw):  # ruff: ignore[missing-type-kwargs]
+        return built
+
+    service.runner_dump_builder = builder
+    config = Config(rcp_secret=_SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    agenda = AgendaService(config, service)
+    service.on_direct_submission = agenda.remember_direct_spec
+    service.on_run_ready = agenda.promote_reuse
+    return agenda, service, built
+
+
+async def test_direct_submission_is_reused_by_an_identical_campaign_leaf(tmp_path) -> None:
+    """H7: a completed ad-hoc submit_simulation is reused, not re-run.
+
+    The bare submission never went through the engine, so its result was absent
+    from the registry and an identical campaign leaf re-ran it.  It is now
+    recorded (pending) on acceptance and promoted on results.ready, so the
+    campaign leaf links to it with no second cluster job.
+    """
+    from pic_agentic.server.agenda import _reuse_key
+
+    agenda, service, built = _direct_service(tmp_path)
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    responder = _DirectResponder(sim_t)
+    tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
+    try:
+        outcome = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        assert outcome.ok
+        assert outcome.run_id == outcome.cmd_id
+        # The result arrives: promote the pending record deterministically.
+        service.on_message(
+            build_submit_event(
+                sim=_SIM,
+                seq=999,
+                cmd_id=outcome.cmd_id,
+                sim_id=outcome.sim_id,
+                state=SimulationState.RESULTS_READY,
+            ).sign(_SECRET),
+        )
+        record = agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test"))
+        assert record is not None
+        assert record.run_id == outcome.cmd_id
+
+        # A campaign whose only leaf is byte-identical must reuse, not resubmit.
+        group = AgendaGroup(name="g").add(leaf=AgendaSim(name="leaf", spec={"sim": built.runner["sim"]}))
+        AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="camp", agenda=group))
+        tick = await agenda.advance(mcp_t.send)
+        assert tick["reused"] == ["leaf"]
+        assert tick["submitted"] == []
+        assert len(responder.commands) == 1  # no second cluster job
+        leaf = agenda.store.load(Campaign).agenda.entries["leaf"]
+        assert leaf.reused is True
+        assert leaf.run_id == outcome.cmd_id
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_direct_submission_under_a_different_revision_is_not_reused(tmp_path) -> None:
+    """A different provenance tuple must not match: reuse stays attributable.
+
+    With no configured revision the key falls back to the spec-carried
+    provenance, so a leaf whose physics is attributed to another PIConGPU
+    revision does not reuse the direct run and is submitted normally.
+    """
+    agenda, service, built = _direct_service(tmp_path, picongpu_revision="")
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    responder = _DirectResponder(sim_t)
+    tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
+    try:
+        outcome = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        service.on_message(
+            build_submit_event(
+                sim=_SIM,
+                seq=999,
+                cmd_id=outcome.cmd_id,
+                sim_id=outcome.sim_id,
+                state=SimulationState.RESULTS_READY,
+            ).sign(_SECRET),
+        )
+        # The leaf's spec carries a different revision: it must not hit.
+        leaf_spec = {"sim": built.runner["sim"], "provenance": {"picongpu_revision": "other-rev"}}
+        group = AgendaGroup(name="g").add(leaf=AgendaSim(name="leaf", spec=leaf_spec))
+        AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="camp", agenda=group))
+        tick = await agenda.advance(mcp_t.send)
+        assert tick["reused"] == []
+        assert tick["submitted"] == ["leaf"]
+        assert len(responder.commands) == 2
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_reused_leaf_records_the_run_it_was_linked_to(tmp_path) -> None:
+    """A reused leaf carries the linked run's run_id, not just the sim label."""
+    store = _store(tmp_path)
+    spec = {"replica": 3}
+    store.save(_campaign([spec]))
+    key = engine_key(spec)
+    registry = {
+        key: ReuseRecord(wire_hash=key, sim_id="simExisting", state="done", run_id="run-original"),
+    }
+
+    def lookup(k: str) -> ReuseRecord | None:
+        record = registry.get(k)
+        return record if record is not None and record.state == "done" else None
+
+    engine = AgendaEngine(store=store, submit=_Submitter(), observe=dict, reuse_lookup=lookup)
+    tick = await engine.tick()
+    assert tick.reused == ["a0"]
+    leaf = store.load(Campaign).agenda.entries["a0"]
+    assert leaf.reused is True
+    assert leaf.sim_id == "simExisting"
+    assert leaf.run_id == "run-original"
+    # The run identity surfaces in status and the campaign report.
+    status_leaf = engine.status()["leaves"][0]
+    assert status_leaf["reused"] is True
+    assert status_leaf["run_id"] == "run-original"
+    assert engine.campaign_report()["leaves"][0]["run_id"] == "run-original"
+
+
+# --- run identity in the server status surface (N1) -------------------------
+
+
+async def test_status_tools_expose_run_id_beside_the_spec_label() -> None:
+    """get_status/list_simulations carry run_id, distinct from the spec label.
+
+    ``sim_id`` alone is ambiguous: re-runs share it.  Surface the run-batch
+    identity so an operator can tell a re-run from a distinct study point.
+    """
+    from pic_agentic.server.app import build_server
+
+    server, runtime = build_server(Config(rcp_secret=_SECRET), _SIM)
+    record = runtime.submit_service._record_for("e8484fcd", cmd_id="run-abc")
+    record.state = SimulationState.ACCEPTED.value
+    runtime.submit_service.registry["e8484fcd"] = record
+
+    status = (await server.call_tool("get_status", {"sim_id": "e8484fcd"})).structured_content
+    assert status["sim_id"] == "e8484fcd"
+    assert status["run_id"] == "run-abc"
+    rows = (await server.call_tool("list_simulations", {})).structured_content["simulations"]
+    assert rows[0]["sim_id"] == "e8484fcd"
+    assert rows[0]["run_id"] == "run-abc"
