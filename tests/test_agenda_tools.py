@@ -144,6 +144,7 @@ async def test_tool_registration_and_annotations() -> None:
         "base_spec_path",
         "patch_path",
         "values",
+        "parameter",
     }
     assert set(tools["create_campaign"].input_schema["required"]) == {"name", "patch_path", "values"}
 
@@ -588,11 +589,138 @@ async def test_create_campaign_patches_a_list_indexed_path(tmp_path) -> None:
         assert focus[1]["component"] == pytest.approx(value)
         # The point names the last path segment and agrees with the patched spec.
         assert leaf.point == {"component": value}
+        # But the sweep is self-describing: the readable name drops the list
+        # indices while keeping every field name.
+        assert leaf.sweep_parameter == "sim.laser.focus_pos_si.component"
         # The nested siblings survive untouched.
         assert focus[0]["component"] == pytest.approx(siblings[0])
         assert focus[2]["component"] == pytest.approx(siblings[1])
     # The base spec is not mutated by the per-leaf patch.
     assert base["sim"]["laser"][0]["focus_pos_si"][1]["component"] == pytest.approx(original)
+
+
+async def test_create_campaign_explicit_parameter_overrides_the_derived_name(tmp_path) -> None:
+    """An explicit ``parameter`` label wins over the patch-path derivation."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "focal",
+            "base_spec": base,
+            "patch_path": "sim.laser.0.focus_pos_si.1.component",
+            "values": [4.4e-5],
+            "parameter": "focal y [m]",
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    leaf = campaign.agenda.entries["leaf000"]
+    assert leaf.sweep_parameter == "focal y [m]"
+    # The point key is unchanged: the label is recorded alongside, not instead.
+    assert leaf.point == {"component": 4.4e-5}
+
+
+async def test_create_campaign_derives_a_readable_name_for_a_dict_key(tmp_path) -> None:
+    """A numeric dict key is kept in the readable name, not mistaken for an index."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    base["sim"]["customuserinput"] = {"tags": ["t"], "0": "periodic"}
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "bc",
+            "base_spec": base,
+            "patch_path": "sim.customuserinput.0",
+            "values": ["open"],
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].sweep_parameter == "sim.customuserinput.0"
+
+
+async def test_create_campaign_sanitises_a_derived_name(tmp_path) -> None:
+    """A caller-influenced spec key cannot smuggle a control char into a report."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    base["sim"]["customuserinput"] = {"tags": ["t"], "bad\x00key": 1}
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "c",
+            "base_spec": base,
+            "patch_path": "sim.customuserinput.bad\x00key",
+            "values": [1],
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].sweep_parameter == "sim.customuserinput.bad key"
+
+
+async def test_create_campaign_preserves_a_non_ascii_label(tmp_path) -> None:
+    """The label sanitiser keeps Unicode units instead of mangling them."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "focal",
+            "base_spec": _valid_spec(),
+            "patch_path": "sim.laser.0.focus_pos_si.1.component",
+            "values": [4.4e-5],
+            "parameter": "focus y [μm]",
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].sweep_parameter == "focus y [μm]"
+
+
+async def test_add_agenda_leaf_records_the_parameter_label(tmp_path) -> None:
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(
+        config,
+        "add_agenda_leaf",
+        {"name": "refined", "spec": {"sim": {"replica": 9}}, "point": {"component": 5.0}, "parameter": "focal y"},
+    )
+    assert result == {"ok": True, "path": "refined"}
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    leaf = campaign.agenda.entries["refined"]
+    assert leaf.sweep_parameter == "focal y"
+    assert leaf.point == {"component": 5.0}
+
+
+async def test_old_campaign_without_sweep_parameter_still_loads(tmp_path) -> None:
+    """A campaign serialised before ``sweep_parameter`` existed loads unchanged."""
+    legacy = {
+        "name": "old",
+        "agenda": {
+            "kind": "group",
+            "name": "group",
+            "entries": {
+                "leaf0": {
+                    "kind": "sim",
+                    "name": "leaf0",
+                    "spec": {"sim": {"time_steps": 4}},
+                    "point": {"time_steps": 4},
+                    "status": "planned",
+                }
+            },
+        },
+    }
+    (tmp_path / "campaign.json").write_text(json.dumps(legacy), encoding="utf-8")
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    status = await _call(config, "agenda_status", {})
+    assert status["leaves"][0]["point"] == {"time_steps": 4}
+    assert status["leaves"][0]["sweep_parameter"] is None
+    # The old campaign is still advanceable.
+    tick = await _call(config, "advance_agenda", {})
+    assert tick["submitted"] == ["leaf0"]
 
 
 async def test_create_campaign_bad_patch_path_is_a_soft_error(tmp_path) -> None:

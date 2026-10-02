@@ -520,6 +520,7 @@ class HelloRuntime:
         *,
         point: dict[str, float | int | str] | None = None,
         depends_on: list[str] | None = None,
+        parameter: str | None = None,
     ) -> dict[str, Any]:
         """Add one leaf to the campaign's root group (agent expansion).
 
@@ -527,7 +528,13 @@ class HelloRuntime:
             ``{"ok": True, "path": name}``, or a soft error.
 
         """
-        return await self.agenda_service.add_leaf(name, spec, point=point, depends_on=depends_on)
+        return await self.agenda_service.add_leaf(
+            name,
+            spec,
+            point=point,
+            depends_on=depends_on,
+            parameter=parameter,
+        )
 
     async def create_campaign(
         self,
@@ -537,6 +544,7 @@ class HelloRuntime:
         values: list[Any],
         *,
         base_spec_path: str | None = None,
+        parameter: str | None = None,
     ) -> dict[str, Any]:
         """Create and persist a campaign with one leaf per sweep value.
 
@@ -550,7 +558,7 @@ class HelloRuntime:
         resolved, error = self._resolve_base_spec(base_spec, base_spec_path)
         if error is not None:
             return error
-        return await self.agenda_service.create_campaign(name, resolved, patch_path, values)
+        return await self.agenda_service.create_campaign(name, resolved, patch_path, values, parameter=parameter)
 
     def _resolve_base_spec(
         self,
@@ -1222,7 +1230,8 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Report the aggregate status of the persisted campaign: its name, "
             "completion flag, per-status counts, accumulated usage and the "
-            "per-leaf view (path, status, sim_id, sweep point)."
+            "per-leaf view (path, status, sim_id, sweep point and its readable "
+            "sweep_parameter)."
         ),
         annotations=_READ_ONLY,
     )
@@ -1262,8 +1271,12 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Create and persist a campaign with one leaf per value: each leaf is "
             "`base_spec` with the dotted Runner-spec path `patch_path` set to "
-            "that value (e.g. patch_path='sim.time_steps'), and records "
-            "point={last path segment: value}. This is the entry point for the "
+            "that value (e.g. patch_path='sim.time_steps', or a list-indexed "
+            "path such as 'sim.laser.0.focus_pos_si.1.component'), and records "
+            "point={last path segment: value} plus a human-readable "
+            "sweep_parameter (the path with list indices dropped, e.g. "
+            "'sim.laser.focus_pos_si.component'; override it with `parameter`). "
+            "This is the entry point for the "
             "research loop -- call build_spec first to get base_spec, then "
             "advance_agenda. Provide the base spec exactly one way: inline as "
             "`base_spec`, or by reference as `base_spec_path` (the `spec_path` "
@@ -1286,6 +1299,7 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         *,
         base_spec: dict[str, Any] | None = None,
         base_spec_path: str | None = None,
+        parameter: str | None = None,
     ) -> dict[str, Any]:
         result = await runtime.create_campaign(
             name,
@@ -1293,6 +1307,7 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             patch_path,
             values,
             base_spec_path=base_spec_path,
+            parameter=parameter,
         )
         return _redact_dict(runtime, result)
 
@@ -1320,7 +1335,9 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Add one simulation leaf to the persisted campaign's root group, so "
             "the next advance_agenda tick can submit it. Used by the agent to "
-            "refine a sweep (e.g. add points around an optimum)."
+            "refine a sweep (e.g. add points around an optimum). `point` is the "
+            "sweep assignment to record; pass `parameter` to label the swept "
+            "quantity in human-readable form (stored as sweep_parameter)."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
@@ -1329,8 +1346,9 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         spec: dict[str, Any],
         point: dict[str, Any] | None = None,
         depends_on: list[str] | None = None,
+        parameter: str | None = None,
     ) -> dict[str, Any]:
-        result = await runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on)
+        result = await runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on, parameter=parameter)
         return _redact_dict(runtime, result)
 
     _register_research_tools(server, runtime)
