@@ -86,6 +86,49 @@ def test_stale_but_terminal_is_not_stalled() -> None:
     assert detect_alerts(records, now=NOW, stall_after_s=60) == []
 
 
+def test_building_record_is_not_stalled() -> None:
+    """H3: a record still building/queued (no job_id) is exempt from ``stalled``.
+
+    The 15-20 min window between ``accepted`` and the SLURM ``job_id`` reports
+    no lifecycle event, so a stale ``last_event_ts`` there is normal, not a
+    wedge.  Both the pre-submit (``accepted``) and the workflow-returned cases
+    must be exempt.
+    """
+    stale = (NOW - timedelta(seconds=1581)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = [
+        _record("accepted", "accepted", active=True, job_id=None, last_event_ts=stale),
+        _record("workflow", "workflow.finished", active=True, job_id=None, last_event_ts=stale),
+    ]
+    assert detect_alerts(records, now=NOW, stall_after_s=900) == []
+
+
+def test_queued_record_with_job_id_is_not_stalled() -> None:
+    """H3: a queued record (job_id known, not yet running) is exempt too."""
+    stale = (NOW - timedelta(seconds=5000)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = [_record("a", "workflow.finished", active=True, job_id=99, last_event_ts=stale)]
+    assert detect_alerts(records, now=NOW, stall_after_s=60) == []
+
+
+def test_idle_running_record_is_still_stalled() -> None:
+    """H3: the exemption must not disarm a genuinely wedged running job."""
+    stale = (NOW - timedelta(seconds=9999)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = [_record("a", "simulation.job_running", active=True, job_id=99, last_event_ts=stale)]
+    alerts = detect_alerts(records, now=NOW, stall_after_s=60)
+    assert [a.kind for a in alerts] == ["stalled"]
+
+
+def test_summary_counts_by_phase() -> None:
+    """H4: the summary exposes building/queued/running counts."""
+    records = [
+        _record("a", "accepted", active=True, job_id=None),
+        _record("b", "workflow.finished", active=True, job_id=1),
+        _record("c", "simulation.job_running", active=True, job_id=2),
+        _record("d", "results.ready", active=False, job_id=3),
+    ]
+    summary = fleet_summary(records)
+    assert summary.by_phase == {"building": 1, "done": 1, "queued": 1, "running": 1}
+
+
 def test_active_without_timestamp_is_not_stalled() -> None:
     records = [_record("a", "simulation.submitted", active=True)]
     assert detect_alerts(records, now=NOW, stall_after_s=60) == []
