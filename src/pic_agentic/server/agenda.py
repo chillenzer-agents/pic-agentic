@@ -338,7 +338,12 @@ class AgendaService:
 
         Args:
             path: The analysed leaf's path.
-            analysis: The ``analyze_output`` sections (or any JSON object).
+            analysis: The ``analyze_output`` sections (or any JSON object).  To be
+                ranked by :meth:`suggest_refinement`, put the scalar objective
+                under a top-level numeric ``score`` (or ``value``/``peak``) key;
+                sections without one are recorded but not ranked.  Retain the
+                sections themselves (and/or the chosen key) so the provenance
+                stays self-describing.
 
         Returns:
             ``{"ok": True, "path": path}``, or a soft error.
@@ -390,7 +395,8 @@ class AgendaService:
         point is deliberately *never* used as a score: a value that was merely
         simulated (not analysed) must not be mistaken for an optimum.  When no
         analysis is recorded the summary reports ``best: null``, ``analysed: 0``
-        and an actionable message instead of inventing a ranking.
+        and an actionable message instead of inventing a ranking; when analyses
+        are recorded but none carries a recognised score the message says so.
 
         Args:
             rel_tol: Relative tolerance for the convergence check.
@@ -408,10 +414,18 @@ class AgendaService:
         result = refine_summary(_analysed_points(campaign), rel_tol=rel_tol)
         response: dict[str, Any] = {"ok": True, **result}
         if result["analysed"] == 0:
-            response["message"] = (
-                "No analyses are recorded yet, so there is no best point to report. "
-                "Record analyses with `record_agenda_analysis` first."
-            )
+            if campaign.analyses:
+                response["message"] = (
+                    "No analysable score is available yet: analyses are recorded, but none "
+                    "exposes a numeric top-level `score` (or `value`/`peak`). Re-record each "
+                    "leaf's analysis with the scalar objective under one of those keys "
+                    "(`record_agenda_analysis`)."
+                )
+            else:
+                response["message"] = (
+                    "No analyses are recorded yet, so there is no best point to report. "
+                    "Record analyses with `record_agenda_analysis` first."
+                )
         return response
 
     async def _mutate_campaign(self, mutate: Callable[[Campaign], dict[str, Any]]) -> dict[str, Any]:
@@ -1032,18 +1046,29 @@ def _analysed_points(campaign: Campaign) -> dict[str, float | None]:
     return points
 
 
+#: Analysis keys holding a scalar objective that refinement can rank.  The
+#: writer-side contract (``record_agenda_analysis`` and ``record_analysis``):
+#: one scalar objective must sit under one of these top-level keys.
+_SCORE_KEYS = ("score", "value", "peak")
+
+
 def _leaf_score(analysis: dict[str, Any] | None) -> float | None:
     """Return a single numeric score for one recorded analysis, or None.
+
+    Only the scalar objective keys in :data:`_SCORE_KEYS` count.  A canonical
+    ``analyze_output`` payload (e.g. ``focal_position_m`` / ``total_electrons`` /
+    ``high_energy_tail``) carries none of them, so it is recorded but not ranked.
 
     Returns:
         The analysis ``score`` (or ``value``/``peak``), else None.
 
     """
-    for key in ("score", "value", "peak"):
-        if isinstance(analysis, dict):
-            candidate = analysis.get(key)
-            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
-                return float(candidate)
+    if not isinstance(analysis, dict):
+        return None
+    for key in _SCORE_KEYS:
+        candidate = analysis.get(key)
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            return float(candidate)
     return None
 
 
