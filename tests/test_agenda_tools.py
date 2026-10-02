@@ -462,6 +462,7 @@ async def test_advance_agenda_reports_complete_state_when_finished(tmp_path) -> 
         first = (await server.call_tool("advance_agenda", {})).structured_content
         assert first["complete"] is False
         assert first["state"] == "running"
+        assert first["lifecycle"] == "running"
 
         sim_id = next(iter(runtime.submit_service.registry))
         runtime.submit_service.registry[sim_id].state = "results.ready"
@@ -470,6 +471,8 @@ async def test_advance_agenda_reports_complete_state_when_finished(tmp_path) -> 
         done = (await server.call_tool("advance_agenda", {})).structured_content
         assert done["complete"] is True
         assert done["state"] == "complete"
+        # The stored lifecycle is still reported, so completion is not lossy.
+        assert done["lifecycle"] == "running"
     finally:
         for task in tasks:
             task.cancel()

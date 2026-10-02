@@ -317,7 +317,9 @@ distinction matters:
 In short: react to the inline list for the tick you just ran, and drain only to
 catch decision points you might otherwise miss. `advance_agenda` also reports
 `state: "complete"` (rather than the stored `running` lifecycle state) once
-every leaf is terminal.
+every leaf is terminal; the stored lifecycle is preserved in the `lifecycle`
+field, so a finished **paused**/**stopped** campaign reads `state: "complete"`
+with `lifecycle: "paused"`/`"stopped"` rather than hiding the pause/stop.
 
 ### Deleting a campaign does not forget its simulations
 
