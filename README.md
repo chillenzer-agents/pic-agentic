@@ -368,13 +368,23 @@ the same 48 KiB wire budget as the other results) and returns a bounded summary:
 
 | Reader | Output | Summary |
 |--------|--------|---------|
-| `energy_histogram` | `*_energyHistogram_*.dat` | bins/counts (keV), window count, `max_energy_kev` |
+| `energy_histogram` | `*_energyHistogram_*.dat` | bins/counts (keV), window count, `n_nonzero_bins`, populated `min_energy_kev`/`max_energy_kev` |
 | `emittance` | `*_emittance_*.dat` | slice positions/emittances, total, peak |
 | `transition_radiation` | `*_transRad_<iter>.dat` | omega/intensity spectrum, peak |
 | `phase_space` | `PhaseSpace_<sp>_<filter>_<ps>_<iter>.h5` | axis ranges, projected marginals, peak bin |
 | `radiation` | `*_radAmplitudes_<iter>_0_0_0.h5` | direction-summed spectrum, peak |
 | `calorimeter` | `*_calorimeter_<filter>_<iter>.h5` | yaw/pitch marginals, energy edges |
 | `png` | `*_png_<axis>_<slice>_<iter>.png` | metadata only (dimensions, path); image via `export` |
+
+The `energy_histogram` reader reports `count_in_window` for a [keV] window that
+is **requestable** with `min_kev`/`max_kev` (both or neither). When they are
+omitted the window is derived from the populated bins: the common 100--1000 keV
+window is kept whenever it contains particles, and otherwise it widens to the
+populated range so the default is never structurally empty for a spectrum that
+starts above it (e.g. an LWFA spectrum beginning at a few MeV). The summary
+always carries `n_nonzero_bins` plus the populated `min_energy_kev`/
+`max_energy_kev`, and warns when a zero `count_in_window` contradicts the
+populated bins, so a mis-window is obvious rather than a silent `0`.
 
 All openPMD readers accept the `h5` and `bp`/`bp5` suffixes. `species_filter`
 is honoured where the reader's filename carries a filter component; the
