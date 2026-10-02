@@ -867,7 +867,6 @@ def cmd_agenda_init(args: argparse.Namespace) -> int:
             sweep_parameter_for,
         )
 
-
         parameter = args.agenda_patch.rsplit(".", 1)[-1]
         sweep_parameter = readable_label(sweep_parameter_for(args.agenda_patch, base_spec))
         leaves = [
