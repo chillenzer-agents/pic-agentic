@@ -11,9 +11,12 @@ testable, so it lives here rather than being hand-computed by the agent each
 time.  Extraction-ready: stdlib only.
 
 A sample is a ``{label: value}`` mapping (the sweep point's label -> its
-analysed score, e.g. peak energy).  ``None`` means "not (yet) analysed" and is
-ignored by every function; a sample with no usable values is handled without
-raising.
+**analysed score**, e.g. peak energy).  ``None`` means "not (yet) analysed" and
+is ignored by every function; a sample with no usable values is handled without
+raising.  Callers must pass analysed scores only: the sweep *point* is an input,
+not a measured outcome, so ranking on it would invent an optimum.  This layer
+cannot tell the two apart, so the distinction is the caller's
+:func:`~pic_agentic.agenda.refine.summary` input contract.
 """
 
 from __future__ import annotations
@@ -145,12 +148,14 @@ def summary(points: Mapping[str, float | None], *, rel_tol: float = 0.05) -> dic
     """Compose a serialisable refinement summary for a sweep.
 
     Args:
-        points: ``label -> value`` (``None`` ignored).
+        points: ``label -> analysed score`` (``None`` ignored).  Pass only real
+            analyses; a leaf that was merely simulated must be ``None``.
         rel_tol: Relative tolerance for :func:`is_converged`.
 
     Returns:
         ``{"best": {"label", "value"} | None, "converged": bool,
-        "suggestions": [{"label", "value"}], "analysed": int}``.
+        "suggestions": [{"label", "value"}], "analysed": int}``.  ``best`` is
+        ``None`` and ``analysed`` is 0 when nothing has been analysed.
 
     """
     best = best_point(points)

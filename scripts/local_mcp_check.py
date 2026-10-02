@@ -858,8 +858,8 @@ def cmd_agenda_init(args: argparse.Namespace) -> int:
     base_spec = _agenda_spec(spec_source)
     if args.agenda_patch:
         # Parse the sweep parameter name from the dotted patch path (the leaf's
-        # ``point`` is what the refinement engine scores: see
-        # ``server.agenda._leaf_score``).
+        # ``point`` is recorded for provenance, not scored: see
+        # ``server.agenda._analysed_points``).
         parameter = args.agenda_patch.rsplit(".", 1)[-1]
         leaves = [
             (f"leaf{index:03d}", _patch_spec(base_spec, args.agenda_patch, value), _point_for(parameter, value))
