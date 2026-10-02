@@ -22,6 +22,10 @@ def _var(name: str) -> dict:
     return {"kind": "var", "name": name}
 
 
+def _var_with(name: str, **attrs: object) -> dict:
+    return {"kind": "var", "name": name, **attrs}
+
+
 def _reduce(op: str, operand: dict, **kw: object) -> dict:
     return {"kind": "reduce", "op": op, "operand": operand, **kw}
 
@@ -130,6 +134,30 @@ def test_source_size_is_capped() -> None:
     huge = {"kind": "var", "name": "x" * (MAX_SOURCE_BYTES + 10)}
     with pytest.raises(ValueError, match="exceeds"):
         ResultParams(sim_id="s", op="compute", program=_program(huge))
+
+
+def test_conflicting_var_attribute_is_rejected() -> None:
+    """A node attribute contradicting its declared selector is ambiguous.
+
+    Node attributes are authoritative at resolution time, but a program that
+    states two different values for the same declared selector is a mistake
+    (C1), so it is rejected rather than silently resolved.
+    """
+    clashing = _var_with(name="Ez", component="x")
+    program = _program(
+        _reduce("sum", clashing),
+        selectors=[{"kind": "var", "name": "Ez", "record": "E", "component": "z"}],
+    )
+    with pytest.raises(ValueError, match="component"):
+        AnalysisProgram.model_validate(program)
+
+
+def test_matching_node_and_declared_attributes_are_accepted() -> None:
+    program = _program(
+        _reduce("sum", _var_with(name="Ez", record="E", component="z", iteration=536)),
+        selectors=[{"kind": "var", "name": "Ez", "record": "E", "component": "z", "iteration": 536}],
+    )
+    AnalysisProgram.model_validate(program)
 
 
 def test_program_round_trips_json() -> None:

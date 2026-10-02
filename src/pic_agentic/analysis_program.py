@@ -205,6 +205,13 @@ class AnalysisProgram(BaseModel):
     selectors, an array); an optional ``selectors`` list documents the named
     inputs.  Reductions turn an array into a scalar, so the common case is a
     program whose ``output`` is a ``reduce`` node over a ``var`` selector.
+
+    A ``var`` node may carry ``record``/``component``/``iteration`` directly;
+    those attributes are authoritative (a missing one falls back to the matching
+    declared selector, then to name-only resolution).  A node attribute that
+    *contradicts* the declared selector is rejected at validation time rather
+    than silently preferring one, because a conflict means the program says two
+    different things about the same input.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -256,7 +263,36 @@ class AnalysisProgram(BaseModel):
             if exponent > MAX_EXPONENT:
                 msg = f"exponent {exponent} exceeds {MAX_EXPONENT}"
                 raise ValueError(msg)
+        self._reject_attribute_conflicts()
         return self
+
+    def _reject_attribute_conflicts(self) -> None:
+        """Reject a ``var`` attribute that contradicts its declared selector.
+
+        Node-level ``record``/``component``/``iteration`` are authoritative, but
+        a node that names a declared selector with a *different* value for the
+        same attribute is ambiguous -- the reader would use the node value while
+        the declaration says otherwise.
+
+        Raises:
+            ValueError: If any referenced ``var`` conflicts with its declaration.
+
+        """
+        declared = {selector.name: selector for selector in self.selectors}
+        for expression in self._expressions():
+            for ref in _iter_var_refs(expression):
+                selector = declared.get(ref.name)
+                if selector is None:
+                    continue
+                for field in ("record", "component", "iteration"):
+                    node_value = getattr(ref, field)
+                    declared_value = getattr(selector, field)
+                    if node_value is not None and declared_value is not None and node_value != declared_value:
+                        msg = (
+                            f"var {ref.name!r} sets {field}={node_value!r} but its declared selector "
+                            f"sets {field}={declared_value!r}"
+                        )
+                        raise ValueError(msg)
 
     def _expressions(self) -> list[Any]:
         """Return the root expressions of this program.
@@ -266,6 +302,23 @@ class AnalysisProgram(BaseModel):
 
         """
         return [self.output, self.points] if self.points is not None else [self.output]
+
+
+def _iter_var_refs(node: Any) -> list[VarRef]:
+    """Collect every ``var`` node under ``node``, in traversal order.
+
+    Returns:
+        The referenced ``VarRef`` nodes.
+
+    """
+    refs: list[VarRef] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if getattr(current, "kind", None) == "var":
+            refs.append(current)
+        stack.extend(getattr(current, field) for field in _CHILDREN.get(getattr(current, "kind", None), ()))
+    return refs
 
 
 def _measure(node: Any, depth: int = 1) -> tuple[int, int, int]:
