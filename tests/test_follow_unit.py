@@ -309,6 +309,65 @@ async def test_missing_link_emits_results_ready_once_link_exists(tmp_path) -> No
     assert events[-1][1]["results_linked"] is True
 
 
+async def test_results_ready_carries_the_suspect_flag_for_an_empty_run(tmp_path, monkeypatch) -> None:
+    """The follower attaches the all-zero health flag to the terminal event (F4).
+
+    The probe is monkeypatched so the test does not need a real plugin reader;
+    the wiring (best-effort probe -> ``suspect`` field on ``results.ready``) is
+    what is under test.
+    """
+    from plugin_fixtures import energy_histogram_dat, write_output_unit
+
+    from pic_agentic import results
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output = run_dir / "simOutput"
+    output.mkdir()
+    write_output_unit(run_dir)
+    energy_histogram_dat(run_dir, zero=True)
+    (run_dir / "link_results.sh").write_text(f'#!/bin/bash\nln -sfn "{output}" "$1"\n')
+    warning = "energy_histogram is all zeros; the run may have no particles in range"
+    monkeypatch.setattr(results, "probe_vacuity", lambda _sim_id, **_kw: warning)
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(run_dir, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.COMPLETED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    ready = next(fields for state, fields in events if state is SimulationState.RESULTS_READY)
+    assert ready["suspect"] == warning
+
+
+async def test_results_ready_omits_suspect_for_a_populated_run(tmp_path, monkeypatch) -> None:
+    from pic_agentic import results
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output = run_dir / "simOutput"
+    output.mkdir()
+    (run_dir / "link_results.sh").write_text(f'#!/bin/bash\nln -sfn "{output}" "$1"\n')
+    monkeypatch.setattr(results, "probe_vacuity", lambda _sim_id, **_kw: None)
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(run_dir, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.COMPLETED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    ready = next(fields for state, fields in events if state is SimulationState.RESULTS_READY)
+    assert "suspect" not in ready
+
+
 async def test_stop_ends_the_loop(tmp_path) -> None:
     async def never_terminal(_job_id: int) -> JobInfo:
         return JobInfo(job_id=4711, state=SlurmJobState.RUNNING, exit_code=None)

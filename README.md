@@ -431,6 +431,27 @@ species from the PyPIConGPU rendering context (the diagnostic's configured
 species), so an electron histogram is not satisfied by a coexisting hydrogen
 file; the arrays in the section are sampled, and `downsampled` says so.
 
+A numeric plugin summary whose value array is entirely zero carries an explicit
+`warning` (an empty spectrum is a legitimate outcome, so it is transparency, not
+an error). That same all-zero warning is reused as the **"successful-but-empty"
+health signal** for a completed simulation: the simclient probes the run's
+numeric artifacts when it emits `results.ready` (and again when a later status
+pull promotes the run) and, when every present numeric artifact is all-zero,
+stamps the warning onto the run. It surfaces as `suspects` in
+`advance_agenda`, `suspect`/`suspect_count` in `agenda_status`, a `suspect` count
+and alert in `fleet_status`, a `suspect` field on the leaf's `done` callback and
+in `campaign_report`, and `suspect` in `get_status`/`list_simulations`. This is
+what lets the loop distinguish "physics ran and succeeded" from "physics ran and
+was empty" (the beta-4 empty-campaign case) without a reviewer reading a
+histogram by hand.
+
+The probe is deliberately narrow: only the numeric *text* readers
+(`energy_histogram`, `emittance`, `transition_radiation`) are examined, and
+*every* matching artifact of each is read, so a populated species clears a run
+with another empty one. A run whose energy histogram is all-zero while a
+phase-space or radiation diagnostic is populated is still flagged; treat the
+signal as "no particles in the numeric diagnostics", not "no particles at all".
+
 ## Tests and tooling
 
 ```bash

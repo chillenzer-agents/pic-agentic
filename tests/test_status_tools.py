@@ -297,6 +297,30 @@ async def test_get_status_reports_progress_from_step_finished_events() -> None:
     assert payload["walltime"] == "1min 0sec 0msec"
 
 
+async def test_get_status_surfaces_the_suspect_flag() -> None:
+    """get_status and list_simulations must carry the F4 health flag (M1).
+
+    The PR documents the flag reaching get_status/fleet_status; fleet_status was
+    wired but the two registry-backed tools omitted it, so an operator asking
+    about a single terminal run saw a clean one.
+    """
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.RESULTS_READY.value
+    record.active = False
+    record.suspect = "energy_histogram is all zeros"
+    runtime.submit_service.registry[SIM_ID] = record
+
+    status = (await server.call_tool("get_status", {"sim_id": SIM_ID})).structured_content
+    assert status["suspect"] == "energy_histogram is all zeros"
+    rows = (await server.call_tool("list_simulations", {})).structured_content["simulations"]
+    assert rows[0]["suspect"] == "energy_histogram is all zeros"
+
+
 def test_merge_status_keeps_projection_progress_the_ack_omits() -> None:
     """A live ack that omits a progress field must not erase the projection."""
     from pic_agentic.server.app import _merge_status

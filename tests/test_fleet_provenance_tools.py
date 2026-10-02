@@ -63,6 +63,35 @@ async def test_fleet_status_reports_stalled_with_configured_threshold() -> None:
     assert [alert["kind"] for alert in payload["alerts"]] == ["stalled"]
 
 
+async def test_fleet_status_flags_a_successfully_empty_run() -> None:
+    """A done run whose output is all-zero surfaces as a suspect, not silence (F4)."""
+    server, runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    record = runtime.submit_service._record_for("a", cmd_id="c1")
+    record.state = "results.ready"
+    record.active = False
+    record.suspect = (
+        "energy_histogram is all zeros; the run may have no particles in range or the diagnostic may be misconfigured"
+    )
+    runtime.submit_service.registry["a"] = record
+
+    payload = (await server.call_tool("fleet_status", {})).structured_content
+    assert payload["summary"]["done"] == 1
+    assert payload["summary"]["suspect"] == 1
+    assert [alert["kind"] for alert in payload["alerts"]] == ["suspect"]
+
+
+async def test_fleet_status_does_not_flag_a_populated_run() -> None:
+    server, runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    record = runtime.submit_service._record_for("a", cmd_id="c1")
+    record.state = "results.ready"
+    record.active = False
+    runtime.submit_service.registry["a"] = record
+
+    payload = (await server.call_tool("fleet_status", {})).structured_content
+    assert payload["summary"]["suspect"] == 0
+    assert payload["alerts"] == []
+
+
 async def test_fleet_status_redacts_secrets() -> None:
     secret = "syt_super_secret"
     server, runtime = build_server(Config(rcp_secret=SECRET, access_token=secret), SIM)

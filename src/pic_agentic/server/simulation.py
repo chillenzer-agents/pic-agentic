@@ -99,6 +99,7 @@ _RECORD_FIELDS = (
     "error",
     "error_code",
     "stage",
+    "suspect",
 )
 
 #: The failure-reason subset of :data:`_RECORD_FIELDS`, projected from a submit
@@ -137,6 +138,10 @@ class SimRecord(BaseModel):
     error_code: str | None = None
     #: Pipeline stage the failure occurred in, when the simclient reported one.
     stage: str | None = None
+    #: The "successful-but-empty" health flag: the all-zero warning text when the
+    #: run completed but its only numeric artifact reads zero (F4).  None when
+    #: the run is not suspect or was never probed.
+    suspect: str | None = None
     last_event_type: str | None = None
     last_event_ts: str | None = None
     active: bool = True
@@ -529,6 +534,13 @@ class SubmitService:
             value = payload.get(field)
             if value is not None:
                 setattr(record, field, value)
+        # The F4 health flag is only meaningful on a completed run's
+        # ``results.ready`` event.  An event allow-list keeps a buggy or
+        # replayed client from stamping ``suspect`` onto a still-running record
+        # (the fleet/agenda guards would ignore it, but the record should never
+        # hold a contradictory value).
+        if state != SimulationState.RESULTS_READY.value:
+            record.suspect = None
         record.state = state
         record.last_event_type = state or record.last_event_type
         record.last_event_ts = message.ts
