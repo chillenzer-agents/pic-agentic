@@ -820,7 +820,14 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "and submit it to the remote SLURM cluster. Returns the simulation "
             "id and the coarse accepted/submitted state. The script should "
             "define a single picmi.Simulation; a trailing sim.run(...) is "
-            "tolerated and ignored (the tool never runs it here)."
+            "tolerated and ignored (the tool never runs it here). The returned "
+            "`sim_id` is a *spec label*: it is the first 8 hex of the payload "
+            "hash, so byte-identical specs (and re-runs of the same spec) share "
+            "it and it is NOT a run id. Use the returned `run_id` (the "
+            "submission's command id) as the identity of this run; two re-runs "
+            "of one spec report the same `sim_id` but different `run_id`. "
+            "A completed direct submit is recorded, so a later identical "
+            "campaign leaf is reused instead of re-run."
         ),
         # write/resource tier: consumes cluster resources, not destructive
         # (design section 6.2).  The server-side MCP client prompts for human
@@ -930,7 +937,8 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "when its numeric diagnostics are all empty. A status is available "
             "for any simulation the signed room records, including runs whose "
             "campaign was since deleted with delete_campaign; such a run is "
-            "history, not live campaign state."
+            "history, not live campaign state. `sim_id` is a spec label (shared "
+            "by identical specs and re-runs); `run_id` is this run's identity."
         ),
         annotations=_READ_ONLY,
     )
@@ -1294,7 +1302,9 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "restart) returns them too until drained. React to the inline "
             "`callbacks` for the tick you just ran; call `take_agenda_callbacks` "
             "only to recover callbacks from earlier ticks, since draining clears "
-            "the persisted copy."
+            "the persisted copy. `reused` lists leaves satisfied by an earlier "
+            "identical run (content-addressed reuse: a completed direct "
+            "submit_simulation counts too), so no new job was started for them."
         ),
         # write/resource tier: a tick may submit new cluster jobs, so it is not
         # read-only and not idempotent, but it is not destructive.
@@ -1309,11 +1319,13 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Report the aggregate status of the persisted campaign: its name, "
             "completion flag, per-status counts, accumulated usage and the "
-            "per-leaf view (path, status, sim_id, sweep point and its readable "
-            "sweep_parameter). A ``done`` leaf whose only numeric artifact reads "
-            "all-zero is flagged `suspect` (and counted in "
-            "`suspect_count`/`suspects`), so an empty run is not reported as a "
-            "clean success."
+            "per-leaf view (path, status, sim_id, reused, run_id, sweep point "
+            "and its readable sweep_parameter). `sim_id` is a spec label shared "
+            "by identical specs/re-runs; `run_id` names the run and `reused` "
+            "marks a leaf satisfied by an earlier identical run. A ``done`` leaf "
+            "whose only numeric artifact reads all-zero is flagged `suspect` "
+            "(and counted in `suspect_count`/`suspects`), so an empty run is not "
+            "reported as a clean success."
         ),
         annotations=_READ_ONLY,
     )

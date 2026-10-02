@@ -349,6 +349,32 @@ results stay reachable). Treat those entries as the recorded history of runs
 that actually happened; use `list_simulations(active_only=true)` to hide
 terminal history when you only care about live work.
 
+### `sim_id` is a spec label, not a run id
+
+A simulation's `sim_id` is only the first 8 hex of its payload hash (32 bits):
+it is a **content label**, so two byte-identical specs — and two re-runs of the
+same spec — share it. It is deliberately *not* a unique run identity, and it is
+too short to be a reliable cache key. The run identity is the **`run_id`** (the
+submission's stable command id): returned by `submit_simulation`, exposed in
+`get_status`/`list_simulations`, and carried per campaign leaf in
+`agenda_status` and the RO-Crate. Two re-runs of one spec therefore report the
+same `sim_id` but different `run_id`s, which is how you tell a re-run from a
+distinct study point.
+
+### Content-addressed reuse
+
+Reuse keys on the **full** wire hash (plus the provenance tuple), not on
+`sim_id`, so an identical spec that already completed is *linked* to that run
+instead of being submitted again. `advance_agenda` reports such leaves under
+`reused`; `agenda_status` marks them with `reused: true` and their `run_id`; the
+RO-Crate flags them `reused`. A **bare `submit_simulation` counts too**: it is
+recorded as pending the moment the cluster accepts it and promoted to reusable
+when its `results.ready` event arrives (only a run whose results exist is
+reused), so a completed ad-hoc run is reused by a later byte-identical campaign
+leaf rather than re-run. Because the provenance tuple is part of the key,
+identical physics attributed to a different PIConGPU revision/schema is **not**
+reused — the result would not be attributable to the campaign's revision.
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path
