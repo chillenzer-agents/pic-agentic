@@ -256,6 +256,48 @@ async def test_build_spec_write_to_omits_the_inline_spec(tmp_path) -> None:
     assert inline["spec"] == {"sim": _runner_dump()["sim"]}
 
 
+async def test_build_spec_over_cap_with_write_to_reports_spec_path(tmp_path) -> None:
+    """An over-cap spec still surfaces the staged path and honours ``include_spec``.
+
+    The staging use case is exactly the spec too big to hand back inline, so the
+    soft error must not drop ``spec_path`` (the runtime already wrote the file);
+    an explicit ``include_spec=true`` returns the inline copy alongside the size
+    warning.
+    """
+    config = Config(
+        rcp_secret=SECRET,
+        agenda_file=str(tmp_path / "campaign.json"),
+        spec_dir=str(tmp_path / "specs"),
+    )
+    oversized = {"sim": {"blob": "a" * (MAX_INLINE_PAYLOAD_BYTES * 2)}}
+    builder = _StubBuilder(_built(oversized))
+    server, runtime = build_server(config, SIM)
+    runtime.submit_service.runner_dump_builder = builder
+
+    staged = (
+        await server.call_tool("build_spec", {"picmi_script": "# picmi\n", "write_to": "base.json"})
+    ).structured_content
+    assert staged["ok"] is False
+    assert staged["error"] == "spec_exceeds_inline_limit"
+    assert staged["wire_bytes"] > MAX_INLINE_PAYLOAD_BYTES
+    # The staged path is reported even though the inline body is not.
+    assert "spec" not in staged
+    assert staged["spec_path"]
+    assert Path(staged["spec_path"]).exists()
+    assert json.loads(Path(staged["spec_path"]).read_text(encoding="utf-8")) == oversized
+
+    forced = (
+        await server.call_tool(
+            "build_spec",
+            {"picmi_script": "# picmi\n", "write_to": "base2.json", "include_spec": True},
+        )
+    ).structured_content
+    assert forced["ok"] is False
+    assert forced["error"] == "spec_exceeds_inline_limit"
+    assert forced["spec"] == oversized
+    assert forced["spec_path"]
+
+
 async def test_build_spec_include_spec_false_omits_without_write_to() -> None:
     builder = _StubBuilder(_built())
     server, _runtime = _server_with_builder(builder)

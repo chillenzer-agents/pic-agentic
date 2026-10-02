@@ -849,7 +849,11 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "create_campaign(base_spec_path=...) without re-typing the spec. When "
             "`write_to` is set the inline `spec` is omitted by default so the "
             "tens-of-KiB body is not echoed; set `include_spec=true` to force it "
-            "back (or `include_spec=false` to omit it without staging). The "
+            "back (or `include_spec=false` to omit it without staging). An "
+            "over-cap spec is reported as `ok: false` with "
+            "`error='spec_exceeds_inline_limit'` and cannot be submitted inline; "
+            "`write_to` still stages it and the result still reports `spec_path`, "
+            "and `include_spec=true` returns the inline copy anyway. The "
             "script should define a single picmi.Simulation; a trailing "
             "sim.run(...) is tolerated and ignored (the tool never runs it here). "
             "Note: the pinned pypicongpu always adds a default `type_radiation` "
@@ -872,11 +876,11 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         except _SUBMIT_TOOL_ERRORS as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
         # A staged spec (``write_to``) is consumed by reference, so echoing the
-        # full tens-of-KiB inline copy would only bloat the tool result; default
-        # to omitting it whenever a path was requested, while letting an explicit
-        # ``include_spec`` override either way.
+        # full tens-of-KiB inline copy would only bloat the tool result; an
+        # over-cap spec is likewise omitted by default (the soft error reports
+        # why), while an explicit ``include_spec`` overrides either way.
         if include_spec is None:
-            include_spec = spec_path is None
+            include_spec = spec_path is None and built.within_inline_limit
         return _built_spec_dict(runtime, built, spec_path=spec_path, include_spec=include_spec)
 
     _register_reporting_tools(server, runtime)
@@ -1791,11 +1795,16 @@ def _built_spec_dict(
 ) -> dict[str, Any]:
     """Shape a dry-run build result for the ``build_spec`` tool.
 
-    The spec is returned when it fits the 48 KiB inline submission cap (the only
-    transport M2 has).  An over-cap spec is *not* returned: it could be stored on
-    a campaign leaf but never submitted, so the failure mode is made explicit
-    instead of handing the agent a spec that would fail later at
-    ``advance_agenda``.
+    An over-cap spec is reported as a soft error (``ok: False`` naming
+    ``spec_exceeds_inline_limit``): it can never be submitted, so the failure
+    mode is made explicit instead of handing the agent a spec that would fail
+    later at ``advance_agenda``.  The staged path, however, is *still* surfaced
+    when ``write_to`` was given -- the runtime has already written the file, so
+    dropping ``spec_path`` would hide the one output the caller asked for (the
+    over-cap + ``write_to`` case has no other use for ``spec``).  An explicit
+    ``include_spec=True`` is likewise honoured over the cap: the inline copy
+    travels over MCP, not the 48 KiB-limited homeserver path, so a caller that
+    asks for it gets it alongside the size warning.
 
     The built spec is trusted builder output (it passed ``check_allowlist``),
     not untrusted free text, so it is returned **verbatim**: routing it through
@@ -1817,32 +1826,27 @@ def _built_spec_dict(
         built: The built wire spec plus its provenance and wire size.
         spec_path: The staged file path when ``write_to`` was given, else None.
         include_spec: Whether to include the inline ``spec`` in the result.
-            ``build_spec`` defaults this to False whenever a ``write_to`` path
-            was staged (the caller consumes it by reference), so a matching
-            ``spec_path`` is still reported while the tens-of-KiB body is not
-            echoed back.
+            ``build_spec`` defaults this to False whenever the spec is over-cap
+            or a ``write_to`` path was staged (the caller consumes either by
+            reference), so a matching ``spec_path`` is still reported while the
+            tens-of-KiB body is not echoed back.
 
     Returns:
-        ``{"ok": True, "spec", "wire_bytes", ...}``, or a soft error naming the
-        over-cap condition.
+        ``{"ok": True, "spec", "wire_bytes", ...}``, or
+        ``{"ok": False, "error": "spec_exceeds_inline_limit", ...}``.
 
     """
     redact = runtime.config.redact
-    if not built.within_inline_limit:
-        return {
-            "ok": False,
-            "error": "spec_exceeds_inline_limit",
-            "wire_bytes": built.wire_bytes,
-            "inline_limit_bytes": built.inline_limit_bytes,
-        }
     payload: dict[str, Any] = {
-        "ok": True,
+        "ok": built.within_inline_limit,
         "wire_bytes": built.wire_bytes,
         "inline_limit_bytes": built.inline_limit_bytes,
         "picongpu_version": redact(built.picongpu_version),
         "picongpu_revision": redact(built.picongpu_revision),
         "schema_hash": built.schema_hash,
     }
+    if not built.within_inline_limit:
+        payload["error"] = "spec_exceeds_inline_limit"
     if include_spec:
         payload["spec"] = built.spec
     if spec_path is not None:
