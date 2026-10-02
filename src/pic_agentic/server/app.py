@@ -1359,9 +1359,11 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     @server.tool(
         title="Suggest a refinement from the recorded analyses",
         description=(
-            "Score the recorded analyses and report the best point, whether the "
+            "Score the *recorded analyses* and report the best point, whether the "
             "sweep has converged, and deterministic refinement points to add "
-            "around the optimum."
+            "around the optimum. Only leaves analysed with "
+            "`record_agenda_analysis` are ranked; with no analyses it returns "
+            "`best: null` and `analysed: 0` (the sweep point is never a score)."
         ),
         annotations=_READ_ONLY,
     )
