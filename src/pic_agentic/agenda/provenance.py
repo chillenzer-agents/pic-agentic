@@ -102,17 +102,29 @@ def campaign_rocrate(
     ]
     for path, sim in campaign.agenda.simulations():
         leaf_id = sanitize_id(path)
+        leaf: dict[str, Any] = {
+            "@id": leaf_id,
+            "@type": "File",
+            "name": path,
+            "sha256": _spec_hash(sim.spec),
+            "identifier": sim.sim_id or path,
+            "description": f"status={sim.status}",
+            "about": {"@id": software_id},
+            "instrument": {"@id": software_id},
+        }
+        # The point is the sweep assignment this leaf ran at; record it for
+        # every leaf that has one, regardless of whether a readable label was
+        # set, so the crate is not asymmetric between labelled and unlabelled
+        # leaves.
+        if sim.point is not None:
+            leaf["point"] = sim.point
+        if sim.sweep_parameter:
+            # The point's key is only the last dotted-path segment; record the
+            # human-readable swept parameter alongside it so the lineage is not
+            # opaque.
+            leaf["sweepParameter"] = sim.sweep_parameter
         entities: list[dict[str, Any]] = [
-            {
-                "@id": leaf_id,
-                "@type": "File",
-                "name": path,
-                "sha256": _spec_hash(sim.spec),
-                "identifier": sim.sim_id or path,
-                "description": f"status={sim.status}",
-                "about": {"@id": software_id},
-                "instrument": {"@id": software_id},
-            },
+            leaf,
             {
                 "@id": f"{leaf_id}/run",
                 "@type": "CreateAction",

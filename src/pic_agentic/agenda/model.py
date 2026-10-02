@@ -24,6 +24,7 @@ the execution layer.
 from __future__ import annotations
 
 import math
+import re
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,6 +35,32 @@ if TYPE_CHECKING:
 #: Characters forbidden in agenda entry names; validated by
 #: :func:`validate_entry_name` (a single source of truth for the rules).
 _ILLEGAL_NAME_CHARS = ("/",)
+
+#: Runs of control characters and whitespace, collapsed to a single space by
+#: :func:`readable_label`.
+_CONTROL_OR_WS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\s]+")
+
+
+def readable_label(text: str) -> str | None:
+    """Reduce a sweep label to display-safe text, preserving Unicode.
+
+    ``sweep_parameter`` is display metadata that travels in the RO-Crate and
+    the MCP tool output, so control characters must not reach a report.  Only
+    runs of control characters and whitespace are collapsed to a single space
+    (and the result trimmed); every printable character is kept, including
+    non-ASCII units and symbols.  An empty or
+    all-whitespace label yields ``None`` so the ``None``-means-absent
+    convention holds.
+
+    Args:
+        text: The caller-supplied parameter label.
+
+    Returns:
+        The cleaned label, or ``None`` when nothing printable remains.
+
+    """
+    cleaned = _CONTROL_OR_WS_RE.sub(" ", text).strip()
+    return cleaned or None
 
 
 def _validate_dependencies(deps: list[str]) -> list[str]:
@@ -171,8 +198,14 @@ class AgendaSim(BaseModel):
 
     ``spec`` is the opaque execution payload (a ``pypicongpu.Runner`` spec in
     this project).  ``point`` records the sweep assignment that produced this
-    leaf, so expanded agendas remain self-describing.  ``depends_on`` names
-    sibling entries that must complete before this one (carried into CWL).
+    leaf, so expanded agendas remain self-describing; ``sweep_parameter`` is
+    the human-readable name of the swept parameter (``point``'s key is only the
+    last dotted-path segment), so a scan is not reduced to a meaningless key.
+    ``point`` is deliberately retained as the refinement engine's contract (the
+    engine scores ``next(iter(point.values()))``); it is not a unique leaf
+    identifier, since ``sim.laser.0...`` and ``sim.laser.1...`` can yield the
+    same derived ``sweep_parameter``.  ``depends_on`` names sibling entries that
+    must complete before this one (carried into CWL).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -181,6 +214,13 @@ class AgendaSim(BaseModel):
     name: str
     spec: dict[str, Any]
     point: dict[str, float | int | str] | None = None
+    #: Human-readable name of the swept parameter this leaf assigns (e.g.
+    #: ``sim.laser.0.focus_pos_si.1.component``), kept alongside ``point`` so a
+    #: scan stays self-describing.  The ``point`` key is only the last path
+    #: segment (``component``), which is meaningless on its own.  Optional for
+    #: backward compatibility: campaigns persisted before this field simply
+    #: lack it and still load.
+    sweep_parameter: str | None = None
     status: Literal["planned", "submitted", "running", "done", "failed"] = "planned"
     depends_on: list[str] = Field(default_factory=list)
     #: The RCP simulation id once this leaf has been submitted (the engine's
@@ -332,6 +372,7 @@ class AgendaGroup(BaseModel):
         name: str,
         spec: dict[str, Any],
         point: dict[str, float | int | str] | None = None,
+        sweep_parameter: str | None = None,
     ) -> AgendaGroup:
         """Add one leaf simulation and return the expanded group.
 
@@ -339,7 +380,7 @@ class AgendaGroup(BaseModel):
             A new group with the leaf inserted.
 
         """
-        return self.add(**{name: AgendaSim(name=name, spec=spec, point=point)})
+        return self.add(**{name: AgendaSim(name=name, spec=spec, point=point, sweep_parameter=sweep_parameter)})
 
     def simulations(self) -> list[tuple[str, AgendaSim]]:
         """Flatten the tree to ``(path, sim)`` pairs, depth-first.
@@ -391,7 +432,15 @@ class AgendaGroup(BaseModel):
             if leaf_name in expanded.entries:
                 msg = f"expand would overwrite an existing entry: {leaf_name!r}"
                 raise ValueError(msg)
-            expanded.entries[leaf_name] = AgendaSim(name=leaf_name, spec=synthesized(point), point=point)
+            expanded.entries[leaf_name] = AgendaSim(
+                name=leaf_name,
+                spec=synthesized(point),
+                point=point,
+                # The sweep parameter is caller-supplied, so it goes through the
+                # same display sanitiser as the server's labels before it can
+                # reach a report.
+                sweep_parameter=readable_label(sweep.parameter),
+            )
         return expanded
 
 

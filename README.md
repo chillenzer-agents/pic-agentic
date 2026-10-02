@@ -295,6 +295,23 @@ symlinks resolved on both sides) and refused otherwise; a path such as
 (`MAX_SPEC_FILE_BYTES`) — larger than the 48 KiB inline cap because the bytes
 are server-local and never cross the homeserver.
 
+### Campaign sweeps are self-describing
+
+A campaign leaf records the sweep assignment in `point` as
+`{last path segment: value}` — exactly what the refinement engine scores — but
+the key alone is opaque: sweeping the list-indexed laser focal component
+`sim.laser.0.focus_pos_si.1.component` would only show
+`point={"component": 4.4e-5}`. Each leaf therefore also records
+`sweep_parameter`, a human-readable name derived from `patch_path` by dropping
+the list indices while keeping every field name
+(`sim.laser.focus_pos_si.component`). Pass `parameter="focal y [m]"` to
+`create_campaign` (or `add_agenda_leaf`) to override the derived name with your
+own label. `sweep_parameter` appears in `agenda_status`, the `!leaves` view and
+the campaign RO-Crate. The derived and explicit labels are both sanitised for
+display: control characters are collapsed, while printable Unicode (units such
+as `µm`) is kept. Campaigns persisted before the field existed still load and
+advance: it is optional.
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path

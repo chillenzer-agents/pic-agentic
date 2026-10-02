@@ -60,6 +60,36 @@ def test_run_action_links_leaf_to_software() -> None:
     assert run["instrument"] == {"@id": "#picongpu"}
 
 
+def test_sweep_parameter_is_recorded_readably() -> None:
+    """A swept leaf carries its readable parameter name, not just the point key.
+
+    The point key alone is opaque (``component``); the RO-Crate must also carry
+    the human-readable swept parameter.
+    """
+    group = AgendaGroup(name="g").add(
+        leaf=AgendaSim(
+            name="leaf",
+            spec={"sim": {"focus": 4.4e-5}},
+            point={"component": 4.4e-5},
+            sweep_parameter="sim.laser.focus_pos_si.component",
+        )
+    )
+    crate = campaign_rocrate(Campaign(name="study", agenda=group))
+    leaf = _by_id(crate, "#leaf")
+    assert leaf["sweepParameter"] == "sim.laser.focus_pos_si.component"
+    assert leaf["point"] == {"component": 4.4e-5}
+
+
+def test_point_is_recorded_without_a_sweep_parameter() -> None:
+    """An unlabelled leaf still carries its point; the label does not gate it."""
+    group = AgendaGroup(name="g").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"focus": 4.4e-5}}, point={"component": 4.4e-5})
+    )
+    leaf = _by_id(campaign_rocrate(Campaign(name="study", agenda=group)), "#leaf")
+    assert "sweepParameter" not in leaf
+    assert leaf["point"] == {"component": 4.4e-5}
+
+
 def test_analysis_linkage() -> None:
     crate = campaign_rocrate(
         _campaign({"sim": {"replica": 0}}),

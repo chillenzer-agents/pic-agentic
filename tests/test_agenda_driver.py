@@ -77,6 +77,7 @@ def test_agenda_init_records_sweep_points(tmp_path: Path) -> None:
     # The patched spec still carries the value, so spec and point agree.
     for leaf in campaign["agenda"]["entries"].values():
         assert leaf["spec"]["sim"]["time_steps"] == leaf["point"]["time_steps"]
+        assert leaf["sweep_parameter"] == "sim.time_steps"
 
 
 def test_patch_spec_indexes_lists_by_decimal_segment() -> None:

@@ -11,7 +11,13 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from pic_agentic.agenda.model import AgendaGroup, AgendaSim, AgendaSweep, validate_entry_name
+from pic_agentic.agenda.model import (
+    AgendaGroup,
+    AgendaSim,
+    AgendaSweep,
+    readable_label,
+    validate_entry_name,
+)
 
 
 def _leaf(name: str, **kw: object) -> AgendaSim:
@@ -90,8 +96,30 @@ def test_expand_is_pure_and_assigns_points() -> None:
     for _path, sim in generated:
         assert sim.spec["sim"]["intensity"] in {1e18, 2e18, 3e18}
         assert sim.point == {"intensity": sim.spec["sim"]["intensity"]}
+        # The sweep records the readable parameter name alongside the point.
+        assert sim.sweep_parameter == "intensity"
     # Source untouched.
     assert [p for p, _ in base.simulations()] == ["seed"]
+
+
+def test_readable_label_preserves_unicode_and_drops_control_chars() -> None:
+    """The label sanitiser keeps printable Unicode but strips control runs."""
+    assert readable_label("focus y [μm]") == "focus y [μm]"
+    assert readable_label("焦距") == "焦距"
+    assert readable_label("a\x00b") == "a b"
+    assert readable_label("  padded  ") == "padded"
+    # An empty or all-whitespace label means "absent", not "".
+    assert readable_label("") is None
+    assert readable_label("\n\t") is None
+
+
+def test_expand_sanitises_the_sweep_parameter() -> None:
+    """``expand`` runs the caller's parameter through the display sanitiser."""
+    base = AgendaGroup(name="scan")
+    sweep = AgendaSweep(parameter="a\x00b", values=[1])
+    expanded = base.expand(sweep, lambda point: {"sim": point})
+    _path, sim = expanded.simulations()[0]
+    assert sim.sweep_parameter == "a b"
 
 
 def test_expand_names_are_distinct_for_int_vs_float() -> None:

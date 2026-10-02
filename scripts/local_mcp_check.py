@@ -859,20 +859,34 @@ def cmd_agenda_init(args: argparse.Namespace) -> int:
     if args.agenda_patch:
         # Parse the sweep parameter name from the dotted patch path (the leaf's
         # ``point`` is what the refinement engine scores: see
-        # ``server.agenda._leaf_score``).
+        # ``server.agenda._leaf_score``) and reuse the server's public
+        # derivation of the human-readable ``sweep_parameter`` so the driver
+        # records the same self-describing label.
+        from pic_agentic.agenda.model import readable_label  # ruff: ignore[import-outside-top-level] - test driver
+        from pic_agentic.server.agenda import (  # ruff: ignore[import-outside-top-level] - test driver
+            sweep_parameter_for,
+        )
+
         parameter = args.agenda_patch.rsplit(".", 1)[-1]
+        sweep_parameter = readable_label(sweep_parameter_for(args.agenda_patch, base_spec))
         leaves = [
-            (f"leaf{index:03d}", _patch_spec(base_spec, args.agenda_patch, value), _point_for(parameter, value))
+            (
+                f"leaf{index:03d}",
+                _patch_spec(base_spec, args.agenda_patch, value),
+                _point_for(parameter, value),
+                sweep_parameter,
+            )
             for index, value in enumerate(_parse_agenda_values(args.agenda_values))
         ]
     else:
         leaves = [
-            (f"leaf{index:03d}", _tag_replica(base_spec, index), None) for index in range(max(1, args.agenda_replicas))
+            (f"leaf{index:03d}", _tag_replica(base_spec, index), None, None)
+            for index in range(max(1, args.agenda_replicas))
         ]
 
     agenda = AgendaGroup(name="campaign")
-    for name, spec, point in leaves:
-        agenda = agenda.add(**{name: AgendaSim(name=name, spec=spec, point=point)})
+    for name, spec, point, sweep_parameter in leaves:
+        agenda = agenda.add(**{name: AgendaSim(name=name, spec=spec, point=point, sweep_parameter=sweep_parameter)})
     campaign = Campaign(name=args.agenda_name, agenda=agenda).with_created_ts()
 
     file_path = Path(args.agenda_file).expanduser()
