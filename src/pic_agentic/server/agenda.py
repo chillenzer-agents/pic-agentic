@@ -37,7 +37,7 @@ from pic_agentic.agenda.engine import (
     TransientSubmitError,
     leaf_at,
 )
-from pic_agentic.agenda.model import AgendaGroup, AgendaSim
+from pic_agentic.agenda.model import AgendaGroup, AgendaSim, readable_label
 from pic_agentic.agenda.refine import summary as refine_summary
 from pic_agentic.agenda.reuse import DEFAULT_REUSE_FILE, ReuseRecord, ReuseRegistry
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
@@ -551,7 +551,7 @@ class AgendaService:
         """
         if not self.store.exists():
             return no_campaign_error()
-        sweep_parameter = _readable_label(parameter) if parameter and point else None
+        sweep_parameter = readable_label(parameter) if parameter and point else None
         async with self._lock:
             try:
                 return self._add_leaf(
@@ -672,7 +672,8 @@ class AgendaService:
         if not values:
             return {"ok": False, "error": "no_values"}
         point_key = _parameter_for(patch_path)
-        sweep_parameter = _readable_label(parameter) if parameter else _sweep_parameter_for(patch_path, base_spec)
+        derived = sweep_parameter_for(patch_path, base_spec)
+        sweep_parameter = readable_label(parameter) if parameter else readable_label(derived)
         if not _leaf_target_exists(base_spec, patch_path):
             return {
                 "ok": False,
@@ -857,7 +858,7 @@ def _parameter_for(patch_path: str) -> str:
     dotted Runner-spec path (``sim.time_steps`` -> ``time_steps``).  Kept as the
     point key for backward compatibility; the human-readable name lives
     alongside it in ``AgendaSim.sweep_parameter`` (see
-    :func:`_sweep_parameter_for`).
+    :func:`sweep_parameter_for`).
 
     Returns:
         The final path segment.
@@ -866,7 +867,7 @@ def _parameter_for(patch_path: str) -> str:
     return patch_path.rsplit(".", 1)[-1]
 
 
-def _sweep_parameter_for(patch_path: str, spec: dict[str, Any]) -> str:
+def sweep_parameter_for(patch_path: str, spec: dict[str, Any]) -> str:
     """Derive a human-readable name for a sweep's dotted patch path.
 
     The leaf's ``point`` key is only the last dotted segment, which is
@@ -896,25 +897,6 @@ def _sweep_parameter_for(patch_path: str, spec: dict[str, Any]) -> str:
         kept.append(part)
         node = node.get(part) if isinstance(node, dict) else None
     return ".".join(kept) or _parameter_for(patch_path)
-
-
-def _readable_label(label: str) -> str:
-    """Reduce an explicit sweep label to characters meaningful in a name.
-
-    ``sweep_parameter`` is display metadata that travels in the RO-Crate and the
-    MCP tool output, so any run of characters outside a conservative readable
-    set (letters, digits, ``. _ - ( ) [ ] space``) is collapsed to a single
-    underscore.  This keeps a free-form label such as ``"focal y [m]"`` intact
-    but stops control characters from reaching a report.
-
-    Args:
-        label: The caller-supplied parameter label.
-
-    Returns:
-        The collapsed, whitespace-trimmed label.
-
-    """
-    return re.sub(r"[^A-Za-z0-9 ._()\[\]-]+", "_", label).strip()
 
 
 def _patch_spec(spec: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
