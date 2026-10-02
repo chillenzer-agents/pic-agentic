@@ -385,6 +385,18 @@ is honoured where the reader's filename carries a filter component; the
 readers, `openpmd_api`/`imageio`) degrades that reader to `reader_unavailable`;
 readers degrade independently, so `png` still works without `openpmd_api`.
 
+A numeric plugin summary whose value array is entirely zero carries an explicit
+`warning` (an empty spectrum is a legitimate outcome, so it is transparency, not
+an error). That same all-zero warning is reused as the **"successful-but-empty"
+health signal** for a completed simulation: the simclient probes the run's
+numeric artifacts when it emits `results.ready` and, when every present one is
+all-zero, stamps the warning onto the run. It surfaces as `suspects` in
+`advance_agenda`, `suspect`/`suspect_count` in `agenda_status`, a `suspect` count
+and alert in `fleet_status`, and a `suspect` field on the leaf's `done` callback
+and in `campaign_report`. This is what lets the loop distinguish "physics ran and
+succeeded" from "physics ran and was empty" (the beta-4 empty-campaign case)
+without a reviewer reading a histogram by hand.
+
 ## Tests and tooling
 
 ```bash

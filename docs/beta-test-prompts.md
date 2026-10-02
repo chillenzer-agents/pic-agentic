@@ -24,6 +24,16 @@ focal example defines no plasma species, so it produces an empty spectrum as
 written. The `instructions` now say the example needs the LWFA tutorial's plasma
 species folded in for a non-empty result.
 
+Independently of *why* a run is empty, a completed run whose only numeric plugin
+artifact reads all-zero is now a first-class **health signal**, not silence:
+`advance_agenda` reports it under `suspects`, `agenda_status` under
+`suspects`/`suspect_count` and a `suspect` field per leaf, `fleet_status` as a
+`suspect` summary count plus a `suspect` alert, and the leaf's `done` callback
+carries the all-zero warning. A run that finished but produced no particles is
+therefore never presented as a clean success — a "successful-but-empty" run
+should be treated as inconclusive physics and re-checked, not reported as a
+result.
+
 ## Prompt 1 — parameter scan from the documented LWFA example
 
 > I want to know how the laser focal position affects electron acceleration in
