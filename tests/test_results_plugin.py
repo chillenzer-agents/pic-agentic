@@ -181,6 +181,70 @@ def test_plugin_all_zero_histogram_carries_a_warning(tmp_path: Path, monkeypatch
     assert summary["source_size_bytes"] > 0
 
 
+def test_probe_vacuity_flags_an_all_zero_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A done run whose only numeric artifact is empty is suspect (F4).
+
+    This is the beta-4 failure: three done leaves, no failures, zero electrons.
+    The probe must reuse the all-zero warning path rather than invent a new
+    detector.
+    """
+
+    class _ZeroReader:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            return [0.0] * 10, [1000.0 * (i + 1) / 10 for i in range(10)], [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _ZeroReader)
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run, zero=True)
+    warning = results.probe_vacuity(SIM_ID, run_dir=run)
+    assert warning is not None
+    assert "all zeros" in warning
+
+
+def test_probe_vacuity_clears_a_populated_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run with a populated histogram is not suspect."""
+
+    class _LiveReader:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            counts = [0.0] * 10
+            counts[4] = 42.0
+            return counts, [1000.0 * (i + 1) / 10 for i in range(10)], [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _LiveReader)
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run)
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None
+
+
+def test_probe_vacuity_without_a_numeric_artifact_is_not_suspect(tmp_path: Path) -> None:
+    """No numeric artifact cannot be judged, so it is not flagged as empty."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None
+
+
 def test_annotate_vacuous_covers_the_numeric_readers() -> None:
     """Each numeric text reader's value array drives the warning independently."""
     cases = {

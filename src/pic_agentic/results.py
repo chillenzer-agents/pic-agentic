@@ -1796,6 +1796,52 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def probe_vacuity(sim_id: str, *, run_dir: Path | str, local_root: str = "") -> str | None:
+    """Return the all-zero warning when a run's only numeric artifact is empty.
+
+    A beta-4 campaign reached three ``done`` leaves, no failures and no alerts,
+    yet produced *zero* electrons; the only thing that caught it was a reviewer
+    reading an all-zero ``energy_histogram`` by hand.  The autonomy loop needs
+    to be suspicious of "successful runs with nothing in them", so this probe
+    reuses :func:`_annotate_vacuous` - the exact all-zero warning path - to
+    classify a completed run's linked output.
+
+    Each numeric text reader in :data:`_VACUOUS_VALUE_KEYS` is read against the
+    run's ``simOutput`` (best-effort; a missing reader or absent artifact is
+    skipped).  The run is *suspect* only when at least one numeric artifact is
+    present and **every** present one carries the all-zero warning: a single
+    non-empty diagnostic clears it, and a run with no numeric artifact at all
+    cannot be judged (e.g. the optional reader is not installed) and is not
+    flagged.
+
+    Args:
+        sim_id: The simulation id.
+        run_dir: The run directory (``simOutput`` lives under it).
+        local_root: Optional server-side results mirror root.
+
+    Returns:
+        The all-zero warning text when the run is suspect, else None.
+
+    """
+    warning: str | None = None
+    saw_artifact = False
+    for reader in _VACUOUS_VALUE_KEYS:
+        params = ResultParams(sim_id=sim_id, op=ResultOp.PLUGIN, reader=reader, iteration="last")
+        try:
+            payload = resolve_result(params, run_dir=run_dir, sim_id=sim_id, local_root=local_root)
+        except Exception:  # ruff: ignore[blind-except] - a probe must never break the caller
+            log.debug("vacuity probe for %r failed", reader)
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            continue
+        saw_artifact = True
+        if "warning" not in result:
+            return None
+        warning = str(result["warning"])
+    return warning if saw_artifact else None
+
+
 def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduction
     instance: Any,
     groups: dict[str, str],
@@ -2307,6 +2353,7 @@ def resolve_result(  # ruff: ignore[too-many-return-statements] - one dispatch p
 __all__ = [
     "ResultsReaderError",
     "ResultsUnavailable",
+    "probe_vacuity",
     "read_image",
     "read_slice",
     "read_stats",
