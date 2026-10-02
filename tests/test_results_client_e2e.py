@@ -135,6 +135,42 @@ async def test_plugin_request_routes_to_the_engine(tmp_path) -> None:
         await sim_t.close()
 
 
+async def test_plugin_energy_window_round_trips_through_the_client(tmp_path) -> None:
+    """``min_kev``/``max_kev`` travel to the engine and are honoured (F2)."""
+    import importlib.util
+
+    from plugin_fixtures import energy_histogram_dat, write_output_unit
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    # Populated range is 2500--20000 keV (peak at 10 MeV), entirely above the
+    # old fixed 100--1000 keV default window.
+    energy_histogram_dat(run, min_kev=0.0, max_kev=20000.0, peak_bin=6, peak_count=200_000_000)
+    sim_t, client = _client(tmp_path)
+    try:
+        _track_sim(client, run)
+        ack = await client.handle(
+            _request(
+                "res12345",
+                ResultOp.PLUGIN,
+                reader="energy_histogram",
+                species="e",
+                min_kev=2500.0,
+                max_kev=20000.0,
+            ),
+        )
+        assert ack is not None
+        if importlib.util.find_spec("picongpu") is None:
+            assert ack.payload.get("error_code") == "reader_unavailable"
+        else:
+            summary = ack.payload["result"]
+            assert summary["count_in_window"]["min_kev"] == pytest.approx(2500.0)
+            assert summary["count_in_window"]["max_kev"] == pytest.approx(20000.0)
+            assert summary["count_in_window"]["count"] > 0
+    finally:
+        await sim_t.close()
+
+
 async def test_result_unknown_sim_and_bad_path(tmp_path) -> None:
     sim_t, client = _client(tmp_path)
     try:
