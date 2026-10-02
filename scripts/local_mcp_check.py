@@ -859,15 +859,16 @@ def cmd_agenda_init(args: argparse.Namespace) -> int:
     if args.agenda_patch:
         # Parse the sweep parameter name from the dotted patch path (the leaf's
         # ``point`` is what the refinement engine scores: see
-        # ``server.agenda._leaf_score``) and reuse the server's derivation of
-        # the human-readable ``sweep_parameter`` so the driver records the same
-        # self-describing label.
+        # ``server.agenda._leaf_score``) and reuse the server's public
+        # derivation of the human-readable ``sweep_parameter`` so the driver
+        # records the same self-describing label.
+        from pic_agentic.agenda.model import readable_label  # ruff: ignore[import-outside-top-level] - test driver
         from pic_agentic.server.agenda import (  # ruff: ignore[import-outside-top-level] - test driver
-            _sweep_parameter_for,
+            sweep_parameter_for,
         )
 
         parameter = args.agenda_patch.rsplit(".", 1)[-1]
-        sweep_parameter = _sweep_parameter_for(args.agenda_patch, base_spec)
+        sweep_parameter = readable_label(sweep_parameter_for(args.agenda_patch, base_spec))
         leaves = [
             (
                 f"leaf{index:03d}",
