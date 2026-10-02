@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from pic_agentic import analysis
 
 SECRET = "super-secret-token-value"
@@ -105,7 +107,196 @@ def test_synthesize_answer_filters_by_query() -> None:
 
 def test_synthesize_answer_no_match_reports_and_falls_back() -> None:
     answer = analysis.synthesize_answer("zzz-nonexistent", {"name": "x"}, {}, {})
-    assert "No analysis fields matched" in answer
+    assert "Cannot answer the physics question" in answer
+    assert "name is x" in answer
+
+
+_HISTOGRAM = {
+    "total": 44.0,
+    "max_energy_kev": 17500.0,
+    "count_in_window": {"min_kev": 100.0, "max_kev": 1000.0, "count": 0.0},
+    "source_path": "e_energyHistogram_all.dat",
+    "iteration": 100,
+}
+
+
+def test_plugin_facts_name_the_physics() -> None:
+    facts = analysis._plugin_physics_facts({"energy_histogram": _HISTOGRAM})
+    joined = "; ".join(facts)
+    assert "44" in joined
+    assert "17500" in joined
+    assert "e_energyHistogram_all.dat" in joined
+
+
+def test_physics_query_is_answered_even_without_a_literal_match() -> None:
+    """The beta-4 regression: a physics question must yield physics, not metadata."""
+    answer = analysis.synthesize_answer(
+        "which focal point maximizes the high-energy tail?",
+        {"name": "Laser sweep"},
+        {},
+        {},
+        {"energy_histogram": _HISTOGRAM},
+    )
+    assert "17500" in answer
+    assert "e_energyHistogram_all.dat" in answer
+
+
+def test_literal_physics_query_matches_the_plugin_fact() -> None:
+    answer = analysis.synthesize_answer("max energy", {}, {}, {}, {"energy_histogram": _HISTOGRAM})
+    assert "Matched the query" in answer
+    assert "17500" in answer
+
+
+def test_no_physics_is_stated_explicitly() -> None:
+    """With no openPMD and no plugin histogram, say so instead of metadata only."""
+    answer = analysis.synthesize_answer("max energy", {"name": "Laser sweep"}, {}, {}, {})
+    assert "Cannot answer the physics question" in answer
+    assert "no openPMD output and no plugin histogram" in answer
+    assert "Laser sweep" in answer
+
+
+@pytest.mark.parametrize(
+    ("query", "name"),
+    [
+        ("what is the maximum energy?", "energy scan"),
+        ("which point maximizes the high-energy tail?", "High-energy tail optimisation"),
+    ],
+)
+def test_physics_query_is_not_answered_by_overlapping_metadata(query: str, name: str) -> None:
+    """The beta-4 defect (B1): a name that shares a word must not win.
+
+    A run named ``energy scan`` used to answer "what is the maximum energy?"
+    with ``Matched ...: experiment name is energy scan.``, bypassing the
+    no-physics path.  A physics question may only be satisfied by physics.
+    """
+    answer = analysis.synthesize_answer(query, {"name": name}, {}, {}, {})
+    assert "Cannot answer the physics question" in answer
+    assert "Matched the query" not in answer
+    assert f"experiment name is {name}" in answer
+
+
+def test_bookkeeping_query_still_matches_bookkeeping() -> None:
+    """A non-physics question is still answered from the metadata."""
+    rocrate = {"name": "Laser sweep", "software": {"name": "PIConGPU", "id": "#p"}}
+    answer = analysis.synthesize_answer("what is the experiment name?", rocrate, {}, {})
+    assert "Matched the query" in answer
+    assert "experiment name is Laser sweep" in answer
+
+
+def test_openpmd_without_plugin_is_stated_explicitly() -> None:
+    answer = analysis.synthesize_answer("max energy", {}, {}, {"latest_step": 10}, {})
+    assert "no plugin histogram" in answer
+    assert "openPMD output is present" in answer
+
+
+def test_unavailable_reader_is_named_in_the_answer() -> None:
+    plugins = {"__unavailable__": {"reason": "the optional picongpu plugin readers are not installed"}}
+    answer = analysis.synthesize_answer("max energy", {}, {}, {}, plugins)
+    assert "picongpu plugin readers are not installed" in answer
+
+
+def test_read_plugin_summaries_reuses_the_results_engine(tmp_path, monkeypatch) -> None:
+    from pic_agentic import results as results_mod
+
+    out = tmp_path / "run" / "simOutput"
+    out.mkdir(parents=True)
+
+    def fake_resolve(params, *, run_dir, sim_id, output_dir=None):
+        _ = (run_dir, sim_id, output_dir)
+        if params.reader == "energy_histogram":
+            return {"result": dict(_HISTOGRAM)}
+        return {"error": "no such file", "error_code": "no_results"}
+
+    monkeypatch.setattr(results_mod, "resolve_result", fake_resolve)
+    summaries = analysis.read_plugin_summaries(out)
+    assert summaries["energy_histogram"]["max_energy_kev"] == pytest.approx(17500.0)
+    assert "phase_space" not in summaries
+
+
+def test_read_plugin_summaries_passes_the_output_dir_explicitly(tmp_path, monkeypatch) -> None:
+    """M1: the linked directory need not be named ``simOutput``.
+
+    The engine's ``<run_dir>/simOutput`` convention must not be silently relied
+    upon: ``read_plugin_summaries`` passes the directory it was given.
+    """
+    from pic_agentic import results as results_mod
+
+    out = tmp_path / "run" / "outputs"
+    out.mkdir(parents=True)
+    seen: dict = {}
+
+    def fake_resolve(params, *, run_dir, sim_id, output_dir=None):
+        _ = (params, sim_id)
+        seen["run_dir"] = run_dir
+        seen["output_dir"] = output_dir
+        return {"error": "no such file", "error_code": "no_results"}
+
+    monkeypatch.setattr(results_mod, "resolve_result", fake_resolve)
+    analysis.read_plugin_summaries(out)
+    assert seen["output_dir"] == out
+    assert seen["run_dir"] == out.parent
+
+
+def test_read_plugin_summaries_uses_the_configured_species(tmp_path, monkeypatch) -> None:
+    """M1: a two-species run must summarize the diagnostic's own species.
+
+    The rendering context names the species each output diagnostic was
+    configured for, so a coincidentally present hydrogen histogram must not be
+    read for an electron diagnostic.
+    """
+    from pic_agentic import results as results_mod
+
+    out = tmp_path / "run" / "simOutput"
+    out.mkdir(parents=True)
+    metadata = {
+        "rendering_context": {
+            "species": [{"species_name": "e"}, {"species_name": "H"}],
+            "output": [
+                {"type_energyhistogram": True, "species": {"species_name": "e"}},
+            ],
+        },
+    }
+    seen: dict = {}
+
+    def fake_resolve(params, *, run_dir, sim_id, output_dir=None):
+        _ = (run_dir, sim_id, output_dir)
+        seen[params.reader] = params.species
+        return {"error": "no such file", "error_code": "no_results"}
+
+    monkeypatch.setattr(results_mod, "resolve_result", fake_resolve)
+    analysis.read_plugin_summaries(out, metadata=metadata)
+    assert seen["energy_histogram"] == "e"
+    # A reader with no shipped output tag still falls back to a single-species
+    # context; with two species it must stay unspecified rather than guess.
+    assert seen["emittance"] is None
+
+
+def test_sample_plugin_arrays_sets_downsampled() -> None:
+    """m2: sampling the analysis arrays must flag the section as downsampled."""
+    summary = {"counts": list(range(100)), "downsampled": False}
+    sampled = analysis._sample_plugin_arrays(summary)
+    assert len(sampled["counts"]) < 100
+    assert sampled["downsampled"] is True
+    small = {"counts": [1, 2, 3], "downsampled": False}
+    assert analysis._sample_plugin_arrays(small)["downsampled"] is False
+
+
+def test_read_plugin_summaries_remembers_reader_unavailable(tmp_path, monkeypatch) -> None:
+    from pic_agentic import results as results_mod
+
+    out = tmp_path / "run" / "simOutput"
+    out.mkdir(parents=True)
+    monkeypatch.setattr(
+        results_mod,
+        "resolve_result",
+        lambda _params, **_kwargs: {"error": "no picongpu", "error_code": "reader_unavailable"},
+    )
+    summaries = analysis.read_plugin_summaries(out)
+    assert summaries["__unavailable__"]["reason"] == "no picongpu"
+
+
+def test_read_plugin_summaries_without_output_is_empty(tmp_path) -> None:
+    assert analysis.read_plugin_summaries(tmp_path / "missing") == {}
 
 
 def test_analyze_never_raises_on_garbage(tmp_path) -> None:
@@ -115,7 +306,7 @@ def test_analyze_never_raises_on_garbage(tmp_path) -> None:
     (bad / "metadata").mkdir()
     (bad / "metadata" / "rc_params.json").write_text("[1,2,3]", encoding="utf-8")
     sections = analysis.analyze(tmp_path / "run", bad, tmp_path / "missing")
-    assert set(sections) == {"rocrate", "metadata", "openpmd", "answer"}
+    assert set(sections) == {"rocrate", "metadata", "openpmd", "plugins", "answer"}
     assert sections["rocrate"] == {}
     assert isinstance(sections["answer"], str)
 
@@ -157,3 +348,35 @@ def test_readers_never_raise_on_bad_bytes(tmp_path) -> None:
     assert analysis.read_pypicongpu_metadata(setup)["rc_params"] == {}
     # A null byte in the path itself must not raise either.
     assert analysis.read_rocrate("bad\x00path") == {}
+
+
+def test_read_plugin_summaries_drives_the_real_reader(tmp_path) -> None:
+    """m3: the analysis summary is pinned against the real ``EnergyHistogramData``.
+
+    The monkeypatched tests cannot catch a regression in the output-directory /
+    species resolution, so this drives the real reader (via
+    ``results.resolve_result``) and asserts the physics reaches the answer.
+    Skipped unless PIConGPU is importable; run it with the real-pin venv:
+    ``PYTHONPATH=src /tmp/opencode/pic-stack-venv/bin/python -m pytest tests/test_analysis.py``.
+    """
+    pytest.importorskip("picongpu")
+    from plugin_fixtures import energy_histogram_dat, write_output_unit
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run, species="e", peak_bin=4, peak_count=42)
+    energy_histogram_dat(run, species="H", peak_bin=1, peak_count=7)
+
+    metadata = {
+        "rendering_context": {
+            "species": [{"species_name": "e"}, {"species_name": "H"}],
+            "output": [{"type_energyhistogram": True, "species": {"species_name": "e"}}],
+        },
+    }
+    summaries = analysis.read_plugin_summaries(run / "simOutput", metadata=metadata)
+    histogram = summaries["energy_histogram"]
+    assert histogram["source_path"] == "e_energyHistogram_all.dat"
+    assert histogram["total"] == pytest.approx(44.0)
+    answer = analysis.synthesize_answer("what is the maximum energy?", {}, metadata, {}, summaries)
+    assert "e_energyHistogram_all.dat" in answer
+    assert "H_energyHistogram_all.dat" not in answer

@@ -132,6 +132,27 @@ def _params(**kwargs: object) -> ResultParams:
     return ResultParams(sim_id=SIM_ID, **kwargs)
 
 
+def test_resolve_result_explicit_output_dir_bypasses_the_convention(tmp_path) -> None:
+    """A caller holding the output dir need not name it ``simOutput``.
+
+    ``resolve_result`` normally looks under ``run_dir/simOutput``; an explicit
+    ``output_dir`` lets a caller pass the linked directory directly.
+    """
+    run = tmp_path / "run"
+    (run / "simOutput").mkdir(parents=True)
+    (run / "simOutput" / "foo.txt").write_text("ignored\n")
+    out = run / "outputs"
+    out.mkdir()
+    (out / "foo.txt").write_text("explicit\n")
+    payload = results.resolve_result(
+        _params(op=ResultOp.READ, path="foo.txt"),
+        run_dir=run,
+        sim_id=SIM_ID,
+        output_dir=out,
+    )
+    assert payload["data"] == ["explicit"]
+
+
 def test_resolve_read_tail_without_openpmd(tmp_path) -> None:
     out, _ = _tree(tmp_path)
     payload = results.resolve_result(

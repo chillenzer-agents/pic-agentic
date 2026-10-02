@@ -1172,10 +1172,18 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
     @server.tool(
         title="Analyze a simulation's output",
         description=(
-            "Compose the RO-Crate experiment metadata, the (redacted) pypicongpu "
-            "run metadata, an openPMD output summary and a deterministic "
-            "natural-language answer. Optionally filter the answer with `query`. "
-            "No LLM is called; missing inputs degrade to empty sections."
+            "Analyze a simulation's output: reuses the shipped PIConGPU plugin "
+            "readers to summarize the physics (energy histogram, phase space, "
+            "radiation, ...), plus the RO-Crate experiment metadata, the "
+            "(redacted) pypicongpu run metadata and an openPMD output summary. "
+            "The deterministic natural-language answer is physics-first: a "
+            "`query` about the spectrum or energy is answered from the plugin "
+            "summary values and never from bookkeeping that merely shares a "
+            "word, and when the run has no openPMD output or no plugin "
+            "histogram the answer says so explicitly instead of returning "
+            "metadata only. For a multi-species run each reader's configured "
+            "species is resolved from the pypicongpu metadata. No LLM is "
+            "called; missing inputs degrade to empty sections."
         ),
         annotations=_READ_ONLY,
     )
@@ -1534,12 +1542,13 @@ async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None
     rocrate = sections.get("rocrate") or {}
     metadata = sections.get("metadata") or {}
     openpmd = sections.get("openpmd") or {}
+    plugins = sections.get("plugins") or {}
     answer = sections.get("answer")
     if query:
         try:
             from pic_agentic import analysis  # ruff: ignore[import-outside-top-level] - lazy optional engine
 
-            answer = analysis.synthesize_answer(query, rocrate, metadata, openpmd)
+            answer = analysis.synthesize_answer(query, rocrate, metadata, openpmd, plugins)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
             return _soft_error(runtime, sim_id, op.value, exc)
     result = {
@@ -1548,6 +1557,7 @@ async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None
         "rocrate": rocrate,
         "metadata": metadata,
         "openpmd": openpmd,
+        "plugins": plugins,
         "answer": answer,
     }
     return _redact_dict(runtime, result)
