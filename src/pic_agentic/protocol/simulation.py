@@ -33,7 +33,7 @@ import re
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, FiniteFloat, computed_field, field_validator, model_validator
 
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, canonical_bytes, encode_wire, new_cmd_id
 from pic_agentic.version import WIRE_FORMAT_VERSION
@@ -1053,6 +1053,33 @@ class ResultParams(BaseModel):
     #: is normalized to PIConGPU's default ``"all"`` filter by the reader path;
     #: leaving it unset keeps it off the wire for non-plugin result ops.
     species_filter: str | None = None
+    #: Energy-histogram window lower/upper edge [keV] for ``PLUGIN`` with the
+    #: ``energy_histogram`` reader.  When unset the reader derives the window
+    #: from the populated bins, so the default is never structurally empty for a
+    #: spectrum that starts above the old fixed 100--1000 keV window (F2).
+    #: Both edges must be given together and the maximum must exceed the
+    #: minimum; they are ignored (and omitted from the wire) for other readers.
+    min_kev: FiniteFloat | None = None
+    max_kev: FiniteFloat | None = None
+
+    @model_validator(mode="after")
+    def _validate_energy_window(self) -> ResultParams:
+        """Require a coherent, paired energy window when one is given.
+
+        Returns:
+            The validated model.
+
+        Raises:
+            ValueError: If only one edge is set, or ``max_kev <= min_kev``.
+
+        """
+        if (self.min_kev is None) != (self.max_kev is None):
+            msg = "min_kev and max_kev must be set together"
+            raise ValueError(msg)
+        if self.min_kev is not None and self.max_kev is not None and self.max_kev <= self.min_kev:
+            msg = f"max_kev ({self.max_kev}) must be greater than min_kev ({self.min_kev})"
+            raise ValueError(msg)
+        return self
 
     @field_validator("path")
     @classmethod
@@ -1319,6 +1346,8 @@ def build_result_command(
             reader=params.reader,
             species=params.species,
             species_filter=params.species_filter,
+            min_kev=params.min_kev,
+            max_kev=params.max_kev,
         ),
     )
     return RcpMessage(

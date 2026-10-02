@@ -273,6 +273,8 @@ async def test_tool_registration_shape() -> None:
         "species_filter",
         "iteration",
         "path",
+        "min_kev",
+        "max_kev",
     }
 
 
