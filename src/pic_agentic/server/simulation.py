@@ -534,6 +534,13 @@ class SubmitService:
             value = payload.get(field)
             if value is not None:
                 setattr(record, field, value)
+        # The F4 health flag is only meaningful on a completed run's
+        # ``results.ready`` event.  An event allow-list keeps a buggy or
+        # replayed client from stamping ``suspect`` onto a still-running record
+        # (the fleet/agenda guards would ignore it, but the record should never
+        # hold a contradictory value).
+        if state != SimulationState.RESULTS_READY.value:
+            record.suspect = None
         record.state = state
         record.last_event_type = state or record.last_event_type
         record.last_event_ts = message.ts

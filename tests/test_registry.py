@@ -164,6 +164,49 @@ def test_non_suspect_run_has_no_flag() -> None:
     assert record.suspect is None
 
 
+def test_suspect_flag_is_cleared_on_a_non_results_ready_event() -> None:
+    """A ``suspect`` payload on a non-terminal event must not stick (m1).
+
+    ``_RECORD_FIELDS`` projects any field a payload carries; the allow-list in
+    :meth:`_project_event` keeps the F4 flag tied to ``results.ready`` so a
+    buggy client cannot stamp a running record as suspect.
+    """
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(_event(SimulationState.RESULTS_READY, seq=2, job_id=1, results_linked=True, suspect="empty"))
+    service.on_message(
+        _event(SimulationState.STEP_FINISHED, cmd_id="cmd-2", seq=3, job_id=1, step=10, suspect="stale-empty"),
+    )
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.state == SimulationState.STEP_FINISHED.value
+    assert record.suspect is None
+
+
+def test_submit_ack_cannot_inject_suspect() -> None:
+    """An ack carrying ``suspect`` never promotes it onto a non-terminal record.
+
+    The submit ack is projected by :meth:`_project_ack`, which reads only the
+    failure fields; the F4 flag travels on events (and the status pull is
+    merged at the tool boundary), so a rogue ack payload must not seed it.
+    """
+    service = _service()
+    ack = build_submit_ack(
+        sim=SIM,
+        seq=1,
+        cmd_id=CMD_ID,
+        sim_id=SIM_ID,
+        state=SimulationState.ACCEPTED,
+        in_reply_to=None,
+        job_id=None,
+    )
+    ack.payload["suspect"] = "should-be-ignored"
+    service.on_message(ack.sign(SECRET))
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.suspect is None
+
+
 def test_terminal_state_marks_inactive() -> None:
     service = _service()
     service.on_message(_ack())
