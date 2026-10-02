@@ -60,3 +60,26 @@ def test_summary_shape_and_no_suggestions_when_converged() -> None:
     assert open_sweep["converged"] is False
     assert open_sweep["best"]["value"] == pytest.approx(5.0)
     assert open_sweep["suggestions"]
+
+
+def test_summary_without_any_analysis_reports_no_best() -> None:
+    """A sweep with no analysed leaf must not invent a best point.
+
+    Regression for F1: before the fix ``summary`` ranked ``None``-free point
+    values, so a sweep that had only been *simulated* looked converged.
+    """
+    result = summary({"leaf000": None, "leaf001": None, "leaf002": None})
+    assert result["best"] is None
+    assert result["analysed"] == 0
+    assert result["converged"] is False
+    assert result["suggestions"] == []
+
+    assert summary({})["best"] is None
+    assert summary({})["analysed"] == 0
+
+
+def test_summary_ranks_only_recorded_analyses() -> None:
+    """``best`` follows the analyses, ignoring leaves that are not analysed."""
+    result = summary({"leaf000": 0.31, "leaf001": None, "leaf002": 0.29}, rel_tol=0.05)
+    assert result["best"] == {"label": "leaf000", "value": pytest.approx(0.31)}
+    assert result["analysed"] == 2
