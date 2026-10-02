@@ -743,7 +743,10 @@ SERVER_INSTRUCTIONS = (
     "source tree show complete setups. Note: the focal example on the "
     "'Defining Your Simulation' page defines no plasma species, so it yields an "
     "empty spectrum as written; fold in the LWFA tutorial's plasma species for "
-    "a non-empty result."
+    "a non-empty result. A run that finishes but whose only numeric plugin "
+    "artifact reads all-zero is reported as `suspect` in advance_agenda, "
+    "agenda_status and fleet_status (and on its done callback); treat such a "
+    "run as inconclusive physics, not as a valid result."
 )
 
 
@@ -1207,7 +1210,11 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "(submitted/waiting/done/failed paths and usage). Failures are "
             "summarised in `failure_summary` and grouped by identical reason in "
             "`failure_groups` (with the full, untruncated text available via "
-            "take_agenda_callbacks)."
+            "take_agenda_callbacks). A leaf that finished but whose only numeric "
+            "artifact reads all-zero is 'successfully empty': it appears in "
+            "`suspects` (path -> warning) and its done callback carries a "
+            "`suspect` warning, so a zero-physics run is never mistaken for a "
+            "real result."
         ),
         # write/resource tier: a tick may submit new cluster jobs, so it is not
         # read-only and not idempotent, but it is not destructive.
@@ -1222,7 +1229,10 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Report the aggregate status of the persisted campaign: its name, "
             "completion flag, per-status counts, accumulated usage and the "
-            "per-leaf view (path, status, sim_id, sweep point)."
+            "per-leaf view (path, status, sim_id, sweep point). A ``done`` leaf "
+            "whose only numeric artifact reads all-zero is flagged `suspect` "
+            "(and counted in `suspect_count`/`suspects`), so an empty run is not "
+            "reported as a clean success."
         ),
         annotations=_READ_ONLY,
     )
@@ -1437,7 +1447,9 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Report the whole fleet at a glance: total/active/terminal counts, "
             "per-state counts, a mean progress percentage, and actionable "
-            "alerts (failed, cancelled, non-zero exit, stalled)."
+            "alerts (failed, cancelled, non-zero exit, stalled, suspect). The "
+            "`suspect` count/alert marks a done run whose only numeric artifact "
+            "reads all-zero - a successful-but-empty run, not a failure."
         ),
         annotations=_READ_ONLY,
     )

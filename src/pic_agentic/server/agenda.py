@@ -34,6 +34,7 @@ from pic_agentic.agenda.engine import (
     EnginePolicy,
     FailureInfo,
     SubmitFailureError,
+    SuspectInfo,
     TransientSubmitError,
     leaf_at,
 )
@@ -269,10 +270,29 @@ class AgendaService:
             policy=self.policy,
             actuals=actuals,
             failures=failures,
+            suspects=self._registry_suspects,
             reuse_lookup=reuse_lookup,
             reuse_record=reuse_record,
             reuse_key=reuse_key,
         )
+
+    def _registry_suspects(self) -> Mapping[str, SuspectInfo]:
+        """Project the registry's "successful-but-empty" flags (F4).
+
+        The engine's :meth:`AgendaEngine.status` probe needs no transport, but
+        the registry only knows the flag the simclient pushed on the
+        ``results.ready`` event.  Passing it here keeps ``agenda_status`` able
+        to flag an already-done empty leaf before the next tick stamps it.
+
+        Returns:
+            ``{sim_id: SuspectInfo}`` for records carrying the flag.
+
+        """
+        return {
+            sim_id: SuspectInfo(warning=record.suspect)
+            for sim_id, record in self.submit_service.registry.items()
+            if record.suspect
+        }
 
     def status(self) -> dict[str, Any]:
         """Return the aggregate campaign status (redacted-safe).
@@ -284,7 +304,13 @@ class AgendaService:
         """
         if not self.store.exists():
             return no_campaign_error()
-        engine = AgendaEngine(store=self.store, submit=_never_submit, observe=dict, policy=self.policy)
+        engine = AgendaEngine(
+            store=self.store,
+            submit=_never_submit,
+            observe=dict,
+            policy=self.policy,
+            suspects=self._registry_suspects,
+        )
         try:
             return engine.status()
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise

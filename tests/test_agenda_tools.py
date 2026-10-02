@@ -216,6 +216,34 @@ async def test_no_campaign_error_is_actionable(tmp_path) -> None:
         assert "create a campaign first" in result["message"], tool
 
 
+async def test_agenda_status_flags_a_successfully_empty_leaf(tmp_path) -> None:
+    """A done leaf whose output is all-zero is flagged, not reported clean (F4)."""
+    warning = "energy_histogram is all zeros; the run may have no particles in range"
+    agenda = AgendaGroup(name="group").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, status="done", sim_id="sim0001", suspect=warning)
+    )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="scan", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+
+    status = await _call(config, "agenda_status", {})
+    assert status["suspect_count"] == 1
+    assert status["suspects"] == {"leaf": warning}
+    (leaf,) = status["leaves"]
+    assert leaf["suspect"] == warning
+
+
+async def test_agenda_status_does_not_flag_a_populated_leaf(tmp_path) -> None:
+    agenda = AgendaGroup(name="group").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, status="done", sim_id="sim0001")
+    )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="scan", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+
+    status = await _call(config, "agenda_status", {})
+    assert status["suspect_count"] == 0
+    assert status["leaves"][0]["suspect"] is None
+
+
 async def test_agenda_status_redacts_secrets(tmp_path) -> None:
     secret = "topsecret-token"
     config = Config(rcp_secret=secret, agenda_file=_campaign_file(tmp_path, name=f"campaign-{secret}"))
