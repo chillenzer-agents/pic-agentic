@@ -108,6 +108,72 @@ def test_result_params_explicit_species_filter_is_forwarded() -> None:
     assert command.payload["species_filter"] == "openPMD"
 
 
+def test_result_params_energy_window_is_forwarded() -> None:
+    """A requested ``min_kev``/``max_kev`` window travels on the wire (F2)."""
+    params = ResultParams(
+        sim_id=SIM,
+        op=ResultOp.PLUGIN,
+        reader="energy_histogram",
+        species="e",
+        min_kev=2500.0,
+        max_kev=20000.0,
+    )
+    command = build_result_command(sim=SIM, seq=1, params=params, cmd_id=CMD_ID)
+    assert command.payload["min_kev"] == pytest.approx(2500.0)
+    assert command.payload["max_kev"] == pytest.approx(20000.0)
+
+
+def test_result_params_unset_energy_window_is_omitted() -> None:
+    params = ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="energy_histogram", species="e")
+    command = build_result_command(sim=SIM, seq=1, params=params, cmd_id=CMD_ID)
+    assert params.min_kev is None
+    assert params.max_kev is None
+    assert "min_kev" not in command.payload
+    assert "max_kev" not in command.payload
+
+
+@pytest.mark.parametrize("kwargs", [{"min_kev": 100.0}, {"max_kev": 1000.0}])
+def test_result_params_window_requires_both_edges(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValidationError, match="must be set together"):
+        ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="energy_histogram", **kwargs)
+
+
+def test_result_params_window_requires_increasing_edges() -> None:
+    with pytest.raises(ValidationError, match="must be greater"):
+        ResultParams(
+            sim_id=SIM,
+            op=ResultOp.PLUGIN,
+            reader="energy_histogram",
+            min_kev=1000.0,
+            max_kev=1000.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_kev": -100.0, "max_kev": -50.0},
+        {"min_kev": -100.0, "max_kev": 100.0},
+    ],
+)
+def test_result_params_window_requires_non_negative_edges(kwargs: dict[str, float]) -> None:
+    """A negative energy window is physically meaningless and rejected (F2 Nit)."""
+    with pytest.raises(ValidationError, match="must be non-negative"):
+        ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="energy_histogram", **kwargs)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_result_params_window_rejects_non_finite(value: float) -> None:
+    with pytest.raises(ValidationError):
+        ResultParams(
+            sim_id=SIM,
+            op=ResultOp.PLUGIN,
+            reader="energy_histogram",
+            min_kev=100.0,
+            max_kev=value,
+        )
+
+
 def test_result_params_non_plugin_ops_omit_species_filter() -> None:
     for op in (ResultOp.DESCRIBE, ResultOp.READ, ResultOp.EXPORT):
         command = build_result_command(sim=SIM, seq=1, params=ResultParams(sim_id=SIM, op=op), cmd_id=CMD_ID)

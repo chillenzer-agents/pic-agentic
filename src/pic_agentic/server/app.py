@@ -1129,7 +1129,11 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
             "'energy_histogram', 'emittance', 'transition_radiation', "
             "'phase_space', 'radiation', 'calorimeter' or 'png'; `species` and "
             "`species_filter` select the output, and `iteration` picks a step "
-            "('last' by default). The PNG reader returns image metadata only "
+            "('last' by default). For `energy_histogram`, `min_kev`/`max_kev` "
+            "set the `count_in_window` energy window; when omitted it is derived "
+            "from the populated bins, and the summary always reports the window, "
+            "`n_nonzero_bins` and the populated min/max so a mismatched window is "
+            "obvious. The PNG reader returns image metadata only "
             "(dimensions, iteration, path); fetch the image with "
             "`export_results`. Use `describe_results` to see which plugin files "
             "exist. Requires the picongpu readers (and, for the openPMD/image "
@@ -1145,6 +1149,8 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
         species_filter: str | None = None,
         iteration: int | str | None = None,
         path: str | None = None,
+        min_kev: float | None = None,
+        max_kev: float | None = None,
     ) -> dict[str, Any]:
         return await _result_tool(
             runtime,
@@ -1155,6 +1161,8 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
             species_filter=species_filter,
             iteration=iteration,
             path=path,
+            min_kev=min_kev,
+            max_kev=max_kev,
         )
 
     @server.tool(

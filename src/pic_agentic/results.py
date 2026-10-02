@@ -93,10 +93,21 @@ _SCALAR_COMPONENT = "\x0bScalar"
 #: Directory (relative to ``run_dir``) the workflow links the results into.
 _SIM_OUTPUT = "simOutput"
 
-#: Default [keV] window for the ``count_in_window`` histogram reduction.  PIConGPU
-#: energy histograms are commonly configured over 0--1000 keV; the window is
-#: always reported in the summary, so the caller need not know the default.
+#: Preferred [keV] window for the ``count_in_window`` histogram reduction.
+#: PIConGPU energy histograms are commonly configured over 0--1000 keV, so this
+#: window is kept for a spectrum that lies entirely inside it.  Otherwise the
+#: default is derived from the populated range so it always captures the whole
+#: population (F2): a spectrum that starts at 2500 keV is covered end to end
+#: rather than clipped at 1000 keV.  A caller can override either way with
+#: ``min_kev``/``max_kev`` on the request.
 _DEFAULT_WINDOW_KEV = (100.0, 1000.0)
+
+#: Fraction of the total counts below which a window is reported as a
+#: mis-window by a ``warning``.  The empty case is covered for any fraction;
+#: this threshold additionally flags a window that only captures a sliver of a
+#: spectrum (e.g. a fixed 100--1000 keV default on a spectrum spanning 900--
+#: 20000 keV, F2).  A full-range window never trips it.
+_WINDOW_COVERAGE_WARNING = 0.9
 
 #: Target number of array points per plugin summary.  The summary is strided
 #: down further if it still exceeds :data:`MAX_RESULT_BYTES`.
@@ -1357,6 +1368,7 @@ def _plugin_summary(
     available: list[int],
     *,
     target: Path,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Call one plugin reader and shape a bounded numeric summary.
 
@@ -1365,7 +1377,7 @@ def _plugin_summary(
 
     """
     selected = _resolve_plugin_iteration(available, iteration)
-    return _PLUGIN_BUILDERS[reader](instance, groups, selected, target)
+    return _PLUGIN_BUILDERS[reader](instance, groups, selected, target, window=window)
 
 
 def _openpmd_pattern(spec: _PluginReader, name: str) -> str | None:
@@ -1448,7 +1460,8 @@ def _plugin_result(
     available = _plugin_available_iterations(reader, spec, output, groups)
     selected = _resolve_plugin_iteration(available, params.iteration)
     instance = _build_plugin_instance(reader, spec, output, target, selected)
-    summary = _plugin_summary(reader, instance, groups, selected, available, target=target)
+    requested = None if params.min_kev is None or params.max_kev is None else (params.min_kev, params.max_kev)
+    summary = _plugin_summary(reader, instance, groups, selected, available, target=target, window=requested)
     return _annotate_vacuous(reader, summary)
 
 
@@ -1534,6 +1547,8 @@ def _build_phase_space(
     groups: dict[str, str],
     iteration: int,
     target: Path,
+    *,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Reduce a ``PhaseSpaceData`` histogram to a bounded summary.
 
@@ -1551,6 +1566,7 @@ def _build_phase_space(
         Axis ranges, strided projections and scalars.
 
     """
+    _ = window
     plane, meta = instance.get(
         iteration=iteration,
         species=groups["species"],
@@ -1590,6 +1606,8 @@ def _build_radiation(
     groups: dict[str, str],
     iteration: int,
     target: Path,
+    *,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Reduce a ``RadiationData`` series to a bounded summary.
 
@@ -1597,7 +1615,7 @@ def _build_radiation(
         Frequency (SI 1/s), the direction-summed spectrum and scalars.
 
     """
-    _ = groups
+    _ = groups, window
     spectra = _as_nested(instance.get_Spectra())
     omegas = [float(value) for value in instance.get_omega()]
     n_directions, n_frequencies = _nested_shape(spectra)
@@ -1665,6 +1683,8 @@ def _build_calorimeter(
     groups: dict[str, str],
     iteration: int,
     target: Path,
+    *,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Reduce a ``particleCalorimeter`` result to a bounded summary.
 
@@ -1672,7 +1692,7 @@ def _build_calorimeter(
         Bin counts, energy edges, the yaw/pitch marginals and scalars.
 
     """
-    _ = groups
+    _ = groups, window
     energy_kev, per_pitch, per_yaw, total, peak = _calorimeter_projections(instance, iteration)
     strided_pitch, downsampled = _stride(per_pitch)
     strided_yaw, _ = _stride(per_yaw)
@@ -1695,6 +1715,8 @@ def _build_png(
     groups: dict[str, str],
     iteration: int,
     target: Path,
+    *,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Describe a ``PNGData`` image without shipping pixels.
 
@@ -1707,6 +1729,7 @@ def _build_png(
         Image dimensions, selector and the relative path.
 
     """
+    _ = window
     species, axis, slice_point = groups["species"], groups["axis"], float(groups["slice_point"])
     image = _as_nested(
         instance.get(
@@ -1796,16 +1819,61 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _default_window(populated: list[float]) -> tuple[float, float]:
+    """Pick the ``count_in_window`` window when the request leaves it unset.
+
+    The preferred 100--1000 keV window is kept only when the populated range
+    lies wholly inside it, so the reported number never changes for the common
+    case.  A spectrum that reaches outside it (an LWFA spectrum starting at
+    2500 keV, or one spanning 900--20000 keV) is instead covered end to end, so
+    the default captures the whole population rather than clipping it to a
+    sliver (F2).  A single populated bin yields a one-bin window, widened by
+    one edge so it is never the degenerate ``max == min`` that ``ResultParams``
+    would reject if requested.
+
+    Returns:
+        ``(min_kev, max_kev)`` for the summary's ``count_in_window``.
+
+    """
+    low, high = _DEFAULT_WINDOW_KEV
+    if not populated or (min(populated) >= low and max(populated) <= high):
+        return low, high
+    span_low, span_high = min(populated), max(populated)
+    if span_low == span_high:
+        return span_low, span_low + 1.0
+    return span_low, span_high
+
+
+def _energy_window(
+    requested: tuple[float, float] | None,
+    populated: list[float],
+) -> tuple[float, float]:
+    """Return the explicit request window or a derived, non-empty default.
+
+    Returns:
+        The ``(min_kev, max_kev)`` window to count in.
+
+    """
+    if requested is not None:
+        return requested
+    return _default_window(populated)
+
+
 def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduction
     instance: Any,
     groups: dict[str, str],
     iteration: int,
     target: Path,
+    *,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Reduce an ``EnergyHistogramData`` result to a bounded summary.
 
+    ``window`` is the caller's requested ``(min_kev, max_kev)`` or ``None`` to
+    derive a non-empty default from the populated bins (F2).
+
     Returns:
-        Bins (keV), counts, the count in the default window and scalars.
+        Bins (keV), counts, the count in the window and scalars.
 
     """
     species, species_filter = groups["species"], groups["filter"]
@@ -1823,23 +1891,38 @@ def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduc
     paired = min(len(bins), len(counts))
     upper_edges = bins[:paired]
     counts = counts[:paired]
-    low, high = _DEFAULT_WINDOW_KEV
-    in_window = sum(count for bin_kev, count in zip(upper_edges, counts, strict=True) if low <= bin_kev <= high)
     # ``max_energy_kev`` is the highest bin edge that actually holds particles,
     # not the modal (argmax-count) edge: the high-energy tail is the number the
     # caller is after.
     populated = [bin_kev for bin_kev, count in zip(upper_edges, counts, strict=True) if count > 0]
+    low, high = _energy_window(window, populated)
+    in_window = sum(count for bin_kev, count in zip(upper_edges, counts, strict=True) if low <= bin_kev <= high)
     strided_bins, downsampled = _stride(upper_edges)
     strided_counts, _ = _stride(counts)
-    return {
+    total = sum(counts)
+    summary: dict[str, Any] = {
         "bins_kev": strided_bins,
         "counts": strided_counts,
         "count_in_window": {"min_kev": low, "max_kev": high, "count": in_window},
-        "total": sum(counts),
+        "total": total,
+        # The number of populated bins and their edges make a partial window
+        # self-evidently a mis-window: ``n_nonzero_bins``/``min``/``max`` next
+        # to a ``count_in_window`` far below ``total`` shows the window missed
+        # the data (F2).
+        "n_nonzero_bins": len(populated),
+        "min_energy_kev": min(populated) if populated else None,
         "max_energy_kev": max(populated) if populated else None,
         **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
+    if populated and total > 0 and in_window < _WINDOW_COVERAGE_WARNING * total:
+        summary["warning"] = (
+            f"energy_histogram has {len(populated)} populated bins "
+            f"({min(populated):g}-{max(populated):g} keV) but count_in_window is {in_window:g} "
+            f"of {total:g} for the {low:g}-{high:g} keV window; the window does not cover the "
+            f"populated range"
+        )
+    return summary
 
 
 def _build_emittance(
@@ -1847,6 +1930,8 @@ def _build_emittance(
     groups: dict[str, str],
     iteration: int,
     target: Path,
+    *,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Reduce an ``EmittanceData`` result to a bounded summary.
 
@@ -1854,6 +1939,7 @@ def _build_emittance(
         Slice positions (m), slice emittances (m rad) and scalars.
 
     """
+    _ = window
     species, species_filter = groups["species"], groups["filter"]
     raw, y_slices, _iteration, _dt = instance.get(
         iteration=iteration,
@@ -1887,6 +1973,8 @@ def _build_transition_radiation(
     groups: dict[str, str],
     iteration: int,
     target: Path,
+    *,
+    window: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Reduce a ``TransitionRadiationData`` result to a bounded summary.
 
@@ -1897,6 +1985,7 @@ def _build_transition_radiation(
         Frequency (SI 1/s), intensity and scalars.
 
     """
+    _ = window
     species = groups["species"]
     omegas, spectrum = instance.get(
         iteration=iteration,
@@ -1923,9 +2012,10 @@ def _build_transition_radiation(
 
 
 #: Reader name -> the summary builder that calls the reader instance.  Every
-#: builder shares the signature ``(instance, groups, iteration, target)`` so the
-#: openPMD/image readers can reach their extra selector components.
-_PLUGIN_BUILDERS: dict[str, Callable[[Any, dict[str, str], int, Path], dict[str, Any]]] = {
+#: builder shares the signature ``(instance, groups, iteration, target, *,
+#: window)`` so the openPMD/image readers can reach their extra selector
+#: components; only the energy-histogram builder uses ``window``.
+_PLUGIN_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "energy_histogram": _build_energy_histogram,
     "emittance": _build_emittance,
     "transition_radiation": _build_transition_radiation,
