@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from pic_agentic import analysis
 
 SECRET = "super-secret-token-value"
@@ -105,7 +107,100 @@ def test_synthesize_answer_filters_by_query() -> None:
 
 def test_synthesize_answer_no_match_reports_and_falls_back() -> None:
     answer = analysis.synthesize_answer("zzz-nonexistent", {"name": "x"}, {}, {})
-    assert "No analysis fields matched" in answer
+    assert "Cannot answer the physics question" in answer
+    assert "name is x" in answer
+
+
+_HISTOGRAM = {
+    "total": 44.0,
+    "max_energy_kev": 17500.0,
+    "count_in_window": {"min_kev": 100.0, "max_kev": 1000.0, "count": 0.0},
+    "source_path": "e_energyHistogram_all.dat",
+    "iteration": 100,
+}
+
+
+def test_plugin_facts_name_the_physics() -> None:
+    facts = analysis._plugin_facts({"energy_histogram": _HISTOGRAM})
+    joined = "; ".join(facts)
+    assert "44" in joined
+    assert "17500" in joined
+    assert "e_energyHistogram_all.dat" in joined
+
+
+def test_physics_query_is_answered_even_without_a_literal_match() -> None:
+    """The beta-4 regression: a physics question must yield physics, not metadata."""
+    answer = analysis.synthesize_answer(
+        "which focal point maximizes the high-energy tail?",
+        {"name": "Laser sweep"},
+        {},
+        {},
+        {"energy_histogram": _HISTOGRAM},
+    )
+    assert "17500" in answer
+    assert "e_energyHistogram_all.dat" in answer
+
+
+def test_literal_physics_query_matches_the_plugin_fact() -> None:
+    answer = analysis.synthesize_answer("max energy", {}, {}, {}, {"energy_histogram": _HISTOGRAM})
+    assert "Matched the query" in answer
+    assert "17500" in answer
+
+
+def test_no_physics_is_stated_explicitly() -> None:
+    """With no openPMD and no plugin histogram, say so instead of metadata only."""
+    answer = analysis.synthesize_answer("max energy", {"name": "Laser sweep"}, {}, {}, {})
+    assert "Cannot answer the physics question" in answer
+    assert "no openPMD output and no plugin histogram" in answer
+    assert "Laser sweep" in answer
+
+
+def test_openpmd_without_plugin_is_stated_explicitly() -> None:
+    answer = analysis.synthesize_answer("max energy", {}, {}, {"latest_step": 10}, {})
+    assert "no plugin histogram" in answer
+    assert "openPMD output is present" in answer
+
+
+def test_unavailable_reader_is_named_in_the_answer() -> None:
+    plugins = {"__unavailable__": {"reason": "the optional picongpu plugin readers are not installed"}}
+    answer = analysis.synthesize_answer("max energy", {}, {}, {}, plugins)
+    assert "picongpu plugin readers are not installed" in answer
+
+
+def test_read_plugin_summaries_reuses_the_results_engine(tmp_path, monkeypatch) -> None:
+    from pic_agentic import results as results_mod
+
+    out = tmp_path / "run" / "simOutput"
+    out.mkdir(parents=True)
+
+    def fake_resolve(params, *, run_dir, sim_id):
+        _ = (run_dir, sim_id)
+        if params.reader == "energy_histogram":
+            return {"result": dict(_HISTOGRAM)}
+        return {"error": "no such file", "error_code": "no_results"}
+
+    monkeypatch.setattr(results_mod, "resolve_result", fake_resolve)
+    summaries = analysis.read_plugin_summaries(out)
+    assert summaries["energy_histogram"]["max_energy_kev"] == pytest.approx(17500.0)
+    assert "phase_space" not in summaries
+
+
+def test_read_plugin_summaries_remembers_reader_unavailable(tmp_path, monkeypatch) -> None:
+    from pic_agentic import results as results_mod
+
+    out = tmp_path / "run" / "simOutput"
+    out.mkdir(parents=True)
+    monkeypatch.setattr(
+        results_mod,
+        "resolve_result",
+        lambda _params, **_kwargs: {"error": "no picongpu", "error_code": "reader_unavailable"},
+    )
+    summaries = analysis.read_plugin_summaries(out)
+    assert summaries["__unavailable__"]["reason"] == "no picongpu"
+
+
+def test_read_plugin_summaries_without_output_is_empty(tmp_path) -> None:
+    assert analysis.read_plugin_summaries(tmp_path / "missing") == {}
 
 
 def test_analyze_never_raises_on_garbage(tmp_path) -> None:
@@ -115,7 +210,7 @@ def test_analyze_never_raises_on_garbage(tmp_path) -> None:
     (bad / "metadata").mkdir()
     (bad / "metadata" / "rc_params.json").write_text("[1,2,3]", encoding="utf-8")
     sections = analysis.analyze(tmp_path / "run", bad, tmp_path / "missing")
-    assert set(sections) == {"rocrate", "metadata", "openpmd", "answer"}
+    assert set(sections) == {"rocrate", "metadata", "openpmd", "plugins", "answer"}
     assert sections["rocrate"] == {}
     assert isinstance(sections["answer"], str)
 
