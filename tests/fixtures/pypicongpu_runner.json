@@ -246,6 +246,7 @@
       "num_tmp_field_slots": 1
     },
     "particle_filters": [],
+    "min_weighting": 10.0,
     "precision": 32,
     "precision_overrides": {
       "sqrt": "core",
