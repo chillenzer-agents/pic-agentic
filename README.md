@@ -306,9 +306,11 @@ the key alone is opaque: sweeping the list-indexed laser focal component
 the list indices while keeping every field name
 (`sim.laser.focus_pos_si.component`). Pass `parameter="focal y [m]"` to
 `create_campaign` (or `add_agenda_leaf`) to override the derived name with your
-own label. `sweep_parameter` appears in `agenda_status`, `fleet`/`leaves`
-formatting and the campaign RO-Crate. Campaigns persisted before the field
-existed still load and advance: it is optional.
+own label. `sweep_parameter` appears in `agenda_status`, the `!leaves` view and
+the campaign RO-Crate. The derived and explicit labels are both sanitised for
+display: control characters are collapsed, while printable Unicode (units such
+as `µm`) is kept. Campaigns persisted before the field existed still load and
+advance: it is optional.
 
 ## Security model (M1)
 
