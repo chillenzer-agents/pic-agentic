@@ -1349,7 +1349,10 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         title="Record an analysis on the campaign",
         description=(
             "Attach one leaf's analysis (e.g. the analyze_output sections) to the "
-            "campaign, so the provenance record links inputs -> runs -> analyses."
+            "campaign, so the provenance record links inputs -> runs -> analyses. "
+            "Only a top-level numeric `score` (or `value`/`peak`) key is ranked by "
+            "`suggest_agenda_refinement`; an analysis without one is recorded but "
+            "not ranked, so keep the scalar objective under such a key."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
@@ -1359,9 +1362,13 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     @server.tool(
         title="Suggest a refinement from the recorded analyses",
         description=(
-            "Score the recorded analyses and report the best point, whether the "
+            "Score the *recorded analyses* and report the best point, whether the "
             "sweep has converged, and deterministic refinement points to add "
-            "around the optimum."
+            "around the optimum. Only leaves analysed with "
+            "`record_agenda_analysis` are ranked; with no analyses it returns "
+            "`best: null` and `analysed: 0` (the sweep point is never a score). "
+            "Convergence needs at least two ranked analyses, so a single analysis "
+            "reports `converged: false`."
         ),
         annotations=_READ_ONLY,
     )

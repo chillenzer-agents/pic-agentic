@@ -31,6 +31,18 @@ def _campaign_file(tmp_path: Path) -> str:
     return str(tmp_path / "campaign.json")
 
 
+def _sweep_file(tmp_path: Path, values: list[float]) -> str:
+    """Build a campaign whose leaves record the given sweep ``point`` values."""
+    agenda = AgendaGroup(name="group")
+    for index, value in enumerate(values):
+        name = f"leaf{index:03d}"
+        agenda = agenda.add(
+            **{name: AgendaSim(name=name, spec={"sim": {"value": value}}, point={"component": value})},
+        )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="study", agenda=agenda))
+    return str(tmp_path / "campaign.json")
+
+
 async def _serve(sim_transport: MemoryTransport) -> asyncio.Task:
     async def responder() -> None:
         counter = 0
@@ -101,6 +113,82 @@ async def test_suggest_refinement_uses_recorded_scores(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert result["best"]["value"] == pytest.approx(9.0)
     assert result["converged"] is False  # a single sample
+
+
+async def test_suggest_refinement_without_analyses_never_invents_a_best(tmp_path: Path) -> None:
+    """F1 regression: the beta-4 focal sweep must not rank the sweep value.
+
+    With ``values=[4.4e-5, 4.6e-5, 4.8e-5]`` and no analyses recorded, the old
+    code reported ``leaf002`` (4.8e-5, the physically worst point) as ``best``
+    and ``analysed: 3``.  It must instead report no best point and count zero
+    analyses, with an actionable message.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=_sweep_file(tmp_path, [4.4e-5, 4.6e-5, 4.8e-5]))
+    result = await _call(config, "suggest_agenda_refinement", {"rel_tol": 0.05})
+    assert result["ok"] is True
+    assert result["best"] is None
+    assert result["analysed"] == 0
+    assert result["converged"] is False
+    assert result["suggestions"] == []
+    assert "record_agenda_analysis" in result["message"]
+
+
+async def test_suggest_refinement_ranks_recorded_analyses_not_sweep_values(tmp_path: Path) -> None:
+    """The best point is the highest analysed score, regardless of its point."""
+    # Sweep points ascend, but the analyses rank the *smallest* point highest.
+    config = Config(rcp_secret=SECRET, agenda_file=_sweep_file(tmp_path, [4.4e-5, 4.6e-5, 4.8e-5]))
+    await _call(config, "record_agenda_analysis", {"path": "leaf000", "analysis": {"score": 0.31}})
+    await _call(config, "record_agenda_analysis", {"path": "leaf001", "analysis": {"score": 0.30}})
+    await _call(config, "record_agenda_analysis", {"path": "leaf002", "analysis": {"score": 0.29}})
+    result = await _call(config, "suggest_agenda_refinement", {"rel_tol": 0.05})
+    assert result["analysed"] == 3
+    assert result["best"] == {"label": "leaf000", "value": pytest.approx(0.31)}
+
+
+async def test_suggest_refinement_distinguishes_unscored_recorded_analyses(tmp_path: Path) -> None:
+    """Beta-4 end state: analyses recorded, but none carries a ranked score.
+
+    The invariant build's ``analyze_output`` sections (``focal_position_m`` /
+    ``total_electrons`` / ``high_energy_tail``) have no top-level
+    ``score``/``value``/``peak``.  Recording them must not be reported as "no
+    analyses are recorded yet": the summary keeps ``analysed: 0`` (nothing is
+    ranked) but the message must distinguish recorded-but-unscored analyses and
+    point at the score contract, rather than inviting a pointless re-record loop.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=_sweep_file(tmp_path, [4.4e-5, 4.6e-5, 4.8e-5]))
+    beta4_payloads = {
+        "leaf000": {
+            "focal_position_m": 4.4e-05,
+            "total_electrons": 444440000000,
+            "high_energy_tail": {"gt_7.5MeV": 733180000, "gt_10MeV": 207690000, "gt_15MeV": 276200},
+            "max_energy_MeV": 17.5,
+        },
+        "leaf001": {
+            "focal_position_m": 4.6e-05,
+            "total_electrons": 443490000000,
+            "high_energy_tail": {"gt_7.5MeV": 718040000, "gt_10MeV": 202880000, "gt_15MeV": 87650},
+            "max_energy_MeV": 15.0,
+        },
+        "leaf002": {
+            "focal_position_m": 4.8e-05,
+            "total_electrons": 442030000000,
+            "high_energy_tail": {"gt_7.5MeV": 703420000, "gt_10MeV": 198230000, "gt_15MeV": 20280},
+            "max_energy_MeV": 15.0,
+        },
+    }
+    for path, payload in beta4_payloads.items():
+        assert await _call(config, "record_agenda_analysis", {"path": path, "analysis": payload}) == {
+            "ok": True,
+            "path": path,
+        }
+    result = await _call(config, "suggest_agenda_refinement", {"rel_tol": 0.05})
+    assert result["ok"] is True
+    assert result["best"] is None
+    assert result["analysed"] == 0
+    assert result["suggestions"] == []
+    assert "No analyses are recorded yet" not in result["message"]
+    assert "score" in result["message"]
+    assert "record_agenda_analysis" in result["message"]
 
 
 async def test_export_agenda_cwl(tmp_path: Path) -> None:
