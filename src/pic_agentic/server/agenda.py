@@ -528,6 +528,7 @@ class AgendaService:
         *,
         point: dict[str, float | int | str] | None = None,
         depends_on: list[str] | None = None,
+        parameter: str | None = None,
     ) -> dict[str, Any]:
         """Add one leaf to the persisted campaign's root group (agent expansion).
 
@@ -540,6 +541,9 @@ class AgendaService:
             spec: The leaf's Runner spec.
             point: Optional sweep point recorded on the leaf.
             depends_on: Optional sibling dependencies.
+            parameter: Optional human-readable name for the swept quantity
+                (stored as ``sweep_parameter``).  It is dropped when no
+                ``point`` is given, since there is then no sweep to label.
 
         Returns:
             ``{"ok": True, "path": name}``, or a soft error.
@@ -547,9 +551,16 @@ class AgendaService:
         """
         if not self.store.exists():
             return no_campaign_error()
+        sweep_parameter = _readable_label(parameter) if parameter and point else None
         async with self._lock:
             try:
-                return self._add_leaf(name, spec, point=point, depends_on=depends_on)
+                return self._add_leaf(
+                    name,
+                    spec,
+                    point=point,
+                    depends_on=depends_on,
+                    sweep_parameter=sweep_parameter,
+                )
             except ValueError as exc:
                 # A duplicate/illegal name or an invalid dependency is a
                 # model-level ValueError: report it as data, not a tool
@@ -579,6 +590,8 @@ class AgendaService:
         base_spec: dict[str, Any],
         patch_path: str,
         values: list[Any],
+        *,
+        parameter: str | None = None,
     ) -> dict[str, Any]:
         """Create and persist a campaign with one leaf per sweep value.
 
@@ -586,9 +599,12 @@ class AgendaService:
         campaign is created with one leaf per entry in ``values``, each holding
         a deep copy of ``base_spec`` with the dotted Runner-spec path
         ``patch_path`` set to that value.  Each leaf records
-        ``point={parameter: value}`` (the last path segment) exactly as
-        :meth:`AgendaSim` and the driver do, so the refinement engine can score
-        the sweep.  The campaign is written through the same
+        ``point={last path segment: value}`` exactly as :meth:`AgendaSim` and
+        the driver do, so the refinement engine can score the sweep, and a
+        human-readable ``sweep_parameter`` (the dotted path with list indices
+        dropped, e.g. ``sim.laser.focus_pos_si.component``) so the point key is
+        not opaque; an explicit ``parameter`` overrides the derived name.  The
+        campaign is written through the same
         :class:`~pic_agentic.agenda.store.AgendaStore` the other agenda tools
         read, so ``advance_agenda`` picks it up on the next tick.
 
@@ -610,6 +626,9 @@ class AgendaService:
             patch_path: A dotted path into ``base_spec`` (e.g.
                 ``sim.time_steps``); the final segment must already exist.
             values: One value per leaf; each patches ``patch_path``.
+            parameter: Optional human-readable name for the swept quantity,
+                stored on each leaf as ``sweep_parameter``.  When omitted it is
+                derived from ``patch_path``.
 
         Returns:
             ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
@@ -620,7 +639,7 @@ class AgendaService:
         """
         async with self._lock:
             try:
-                return self._create_campaign(name, base_spec, patch_path, values)
+                return self._create_campaign(name, base_spec, patch_path, values, parameter=parameter)
             except (TypeError, ValueError, IndexError) as exc:
                 # A bad patch path (including an out-of-range list index) or an
                 # invalid leaf name/value is a model-level error: report it as
@@ -636,6 +655,8 @@ class AgendaService:
         base_spec: dict[str, Any],
         patch_path: str,
         values: list[Any],
+        *,
+        parameter: str | None = None,
     ) -> dict[str, Any]:
         """Build the campaign and save it (may raise).
 
@@ -650,7 +671,8 @@ class AgendaService:
             return {"ok": False, "error": "campaign_exists"}
         if not values:
             return {"ok": False, "error": "no_values"}
-        parameter = _parameter_for(patch_path)
+        point_key = _parameter_for(patch_path)
+        sweep_parameter = _readable_label(parameter) if parameter else _sweep_parameter_for(patch_path, base_spec)
         if not _leaf_target_exists(base_spec, patch_path):
             return {
                 "ok": False,
@@ -673,7 +695,12 @@ class AgendaService:
         leaves: list[str] = []
         for index, spec in enumerate(patched):
             leaf_name = f"leaf{index:03d}"
-            leaf = AgendaSim(name=leaf_name, spec=spec, point=_point_for(parameter, values[index]))
+            leaf = AgendaSim(
+                name=leaf_name,
+                spec=spec,
+                point=_point_for(point_key, values[index]),
+                sweep_parameter=sweep_parameter,
+            )
             agenda = agenda.add(**{leaf_name: leaf})
             leaves.append(leaf_name)
         self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
@@ -797,6 +824,7 @@ class AgendaService:
         *,
         point: dict[str, float | int | str] | None,
         depends_on: list[str] | None,
+        sweep_parameter: str | None = None,
     ) -> dict[str, Any]:
         """Load, add the leaf and save (may raise).
 
@@ -810,23 +838,83 @@ class AgendaService:
 
         """
         campaign = self.store.load(Campaign)
-        leaf = AgendaSim(name=name, spec=spec, point=point, depends_on=list(depends_on or []))
+        leaf = AgendaSim(
+            name=name,
+            spec=spec,
+            point=point,
+            sweep_parameter=sweep_parameter,
+            depends_on=list(depends_on or []),
+        )
         agenda = campaign.agenda.add(**{name: leaf})
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": name}
 
 
 def _parameter_for(patch_path: str) -> str:
-    """Return the sweep parameter name encoded in a dotted patch path.
+    """Return the sweep parameter key encoded in a dotted patch path.
 
     Mirrors the driver: the leaf's ``point`` key is the last segment of the
-    dotted Runner-spec path (``sim.time_steps`` -> ``time_steps``).
+    dotted Runner-spec path (``sim.time_steps`` -> ``time_steps``).  Kept as the
+    point key for backward compatibility; the human-readable name lives
+    alongside it in ``AgendaSim.sweep_parameter`` (see
+    :func:`_sweep_parameter_for`).
 
     Returns:
         The final path segment.
 
     """
     return patch_path.rsplit(".", 1)[-1]
+
+
+def _sweep_parameter_for(patch_path: str, spec: dict[str, Any]) -> str:
+    """Derive a human-readable name for a sweep's dotted patch path.
+
+    The leaf's ``point`` key is only the last dotted segment, which is
+    meaningless on its own: the focal scan
+    ``sim.laser.0.focus_pos_si.1.component`` would otherwise only record
+    ``point={"component": ...}``.  This drops list indices while keeping every
+    field name, yielding ``sim.laser.focus_pos_si.component``.  A numeric
+    segment that indexes a *dict key* (``sim.bc.0`` for ``{"0": ...}``) is
+    kept; the base ``spec`` tells the two apart since a list node is only
+    indexed numerically.
+
+    Args:
+        patch_path: The dotted Runner-spec path.
+        spec: The base spec, used to tell a list index from a numeric dict key.
+
+    Returns:
+        The readable parameter name; never empty for a non-empty path.
+
+    """
+    kept: list[str] = []
+    node: Any = spec
+    for part in patch_path.split("."):
+        if isinstance(node, list) and _LIST_INDEX_RE.fullmatch(part):
+            index = int(part)
+            node = node[index] if -len(node) <= index < len(node) else None
+            continue
+        kept.append(part)
+        node = node.get(part) if isinstance(node, dict) else None
+    return ".".join(kept) or _parameter_for(patch_path)
+
+
+def _readable_label(label: str) -> str:
+    """Reduce an explicit sweep label to characters meaningful in a name.
+
+    ``sweep_parameter`` is display metadata that travels in the RO-Crate and the
+    MCP tool output, so any run of characters outside a conservative readable
+    set (letters, digits, ``. _ - ( ) [ ] space``) is collapsed to a single
+    underscore.  This keeps a free-form label such as ``"focal y [m]"`` intact
+    but stops control characters from reaching a report.
+
+    Args:
+        label: The caller-supplied parameter label.
+
+    Returns:
+        The collapsed, whitespace-trimmed label.
+
+    """
+    return re.sub(r"[^A-Za-z0-9 ._()\[\]-]+", "_", label).strip()
 
 
 def _patch_spec(spec: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
