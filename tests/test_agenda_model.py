@@ -90,6 +90,8 @@ def test_expand_is_pure_and_assigns_points() -> None:
     for _path, sim in generated:
         assert sim.spec["sim"]["intensity"] in {1e18, 2e18, 3e18}
         assert sim.point == {"intensity": sim.spec["sim"]["intensity"]}
+        # The sweep records the readable parameter name alongside the point.
+        assert sim.sweep_parameter == "intensity"
     # Source untouched.
     assert [p for p, _ in base.simulations()] == ["seed"]
 
