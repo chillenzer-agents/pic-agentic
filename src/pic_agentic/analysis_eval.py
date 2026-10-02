@@ -109,6 +109,13 @@ def _typecheck(program: AnalysisProgram, node: Any, resolve: Any) -> dict[str, V
     Resolving only referenced selectors keeps the openPMD reads minimal and
     makes an unused declared selector harmless.
 
+    Attributes carried directly on a ``var`` node (``record``/``component``/
+    ``iteration``) are authoritative and honoured: the tool description
+    advertises that form.  Each attribute falls back to the matching declared
+    selector's value and then to ``None`` (name-only resolution).  The cache is
+    keyed by selector name, so a name is resolved once even when it appears in
+    several expression nodes.
+
     Returns:
         A ``selector name -> value`` cache.
 
@@ -117,12 +124,9 @@ def _typecheck(program: AnalysisProgram, node: Any, resolve: Any) -> dict[str, V
 
     """
     data: dict[str, Value] = {}
-    for name in _selector_names(node):
-        selector = next((item for item in program.selectors if item.name == name), None)
-        if selector is None:
-            # A bare ``var`` not declared in ``selectors`` is still resolvable by
-            # name alone (a declared list is documentation, not a gate).
-            selector = VarRef(name=name)
+    for name, ref in _selector_refs(node).items():
+        declared = next((item for item in program.selectors if item.name == name), None)
+        selector = _merge_ref(ref, declared)
         try:
             values = resolve(selector)
         except ProgramError:
@@ -134,24 +138,53 @@ def _typecheck(program: AnalysisProgram, node: Any, resolve: Any) -> dict[str, V
     return data
 
 
-def _selector_names(node: Any) -> list[str]:
-    """Return every selector name referenced by ``node``, in first-seen order.
+def _merge_ref(ref: VarRef, declared: VarRef | None) -> VarRef:
+    """Combine a referenced ``var`` node with its declared selector.
+
+    Node-level attributes win; a missing node attribute falls back to the
+    declared selector and then to ``None``.  When no selector is declared the
+    node is resolved by name alone (a declared list is documentation, not a
+    gate).
 
     Returns:
-        The referenced selector names.
+        The selector to hand to the reader.
 
     """
-    names: list[str] = []
+    if declared is None:
+        return VarRef(name=ref.name, record=ref.record, component=ref.component, iteration=ref.iteration)
+    return VarRef(
+        name=ref.name,
+        record=ref.record if ref.record is not None else declared.record,
+        component=ref.component if ref.component is not None else declared.component,
+        iteration=ref.iteration if ref.iteration is not None else declared.iteration,
+    )
+
+
+def _selector_refs(node: Any) -> dict[str, VarRef]:
+    """Return every selector referenced by ``node``, keyed by name.
+
+    The full ``var`` node is captured (not just its name), so node-level
+    ``record``/``component``/``iteration`` survive to :func:`_merge_ref`.  A
+    name appears once, in first-seen traversal order; if the same name is
+    referenced by several nodes the first is used.
+
+    Returns:
+        ``selector name -> var node`` in first-seen order.
+
+    """
+    refs: dict[str, VarRef] = {}
     stack = [node]
     while stack:
         current = stack.pop()
-        if getattr(current, "kind", None) == "var" and current.name not in names:
-            names.append(current.name)
+        if getattr(current, "kind", None) == "var" and current.name not in refs:
+            refs[current.name] = VarRef(
+                name=current.name, record=current.record, component=current.component, iteration=current.iteration
+            )
         for field in ("left", "right", "operand"):
             child = getattr(current, field, None)
             if child is not None:
                 stack.append(child)
-    return names
+    return refs
 
 
 def _eval(node: Any, data: Mapping[str, Value]) -> Value:
