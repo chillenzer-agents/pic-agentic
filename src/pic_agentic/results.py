@@ -95,12 +95,19 @@ _SIM_OUTPUT = "simOutput"
 
 #: Preferred [keV] window for the ``count_in_window`` histogram reduction.
 #: PIConGPU energy histograms are commonly configured over 0--1000 keV, so this
-#: window is kept for a spectrum that has particles inside it.  When the
-#: populated bins lie entirely outside it (e.g. an LWFA spectrum that starts at
-#: 2500 keV), the default is instead derived from the populated range so it is
-#: never structurally empty (F2).  A caller can override either way with
+#: window is kept for a spectrum that lies entirely inside it.  Otherwise the
+#: default is derived from the populated range so it always captures the whole
+#: population (F2): a spectrum that starts at 2500 keV is covered end to end
+#: rather than clipped at 1000 keV.  A caller can override either way with
 #: ``min_kev``/``max_kev`` on the request.
 _DEFAULT_WINDOW_KEV = (100.0, 1000.0)
+
+#: Fraction of the total counts below which a window is reported as a
+#: mis-window by a ``warning``.  The empty case is covered for any fraction;
+#: this threshold additionally flags a window that only captures a sliver of a
+#: spectrum (e.g. a fixed 100--1000 keV default on a spectrum spanning 900--
+#: 20000 keV, F2).  A full-range window never trips it.
+_WINDOW_COVERAGE_WARNING = 0.9
 
 #: Target number of array points per plugin summary.  The summary is strided
 #: down further if it still exceeds :data:`MAX_RESULT_BYTES`.
@@ -1815,21 +1822,26 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
 def _default_window(populated: list[float]) -> tuple[float, float]:
     """Pick the ``count_in_window`` window when the request leaves it unset.
 
-    The preferred 100--1000 keV window is kept whenever at least one populated
-    bin lies inside it, so the reported number never changes for the common
-    case.  An LWFA spectrum that starts at a few MeV however has *no* populated
-    bin there, and a structurally-empty default would report ``count: 0`` while
-    millions of electrons sit above it (F2).  In that case the window is derived
-    from the populated edges so it necessarily contains particles.
+    The preferred 100--1000 keV window is kept only when the populated range
+    lies wholly inside it, so the reported number never changes for the common
+    case.  A spectrum that reaches outside it (an LWFA spectrum starting at
+    2500 keV, or one spanning 900--20000 keV) is instead covered end to end, so
+    the default captures the whole population rather than clipping it to a
+    sliver (F2).  A single populated bin yields a one-bin window, widened by
+    one edge so it is never the degenerate ``max == min`` that ``ResultParams``
+    would reject if requested.
 
     Returns:
         ``(min_kev, max_kev)`` for the summary's ``count_in_window``.
 
     """
     low, high = _DEFAULT_WINDOW_KEV
-    if not populated or any(low <= edge <= high for edge in populated):
+    if not populated or (min(populated) >= low and max(populated) <= high):
         return low, high
-    return min(populated), max(populated)
+    span_low, span_high = min(populated), max(populated)
+    if span_low == span_high:
+        return span_low, span_low + 1.0
+    return span_low, span_high
 
 
 def _energy_window(
@@ -1887,25 +1899,28 @@ def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduc
     in_window = sum(count for bin_kev, count in zip(upper_edges, counts, strict=True) if low <= bin_kev <= high)
     strided_bins, downsampled = _stride(upper_edges)
     strided_counts, _ = _stride(counts)
+    total = sum(counts)
     summary: dict[str, Any] = {
         "bins_kev": strided_bins,
         "counts": strided_counts,
         "count_in_window": {"min_kev": low, "max_kev": high, "count": in_window},
-        "total": sum(counts),
-        # The number of populated bins and their edges make a zero window
-        # self-evidently a mis-window: a nonzero ``n_nonzero_bins`` next to a
-        # zero ``count_in_window`` shows the window missed the data (F2).
+        "total": total,
+        # The number of populated bins and their edges make a partial window
+        # self-evidently a mis-window: ``n_nonzero_bins``/``min``/``max`` next
+        # to a ``count_in_window`` far below ``total`` shows the window missed
+        # the data (F2).
         "n_nonzero_bins": len(populated),
         "min_energy_kev": min(populated) if populated else None,
         "max_energy_kev": max(populated) if populated else None,
         **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
-    if in_window == 0 and populated:
+    if populated and total > 0 and in_window < _WINDOW_COVERAGE_WARNING * total:
         summary["warning"] = (
             f"energy_histogram has {len(populated)} populated bins "
-            f"({min(populated):g}-{max(populated):g} keV) but count_in_window is 0 for the "
-            f"{low:g}-{high:g} keV window; the window does not cover the populated range"
+            f"({min(populated):g}-{max(populated):g} keV) but count_in_window is {in_window:g} "
+            f"of {total:g} for the {low:g}-{high:g} keV window; the window does not cover the "
+            f"populated range"
         )
     return summary
 
