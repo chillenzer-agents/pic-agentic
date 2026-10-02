@@ -840,12 +840,15 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "a base spec for create_campaign or add_agenda_leaf. The returned "
             "`spec` is the inline `{sim: ...}` wire object accepted by those "
             "tools; the result also reports the encoded wire size and whether it "
-            "fits the 48 KiB inline submission limit. Pass `write_to` to also "
-            "stage the spec as JSON under the server's spec directory (a "
+            "fits the 48 KiB inline submission limit. Pass `write_to` to stage "
+            "the spec as JSON under the server's spec directory (a "
             "relative path is resolved there and a missing parent is created; a "
             "path outside that root is refused): the "
             "returned `spec_path` can then be handed to "
-            "create_campaign(base_spec_path=...) without re-typing the spec. The "
+            "create_campaign(base_spec_path=...) without re-typing the spec. When "
+            "`write_to` is set the inline `spec` is omitted by default so the "
+            "tens-of-KiB body is not echoed; set `include_spec=true` to force it "
+            "back (or `include_spec=false` to omit it without staging). The "
             "script should define a single picmi.Simulation; a trailing "
             "sim.run(...) is tolerated and ignored (the tool never runs it here). "
             "Note: the pinned pypicongpu always adds a default `type_radiation` "
@@ -857,12 +860,23 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         # read-tier: it builds locally and starts no cluster work.
         annotations=_READ_ONLY,
     )
-    async def build_spec(picmi_script: str, *, write_to: str | None = None) -> dict[str, Any]:
+    async def build_spec(
+        picmi_script: str,
+        *,
+        write_to: str | None = None,
+        include_spec: bool | None = None,
+    ) -> dict[str, Any]:
         try:
             built, spec_path = await runtime.build_spec(picmi_script, write_to=write_to)
         except _SUBMIT_TOOL_ERRORS as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
-        return _built_spec_dict(runtime, built, spec_path=spec_path)
+        # A staged spec (``write_to``) is consumed by reference, so echoing the
+        # full tens-of-KiB inline copy would only bloat the tool result; default
+        # to omitting it whenever a path was requested, while letting an explicit
+        # ``include_spec`` override either way.
+        if include_spec is None:
+            include_spec = spec_path is None
+        return _built_spec_dict(runtime, built, spec_path=spec_path, include_spec=include_spec)
 
     _register_reporting_tools(server, runtime)
     _register_control_result_tools(server, runtime)
@@ -1738,7 +1752,13 @@ def _redact_dict(runtime: HelloRuntime, payload: Any, _depth: int = 0) -> Any:
     return payload
 
 
-def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec, *, spec_path: str | None = None) -> dict[str, Any]:
+def _built_spec_dict(
+    runtime: HelloRuntime,
+    built: BuiltSpec,
+    *,
+    spec_path: str | None = None,
+    include_spec: bool = True,
+) -> dict[str, Any]:
     """Shape a dry-run build result for the ``build_spec`` tool.
 
     The spec is returned when it fits the 48 KiB inline submission cap (the only
@@ -1762,6 +1782,16 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec, *, spec_path: str 
     reference form of ``create_campaign``'s ``base_spec``).  The path is
     server-controlled config output, not free text.
 
+    Args:
+        runtime: The runtime whose config holds the secrets.
+        built: The built wire spec plus its provenance and wire size.
+        spec_path: The staged file path when ``write_to`` was given, else None.
+        include_spec: Whether to include the inline ``spec`` in the result.
+            ``build_spec`` defaults this to False whenever a ``write_to`` path
+            was staged (the caller consumes it by reference), so a matching
+            ``spec_path`` is still reported while the tens-of-KiB body is not
+            echoed back.
+
     Returns:
         ``{"ok": True, "spec", "wire_bytes", ...}``, or a soft error naming the
         over-cap condition.
@@ -1777,13 +1807,14 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec, *, spec_path: str 
         }
     payload: dict[str, Any] = {
         "ok": True,
-        "spec": built.spec,
         "wire_bytes": built.wire_bytes,
         "inline_limit_bytes": built.inline_limit_bytes,
         "picongpu_version": redact(built.picongpu_version),
         "picongpu_revision": redact(built.picongpu_revision),
         "schema_hash": built.schema_hash,
     }
+    if include_spec:
+        payload["spec"] = built.spec
     if spec_path is not None:
         payload["spec_path"] = spec_path
     return payload

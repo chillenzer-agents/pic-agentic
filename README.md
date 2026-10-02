@@ -282,11 +282,14 @@ that venv, or point `--picongpu-python` at it).
 ### Campaign specs by reference
 
 A Runner spec is tens of KiB, so an agent should never hand-copy one into the
-LLM. `build_spec(picmi_script, write_to="base.json")` builds and returns the
-spec inline **and** stages a JSON copy under the server's spec directory,
-returning its absolute `spec_path`; `create_campaign` then takes
-`base_spec_path=<spec_path>` instead of an inline `base_spec` (provide exactly
-one of the two). The staged file is ordinary JSON (`{"sim": ...}`) and the
+LLM. `build_spec(picmi_script, write_to="base.json")` builds the spec and stages
+a JSON copy under the server's spec directory, returning its absolute
+`spec_path`; because the caller consumes the staged file by reference, the
+inline `spec` is omitted from the result by default (pass `include_spec=true` to
+force the inline copy back, or `include_spec=false` to omit it without staging).
+`create_campaign` then takes `base_spec_path=<spec_path>` instead of an inline
+`base_spec` (provide exactly one of the two). The staged file is ordinary JSON
+(`{"sim": ...}`) and the
 staging root is the configured `PIC_AGENTIC_SPEC_DIR`, or a `spec/`
 subdirectory of `PIC_AGENTIC_MESSAGE_DIR` when unset. `base_spec_path` is
 LLM-controlled, so it is resolved **strictly inside that root** (safe charset,

@@ -69,7 +69,7 @@ async def test_build_spec_tool_registration_and_annotations() -> None:
     assert annotations is not None
     assert annotations.read_only_hint is True
     assert annotations.destructive_hint is False
-    assert set(tools["build_spec"].input_schema["properties"]) == {"picmi_script", "write_to"}
+    assert set(tools["build_spec"].input_schema["properties"]) == {"picmi_script", "write_to", "include_spec"}
 
 
 async def test_build_spec_returns_the_runner_spec_without_submitting() -> None:
@@ -224,6 +224,47 @@ async def test_build_spec_cap_boundary_is_inclusive() -> None:
     assert over["error"] == "spec_exceeds_inline_limit"
     assert over["wire_bytes"] > MAX_INLINE_PAYLOAD_BYTES
     assert _ENVELOPE_ALLOWANCE_BYTES > 0  # sanity: the allowance is part of the measure
+
+
+async def test_build_spec_write_to_omits_the_inline_spec(tmp_path) -> None:
+    """``write_to`` stages the spec, so it is not echoed inline by default."""
+    config = Config(
+        rcp_secret=SECRET,
+        agenda_file=str(tmp_path / "campaign.json"),
+        spec_dir=str(tmp_path / "specs"),
+    )
+    builder = _StubBuilder(_built())
+    server, runtime = build_server(config, SIM)
+    runtime.submit_service.runner_dump_builder = builder
+
+    staged = (
+        await server.call_tool("build_spec", {"picmi_script": "# picmi\n", "write_to": "base.json"})
+    ).structured_content
+    assert staged["ok"] is True
+    assert "spec" not in staged
+    assert staged["spec_path"]
+    assert staged["wire_bytes"] > 0
+    # The staged file still carries the full spec.
+    assert json.loads(Path(staged["spec_path"]).read_text(encoding="utf-8")) == {"sim": _runner_dump()["sim"]}
+
+    inline = (
+        await server.call_tool(
+            "build_spec",
+            {"picmi_script": "# picmi\n", "write_to": "base2.json", "include_spec": True},
+        )
+    ).structured_content
+    assert inline["spec"] == {"sim": _runner_dump()["sim"]}
+
+
+async def test_build_spec_include_spec_false_omits_without_write_to() -> None:
+    builder = _StubBuilder(_built())
+    server, _runtime = _server_with_builder(builder)
+    payload = (
+        await server.call_tool("build_spec", {"picmi_script": "# picmi\n", "include_spec": False})
+    ).structured_content
+    assert payload["ok"] is True
+    assert "spec" not in payload
+    assert "spec_path" not in payload
 
 
 async def test_build_spec_build_failure_is_a_soft_error() -> None:
