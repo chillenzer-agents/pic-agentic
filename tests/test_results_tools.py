@@ -278,6 +278,49 @@ async def test_tool_registration_shape() -> None:
     }
 
 
+async def test_read_plugin_result_tool_forwards_the_energy_window() -> None:
+    """The ``read_plugin_result`` tool forwards ``min_kev``/``max_kev`` (F2 Nit).
+
+    Closes the ``read_plugin_result -> _result_tool -> ResultParams ->
+    build_result_command`` leg that the direct-service round-trips do not
+    exercise.
+    """
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    runtime._transport = mcp_t
+    captured: list[dict[str, object]] = []
+
+    async def responder() -> None:
+        async for command in sim_t.receive():
+            if command.type == SimulationType.RESULT_COMMAND:
+                captured.append(dict(command.payload))
+                await sim_t.send(_ack_for(command.type, command.payload, event_id=command.transport_event_id))
+
+    tasks = [asyncio.create_task(responder()), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        await server.call_tool(
+            "read_plugin_result",
+            {
+                "sim_id": SIM_ID,
+                "reader": "energy_histogram",
+                "species": "e",
+                "min_kev": 2500.0,
+                "max_kev": 20000.0,
+            },
+        )
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+    assert captured, "the tool emitted no result_request"
+    payload = captured[-1]
+    assert payload["reader"] == "energy_histogram"
+    assert payload["min_kev"] == pytest.approx(2500.0)
+    assert payload["max_kev"] == pytest.approx(20000.0)
+
+
 async def test_direct_service_control_round_trip() -> None:
     mcp_t, sim_t = MemoryTransport.create_pair()
     service = _service()
