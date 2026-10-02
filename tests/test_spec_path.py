@@ -171,7 +171,9 @@ async def test_build_spec_stages_a_path_create_campaign_reads(tmp_path) -> None:
     ).structured_content
     assert built["ok"] is True
     assert Path(built["spec_path"]).exists()
-    assert json.loads(Path(built["spec_path"]).read_text(encoding="utf-8")) == built["spec"]
+    # ``write_to`` stages the spec, so the inline copy is omitted by default.
+    assert "spec" not in built
+    assert json.loads(Path(built["spec_path"]).read_text(encoding="utf-8")) == {"sim": _runner_dump()["sim"]}
 
     created = (
         await server.call_tool(

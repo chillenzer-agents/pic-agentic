@@ -524,6 +524,60 @@ async def test_take_callbacks_drains_durably(tmp_path) -> None:
         await sim_t.close()
 
 
+async def test_advance_agenda_reports_complete_state_when_finished(tmp_path) -> None:
+    """A completed tick says ``state: "complete"``, not ``"running"``."""
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+    tasks = [await _serve(sim_t), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        first = (await server.call_tool("advance_agenda", {})).structured_content
+        assert first["complete"] is False
+        assert first["state"] == "running"
+        assert first["lifecycle"] == "running"
+
+        sim_id = next(iter(runtime.submit_service.registry))
+        runtime.submit_service.registry[sim_id].state = "results.ready"
+        runtime.submit_service.registry[sim_id].active = False
+
+        done = (await server.call_tool("advance_agenda", {})).structured_content
+        assert done["complete"] is True
+        assert done["state"] == "complete"
+        # The stored lifecycle is still reported, so completion is not lossy.
+        assert done["lifecycle"] == "running"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_callback_tool_descriptions_explain_the_double_exposure() -> None:
+    """The inline vs. drained callback contract is documented on the tools."""
+    server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+
+    advance = tools["advance_agenda"].description
+    assert "take_agenda_callbacks" in advance
+    assert "drain" in advance
+
+    drain = tools["take_agenda_callbacks"].description
+    assert "advance_agenda" in drain
+    assert "destructive" in drain
+    assert "empty list" in drain
+
+
+async def test_delete_campaign_description_notes_the_registry_survives() -> None:
+    """Deleting a campaign must not be read as forgetting its simulations."""
+    server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    description = tools["delete_campaign"].description
+    assert "fleet registry" in description
+    assert "list_simulations" in description
+    assert "registry" in tools["list_simulations"].description
+
+
 async def test_add_leaf_is_submitted_by_the_next_tick(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
     added = await _call(config, "add_agenda_leaf", {"name": "refined", "spec": {"sim": {"replica": 9}}})

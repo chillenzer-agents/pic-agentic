@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.agenda.budget import Budget, BudgetUsage
-from pic_agentic.agenda.campaign import Callback, Campaign, CampaignState, utc_now_iso
+from pic_agentic.agenda.campaign import Callback, Campaign, CampaignState, TickState, utc_now_iso
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.planner import (
     PlanStep,
@@ -239,8 +239,17 @@ class TickResult(BaseModel):
     #: ``done`` leaf that is nonetheless suspect is listed here so an agent can
     #: tell "physics ran and succeeded" from "physics ran and was empty".
     suspects: dict[str, str] = Field(default_factory=dict)
-    #: The campaign's lifecycle state after this tick.
-    state: CampaignState = "running"
+    #: The campaign's lifecycle state after this tick, or ``"complete"`` once
+    #: every leaf is terminal (so ``state`` never reads ``"running"`` next to
+    #: ``complete: true``).  ``lifecycle`` always carries the stored
+    #: :data:`~pic_agentic.agenda.campaign.CampaignState`, so a terminal tick on
+    #: a paused/stopped campaign is not lossy: ``state == "complete"`` reports
+    #: that all work is finished while ``lifecycle`` keeps the pause/stop.
+    state: TickState = "running"
+    #: The stored lifecycle state after this tick, unchanged by completion, so
+    #: ``state == "complete"`` does not hide a paused/stopped campaign.  Equals
+    #: ``state`` whenever the campaign is not terminal.
+    lifecycle: CampaignState = "running"
     #: Leaves the planner would have submitted but the lifecycle held back.
     held: list[str] = Field(default_factory=list)
 
@@ -342,10 +351,23 @@ class AgendaEngine:
         # the callback is already on disk rather than lost (the next tick would
         # see the leaf already terminal and emit nothing).
         campaign, emitted, suspects = self._emit_callbacks(campaign, before, failures, suspects)
-        result = TickResult(state=campaign.state, callbacks=list(emitted), reused=list(reused), suspects=dict(suspects))
+        result = TickResult(
+            state=campaign.state,
+            lifecycle=campaign.state,
+            callbacks=list(emitted),
+            reused=list(reused),
+            suspects=dict(suspects),
+        )
         self.store.save(campaign)
         campaign = await self._run_steps(campaign, steps, result, budget)
         result.complete = _is_complete(campaign.agenda)
+        # A completed campaign reports ``state: "complete"`` rather than the
+        # stored ``"running"`` lifecycle state, so a tick can never contradict
+        # itself with ``state: "running"`` next to ``complete: true``.  The
+        # stored lifecycle is preserved in ``lifecycle`` so a terminal tick on a
+        # paused/stopped campaign is not lossy.
+        if result.complete:
+            result.state = "complete"
         result.usage = campaign.usage
         self._record_reuse(campaign, observed, before)
         self.store.save(campaign)

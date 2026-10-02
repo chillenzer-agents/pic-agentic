@@ -282,11 +282,14 @@ that venv, or point `--picongpu-python` at it).
 ### Campaign specs by reference
 
 A Runner spec is tens of KiB, so an agent should never hand-copy one into the
-LLM. `build_spec(picmi_script, write_to="base.json")` builds and returns the
-spec inline **and** stages a JSON copy under the server's spec directory,
-returning its absolute `spec_path`; `create_campaign` then takes
-`base_spec_path=<spec_path>` instead of an inline `base_spec` (provide exactly
-one of the two). The staged file is ordinary JSON (`{"sim": ...}`) and the
+LLM. `build_spec(picmi_script, write_to="base.json")` builds the spec and stages
+a JSON copy under the server's spec directory, returning its absolute
+`spec_path`; because the caller consumes the staged file by reference, the
+inline `spec` is omitted from the result by default (pass `include_spec=true` to
+force the inline copy back, or `include_spec=false` to omit it without staging).
+`create_campaign` then takes `base_spec_path=<spec_path>` instead of an inline
+`base_spec` (provide exactly one of the two). The staged file is ordinary JSON
+(`{"sim": ...}`) and the
 staging root is the configured `PIC_AGENTIC_SPEC_DIR`, or a `spec/`
 subdirectory of `PIC_AGENTIC_MESSAGE_DIR` when unset. `base_spec_path` is
 LLM-controlled, so it is resolved **strictly inside that root** (safe charset,
@@ -298,7 +301,8 @@ are server-local and never cross the homeserver.
 ### Campaign sweeps are self-describing
 
 A campaign leaf records the sweep assignment in `point` as
-`{last path segment: value}` — exactly what the refinement engine scores — but
+`{last path segment: value}` — recorded for provenance, not scored (only a
+recorded analysis with a top-level `score`/`value`/`peak` is ranked) — but
 the key alone is opaque: sweeping the list-indexed laser focal component
 `sim.laser.0.focus_pos_si.1.component` would only show
 `point={"component": 4.4e-5}`. Each leaf therefore also records
@@ -311,6 +315,39 @@ the campaign RO-Crate. The derived and explicit labels are both sanitised for
 display: control characters are collapsed, while printable Unicode (units such
 as `µm`) is kept. Campaigns persisted before the field existed still load and
 advance: it is optional.
+
+### Campaign callbacks
+
+A durable campaign emits a **callback** each time a leaf reaches a terminal
+status (done or failed). Callbacks are only decision points: the agent reacts by
+analysing the run, refining the agenda or declaring the conclusion. An MCP
+server cannot call the agent, so callbacks are exposed two ways and the
+distinction matters:
+
+- `advance_agenda` returns the callbacks emitted by **that tick** inline under
+  `callbacks`. Inline callbacks do **not** consume the stored copy, so the same
+  decision point is returned again by the next means below.
+- `take_agenda_callbacks` drains the persisted store and clears it. Use it to
+  recover callbacks from ticks you did not observe (e.g. after a server
+  restart); it is **destructive**, so a repeat call returns an empty list and
+  drained callbacks are gone.
+
+In short: react to the inline list for the tick you just ran, and drain only to
+catch decision points you might otherwise miss. `advance_agenda` also reports
+`state: "complete"` (rather than the stored `running` lifecycle state) once
+every leaf is terminal; the stored lifecycle is preserved in the `lifecycle`
+field, so a finished **paused**/**stopped** campaign reads `state: "complete"`
+with `lifecycle: "paused"`/`"stopped"` rather than hiding the pause/stop.
+
+### Deleting a campaign does not forget its simulations
+
+`delete_campaign` removes only the persisted campaign (and its reuse registry),
+so a fresh campaign can be created. The **fleet registry** is a replay of the
+signed room, not the campaign file, so the simulations the deleted campaign
+already ran remain visible in `list_simulations` and `get_status` (and their
+results stay reachable). Treat those entries as the recorded history of runs
+that actually happened; use `list_simulations(active_only=true)` to hide
+terminal history when you only care about live work.
 
 ## Security model (M1)
 

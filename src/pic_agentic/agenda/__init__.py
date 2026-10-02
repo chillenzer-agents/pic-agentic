@@ -16,7 +16,7 @@ from pic_agentic.agenda.budget import (
     ResourceRequest,
     check_admission,
 )
-from pic_agentic.agenda.campaign import Callback, Campaign, CampaignState
+from pic_agentic.agenda.campaign import Callback, Campaign, CampaignState, TickState
 from pic_agentic.agenda.cwl import dump_cwl_workflow, to_cwl_workflow
 from pic_agentic.agenda.engine import AgendaEngine, EnginePolicy, TickResult
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim, AgendaSweep, validate_entry_name
@@ -43,6 +43,7 @@ __all__ = [
     "PlanStep",
     "ResourceRequest",
     "TickResult",
+    "TickState",
     "account",
     "apply_states",
     "campaign_rocrate",

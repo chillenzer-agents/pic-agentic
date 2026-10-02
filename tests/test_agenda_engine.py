@@ -258,7 +258,33 @@ async def test_dependency_ordering_and_completion(tmp_path) -> None:
         state[sim_id] = "results.ready"
     third = await engine.tick()
     assert third.complete is True
+    # A completed tick reports ``complete`` rather than the stored ``running``
+    # lifecycle state, so state and complete never contradict.
+    assert third.state == "complete"
+    # The stored lifecycle is preserved separately, not folded into ``state``.
+    assert third.lifecycle == "running"
     assert set(third.done) == {"a0", "a1"}
+
+
+async def test_complete_tick_on_paused_campaign_keeps_lifecycle(tmp_path) -> None:
+    """A terminal tick on a non-running campaign is not lossy.
+
+    ``state`` reports ``complete`` (all leaves terminal) while ``lifecycle``
+    keeps the real pause/stop, so the two never collapse into one field.
+    """
+    for lifecycle in ("paused", "stopped"):
+        root = tmp_path / lifecycle
+        root.mkdir()
+        store = _store(root)
+        agenda = _agenda(1)
+        agenda.entries["a0"].status = "done"
+        store.save(Campaign(name="c", agenda=agenda, state=lifecycle))
+
+        result = await AgendaEngine(store=store, submit=_Submitter(), observe=dict).tick()
+
+        assert result.complete is True
+        assert result.state == "complete"
+        assert result.lifecycle == lifecycle
 
 
 async def test_approval_gate(tmp_path) -> None:
