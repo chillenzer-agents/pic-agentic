@@ -461,17 +461,46 @@ def _plugin_facts(plugins: Any) -> list[str]:
         The plugin-summary fact strings.
 
     """
-    if not isinstance(plugins, dict) or not plugins:
+    facts = _plugin_physics_facts(plugins)
+    reason = _plugin_unavailable_reason(plugins)
+    if reason:
+        facts.append(f"no plugin reader could summarize the output: {reason}")
+    return facts
+
+
+def _plugin_physics_facts(plugins: Any) -> list[str]:
+    """Physics facts from the readers that actually produced a summary.
+
+    The reserved ``__unavailable__`` entry is not a physics fact and is excluded,
+    so the query path can tell "no physics values" from "readers missing".
+
+    Returns:
+        The physics fact strings (possibly empty).
+
+    """
+    if not isinstance(plugins, dict):
         return []
     facts: list[str] = []
     for reader, summary in plugins.items():
         if reader.startswith("__") or not isinstance(summary, dict):
             continue
         facts.extend(_one_plugin_facts(reader, summary))
+    return facts
+
+
+def _plugin_unavailable_reason(plugins: Any) -> str | None:
+    """Return the first reader-unavailable reason recorded, if any.
+
+    Returns:
+        The reason string, or None when no reader reported unavailability.
+
+    """
+    if not isinstance(plugins, dict):
+        return None
     unavailable = plugins.get("__unavailable__")
     if isinstance(unavailable, dict) and unavailable.get("reason"):
-        facts.append(f"no plugin reader could summarize the output: {unavailable['reason']}")
-    return facts
+        return str(unavailable["reason"])
+    return None
 
 
 def _one_plugin_facts(reader: str, summary: dict[str, Any]) -> list[str]:
@@ -633,9 +662,11 @@ def synthesize_answer(
         The synthesized answer string.
 
     """
-    physics = _plugin_facts(plugins)
+    physics = _plugin_physics_facts(plugins)
+    unavailable = _plugin_unavailable_reason(plugins)
+    notes = [f"no plugin reader could summarize the output: {unavailable}"] if unavailable else []
     bookkeeping = _facts(rocrate, metadata, openpmd)
-    facts = physics + bookkeeping
+    facts = physics + notes + bookkeeping
     if query:
         tokens = [token.lower() for token in re.split(r"\W+", query) if token]
         matched = [fact for fact in facts if any(token in fact.lower() for token in tokens)]
@@ -645,14 +676,14 @@ def synthesize_answer(
             return (
                 f"No fact matched the query {query!r} literally; the available physics is: " + "; ".join(physics) + "."
             )
-        return _no_physics_answer(query, openpmd, plugins, bookkeeping)
+        return _no_physics_answer(query, openpmd, unavailable, bookkeeping)
     return _default_answer(facts)
 
 
 def _no_physics_answer(
     query: str,
     openpmd: dict[str, Any] | None,
-    plugins: dict[str, Any] | None,
+    unavailable: str | None,
     bookkeeping: list[str],
 ) -> str:
     """Explain, explicitly, that no physics could be read for this run.
@@ -666,7 +697,7 @@ def _no_physics_answer(
     Args:
         query: The caller's question.
         openpmd: The openPMD summary section.
-        plugins: The plugin-summary section.
+        unavailable: The reader-unavailable reason, when one was recorded.
         bookkeeping: The non-physics fact strings.
 
     Returns:
@@ -674,11 +705,10 @@ def _no_physics_answer(
 
     """
     tail = f" Bookkeeping metadata: {'; '.join(bookkeeping)}." if bookkeeping else ""
-    unavailable = plugins.get("__unavailable__") if isinstance(plugins, dict) else None
-    if isinstance(unavailable, dict) and unavailable.get("reason"):
+    if unavailable:
         return (
             f"Cannot answer the physics question {query!r}: no plugin artifact could be summarized "
-            f"({unavailable['reason']}).{tail}"
+            f"({unavailable}).{tail}"
         )
     if not openpmd:
         return (
