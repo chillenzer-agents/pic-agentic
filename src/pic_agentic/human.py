@@ -198,7 +198,13 @@ def format_leaves(status: dict) -> str:
     for leaf in leaves:
         sim_id = leaf.get("sim_id") or "-"
         point = leaf.get("point")
-        point_text = f" {point}" if point else ""
+        parameter = leaf.get("sweep_parameter")
+        point_text = ""
+        if isinstance(point, dict) and len(point) == 1:
+            key = next(iter(point))
+            point_text = f" {parameter or key}={point[key]}"
+        elif point:
+            point_text = f" {point}"
         lines.append(f"  {leaf.get('path')}: {leaf.get('status')} [{sim_id}]{point_text}")
     return "\n".join(lines)
 
