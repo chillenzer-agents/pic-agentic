@@ -462,13 +462,16 @@ def _sample_plugin_arrays(summary: dict[str, Any]) -> dict[str, Any]:
     ``read_plugin_result`` which sends a single summary.  The answer is built
     from the scalars, so the arrays only need a shape hint; sampling
     :data:`_PLUGIN_SAMPLE_POINTS` points (endpoints kept) keeps the whole ack
-    inside :data:`~pic_agentic.protocol.simulation.MAX_RESULT_BYTES`.
+    inside :data:`~pic_agentic.protocol.simulation.MAX_RESULT_BYTES`.  A
+    summary actually sampled here has its ``downsampled`` flag set, so a caller
+    reading the section is not told it sees the full distribution (m2).
 
     Returns:
         The summary with each list array sampled down, or unchanged when small.
 
     """
     sampled: dict[str, Any] = dict(summary)
+    reduced = False
     for key, value in summary.items():
         if not isinstance(value, list) or len(value) <= _PLUGIN_SAMPLE_POINTS:
             continue
@@ -477,6 +480,9 @@ def _sample_plugin_arrays(summary: dict[str, Any]) -> dict[str, Any]:
         if points[-1] != value[-1]:
             points = [*points, value[-1]]
         sampled[key] = points
+        reduced = True
+    if reduced:
+        sampled["downsampled"] = True
     return sampled
 
 

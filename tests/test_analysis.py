@@ -271,6 +271,16 @@ def test_read_plugin_summaries_uses_the_configured_species(tmp_path, monkeypatch
     assert seen["emittance"] is None
 
 
+def test_sample_plugin_arrays_sets_downsampled() -> None:
+    """m2: sampling the analysis arrays must flag the section as downsampled."""
+    summary = {"counts": list(range(100)), "downsampled": False}
+    sampled = analysis._sample_plugin_arrays(summary)
+    assert len(sampled["counts"]) < 100
+    assert sampled["downsampled"] is True
+    small = {"counts": [1, 2, 3], "downsampled": False}
+    assert analysis._sample_plugin_arrays(small)["downsampled"] is False
+
+
 def test_read_plugin_summaries_remembers_reader_unavailable(tmp_path, monkeypatch) -> None:
     from pic_agentic import results as results_mod
 
