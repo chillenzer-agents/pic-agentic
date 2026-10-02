@@ -394,6 +394,14 @@ and openPMD bookkeeping. When no openPMD output **and** no plugin histogram exis
 (or the optional readers are not installed), the answer says so explicitly
 instead of falling back to metadata alone.
 
+A physics question is answered only from physics: a query token that happens to
+appear in the experiment name or run metadata (e.g. a run named `energy scan`
+asked "what is the maximum energy?") never masquerades as the answer. In a
+run with more than one species, `analyze_output` resolves each plugin reader's
+species from the PyPIConGPU rendering context (the diagnostic's configured
+species), so an electron histogram is not satisfied by a coexisting hydrogen
+file; the arrays in the section are sampled, and `downsampled` says so.
+
 ## Tests and tooling
 
 ```bash
