@@ -339,6 +339,22 @@ every leaf is terminal; the stored lifecycle is preserved in the `lifecycle`
 field, so a finished **paused**/**stopped** campaign reads `state: "complete"`
 with `lifecycle: "paused"`/`"stopped"` rather than hiding the pause/stop.
 
+### Lost acknowledgements are deferred, not failures
+
+When the simclient accepts a submission but its acknowledgement is lost (or it
+died before recording an outcome), it replays a **pending idempotency record**
+whose error code is `outcome_unknown`. The job may well be running, so the
+engine does **not** mark the leaf failed: it stays `planned` and is retried on
+the next tick under the same exactly-once command id, which re-acks the original
+job instead of submitting a second one. Such a leaf is reported separately in
+the tick's `deferred` list and in `agenda_status` (`deferred: true` plus
+`deferred_attempts`), so a lost acknowledgement is never presented as a physics
+failure. Retrying is bounded: after `MAX_DEFERRED_SUBMIT_ATTEMPTS` consecutive
+deferrals the leaf is failed with an `outcome_unknown` code (the job may still
+exist — check `list_simulations`/`get_status` and clean it up). A *genuine*
+rejection (bad payload, policy, version drift) is terminal immediately and keeps
+its `rejected_by_policy`-style code.
+
 ### Deleting a campaign does not forget its simulations
 
 `delete_campaign` removes only the persisted campaign (and its reuse registry),

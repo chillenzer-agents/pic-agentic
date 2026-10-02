@@ -372,6 +372,42 @@ async def test_cancel_without_job_id_never_reaches_slurm(shared_dir, tmp_path) -
         await sim_t.close()
 
 
+async def test_control_cancel_of_a_stranded_accepted_sim_is_actionable(shared_dir, tmp_path) -> None:
+    """A known-but-untracked sim is not a bare ``unknown_sim`` (H6).
+
+    An accepted build (or a crash left a pending idempotency record): the sim is
+    known to the record store but has no ``TrackedSim``/job yet.  The cancel must
+    name the state and be actionable rather than reporting ``unknown_sim``.
+    """
+    from pic_agentic.simclient.client import ProcessedCommand
+
+    shared, _state_dir = shared_dir
+    _mcp_t, sim_t, _service, client, control = _make_pair(shared)
+    # A pending record: persisted before execution, no outcome recorded.
+    client._persist_processed(ProcessedCommand(cmd_id="build-cmd", sim_id="build123"))
+    try:
+        ack = await client.handle(_control("build123", SimulationOp.CANCEL, seq=801))
+        assert ack is not None
+        assert ack.payload["ok"] is False
+        assert ack.payload["error_code"] == "not_signalable"
+        assert "unknown_sim" not in ack.payload["error"]
+        assert "accepted" in ack.payload["error"]
+        # Nothing reached SLURM: there is no job id to cancel.
+        assert control.calls == []
+
+        # A signal op on the same stranded sim is likewise actionable.
+        signal = await client.handle(_control("build123", SimulationOp.CHECKPOINT, seq=802))
+        assert signal is not None
+        assert signal.payload["error_code"] == "not_signalable"
+
+        # A genuinely unknown sim still reports unknown_sim.
+        unknown = await client.handle(_control("nope1234", SimulationOp.CANCEL, seq=803))
+        assert unknown is not None
+        assert unknown.payload["error"] == "unknown_sim"
+    finally:
+        await sim_t.close()
+
+
 async def test_control_redelivery_is_idempotent(shared_dir, tmp_path) -> None:
     """A redelivered control command re-acks instead of signalling twice."""
     shared, state_dir = shared_dir

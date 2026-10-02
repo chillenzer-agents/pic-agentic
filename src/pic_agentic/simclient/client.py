@@ -1350,6 +1350,9 @@ class SimClient:
 
         """
         if tracked is None:
+            pending = self._latest_record_for_sim(params.sim_id)
+            if pending is not None:
+                return await self._control_untracked(message, params, pending)
             return await self._send_control_ack(
                 message,
                 params=params,
@@ -1391,6 +1394,65 @@ class SimClient:
                 error_code=SimulationErrorCode.NOT_TERMINAL,
             )
         return None
+
+    def _latest_record_for_sim(self, sim_id: str) -> ProcessedCommand | None:
+        """Return the most recent durable record naming ``sim_id``, if any.
+
+        Used by the control gate to recover a sim that is known to the
+        idempotency store but not yet (or no longer) tracked: an
+        accepted-but-unsubmitted build, or a pending outcome-unknown record left
+        by a crash.  Returns None for a sim that was never submitted.
+
+        Returns:
+            The latest ``ProcessedCommand`` for ``sim_id``, or None.
+
+        """
+        if not sim_id:
+            return None
+        return next(
+            (record for record in reversed(self._processed.values()) if record.sim_id == sim_id),
+            None,
+        )
+
+    async def _control_untracked(
+        self,
+        message: RcpMessage,
+        params: ControlParams,
+        record: ProcessedCommand,
+    ) -> RcpMessage:
+        """Answer a control request for a known-but-untracked simulation.
+
+        A sim with no ``TrackedSim`` is not necessarily unknown: it may be an
+        accepted build not yet launched (no scheduler job to signal) or a
+        pending outcome-unknown record left by a crash.  There is no job id to
+        ``scancel``/signal, so the request is answered with the actionable
+        ``not_signalable`` code and a message naming the state -- instead of the
+        false, un-actionable ``unknown_sim`` -- so the caller can tell a
+        genuinely unknown id from one that was accepted but stranded.  The
+        pending build *may* still launch on this host (the record was written
+        before execution), so this does not claim the job was cancelled; the
+        caller should re-check ``get_status``/``list_simulations`` after.
+
+        Returns:
+            The signed ``control_ack`` that was sent.
+
+        """
+        pending = not record.completed
+        detail = (
+            "the simulation was accepted but never recorded an outcome (the "
+            "simclient may have died mid-build); it has no scheduler job to signal yet"
+            if pending
+            else f"the simulation has no live scheduler job (state={record.state or 'unknown'})"
+        )
+        return await self._send_control_ack(
+            message,
+            params=params,
+            tracked=None,
+            ok=False,
+            error=f"not_signalable: {detail}",
+            error_code=SimulationErrorCode.NOT_SIGNALABLE,
+            state=record.state,
+        )
 
     async def _send_control_ack(
         self,

@@ -51,6 +51,7 @@ from pic_agentic.protocol.simulation import (
 )
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
+from pic_agentic.simclient.simulation import SimulationErrorCode
 from pic_agentic.simulation_build import check_spec_round_trip
 
 if TYPE_CHECKING:
@@ -84,6 +85,11 @@ _IN_FLIGHT_STATUSES = frozenset({"planned", "submitted", "running"})
 
 #: A dotted patch-path segment that indexes a list rather than a dict key.
 _LIST_INDEX_RE = re.compile(r"-?\d+")
+
+#: Control-ack codes that mean "the sim is known but has no live job to kill":
+#: the requested cancellation is satisfied by clearing it, not an error.
+_NOT_SIGNALABLE_CODE = SimulationErrorCode.NOT_SIGNALABLE.value
+_NOT_TERMINAL_CODE = SimulationErrorCode.NOT_TERMINAL.value
 
 
 def no_campaign_error() -> dict[str, Any]:
@@ -501,17 +507,26 @@ class AgendaService:
         in-flight tick to finish (whose final save would otherwise overwrite the
         stop) and then blocks every later tick.  The state is set to ``stopped``
         and persisted *before* any cancellation, so a crash mid-cancellation
-        still leaves the campaign stopped.  Only cancellations the simclient
-        confirmed (``ok`` and no error) are reported as ``cancelled``;
-        everything else -- a timeout, a rejection, an exception -- is collected
-        in ``errors`` and never raised.
+        still leaves the campaign stopped.
+
+        Every non-terminal leaf carrying a ``sim_id`` is targeted, not only
+        ``submitted``/``running`` ones: a lost-ack submission stays ``planned``
+        but has already been stamped with a ``sim_id``, so leaving it out would
+        orphan a job that may well be running.  A cancellation the simclient
+        confirmed (``ok`` and no error) is reported as ``cancelled``; a
+        ``not_signalable``/``not_terminal`` answer means the sim is known but has
+        no live job, so it is reported as ``cleared`` (resolved, nothing to
+        kill); everything else -- a timeout, a rejection, an exception -- is
+        collected in ``errors`` with its ``error_code`` and message (never a
+        bare ``rejected``) and never raised.
 
         Args:
             send: Async RCP sender from the running transport.
 
         Returns:
             ``{"ok": True, "state": "stopped", "cancelled": [...],
-            "errors": [...]}``, or a soft error when no transport/campaign.
+            "cleared": [...], "errors": [...]}``, or a soft error when no
+            transport/campaign.
 
         """
         if not self.store.exists():
@@ -523,24 +538,53 @@ class AgendaService:
             except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
                 log.warning("agenda stop failed: %s", exc)
                 return {"ok": False, "error": self.config.redact(str(exc))}
+            # Any non-terminal leaf with a sim_id may have a live job: include
+            # ``planned`` so a deferred/lost-ack leaf is not stranded.
             in_flight = [
                 sim.sim_id
                 for _, sim in campaign.agenda.simulations()
-                if sim.status in {"submitted", "running"} and sim.sim_id
+                if sim.status in _IN_FLIGHT_STATUSES and sim.sim_id
             ]
             cancelled: list[str] = []
+            cleared: list[str] = []
             errors: list[dict[str, str]] = []
             for sim_id in in_flight:
                 try:
                     ack = await self.submit_service.control(send, sim_id, SimulationOp.CANCEL)
                 except Exception as exc:  # ruff: ignore[blind-except] - collect, never raise
-                    errors.append({"sim_id": sim_id, "error": self.config.redact(str(exc))})
+                    errors.append(
+                        {
+                            "sim_id": sim_id,
+                            "error": "cancellation request failed",
+                            "detail": self.config.redact(str(exc)),
+                        },
+                    )
                     continue
                 if ack.get("ok") and not ack.get("error"):
                     cancelled.append(sim_id)
-                else:
-                    errors.append({"sim_id": sim_id, "error": self.config.redact(str(ack.get("error", "rejected")))})
-        return {"ok": True, "state": "stopped", "cancelled": cancelled, "errors": errors}
+                    continue
+                code = ack.get("error_code")
+                if code in {_NOT_SIGNALABLE_CODE, _NOT_TERMINAL_CODE}:
+                    # Known sim, but no live job to cancel (never started, or
+                    # already finished): the orphan is resolved by recording it,
+                    # not an error.  No longer leave it lingering in ``errors``.
+                    cleared.append(sim_id)
+                    continue
+                errors.append(
+                    {
+                        "sim_id": sim_id,
+                        "error": "cancellation rejected",
+                        "detail": self.config.redact(str(ack.get("error") or "the simclient reported no reason")),
+                        "error_code": self.config.redact(str(code)) if code else "",
+                    },
+                )
+        return {
+            "ok": True,
+            "state": "stopped",
+            "cancelled": cancelled,
+            "cleared": cleared,
+            "errors": errors,
+        }
 
     async def take_callbacks(self) -> dict[str, Any]:
         """Return and durably clear the pending decision-point callbacks.
