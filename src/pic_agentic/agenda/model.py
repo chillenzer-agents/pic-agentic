@@ -171,8 +171,11 @@ class AgendaSim(BaseModel):
 
     ``spec`` is the opaque execution payload (a ``pypicongpu.Runner`` spec in
     this project).  ``point`` records the sweep assignment that produced this
-    leaf, so expanded agendas remain self-describing.  ``depends_on`` names
-    sibling entries that must complete before this one (carried into CWL).
+    leaf, so expanded agendas remain self-describing; ``sweep_parameter`` is
+    the human-readable name of the swept parameter (``point``'s key is only the
+    last dotted-path segment), so a scan is not reduced to a meaningless key.
+    ``depends_on`` names sibling entries that must complete before this one
+    (carried into CWL).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -181,6 +184,13 @@ class AgendaSim(BaseModel):
     name: str
     spec: dict[str, Any]
     point: dict[str, float | int | str] | None = None
+    #: Human-readable name of the swept parameter this leaf assigns (e.g.
+    #: ``sim.laser.0.focus_pos_si.1.component``), kept alongside ``point`` so a
+    #: scan stays self-describing.  The ``point`` key is only the last path
+    #: segment (``component``), which is meaningless on its own.  Optional for
+    #: backward compatibility: campaigns persisted before this field simply
+    #: lack it and still load.
+    sweep_parameter: str | None = None
     status: Literal["planned", "submitted", "running", "done", "failed"] = "planned"
     depends_on: list[str] = Field(default_factory=list)
     #: The RCP simulation id once this leaf has been submitted (the engine's
@@ -332,6 +342,7 @@ class AgendaGroup(BaseModel):
         name: str,
         spec: dict[str, Any],
         point: dict[str, float | int | str] | None = None,
+        sweep_parameter: str | None = None,
     ) -> AgendaGroup:
         """Add one leaf simulation and return the expanded group.
 
@@ -339,7 +350,7 @@ class AgendaGroup(BaseModel):
             A new group with the leaf inserted.
 
         """
-        return self.add(**{name: AgendaSim(name=name, spec=spec, point=point)})
+        return self.add(**{name: AgendaSim(name=name, spec=spec, point=point, sweep_parameter=sweep_parameter)})
 
     def simulations(self) -> list[tuple[str, AgendaSim]]:
         """Flatten the tree to ``(path, sim)`` pairs, depth-first.
@@ -391,7 +402,12 @@ class AgendaGroup(BaseModel):
             if leaf_name in expanded.entries:
                 msg = f"expand would overwrite an existing entry: {leaf_name!r}"
                 raise ValueError(msg)
-            expanded.entries[leaf_name] = AgendaSim(name=leaf_name, spec=synthesized(point), point=point)
+            expanded.entries[leaf_name] = AgendaSim(
+                name=leaf_name,
+                spec=synthesized(point),
+                point=point,
+                sweep_parameter=sweep.parameter,
+            )
         return expanded
 
 
