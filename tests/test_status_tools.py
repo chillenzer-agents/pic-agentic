@@ -336,6 +336,57 @@ def test_merge_status_keeps_projection_progress_the_ack_omits() -> None:
     assert projection["percent"] == 40
 
 
+async def test_get_status_reports_phase_transitions() -> None:
+    """H4: get_status/list_simulations expose the build-vs-queue substate.
+
+    The phase is derived from the record's state and job id: ``accepted`` with
+    no job id is ``building``; a job id without a running event is ``queued``;
+    a running/job-progress event is ``running``; a completed run is ``done``.
+    """
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    service = runtime.submit_service
+
+    async def phase() -> str:
+        status = (await server.call_tool("get_status", {"sim_id": SIM_ID})).structured_content
+        rows = (await server.call_tool("list_simulations", {})).structured_content["simulations"]
+        assert status["phase"] == rows[0]["phase"]
+        return status["phase"]
+
+    service.on_message(_event(SimulationState.ACCEPTED, ts="2026-09-25T10:00:00Z", seq=1))
+    assert await phase() == "building"
+
+    service.on_message(_event(SimulationState.WORKFLOW_FINISHED, ts="2026-09-25T10:00:01Z", seq=2, job_id=JOB_ID))
+    assert await phase() == "queued"
+
+    service.on_message(_event(SimulationState.JOB_RUNNING, ts="2026-09-25T10:00:02Z", seq=3, job_id=JOB_ID))
+    assert await phase() == "running"
+
+    service.on_message(_event(SimulationState.RESULTS_READY, ts="2026-09-25T10:10:00Z", seq=4, job_id=JOB_ID))
+    assert await phase() == "done"
+
+
+async def test_get_events_explains_an_empty_building_phase() -> None:
+    """H4: an empty get_events result names the build phase instead of silence."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.ACCEPTED.value
+    record.active = True
+
+    payload = (await server.call_tool("get_events", {"sim_id": SIM_ID})).structured_content
+    assert payload["events"] == []
+    assert payload["phase"] == "building"
+    assert "building" in payload["note"]
+    assert "SLURM job" in payload["note"]
+
+
 async def test_get_status_redacts_secrets() -> None:
     from pic_agentic.config import Config
     from pic_agentic.server.app import build_server

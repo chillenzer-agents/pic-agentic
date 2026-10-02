@@ -349,6 +349,37 @@ results stay reachable). Treat those entries as the recorded history of runs
 that actually happened; use `list_simulations(active_only=true)` to hide
 terminal history when you only care about live work.
 
+### Build/queue phase, and when a run counts as stalled
+
+A run can spend 15-20 minutes between `accepted` and the SLURM `job_id`: the
+simclient builds the setup locally and only then parses the job id out of
+`submission_information.txt`. During that window `job_id` is `null`, there are
+no step/percent values, `get_events` is empty and the logs read "not started
+yet" — which is normal, not wedged.
+
+To make that window legible, every status surface carries a derived `phase`
+field (`building`/`queued`/`running`/`done`/`failed`/`cancelled`):
+
+- `building` — accepted, no `job_id` yet (local CWL build, and the queue wait
+  for the job id to be parsed; the event stream cannot separate the two, so the
+  bucket is deliberately best-effort).
+- `queued` — a `job_id` exists but no running/job-progress event has arrived.
+- `running` — a `simulation.job_running` or `simulation.step_finished` event
+  has been seen.
+- `done`/`failed`/`cancelled` — terminal outcomes.
+
+`get_status`, `list_simulations` and `get_events` report `phase`; the
+`fleet_status` summary reports `by_phase`, and `get_events` adds a `note`
+explaining an empty event list (build window vs filter).
+
+`fleet_status`'s `stalled` alert fires only for a `running` record that has gone
+`fleet_stall_after_s` (default 900 s) without a lifecycle event. A
+`building`/`queued` record is explicitly exempt — it is expected to be silent
+for many minutes — while a genuinely idle running job is still flagged. The
+phase is computed with `simulation_phase` in
+`src/pic_agentic/protocol/simulation.py`; it is a pure projection of the
+existing event stream and adds no wire message.
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path

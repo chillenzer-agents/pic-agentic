@@ -42,6 +42,7 @@ from pic_agentic.protocol.simulation import (
     SimulationOp,
     SubmitParams,
     UnsupportedPayloadError,
+    simulation_phase,
 )
 from pic_agentic.server.agenda import AgendaService, no_campaign_error
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
@@ -919,6 +920,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "signed-room projection is returned. Progress (step, percent, "
             "walltime, avg_per_step, eta_s) is populated from the run's "
             "step_finished events while it is running, not only after it finishes. "
+            "`phase` is the coarse build-vs-queue-vs-run substate "
+            "(building/queued/running/done/failed/cancelled): while `job_id` is "
+            "null the run is `building`, which can take 15-20 minutes before the "
+            "SLURM job id appears, so a null `job_id` is not a fault. "
             "For a completed run, `suspect` carries the all-zero health warning "
             "when its numeric diagnostics are all empty. A status is available "
             "for any simulation the signed room records, including runs whose "
@@ -934,7 +939,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         title="List simulations",
         description=(
             "List the simulations the server knows about, optionally only the "
-            "still-active ones. Each row carries `suspect`, the all-zero health "
+            "still-active ones. Each row carries `phase` (building/queued/"
+            "running/done/failed/cancelled), so a run with `job_id: null` in the "
+            "`building` phase is visibly mid-build rather than missing. Each row "
+            "also carries `suspect`, the all-zero health "
             "warning for a completed empty run. This is the fleet registry (a "
             "replay of the signed room), so it is independent of the campaign "
             "file: deleting a campaign with delete_campaign does not remove its "
@@ -949,6 +957,7 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
                 "sim_id": record.sim_id,
                 "cmd_id": record.cmd_id,
                 "state": record.state,
+                "phase": record.phase,
                 "job_id": record.job_id,
                 "suspect": record.suspect,
                 "last_event_type": record.last_event_type,
@@ -964,7 +973,12 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Return the condensed lifecycle-event history of one simulation "
             "(consecutive duplicate states collapse). Optionally filter by an "
-            "ISO timestamp lower bound and by state type."
+            "ISO timestamp lower bound and by state type. An empty `events` "
+            "list is not an error: between `accepted` and the SLURM job the "
+            "simclient reports no lifecycle event for the multi-minute local "
+            "build, so read `phase` from get_status/list_simulations to tell "
+            "`building`/`queued` apart; `note` says which case an empty result "
+            "is."
         ),
         annotations=_READ_ONLY,
     )
@@ -976,7 +990,13 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         limit: int = 50,
     ) -> dict[str, Any]:
         events = runtime.condensed_events(sim_id, since=since, types=types, limit=limit)
-        return _redact_dict(runtime, {"sim_id": sim_id, "events": events, "count": len(events)})
+        result: dict[str, Any] = {"sim_id": sim_id, "events": events, "count": len(events)}
+        record = runtime.get_sim(sim_id)
+        if record is not None:
+            result["phase"] = record.phase
+        if not events:
+            result["note"] = _empty_events_note(record)
+        return _redact_dict(runtime, result)
 
     @server.tool(
         title="Get simulation logs",
@@ -1550,8 +1570,12 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         title="Get the aggregate fleet status",
         description=(
             "Report the whole fleet at a glance: total/active/terminal counts, "
-            "per-state counts, a mean progress percentage, and actionable "
-            "alerts (failed, cancelled, non-zero exit, stalled, suspect). The "
+            "per-state counts, a mean progress percentage, per-phase counts "
+            "(building/queued/running/done/failed/cancelled), and actionable "
+            "alerts (failed, cancelled, non-zero exit, stalled, suspect). A "
+            "`building`/`queued` run is never reported as `stalled` even if it "
+            "has been silent for a long time: only a `running` run that stops "
+            "emitting progress is flagged. The "
             "`suspect` count/alert marks a done run whose only numeric artifact "
             "reads all-zero - a successful-but-empty run, not a failure."
         ),
@@ -1763,6 +1787,7 @@ def _status_dict(record: SimRecord) -> dict[str, Any]:
     return {
         "sim_id": record.sim_id,
         "state": record.state,
+        "phase": record.phase,
         "slurm_state": record.slurm_state,
         "job_id": record.job_id,
         "step": record.step,
@@ -1799,6 +1824,38 @@ def _merge_status(projection: dict[str, Any], live: dict[str, Any]) -> None:
     ):
         if live.get(field) is not None:
             projection[field] = live[field]
+    # ``phase`` is derived from the (possibly updated) state/job_id, so it must
+    # be recomputed after the overlay rather than merged as a raw field.
+    projection["phase"] = simulation_phase(str(projection.get("state", "")), projection.get("job_id"))
+
+
+def _empty_events_note(record: SimRecord | None) -> str:
+    """Explain an empty ``get_events`` result (H4: latency opacity).
+
+    An empty list is normal either because the simclient reports no lifecycle
+    event during the multi-minute local build/queue window or because a
+    ``since``/``types`` filter excluded every row.  The note names which case
+    applies so an empty result is not mistaken for "started but silent".
+
+    Returns:
+        A short human-readable explanation.
+
+    """
+    if record is None:
+        return "no lifecycle event matches; the simulation is not in the registry (it may never have been submitted)"
+    phase = record.phase
+    if phase in {"building", "queued"}:
+        return (
+            f"no lifecycle event yet: the run is in the {phase} phase, where the simclient "
+            "builds locally and waits for the SLURM job id; this can take 15-20 minutes and "
+            "logs are not written yet, so there is nothing to report until the job starts"
+        )
+    if phase == "running":
+        return (
+            "no lifecycle event recorded yet for this running run; progress events are emitted "
+            "only every 25% of the run, so a long-running job can be between events"
+        )
+    return "no lifecycle event matches the requested filters; widen `since`/`types` or omit them"
 
 
 def _since_last_event_s(ts: str | None) -> int | None:
