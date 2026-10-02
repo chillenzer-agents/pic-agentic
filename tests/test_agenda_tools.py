@@ -449,6 +449,50 @@ async def test_identical_leaf_failures_are_grouped_and_truncated(tmp_path) -> No
         await sim_t.close()
 
 
+async def test_advance_flags_a_successfully_empty_campaign(tmp_path) -> None:
+    """The beta-4 scenario: a done leaf with zero physics is reported, not clean.
+
+    Drives one submitted leaf to ``results.ready`` with the registry carrying the
+    all-zero health flag, then asserts the tick result, its done callback,
+    ``agenda_status`` and ``fleet_status`` all surface it.
+    """
+    warning = "energy_histogram is all zeros; the run may have no particles in range"
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    server, runtime = build_server(config, SIM)
+    runtime._transport = mcp_t
+    tasks = [await _serve(sim_t), await _pump(mcp_t, runtime.submit_service)]
+    try:
+        await server.call_tool("advance_agenda", {})
+        sim_id = next(iter(runtime.submit_service.registry))
+        record = runtime.submit_service.registry[sim_id]
+        record.state = "results.ready"
+        record.active = False
+        record.suspect = warning
+
+        tick = (await server.call_tool("advance_agenda", {})).structured_content
+        assert tick["done"] == ["leaf0"]
+        assert tick["suspects"] == {"leaf0": warning}
+        (callback,) = tick["callbacks"]
+        assert callback["kind"] == "done"
+        assert callback["suspect"] == warning
+        assert callback["error"] is None
+
+        status = (await server.call_tool("agenda_status", {})).structured_content
+        assert status["suspect_count"] == 1
+        assert status["suspects"] == {"leaf0": warning}
+        assert status["leaves"][0]["suspect"] == warning
+
+        fleet = (await server.call_tool("fleet_status", {})).structured_content
+        assert fleet["summary"]["suspect"] == 1
+        assert [alert["kind"] for alert in fleet["alerts"]] == ["suspect"]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
 async def test_take_callbacks_drains_durably(tmp_path) -> None:
     """Callbacks emitted by a tick are returned once, then cleared on disk."""
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
