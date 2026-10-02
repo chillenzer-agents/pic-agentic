@@ -298,6 +298,27 @@ symlinks resolved on both sides) and refused otherwise; a path such as
 (`MAX_SPEC_FILE_BYTES`) — larger than the 48 KiB inline cap because the bytes
 are server-local and never cross the homeserver.
 
+### Campaign callbacks
+
+A durable campaign emits a **callback** each time a leaf reaches a terminal
+status (done or failed). Callbacks are only decision points: the agent reacts by
+analysing the run, refining the agenda or declaring the conclusion. An MCP
+server cannot call the agent, so callbacks are exposed two ways and the
+distinction matters:
+
+- `advance_agenda` returns the callbacks emitted by **that tick** inline under
+  `callbacks`. Inline callbacks do **not** consume the stored copy, so the same
+  decision point is returned again by the next means below.
+- `take_agenda_callbacks` drains the persisted store and clears it. Use it to
+  recover callbacks from ticks you did not observe (e.g. after a server
+  restart); it is **destructive**, so a repeat call returns an empty list and
+  drained callbacks are gone.
+
+In short: react to the inline list for the tick you just ran, and drain only to
+catch decision points you might otherwise miss. `advance_agenda` also reports
+`state: "complete"` (rather than the stored `running` lifecycle state) once
+every leaf is terminal.
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path

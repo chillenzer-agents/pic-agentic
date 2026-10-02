@@ -1226,8 +1226,13 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "campaign's lifecycle state (running/paused/stopped), or `complete` "
             "once `complete` is true and every leaf has finished. Failures are "
             "summarised in `failure_summary` and grouped by identical reason in "
-            "`failure_groups` (with the full, untruncated text available via "
-            "take_agenda_callbacks)."
+            "`failure_groups`. `callbacks` holds only the decision points "
+            "emitted by *this* tick; they are also persisted, so "
+            "`take_agenda_callbacks` (which drains the durable store and is the "
+            "recovery path after a restart) returns them too until drained. "
+            "React to the inline `callbacks` for the tick you just ran; call "
+            "`take_agenda_callbacks` only to recover callbacks from earlier "
+            "ticks, since draining clears the persisted copy."
         ),
         # write/resource tier: a tick may submit new cluster jobs, so it is not
         # read-only and not idempotent, but it is not destructive.
@@ -1269,8 +1274,13 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Return and clear the pending callbacks for newly finished or failed "
             "campaign leaves. An MCP server cannot call the agent, so these are "
             "pollable records: drain them, analyse the run or refine the agenda, "
-            "then advance_agenda again. Draining persists, so a repeat call "
-            "returns an empty list."
+            "then advance_agenda again. `advance_agenda` also returns each "
+            "tick's new callbacks inline, and that inline copy does **not** "
+            "consume the stored ones: react to the inline list for the tick you "
+            "just ran, and use this tool only to recover callbacks from earlier "
+            "ticks or after a restart. Draining is destructive -- it clears the "
+            "persisted copy, so a repeat call returns an empty list, and after "
+            "draining the same callbacks are no longer available at all."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )

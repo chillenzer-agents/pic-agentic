@@ -477,6 +477,21 @@ async def test_advance_agenda_reports_complete_state_when_finished(tmp_path) -> 
         await sim_t.close()
 
 
+async def test_callback_tool_descriptions_explain_the_double_exposure() -> None:
+    """The inline vs. drained callback contract is documented on the tools."""
+    server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+
+    advance = tools["advance_agenda"].description
+    assert "take_agenda_callbacks" in advance
+    assert "drain" in advance
+
+    drain = tools["take_agenda_callbacks"].description
+    assert "advance_agenda" in drain
+    assert "destructive" in drain
+    assert "empty list" in drain
+
+
 async def test_add_leaf_is_submitted_by_the_next_tick(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
     added = await _call(config, "add_agenda_leaf", {"name": "refined", "spec": {"sim": {"replica": 9}}})
