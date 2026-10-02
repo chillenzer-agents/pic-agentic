@@ -731,6 +731,11 @@ SERVER_INSTRUCTIONS = (
     "A large spec should be passed by reference, not re-typed: call "
     "build_spec(picmi_script, write_to=...) and hand the returned spec_path to "
     "create_campaign(base_spec_path=...). "
+    "create_campaign's patch_path is a dotted Runner-spec path addressed node "
+    "by node: a numeric segment is a list index on a list or a dict key on a "
+    "dict, so a nested list element is reachable too "
+    "(e.g. sim.laser.0.focus_pos_si.1.component for the laser's focal-position "
+    "component), not only a top-level field such as sim.time_steps. "
     "create_campaign refuses to overwrite an existing campaign; to start a fresh "
     "one, remove the old state first with delete_campaign (reset), optionally "
     "after stop_agenda to cancel in-flight jobs. "
@@ -836,12 +841,19 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "a base spec for create_campaign or add_agenda_leaf. The returned "
             "`spec` is the inline `{sim: ...}` wire object accepted by those "
             "tools; the result also reports the encoded wire size and whether it "
-            "fits the 48 KiB inline submission limit. Pass `write_to` to also "
-            "stage the spec as JSON under the server's spec directory (a "
+            "fits the 48 KiB inline submission limit. Pass `write_to` to stage "
+            "the spec as JSON under the server's spec directory (a "
             "relative path is resolved there and a missing parent is created; a "
             "path outside that root is refused): the "
             "returned `spec_path` can then be handed to "
-            "create_campaign(base_spec_path=...) without re-typing the spec. The "
+            "create_campaign(base_spec_path=...) without re-typing the spec. When "
+            "`write_to` is set the inline `spec` is omitted by default so the "
+            "tens-of-KiB body is not echoed; set `include_spec=true` to force it "
+            "back (or `include_spec=false` to omit it without staging). An "
+            "over-cap spec is reported as `ok: false` with "
+            "`error='spec_exceeds_inline_limit'` and cannot be submitted inline; "
+            "`write_to` still stages it and the result still reports `spec_path`, "
+            "and `include_spec=true` returns the inline copy anyway. The "
             "script should define a single picmi.Simulation; a trailing "
             "sim.run(...) is tolerated and ignored (the tool never runs it here). "
             "Note: the pinned pypicongpu always adds a default `type_radiation` "
@@ -853,12 +865,23 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
         # read-tier: it builds locally and starts no cluster work.
         annotations=_READ_ONLY,
     )
-    async def build_spec(picmi_script: str, *, write_to: str | None = None) -> dict[str, Any]:
+    async def build_spec(
+        picmi_script: str,
+        *,
+        write_to: str | None = None,
+        include_spec: bool | None = None,
+    ) -> dict[str, Any]:
         try:
             built, spec_path = await runtime.build_spec(picmi_script, write_to=write_to)
         except _SUBMIT_TOOL_ERRORS as exc:
             return {"ok": False, "state": "error", "error": runtime.config.redact(str(exc))}
-        return _built_spec_dict(runtime, built, spec_path=spec_path)
+        # A staged spec (``write_to``) is consumed by reference, so echoing the
+        # full tens-of-KiB inline copy would only bloat the tool result; an
+        # over-cap spec is likewise omitted by default (the soft error reports
+        # why), while an explicit ``include_spec`` overrides either way.
+        if include_spec is None:
+            include_spec = spec_path is None and built.within_inline_limit
+        return _built_spec_dict(runtime, built, spec_path=spec_path, include_spec=include_spec)
 
     _register_reporting_tools(server, runtime)
     _register_control_result_tools(server, runtime)
@@ -884,7 +907,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "cluster and merged over the last-event projection; otherwise the "
             "signed-room projection is returned. Progress (step, percent, "
             "walltime, avg_per_step, eta_s) is populated from the run's "
-            "step_finished events while it is running, not only after it finishes."
+            "step_finished events while it is running, not only after it finishes. "
+            "A status is available for any simulation the signed room records, "
+            "including runs whose campaign was since deleted with "
+            "delete_campaign; such a run is history, not live campaign state."
         ),
         annotations=_READ_ONLY,
     )
@@ -893,7 +919,14 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
 
     @server.tool(
         title="List simulations",
-        description="List the simulations the server knows about, optionally only the still-active ones.",
+        description=(
+            "List the simulations the server knows about, optionally only the "
+            "still-active ones. This is the fleet registry (a replay of the "
+            "signed room), so it is independent of the campaign file: deleting "
+            "a campaign with delete_campaign does not remove its already-run "
+            "simulations from this list, and their results stay reachable. Use "
+            "active_only=true to hide terminal history."
+        ),
         annotations=_READ_ONLY,
     )
     def list_simulations(*, active_only: bool = False) -> dict[str, Any]:
@@ -1204,10 +1237,20 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Run one durable tick of the campaign engine stored on the server: "
             "observe the known simulations, plan the next actions and submit "
             "what the budget and the policy allow. Returns the tick result "
-            "(submitted/waiting/done/failed paths and usage). Failures are "
+            "(submitted/waiting/done/failed paths and usage). `state` is the "
+            "campaign's lifecycle state (running/paused/stopped), or `complete` "
+            "once `complete` is true and every leaf has finished; `lifecycle` "
+            "always carries the stored lifecycle state (running/paused/stopped), "
+            "so a finished paused/stopped campaign reads `state: complete` with "
+            "`lifecycle: paused`/`stopped`. Failures are "
             "summarised in `failure_summary` and grouped by identical reason in "
-            "`failure_groups` (with the full, untruncated text available via "
-            "take_agenda_callbacks)."
+            "`failure_groups`. `callbacks` holds only the decision points "
+            "emitted by *this* tick; they are also persisted, so "
+            "`take_agenda_callbacks` (which drains the durable store and is the "
+            "recovery path after a restart) returns them too until drained. "
+            "React to the inline `callbacks` for the tick you just ran; call "
+            "`take_agenda_callbacks` only to recover callbacks from earlier "
+            "ticks, since draining clears the persisted copy."
         ),
         # write/resource tier: a tick may submit new cluster jobs, so it is not
         # read-only and not idempotent, but it is not destructive.
@@ -1249,8 +1292,13 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Return and clear the pending callbacks for newly finished or failed "
             "campaign leaves. An MCP server cannot call the agent, so these are "
             "pollable records: drain them, analyse the run or refine the agenda, "
-            "then advance_agenda again. Draining persists, so a repeat call "
-            "returns an empty list."
+            "then advance_agenda again. `advance_agenda` also returns each "
+            "tick's new callbacks inline, and that inline copy does **not** "
+            "consume the stored ones: react to the inline list for the tick you "
+            "just ran, and use this tool only to recover callbacks from earlier "
+            "ticks or after a restart. Draining is destructive -- it clears the "
+            "persisted copy, so a repeat call returns an empty list, and after "
+            "draining the same callbacks are no longer available at all."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
@@ -1263,7 +1311,12 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Create and persist a campaign with one leaf per value: each leaf is "
             "`base_spec` with the dotted Runner-spec path `patch_path` set to "
             "that value (e.g. patch_path='sim.time_steps'), and records "
-            "point={last path segment: value}. This is the entry point for the "
+            "point={last path segment: value}. A numeric path segment is "
+            "interpreted by the node it addresses: a list index on a list, or a "
+            "dict key on a dict, so a nested list element is reachable (e.g. "
+            "patch_path='sim.laser.0.focus_pos_si.1.component' for the laser's "
+            "focal-position component); the final segment must already address "
+            "an existing field or in-range list index. This is the entry point for the "
             "research loop -- call build_spec first to get base_spec, then "
             "advance_agenda. Provide the base spec exactly one way: inline as "
             "`base_spec`, or by reference as `base_spec_path` (the `spec_path` "
@@ -1306,7 +1359,13 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "running, or a non-terminal leaf carrying a sim_id such as a lost-ack "
             "submission), since deleting then would orphan the jobs; pass "
             "force=true to delete anyway, or stop_agenda first to cancel them. A "
-            "corrupt campaign file is removed without the guard."
+            "corrupt campaign file is removed without the guard. This only "
+            "clears the campaign: the simulations that already ran stay in the "
+            "fleet registry (list_simulations/get_status/fleet_status), because "
+            "the registry is a replay of the signed room, not the campaign file, "
+            "and their results remain reachable. Treat those entries as the "
+            "history of runs that actually happened, not as live campaign "
+            "state."
         ),
         # destructive: it irreversibly removes the persisted campaign state.
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
@@ -1730,14 +1789,25 @@ def _redact_dict(runtime: HelloRuntime, payload: Any, _depth: int = 0) -> Any:
     return payload
 
 
-def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec, *, spec_path: str | None = None) -> dict[str, Any]:
+def _built_spec_dict(
+    runtime: HelloRuntime,
+    built: BuiltSpec,
+    *,
+    spec_path: str | None = None,
+    include_spec: bool = True,
+) -> dict[str, Any]:
     """Shape a dry-run build result for the ``build_spec`` tool.
 
-    The spec is returned when it fits the 48 KiB inline submission cap (the only
-    transport M2 has).  An over-cap spec is *not* returned: it could be stored on
-    a campaign leaf but never submitted, so the failure mode is made explicit
-    instead of handing the agent a spec that would fail later at
-    ``advance_agenda``.
+    An over-cap spec is reported as a soft error (``ok: False`` naming
+    ``spec_exceeds_inline_limit``): it can never be submitted, so the failure
+    mode is made explicit instead of handing the agent a spec that would fail
+    later at ``advance_agenda``.  The staged path, however, is *still* surfaced
+    when ``write_to`` was given -- the runtime has already written the file, so
+    dropping ``spec_path`` would hide the one output the caller asked for (the
+    over-cap + ``write_to`` case has no other use for ``spec``).  An explicit
+    ``include_spec=True`` is likewise honoured over the cap: the inline copy
+    travels over MCP, not the 48 KiB-limited homeserver path, so a caller that
+    asks for it gets it alongside the size warning.
 
     The built spec is trusted builder output (it passed ``check_allowlist``),
     not untrusted free text, so it is returned **verbatim**: routing it through
@@ -1754,28 +1824,34 @@ def _built_spec_dict(runtime: HelloRuntime, built: BuiltSpec, *, spec_path: str 
     reference form of ``create_campaign``'s ``base_spec``).  The path is
     server-controlled config output, not free text.
 
+    Args:
+        runtime: The runtime whose config holds the secrets.
+        built: The built wire spec plus its provenance and wire size.
+        spec_path: The staged file path when ``write_to`` was given, else None.
+        include_spec: Whether to include the inline ``spec`` in the result.
+            ``build_spec`` defaults this to False whenever the spec is over-cap
+            or a ``write_to`` path was staged (the caller consumes either by
+            reference), so a matching ``spec_path`` is still reported while the
+            tens-of-KiB body is not echoed back.
+
     Returns:
-        ``{"ok": True, "spec", "wire_bytes", ...}``, or a soft error naming the
-        over-cap condition.
+        ``{"ok": True, "spec", "wire_bytes", ...}``, or
+        ``{"ok": False, "error": "spec_exceeds_inline_limit", ...}``.
 
     """
     redact = runtime.config.redact
-    if not built.within_inline_limit:
-        return {
-            "ok": False,
-            "error": "spec_exceeds_inline_limit",
-            "wire_bytes": built.wire_bytes,
-            "inline_limit_bytes": built.inline_limit_bytes,
-        }
     payload: dict[str, Any] = {
-        "ok": True,
-        "spec": built.spec,
+        "ok": built.within_inline_limit,
         "wire_bytes": built.wire_bytes,
         "inline_limit_bytes": built.inline_limit_bytes,
         "picongpu_version": redact(built.picongpu_version),
         "picongpu_revision": redact(built.picongpu_revision),
         "schema_hash": built.schema_hash,
     }
+    if not built.within_inline_limit:
+        payload["error"] = "spec_exceeds_inline_limit"
+    if include_spec:
+        payload["spec"] = built.spec
     if spec_path is not None:
         payload["spec_path"] = spec_path
     return payload
