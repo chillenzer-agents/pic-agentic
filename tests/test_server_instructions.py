@@ -45,4 +45,9 @@ async def test_create_campaign_description_publicises_the_list_indexed_path() ->
     tools = {tool.name: tool for tool in await server.list_tools()}
     description = tools["create_campaign"].description
     assert "sim.laser.0.focus_pos_si.1.component" in description
-    assert "indexes a list" in description
+    # The rule must match the patcher: the *node* decides, so a numeric segment
+    # is a list index on a list but a dict key on a dict (the ``sim.bc.0``
+    # boundary-condition map).  A spelling-based "numeric means list" rule would
+    # contradict ``_patch_spec`` and ``test_create_campaign_reaches_a_numeric_dict_key``.
+    assert "a list index on a list, or a " in description
+    assert "dict key on a dict" in description
