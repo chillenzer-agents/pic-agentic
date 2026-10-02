@@ -145,6 +145,52 @@ async def test_suggest_refinement_ranks_recorded_analyses_not_sweep_values(tmp_p
     assert result["best"] == {"label": "leaf000", "value": pytest.approx(0.31)}
 
 
+async def test_suggest_refinement_distinguishes_unscored_recorded_analyses(tmp_path: Path) -> None:
+    """Beta-4 end state: analyses recorded, but none carries a ranked score.
+
+    The invariant build's ``analyze_output`` sections (``focal_position_m`` /
+    ``total_electrons`` / ``high_energy_tail``) have no top-level
+    ``score``/``value``/``peak``.  Recording them must not be reported as "no
+    analyses are recorded yet": the summary keeps ``analysed: 0`` (nothing is
+    ranked) but the message must distinguish recorded-but-unscored analyses and
+    point at the score contract, rather than inviting a pointless re-record loop.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=_sweep_file(tmp_path, [4.4e-5, 4.6e-5, 4.8e-5]))
+    beta4_payloads = {
+        "leaf000": {
+            "focal_position_m": 4.4e-05,
+            "total_electrons": 444440000000,
+            "high_energy_tail": {"gt_7.5MeV": 733180000, "gt_10MeV": 207690000, "gt_15MeV": 276200},
+            "max_energy_MeV": 17.5,
+        },
+        "leaf001": {
+            "focal_position_m": 4.6e-05,
+            "total_electrons": 443490000000,
+            "high_energy_tail": {"gt_7.5MeV": 718040000, "gt_10MeV": 202880000, "gt_15MeV": 87650},
+            "max_energy_MeV": 15.0,
+        },
+        "leaf002": {
+            "focal_position_m": 4.8e-05,
+            "total_electrons": 442030000000,
+            "high_energy_tail": {"gt_7.5MeV": 703420000, "gt_10MeV": 198230000, "gt_15MeV": 20280},
+            "max_energy_MeV": 15.0,
+        },
+    }
+    for path, payload in beta4_payloads.items():
+        assert await _call(config, "record_agenda_analysis", {"path": path, "analysis": payload}) == {
+            "ok": True,
+            "path": path,
+        }
+    result = await _call(config, "suggest_agenda_refinement", {"rel_tol": 0.05})
+    assert result["ok"] is True
+    assert result["best"] is None
+    assert result["analysed"] == 0
+    assert result["suggestions"] == []
+    assert "No analyses are recorded yet" not in result["message"]
+    assert "score" in result["message"]
+    assert "record_agenda_analysis" in result["message"]
+
+
 async def test_export_agenda_cwl(tmp_path: Path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
     result = await _call(config, "export_agenda_cwl", {})
