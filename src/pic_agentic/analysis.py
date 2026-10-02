@@ -287,7 +287,95 @@ def read_openpmd_summary(output_dir: Path | str) -> dict[str, Any]:
     }
 
 
-def read_plugin_summaries(output_dir: Path | str) -> dict[str, dict[str, Any]]:
+#: Plugin reader name -> the rendering-context output entry's boolean type tag.
+#: Used to resolve the species a diagnostic was configured for, so a
+#: two-species run does not silently summarize the alphabetically-first
+#: species' file (M1).  Readers without a shipped output class in the pinned
+#: PIConGPU (emittance, transition_radiation, calorimeter) are absent and fall
+#: back to the single-species heuristic below.
+_PLUGIN_OUTPUT_TAGS = {
+    "energy_histogram": "type_energyhistogram",
+    "phase_space": "type_phasespace",
+    "radiation": "type_radiation",
+}
+
+
+def _sim_contexts(metadata: Any) -> list[dict[str, Any]]:
+    """Collect the simulation-context mappings from the metadata sections.
+
+    Both ``rendering_context`` and ``runner["sim"]`` carry the same
+    species/output structure; either may be present.
+
+    Returns:
+        The non-empty simulation-context mappings.
+
+    """
+    if not isinstance(metadata, dict):
+        return []
+    contexts = []
+    rendering = metadata.get("rendering_context")
+    if isinstance(rendering, dict) and rendering:
+        contexts.append(rendering)
+    runner = metadata.get("runner")
+    sim = runner.get("sim") if isinstance(runner, dict) else None
+    if isinstance(sim, dict) and sim:
+        contexts.append(sim)
+    return contexts
+
+
+def _species_name(candidate: Any) -> str | None:
+    """Return a species object's PIConGPU short name.
+
+    Returns:
+        The ``species_name`` (preferred) or ``name``, or None.
+
+    """
+    if not isinstance(candidate, dict):
+        return None
+    name = candidate.get("species_name") or candidate.get("name")
+    return str(name) if name else None
+
+
+def _configured_species(metadata: Any, reader: str) -> str | None:
+    """Resolve the species a reader's diagnostic was configured for.
+
+    A two-species run that only configured a histogram for electrons must not
+    answer from a coincidentally present hydrogen histogram.  The rendering
+    context names each output diagnostic's species, so this is read back rather
+    than guessed.  When the reader has no shipped output tag or the diagnostic's
+    species cannot be resolved, the simulation's species list is used only when
+    it names exactly one species (still unambiguous).
+
+    Returns:
+        The configured species name, or None when it cannot be resolved.
+
+    """
+    for context in _sim_contexts(metadata):
+        tag = _PLUGIN_OUTPUT_TAGS.get(reader)
+        if tag:
+            for entry in context.get("output") or []:
+                if not (isinstance(entry, dict) and entry.get(tag)):
+                    continue
+                configured = entry.get("species")
+                candidates = configured if isinstance(configured, list) else [configured]
+                names = {name for name in (_species_name(item) for item in candidates) if name}
+                if len(names) == 1:
+                    return names.pop()
+        species = context.get("species")
+        if isinstance(species, list):
+            names = {name for name in (_species_name(item) for item in species) if name}
+            if len(names) == 1:
+                return names.pop()
+    return None
+
+
+def read_plugin_summaries(
+    output_dir: Path | str,
+    *,
+    species: str | None = None,
+    species_filter: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     """Summarize the run's plugin artifacts by reusing the results engine.
 
     The beta-4 physics question (``which point maximizes the high-energy
@@ -299,16 +387,31 @@ def read_plugin_summaries(output_dir: Path | str) -> dict[str, dict[str, Any]]:
     name the physics (populated spectrum range, maximum energy, counts) rather
     than duplicating any reader or reduction logic.
 
-    Each reader is attempted independently against the linked ``simOutput``:
-    the first file matching the reader's pattern is read at iteration ``last``,
-    and a reader that is not installed (``reader_unavailable``) or has no
-    matching output (``no_results``) is skipped.  The first error for a reader
-    whose optional dependency is missing is remembered under the reserved
-    ``__unavailable__`` key so the answer can be explicit about *why* there is
-    no physics; a plain absence of artifacts is not an error.
+    The linked output directory is passed to the engine *explicitly* (as
+    ``output_dir``), so the directory need not be named ``simOutput`` and the
+    results engine's ``<run_dir>/simOutput`` convention is not silently relied
+    upon (M1).  When ``species`` is given, every reader is asked for that
+    species; otherwise the engine's own deterministic resolution is used - the
+    first filename matching the reader's pattern in lexical order - so a
+    two-species run must pass ``species`` to avoid summarizing the wrong one.
+
+    Each reader is attempted independently against the linked output: the
+    resolved file is read at iteration ``last``, and a reader that is not
+    installed (``reader_unavailable``) or has no matching output
+    (``no_results``) is skipped.  The first error for a reader whose optional
+    dependency is missing is remembered under the reserved ``__unavailable__``
+    key so the answer can be explicit about *why* there is no physics; a plain
+    absence of artifacts is not an error.
 
     Args:
-        output_dir: The run's linked ``simOutput`` directory.
+        output_dir: The run's linked output directory (normally ``simOutput``).
+        species: Optional species name every reader is asked for.  Required for
+            a run with more than one species' output.
+        species_filter: Optional particle-filter name; ``None``/``all`` means
+            the default PIConGPU filter.
+        metadata: Optional :func:`read_pypicongpu_metadata` section used to
+            resolve each reader's configured species when ``species`` is not
+            given; omit it only when the run has a single species.
 
     Returns:
         ``{reader: summary}`` for every reader that produced a summary, plus an
@@ -327,9 +430,17 @@ def read_plugin_summaries(output_dir: Path | str) -> dict[str, dict[str, Any]]:
     summaries: dict[str, dict[str, Any]] = {}
     unavailable: str | None = None
     for reader in _PLUGIN_SUMMARY_READERS:
+        reader_species = species if species is not None else _configured_species(metadata, reader)
         try:
-            params = ResultParams(sim_id="", op=ResultOp.PLUGIN, reader=reader, iteration="last")
-            payload = results.resolve_result(params, run_dir=root.parent, sim_id="")
+            params = ResultParams(
+                sim_id="",
+                op=ResultOp.PLUGIN,
+                reader=reader,
+                species=reader_species,
+                species_filter=species_filter,
+                iteration="last",
+            )
+            payload = results.resolve_result(params, run_dir=root.parent, sim_id="", output_dir=root)
         except Exception as exc:  # ruff: ignore[blind-except] - a summary read is best-effort
             log.debug("plugin summary %r failed: %s", reader, exc)
             continue
@@ -861,7 +972,7 @@ def analyze(
         openpmd = {}
     if plugins is None:
         try:
-            plugins = read_plugin_summaries(output) if output is not None else {}
+            plugins = read_plugin_summaries(output, metadata=metadata) if output is not None else {}
         except Exception:  # ruff: ignore[blind-except] - analyze must never raise
             plugins = {}
     try:
