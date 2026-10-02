@@ -80,6 +80,16 @@ def test_sweep_parameter_is_recorded_readably() -> None:
     assert leaf["point"] == {"component": 4.4e-5}
 
 
+def test_point_is_recorded_without_a_sweep_parameter() -> None:
+    """An unlabelled leaf still carries its point; the label does not gate it."""
+    group = AgendaGroup(name="g").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"focus": 4.4e-5}}, point={"component": 4.4e-5})
+    )
+    leaf = _by_id(campaign_rocrate(Campaign(name="study", agenda=group)), "#leaf")
+    assert "sweepParameter" not in leaf
+    assert leaf["point"] == {"component": 4.4e-5}
+
+
 def test_analysis_linkage() -> None:
     crate = campaign_rocrate(
         _campaign({"sim": {"replica": 0}}),

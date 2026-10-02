@@ -642,6 +642,45 @@ async def test_create_campaign_derives_a_readable_name_for_a_dict_key(tmp_path) 
     assert campaign.agenda.entries["leaf000"].sweep_parameter == "sim.customuserinput.0"
 
 
+async def test_create_campaign_sanitises_a_derived_name(tmp_path) -> None:
+    """A caller-influenced spec key cannot smuggle a control char into a report."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    base["sim"]["customuserinput"] = {"tags": ["t"], "bad\x00key": 1}
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "c",
+            "base_spec": base,
+            "patch_path": "sim.customuserinput.bad\x00key",
+            "values": [1],
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].sweep_parameter == "sim.customuserinput.bad key"
+
+
+async def test_create_campaign_preserves_a_non_ascii_label(tmp_path) -> None:
+    """The label sanitiser keeps Unicode units instead of mangling them."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "focal",
+            "base_spec": _valid_spec(),
+            "patch_path": "sim.laser.0.focus_pos_si.1.component",
+            "values": [4.4e-5],
+            "parameter": "focus y [μm]",
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].sweep_parameter == "focus y [μm]"
+
+
 async def test_add_agenda_leaf_records_the_parameter_label(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
     result = await _call(

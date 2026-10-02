@@ -70,6 +70,31 @@ def test_format_status_and_leaves() -> None:
     assert "a: done [sim1]" in leaves
 
 
+def test_format_leaves_prefers_the_readable_sweep_parameter() -> None:
+    """A labelled single-key point renders as ``parameter=value``."""
+    status = {
+        "ok": True,
+        "leaves": [
+            {
+                "path": "leaf000",
+                "status": "planned",
+                "sim_id": None,
+                "point": {"component": 4.4e-5},
+                "sweep_parameter": "sim.laser.focus_pos_si.component",
+            }
+        ],
+    }
+    text = format_leaves(status)
+    assert "leaf000: planned [-]" in text
+    assert "sim.laser.focus_pos_si.component=4.4e-05" in text
+
+
+def test_format_leaves_falls_back_to_the_point_key() -> None:
+    """Without a label the old single-key behaviour is unchanged."""
+    status = {"ok": True, "leaves": [{"path": "a", "status": "done", "sim_id": "s", "point": {"i": 1}}]}
+    assert "a: done [s] i=1" in format_leaves(status)
+
+
 def test_format_fleet_with_alerts() -> None:
     fleet = {
         "summary": {"total": 2, "active": 1, "terminal": 1, "by_state": {"running": 1}, "aggregate_percent": 50.0},
