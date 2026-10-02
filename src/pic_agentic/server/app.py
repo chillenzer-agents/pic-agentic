@@ -1178,10 +1178,12 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
             "(redacted) pypicongpu run metadata and an openPMD output summary. "
             "The deterministic natural-language answer is physics-first: a "
             "`query` about the spectrum or energy is answered from the plugin "
-            "summary values, and when the run has no openPMD output or no plugin "
+            "summary values and never from bookkeeping that merely shares a "
+            "word, and when the run has no openPMD output or no plugin "
             "histogram the answer says so explicitly instead of returning "
-            "metadata only. No LLM is called; missing inputs degrade to empty "
-            "sections."
+            "metadata only. For a multi-species run each reader's configured "
+            "species is resolved from the pypicongpu metadata. No LLM is "
+            "called; missing inputs degrade to empty sections."
         ),
         annotations=_READ_ONLY,
     )
