@@ -887,7 +887,9 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "cluster and merged over the last-event projection; otherwise the "
             "signed-room projection is returned. Progress (step, percent, "
             "walltime, avg_per_step, eta_s) is populated from the run's "
-            "step_finished events while it is running, not only after it finishes."
+            "step_finished events while it is running, not only after it finishes. "
+            "For a completed run, `suspect` carries the all-zero health warning "
+            "when its numeric diagnostics are all empty."
         ),
         annotations=_READ_ONLY,
     )
@@ -896,7 +898,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
 
     @server.tool(
         title="List simulations",
-        description="List the simulations the server knows about, optionally only the still-active ones.",
+        description=(
+            "List the simulations the server knows about, optionally only the still-active ones. "
+            "Each row carries `suspect`, the all-zero health warning for a completed empty run."
+        ),
         annotations=_READ_ONLY,
     )
     def list_simulations(*, active_only: bool = False) -> dict[str, Any]:
@@ -906,6 +911,7 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
                 "cmd_id": record.cmd_id,
                 "state": record.state,
                 "job_id": record.job_id,
+                "suspect": record.suspect,
                 "last_event_type": record.last_event_type,
                 "last_event_ts": record.last_event_ts,
                 "active": record.active,
@@ -1663,6 +1669,7 @@ def _status_dict(record: SimRecord) -> dict[str, Any]:
         "percent": record.percent,
         "walltime": record.walltime,
         "eta_s": record.eta_s,
+        "suspect": record.suspect,
         "since_last_event_s": _since_last_event_s(record.last_event_ts),
     }
 
@@ -1688,6 +1695,7 @@ def _merge_status(projection: dict[str, Any], live: dict[str, Any]) -> None:
         "avg_per_step",
         "eta_s",
         "exit_code",
+        "suspect",
     ):
         if live.get(field) is not None:
             projection[field] = live[field]
