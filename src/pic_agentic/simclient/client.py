@@ -195,6 +195,10 @@ class HelloResult(BaseModel):
     job_id: int | None
     cluster_output: str | None
     error: str | None = None
+    #: Stable machine-readable code for a non-``None`` ``error`` (e.g. the
+    #: ``outcome_unknown`` of a pending idempotency record), so a caller does
+    #: not have to match on the human-readable string.
+    error_code: str | None = None
 
 
 class ProcessedCommand(BaseModel):
@@ -230,8 +234,18 @@ class ProcessedCommand(BaseModel):
 
         """
         if self.completed:
-            return HelloResult(job_id=self.job_id, cluster_output=self.cluster_output, error=self.error)
-        return HelloResult(job_id=self.job_id, cluster_output=None, error="already_submitted:outcome_unknown")
+            return HelloResult(
+                job_id=self.job_id,
+                cluster_output=self.cluster_output,
+                error=self.error,
+                error_code=self.error_code,
+            )
+        return HelloResult(
+            job_id=self.job_id,
+            cluster_output=None,
+            error="already_submitted:outcome_unknown",
+            error_code=SimulationErrorCode.OUTCOME_UNKNOWN,
+        )
 
 
 class SimClient:
@@ -755,7 +769,7 @@ class SimClient:
             else:
                 state = SimulationState.FAILED.value
                 error = "already_submitted:outcome_unknown"
-                code = SimulationErrorCode.REJECTED
+                code = SimulationErrorCode.OUTCOME_UNKNOWN
             ack = self._build_submit_ack(
                 message,
                 cmd_id=cmd_id,
@@ -1959,6 +1973,7 @@ class SimClient:
             job_id=result.job_id,
             cluster_output=result.cluster_output,
             error=result.error,
+            error_code=result.error_code,
             capabilities=self.capabilities,
         ).sign(self.secret)
 

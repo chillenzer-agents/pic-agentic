@@ -288,6 +288,8 @@ async def test_crash_before_result_is_not_resubmitted(shared_dir) -> None:
     ack = await second.handle(command)
     assert ack is not None
     assert ack.payload["error"] == "already_submitted:outcome_unknown"
+    # The stable code lets a caller classify this as transient, not a rejection.
+    assert ack.payload["error_code"] == "outcome_unknown"
     assert not list((shared_dir / "out").glob("*.out"))
 
 

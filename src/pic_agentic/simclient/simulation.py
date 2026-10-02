@@ -56,6 +56,13 @@ class SimulationErrorCode(StrEnum):
     VERSION_MISMATCH = "version_mismatch"
     SUBMIT_SYSTEM_MISMATCH = "submit_system_mismatch"
     REJECTED = "rejected_by_policy"
+    #: A submit/hello replay found a *pending* idempotency record: the command
+    #: was received (so a job may already exist or even be running) but this
+    #: process died before recording an outcome.  Distinct from
+    #: :data:`REJECTED` because it is not a policy rejection of the payload: the
+    #: exactly-once ``cmd_id`` makes a retry safe, so a caller must classify it
+    #: as transient (defer and retry) rather than terminal.
+    OUTCOME_UNKNOWN = "outcome_unknown"
     PICONGPU_UNAVAILABLE = "picongpu_unavailable"
     GENERATE_FAILED = "generate_failed"
     RUN_FAILED = "run_failed"
