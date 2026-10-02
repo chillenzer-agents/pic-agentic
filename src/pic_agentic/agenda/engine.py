@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.agenda.budget import Budget, BudgetUsage
-from pic_agentic.agenda.campaign import Callback, Campaign, CampaignState, utc_now_iso
+from pic_agentic.agenda.campaign import Callback, Campaign, TickState, utc_now_iso
 from pic_agentic.agenda.model import AgendaGroup, AgendaSim
 from pic_agentic.agenda.planner import (
     PlanStep,
@@ -222,8 +222,10 @@ class TickResult(BaseModel):
     #: reason), so the common "N leaves failed identically" case reads as a
     #: sentence rather than N repeated payloads.  None when nothing failed.
     failure_summary: str | None = None
-    #: The campaign's lifecycle state after this tick.
-    state: CampaignState = "running"
+    #: The campaign's lifecycle state after this tick, or ``"complete"`` once
+    #: every leaf is terminal (so ``state`` never reads ``"running"`` next to
+    #: ``complete: true``).
+    state: TickState = "running"
     #: Leaves the planner would have submitted but the lifecycle held back.
     held: list[str] = Field(default_factory=list)
 
@@ -321,6 +323,11 @@ class AgendaEngine:
         self.store.save(campaign)
         campaign = await self._run_steps(campaign, steps, result, budget)
         result.complete = _is_complete(campaign.agenda)
+        # A completed campaign reports ``state: "complete"`` rather than the
+        # stored ``"running"`` lifecycle state, so a tick can never contradict
+        # itself with ``state: "running"`` next to ``complete: true``.
+        if result.complete:
+            result.state = "complete"
         result.usage = campaign.usage
         self._record_reuse(campaign, observed, before)
         self.store.save(campaign)

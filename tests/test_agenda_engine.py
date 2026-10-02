@@ -258,6 +258,9 @@ async def test_dependency_ordering_and_completion(tmp_path) -> None:
         state[sim_id] = "results.ready"
     third = await engine.tick()
     assert third.complete is True
+    # A completed tick reports ``complete`` rather than the stored ``running``
+    # lifecycle state, so state and complete never contradict.
+    assert third.state == "complete"
     assert set(third.done) == {"a0", "a1"}
 
 

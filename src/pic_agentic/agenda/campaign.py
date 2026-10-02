@@ -26,6 +26,12 @@ from pic_agentic.agenda.model import AgendaGroup  # ruff: ignore[typing-only-fir
 #: ``stopped`` is the kill-switch terminal state.
 CampaignState = Literal["running", "paused", "stopped"]
 
+#: A tick's reported state.  It mirrors :data:`CampaignState` and additionally
+#: reports ``complete`` once every leaf has reached a terminal status, so a tick
+#: result says the work is finished instead of leaving ``state: "running"``
+#: alongside ``complete: true``.  ``complete`` supersedes the lifecycle state.
+TickState = Literal["running", "paused", "stopped", "complete"]
+
 
 def utc_now_iso() -> str:
     """Return the current UTC time as an ISO-8601 ``Z`` string.
@@ -95,4 +101,4 @@ class Campaign(BaseModel):
         return self.model_copy(update={"created_ts": utc_now_iso()})
 
 
-__all__ = ["Callback", "Campaign", "CampaignState", "utc_now_iso"]
+__all__ = ["Callback", "Campaign", "CampaignState", "TickState", "utc_now_iso"]
