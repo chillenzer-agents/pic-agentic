@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from pic_agentic.config import Config
 from pic_agentic.protocol.simulation import ResultOp, SimulationType, build_result_ack
 from pic_agentic.rcp import new_secret_hex
@@ -28,6 +30,19 @@ _SECTIONS = {
     "metadata": {"runner": {"run_dir": "/x/run"}, "rc_params": {}, "rendering_context": {}},
     "openpmd": {"iterations": [0, 10], "latest_step": 10, "backends": ["openpmd-adios2"]},
     "answer": "Analysis summary: experiment name is Laser sweep.",
+}
+
+_PHYSICS_SECTIONS = {
+    **_SECTIONS,
+    "plugins": {
+        "energy_histogram": {
+            "total": 44.0,
+            "max_energy_kev": 17500.0,
+            "count_in_window": {"min_kev": 100.0, "max_kev": 1000.0, "count": 0.0},
+            "source_path": "e_energyHistogram_all.dat",
+            "iteration": 100,
+        },
+    },
 }
 
 
@@ -110,6 +125,29 @@ async def test_analyze_tool_query_resynthesizes_answer() -> None:
     )
     assert "Matched the query" in payload["answer"]
     assert "openPMD iterations" in payload["answer"]
+
+
+async def test_analyze_tool_physics_query_returns_physics() -> None:
+    """F3 regression: a physics query must be answered from the plugin summary."""
+    payload = await _call_tool(
+        Config(rcp_secret=SECRET),
+        "analyze_output",
+        {"sim_id": SIM_ID, "query": "which point maximizes the high-energy tail?"},
+        sections=_PHYSICS_SECTIONS,
+    )
+    assert payload["plugins"]["energy_histogram"]["max_energy_kev"] == pytest.approx(17500.0)
+    assert "17500" in payload["answer"]
+    assert "e_energyHistogram_all.dat" in payload["answer"]
+
+
+async def test_analyze_tool_no_physics_is_explicit() -> None:
+    payload = await _call_tool(
+        Config(rcp_secret=SECRET),
+        "analyze_output",
+        {"sim_id": SIM_ID, "query": "max energy"},
+        sections={**_SECTIONS, "openpmd": {}, "plugins": {}},
+    )
+    assert "Cannot answer the physics question" in payload["answer"]
 
 
 async def test_analyze_tool_error_is_soft() -> None:
