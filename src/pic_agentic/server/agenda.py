@@ -386,9 +386,11 @@ class AgendaService:
     def suggest_refinement(self, *, rel_tol: float = 0.05) -> dict[str, Any]:
         """Suggest refinement points from the recorded analyses (gap 2).
 
-        Scores each leaf by its recorded analysis's numeric ``score`` (falling
-        back to the sweep point's single numeric value), then applies the
-        deterministic :mod:`pic_agentic.agenda.refine` helpers.
+        Scores each leaf by its recorded analysis's numeric score.  The sweep
+        point is deliberately *never* used as a score: a value that was merely
+        simulated (not analysed) must not be mistaken for an optimum.  When no
+        analysis is recorded the summary reports ``best: null``, ``analysed: 0``
+        and an actionable message instead of inventing a ranking.
 
         Args:
             rel_tol: Relative tolerance for the convergence check.
@@ -403,8 +405,14 @@ class AgendaService:
             campaign = self.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
             return {"ok": False, "error": self.config.redact(str(exc))}
-        points = _analysis_points(campaign)
-        return {"ok": True, **refine_summary(points, rel_tol=rel_tol)}
+        result = refine_summary(_analysed_points(campaign), rel_tol=rel_tol)
+        response: dict[str, Any] = {"ok": True, **result}
+        if result["analysed"] == 0:
+            response["message"] = (
+                "No analyses are recorded yet, so there is no best point to report. "
+                "Record analyses with `record_agenda_analysis` first."
+            )
+        return response
 
     async def _mutate_campaign(self, mutate: Callable[[Campaign], dict[str, Any]]) -> dict[str, Any]:
         """Run a locked load -> mutate -> save, degrading failures to data.
@@ -587,8 +595,8 @@ class AgendaService:
         a deep copy of ``base_spec`` with the dotted Runner-spec path
         ``patch_path`` set to that value.  Each leaf records
         ``point={parameter: value}`` (the last path segment) exactly as
-        :meth:`AgendaSim` and the driver do, so the refinement engine can score
-        the sweep.  The campaign is written through the same
+        :meth:`AgendaSim` and the driver do, preserving the sweep assignment for
+        provenance.  The campaign is written through the same
         :class:`~pic_agentic.agenda.store.AgendaStore` the other agenda tools
         read, so ``advance_agenda`` picks it up on the next tick.
 
@@ -1005,29 +1013,30 @@ def _point_for(parameter: str, value: Any) -> dict[str, float | int | str] | Non
     return {parameter: value}
 
 
-def _analysis_points(campaign: Campaign) -> dict[str, float | None]:
-    """Extract ``leaf path -> score`` from a campaign's recorded analyses.
+def _analysed_points(campaign: Campaign) -> dict[str, float | None]:
+    """Extract ``leaf path -> analysed score`` from a campaign's analyses.
 
-    A leaf's score is the numeric ``score`` field of its recorded analysis, or
-    its sweep point's single numeric value.  A leaf with neither (or with no
-    recorded analysis/point) maps to ``None``, which the refine helpers ignore.
+    A leaf's score is the numeric score field of its *recorded analysis* only.
+    The sweep ``point`` is deliberately not consulted: it is an input, not a
+    measured outcome, and ranking on it points users at a wrong optimum.  A
+    leaf with no recorded analysis (or one without a usable score) maps to
+    ``None``, which the refine helpers ignore and do not count.
 
     Returns:
-        The ``path -> value`` sample map.
+        The ``path -> score`` sample map (``None`` for unanalysed leaves).
 
     """
     points: dict[str, float | None] = {}
-    for path, sim in campaign.agenda.simulations():
-        points[path] = _leaf_score(campaign.analyses.get(path), sim)
+    for path, _sim in campaign.agenda.simulations():
+        points[path] = _leaf_score(campaign.analyses.get(path))
     return points
 
 
-def _leaf_score(analysis: dict[str, Any] | None, sim: AgendaSim) -> float | None:
-    """Return a single numeric score for one leaf, or None.
+def _leaf_score(analysis: dict[str, Any] | None) -> float | None:
+    """Return a single numeric score for one recorded analysis, or None.
 
     Returns:
-        The analysis ``score`` (or ``value``/``peak``), else the sweep point's
-        single numeric value, else None.
+        The analysis ``score`` (or ``value``/``peak``), else None.
 
     """
     for key in ("score", "value", "peak"):
@@ -1035,10 +1044,6 @@ def _leaf_score(analysis: dict[str, Any] | None, sim: AgendaSim) -> float | None
             candidate = analysis.get(key)
             if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
                 return float(candidate)
-    if isinstance(sim.point, dict) and len(sim.point) == 1:
-        value = next(iter(sim.point.values()))
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return float(value)
     return None
 
 
