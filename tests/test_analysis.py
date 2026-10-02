@@ -155,6 +155,34 @@ def test_no_physics_is_stated_explicitly() -> None:
     assert "Laser sweep" in answer
 
 
+@pytest.mark.parametrize(
+    ("query", "name"),
+    [
+        ("what is the maximum energy?", "energy scan"),
+        ("which point maximizes the high-energy tail?", "High-energy tail optimisation"),
+    ],
+)
+def test_physics_query_is_not_answered_by_overlapping_metadata(query: str, name: str) -> None:
+    """The beta-4 defect (B1): a name that shares a word must not win.
+
+    A run named ``energy scan`` used to answer "what is the maximum energy?"
+    with ``Matched ...: experiment name is energy scan.``, bypassing the
+    no-physics path.  A physics question may only be satisfied by physics.
+    """
+    answer = analysis.synthesize_answer(query, {"name": name}, {}, {}, {})
+    assert "Cannot answer the physics question" in answer
+    assert "Matched the query" not in answer
+    assert f"experiment name is {name}" in answer
+
+
+def test_bookkeeping_query_still_matches_bookkeeping() -> None:
+    """A non-physics question is still answered from the metadata."""
+    rocrate = {"name": "Laser sweep", "software": {"name": "PIConGPU", "id": "#p"}}
+    answer = analysis.synthesize_answer("what is the experiment name?", rocrate, {}, {})
+    assert "Matched the query" in answer
+    assert "experiment name is Laser sweep" in answer
+
+
 def test_openpmd_without_plugin_is_stated_explicitly() -> None:
     answer = analysis.synthesize_answer("max energy", {}, {}, {"latest_step": 10}, {})
     assert "no plugin histogram" in answer

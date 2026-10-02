@@ -616,6 +616,89 @@ _PLUGIN_FACT_BUILDERS: dict[str, Callable[[dict[str, Any], str, str], list[str]]
     "calorimeter": _calorimeter_physics,
 }
 
+#: Query words that mark a *physics* question, i.e. one the plugin summaries are
+#: meant to answer.  The beta-4 defect (B1) was that a run named e.g. ``energy
+#: scan`` answered "what is the maximum energy?" with its own RO-Crate name, so a
+#: physics question must never be satisfied by a bookkeeping-only match.  The
+#: words mirror the reader registry's vocabulary (energy, spectrum, phase space,
+#: emittance, radiation, calorimeter, ...) plus the LWFA terms a beta scientist
+#: uses; token membership (not substring) keeps a stray ``max`` in "maximum
+#: iterations" from being read as a physics word on its own.
+_PHYSICS_QUERY_TERMS = frozenset(
+    {
+        "absorption",
+        "acceleration",
+        "accelerated",
+        "beam",
+        "calorimeter",
+        "charge",
+        "current",
+        "density",
+        "dispersion",
+        "distribution",
+        "electron",
+        "electrons",
+        "emittance",
+        "energy",
+        "ev",
+        "field",
+        "frequency",
+        "gev",
+        "histogram",
+        "hydrogen",
+        "intensity",
+        "ion",
+        "ionization",
+        "ions",
+        "kev",
+        "mev",
+        "momentum",
+        "omega",
+        "particle",
+        "particles",
+        "phase",
+        "plasma",
+        "positron",
+        "proton",
+        "radiation",
+        "spectra",
+        "spectrum",
+        "synchrotron",
+        "tail",
+        "temperature",
+    },
+)
+
+
+def _query_tokens(query: str) -> list[str]:
+    """Split a free-text query into lowercased word tokens.
+
+    Returns:
+        The non-empty tokens of ``query``.
+
+    """
+    return [token.lower() for token in re.split(r"\W+", query) if token]
+
+
+def _is_physics_question(tokens: list[str]) -> bool:
+    """Whether a query asks about physics (as opposed to bookkeeping).
+
+    Returns:
+        True when any token names a physics quantity.
+
+    """
+    return any(token in _PHYSICS_QUERY_TERMS for token in tokens)
+
+
+def _matched_facts(facts: list[str], tokens: list[str]) -> list[str]:
+    """Return the facts a query's tokens match.
+
+    Returns:
+        The matching facts, in their original order.
+
+    """
+    return [fact for fact in facts if any(token in fact.lower() for token in tokens)]
+
 
 def synthesize_answer(
     query: str | None,
@@ -628,11 +711,13 @@ def synthesize_answer(
 
     No LLM is called.  Without a ``query`` the answer lists the physics facts
     (from the plugin summaries, when present) before the bookkeeping metadata.
-    With a ``query``, facts are filtered by case-insensitive keyword match; when
-    nothing matches literally but physics facts exist, those physics facts are
-    reported anyway, so a physics question is answered with physics rather than
-    with RO-Crate metadata.  When no physics could be read at all, the answer
-    says so explicitly instead of returning metadata only.
+    With a ``query``, facts are filtered by case-insensitive keyword match.  A
+    *physics* question (see :data:`_PHYSICS_QUERY_TERMS`) is satisfied only by
+    physics facts: an RO-Crate/metadata fact that happens to share a word with
+    the question must never be presented as the answer - that was the beta-4
+    defect (a run named ``energy scan`` answering "what is the maximum energy?"
+    with its own name).  When no physics could be read at all, the answer says
+    so explicitly instead of returning metadata only.
 
     Args:
         query: Optional free-text question used to select relevant facts.
@@ -647,20 +732,24 @@ def synthesize_answer(
     """
     physics = _plugin_physics_facts(plugins)
     unavailable = _plugin_unavailable_reason(plugins)
-    notes = [f"no plugin reader could summarize the output: {unavailable}"] if unavailable else []
     bookkeeping = _facts(rocrate, metadata, openpmd)
-    facts = physics + notes + bookkeeping
     if query:
-        tokens = [token.lower() for token in re.split(r"\W+", query) if token]
-        matched = [fact for fact in facts if any(token in fact.lower() for token in tokens)]
-        if matched:
-            return f"Matched the query {query!r}: " + "; ".join(matched) + "."
+        tokens = _query_tokens(query)
+        physics_question = _is_physics_question(tokens)
+        matched_physics = _matched_facts(physics, tokens)
+        if matched_physics:
+            return f"Matched the query {query!r}: " + "; ".join(matched_physics) + "."
+        if not physics_question:
+            matched_bookkeeping = _matched_facts(bookkeeping, tokens)
+            if matched_bookkeeping:
+                return f"Matched the query {query!r}: " + "; ".join(matched_bookkeeping) + "."
         if physics:
             return (
                 f"No fact matched the query {query!r} literally; the available physics is: " + "; ".join(physics) + "."
             )
         return _no_physics_answer(query, openpmd, unavailable, bookkeeping)
-    return _default_answer(facts)
+    notes = [f"no plugin reader could summarize the output: {unavailable}"] if unavailable else []
+    return _default_answer([*physics, *notes, *bookkeeping])
 
 
 def _no_physics_answer(
