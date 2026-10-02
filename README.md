@@ -377,14 +377,16 @@ the same 48 KiB wire budget as the other results) and returns a bounded summary:
 | `png` | `*_png_<axis>_<slice>_<iter>.png` | metadata only (dimensions, path); image via `export` |
 
 The `energy_histogram` reader reports `count_in_window` for a [keV] window that
-is **requestable** with `min_kev`/`max_kev` (both or neither). When they are
-omitted the window is derived from the populated bins: the common 100--1000 keV
-window is kept whenever it contains particles, and otherwise it widens to the
-populated range so the default is never structurally empty for a spectrum that
-starts above it (e.g. an LWFA spectrum beginning at a few MeV). The summary
-always carries `n_nonzero_bins` plus the populated `min_energy_kev`/
-`max_energy_kev`, and warns when a zero `count_in_window` contradicts the
-populated bins, so a mis-window is obvious rather than a silent `0`.
+is **requestable** with `min_kev`/`max_kev` (both or neither, non-negative,
+`max_kev > min_kev`). When they are omitted the window is derived from the
+populated bins: the common 100--1000 keV window is kept only when the whole
+populated range lies inside it, and otherwise it is widened to exactly the
+populated range, so the default always captures the whole population instead of
+clipping a spectrum that starts above or spans past 1000 keV (e.g. an LWFA
+spectrum beginning at a few MeV). The summary always carries `n_nonzero_bins`
+plus the populated `min_energy_kev`/`max_energy_kev`, and warns whenever
+`count_in_window` captures less than 90% of the total (including `0`), so a
+partial or mis-window is obvious rather than a silent undercount.
 
 All openPMD readers accept the `h5` and `bp`/`bp5` suffixes. `species_filter`
 is honoured where the reader's filename carries a filter component; the
