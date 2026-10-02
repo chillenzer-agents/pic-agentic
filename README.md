@@ -319,6 +319,16 @@ catch decision points you might otherwise miss. `advance_agenda` also reports
 `state: "complete"` (rather than the stored `running` lifecycle state) once
 every leaf is terminal.
 
+### Deleting a campaign does not forget its simulations
+
+`delete_campaign` removes only the persisted campaign (and its reuse registry),
+so a fresh campaign can be created. The **fleet registry** is a replay of the
+signed room, not the campaign file, so the simulations the deleted campaign
+already ran remain visible in `list_simulations` and `get_status` (and their
+results stay reachable). Treat those entries as the recorded history of runs
+that actually happened; use `list_simulations(active_only=true)` to hide
+terminal history when you only care about live work.
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path

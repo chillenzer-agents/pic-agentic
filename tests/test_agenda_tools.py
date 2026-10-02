@@ -492,6 +492,16 @@ async def test_callback_tool_descriptions_explain_the_double_exposure() -> None:
     assert "empty list" in drain
 
 
+async def test_delete_campaign_description_notes_the_registry_survives() -> None:
+    """Deleting a campaign must not be read as forgetting its simulations."""
+    server, _runtime = build_server(Config(rcp_secret=SECRET), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    description = tools["delete_campaign"].description
+    assert "fleet registry" in description
+    assert "list_simulations" in description
+    assert "registry" in tools["list_simulations"].description
+
+
 async def test_add_leaf_is_submitted_by_the_next_tick(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
     added = await _call(config, "add_agenda_leaf", {"name": "refined", "spec": {"sim": {"replica": 9}}})

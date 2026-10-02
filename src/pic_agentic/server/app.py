@@ -902,7 +902,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "cluster and merged over the last-event projection; otherwise the "
             "signed-room projection is returned. Progress (step, percent, "
             "walltime, avg_per_step, eta_s) is populated from the run's "
-            "step_finished events while it is running, not only after it finishes."
+            "step_finished events while it is running, not only after it finishes. "
+            "A status is available for any simulation the signed room records, "
+            "including runs whose campaign was since deleted with "
+            "delete_campaign; such a run is history, not live campaign state."
         ),
         annotations=_READ_ONLY,
     )
@@ -911,7 +914,14 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
 
     @server.tool(
         title="List simulations",
-        description="List the simulations the server knows about, optionally only the still-active ones.",
+        description=(
+            "List the simulations the server knows about, optionally only the "
+            "still-active ones. This is the fleet registry (a replay of the "
+            "signed room), so it is independent of the campaign file: deleting "
+            "a campaign with delete_campaign does not remove its already-run "
+            "simulations from this list, and their results stay reachable. Use "
+            "active_only=true to hide terminal history."
+        ),
         annotations=_READ_ONLY,
     )
     def list_simulations(*, active_only: bool = False) -> dict[str, Any]:
@@ -1340,7 +1350,13 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "running, or a non-terminal leaf carrying a sim_id such as a lost-ack "
             "submission), since deleting then would orphan the jobs; pass "
             "force=true to delete anyway, or stop_agenda first to cancel them. A "
-            "corrupt campaign file is removed without the guard."
+            "corrupt campaign file is removed without the guard. This only "
+            "clears the campaign: the simulations that already ran stay in the "
+            "fleet registry (list_simulations/get_status/fleet_status), because "
+            "the registry is a replay of the signed room, not the campaign file, "
+            "and their results remain reachable. Treat those entries as the "
+            "history of runs that actually happened, not as live campaign "
+            "state."
         ),
         # destructive: it irreversibly removes the persisted campaign state.
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
