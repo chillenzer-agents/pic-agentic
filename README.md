@@ -349,6 +349,7 @@ The MCP server exposes a read-only results surface over a run's linked
 | `get_result_image` | bounded base64 PNG thumbnail of one openPMD record |
 | `read_result` | a small text tail (file, or captured stdout/stderr) |
 | `read_plugin_result` | a bounded summary from a shipped PIConGPU plugin reader |
+| `analyze_output` | physics-first answer + RO-Crate/metadata/openPMD/plugin sections |
 | `export_results` | a transfer ticket (the bulk data never moves itself) |
 
 `describe_results` labels each file with a `format`: `openpmd-adios2` /
@@ -384,6 +385,14 @@ is honoured where the reader's filename carries a filter component; the
 `iteration` defaults to `last`. A missing PIConGPU (or, for the openPMD/image
 readers, `openpmd_api`/`imageio`) degrades that reader to `reader_unavailable`;
 readers degrade independently, so `png` still works without `openpmd_api`.
+
+`analyze_output` answers physics questions deterministically (no LLM). It reuses
+the same bounded plugin summaries as `read_plugin_result` — so a run whose only
+artifact is a text plugin histogram still reports the populated energy range,
+the maximum energy and the counts — and only then adds the RO-Crate, run-metadata
+and openPMD bookkeeping. When no openPMD output **and** no plugin histogram exist
+(or the optional readers are not installed), the answer says so explicitly
+instead of falling back to metadata alone.
 
 ## Tests and tooling
 
