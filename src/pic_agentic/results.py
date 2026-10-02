@@ -2265,6 +2265,7 @@ def resolve_result(  # ruff: ignore[too-many-return-statements] - one dispatch p
     run_dir: Path | str,
     sim_id: str,
     local_root: str = "",
+    output_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Return the ack payload fields for one result request.
 
@@ -2280,13 +2281,17 @@ def resolve_result(  # ruff: ignore[too-many-return-statements] - one dispatch p
         run_dir: The run directory (``simOutput`` lives under it).
         sim_id: The simulation id.
         local_root: Optional server-side results mirror root.
+        output_dir: Optional explicit output directory, bypassing the
+            ``run_dir/simOutput`` convention.  A caller holding the linked
+            output directory directly (rather than a run that names it
+            ``simOutput``) passes it here.
 
     Returns:
         The ack fields for this request.
 
     """
     run = Path(run_dir)
-    output = run / _SIM_OUTPUT
+    output = Path(output_dir) if output_dir is not None else run / _SIM_OUTPUT
     if params.op is ResultOp.DESCRIBE:
         return _describe(output, sim_id=sim_id, run_dir=run, local_root=local_root)
     if params.op is ResultOp.READ:
