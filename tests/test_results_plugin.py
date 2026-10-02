@@ -245,6 +245,54 @@ def test_probe_vacuity_without_a_numeric_artifact_is_not_suspect(tmp_path: Path)
     assert results.probe_vacuity(SIM_ID, run_dir=run) is None
 
 
+def test_probe_vacuity_examines_every_matching_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every species' artifact participates in the verdict, not just the first.
+
+    This is the B1 regression from the R10 review: with two species the probe
+    read only ``a_energyHistogram_all.dat`` (alphabetically first), so a
+    populated ``b`` was a false positive and a populated ``a`` with an empty
+    ``b`` was a false negative.  The stub is species-aware so the test pins the
+    aggregation without needing PIConGPU; the real readers are exercised by the
+    plugin tests below when PIConGPU is importable.
+    """
+
+    class _SpeciesReader:
+        def __init__(self, run_directory: str) -> None:
+            self.run_directory = Path(run_directory)
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        def get(self, iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = kwargs
+            path = self.run_directory / "simOutput" / f"{species}_energyHistogram_{species_filter}.dat"
+            populated = "42" in path.read_text(encoding="utf-8")
+            counts = [0.0] * 10
+            if populated:
+                counts[4] = 42.0
+            return counts, [1000.0 * (i + 1) / 10 for i in range(10)], [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _SpeciesReader)
+    run = tmp_path / "run"
+    write_output_unit(run)
+
+    energy_histogram_dat(run, species="a", zero=True)
+    energy_histogram_dat(run, species="b")
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None, "populated b must clear the run"
+
+    # Both species empty: the run is now suspect.
+    energy_histogram_dat(run, species="a", zero=True)
+    energy_histogram_dat(run, species="b", zero=True)
+    warning = results.probe_vacuity(SIM_ID, run_dir=run)
+    assert warning is not None
+    assert "all zeros" in warning
+
+
 def test_annotate_vacuous_covers_the_numeric_readers() -> None:
     """Each numeric text reader's value array drives the warning independently."""
     cases = {
@@ -480,6 +528,29 @@ def test_real_nonzero_histogram_survives_the_real_reader(tmp_path: Path) -> None
     assert summary["total"] == pytest.approx(44.0)
     assert summary["count_in_window"]["count"] == pytest.approx(44.0)
     assert "warning" not in summary
+
+
+def test_real_probe_vacuity_aggregates_every_species(tmp_path: Path) -> None:
+    """The real reader path probes *all* species, not the first (B1).
+
+    The R10 review reproduced a false positive and a false negative on the real
+    pin: with ``a_energyHistogram_all.dat`` empty and ``b_...`` populated the
+    probe read only ``a`` and flagged the run; the reverse order reported it
+    clean.  Every matching artifact must participate.
+    """
+    pytest.importorskip("picongpu")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run, species="a", zero=True)
+    energy_histogram_dat(run, species="b", zero=False)
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None
+
+    energy_histogram_dat(run, species="a", zero=True)
+    energy_histogram_dat(run, species="b", zero=True)
+    warning = results.probe_vacuity(SIM_ID, run_dir=run)
+    assert warning is not None
+    assert "all zeros" in warning
 
 
 def test_max_energy_is_the_highest_populated_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
