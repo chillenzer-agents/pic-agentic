@@ -447,6 +447,159 @@ def test_max_energy_is_the_highest_populated_bin(tmp_path: Path, monkeypatch: py
     assert payload["result"]["max_energy_kev"] == pytest.approx(1000.0)
 
 
+class _HighEnergyHistogram:
+    """An LWFA-like spectrum whose populated bins start above 1000 keV.
+
+    The beta-4 shape: the fixed 100--1000 keV default window held no particles
+    at all while the spectrum is populated in the few-MeV range.
+    """
+
+    #: Upper edges [keV] of the four bins; only the last three hold particles.
+    _EDGES: ClassVar[list[float]] = [2500.0, 5000.0, 10000.0, 20000.0]
+    _COUNTS: ClassVar[list[float]] = [0.0, 1.0e8, 9.0e7, 1.0e7]
+
+    def __init__(self, run_directory: str) -> None:
+        _ = run_directory
+
+    @staticmethod
+    def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+        _ = (species, species_filter)
+        return [100]
+
+    @staticmethod
+    def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+        _ = (species, species_filter, kwargs)
+        return list(_HighEnergyHistogram._COUNTS), list(_HighEnergyHistogram._EDGES), [iteration], 1e-16
+
+
+def _high_energy_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _HighEnergyHistogram)
+    return _high_energy_tree(tmp_path)
+
+
+def _high_energy_tree(tmp_path: Path) -> Path:
+    run = tmp_path / "run"
+    write_output_unit(run)
+    (run / "simOutput" / "e_energyHistogram_all.dat").write_text("x\n", encoding="utf-8")
+    return run
+
+
+def test_energy_histogram_default_window_tracks_a_high_energy_spectrum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default window must never be structurally empty (F2).
+
+    The preferred 100--1000 keV window has no populated bin here, so the default
+    must widen to the populated range and report the real ~2e8 count instead of
+    the misleading ``count: 0`` beta-4 produced.
+    """
+    run = _high_energy_run(tmp_path, monkeypatch)
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    summary = payload["result"]
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(5000.0)
+    assert summary["count_in_window"]["max_kev"] == pytest.approx(20000.0)
+    assert summary["count_in_window"]["count"] == pytest.approx(2.0e8)
+    assert summary["n_nonzero_bins"] == 3
+    assert summary["min_energy_kev"] == pytest.approx(5000.0)
+    assert summary["max_energy_kev"] == pytest.approx(20000.0)
+    # A populated spectrum with a matching default is not a mis-window.
+    assert "warning" not in summary
+
+
+def test_energy_histogram_prefers_the_standard_window_when_populated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preferred window is kept when it contains particles (F2 no-regression)."""
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubReader)
+    run = _tree(tmp_path)
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    summary = payload["result"]
+    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(44.0)}
+    assert summary["n_nonzero_bins"] == 3
+
+
+def test_energy_histogram_requestable_window_below_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit window below the data yields 0 but flags it as a mis-window (F2).
+
+    A requested window is honoured literally, so a caller can ask for any band;
+    the ``n_nonzero_bins``/populated-range fields and the warning make the empty
+    count self-explanatory rather than a silent contradiction.
+    """
+    run = _high_energy_run(tmp_path, monkeypatch)
+    payload = results.resolve_result(
+        _params(species="e", min_kev=100.0, max_kev=1000.0),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    summary = payload["result"]
+    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(0.0)}
+    assert summary["n_nonzero_bins"] == 3
+    assert summary["min_energy_kev"] == pytest.approx(5000.0)
+    assert "warning" in summary
+    assert "count_in_window is 0" in summary["warning"]
+
+
+def test_energy_histogram_requestable_window_above_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit window above the data is an empty (but transparent) count (F2)."""
+    run = _high_energy_run(tmp_path, monkeypatch)
+    payload = results.resolve_result(
+        _params(species="e", min_kev=50000.0, max_kev=100000.0),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    summary = payload["result"]
+    assert summary["count_in_window"]["count"] == pytest.approx(0.0)
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(50000.0)
+    assert summary["n_nonzero_bins"] == 3
+    assert "warning" in summary
+
+
+def test_energy_histogram_requestable_window_selects_a_subrange(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requested window that covers part of the range counts only that part (F2)."""
+    run = _high_energy_run(tmp_path, monkeypatch)
+    payload = results.resolve_result(
+        _params(species="e", min_kev=4000.0, max_kev=15000.0),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    summary = payload["result"]
+    # 5000 and 10000 keV edges are inside; the 20000 keV edge is outside.
+    assert summary["count_in_window"]["count"] == pytest.approx(1.9e8)
+    assert "warning" not in summary
+
+
+def test_energy_histogram_all_zero_still_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuinely all-zero histogram keeps the existing vacuous warning (F2)."""
+
+    class _ZeroHistogram:
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            return [0.0] * 4, [2500.0, 5000.0, 10000.0, 20000.0], [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _ZeroHistogram)
+    run = _high_energy_tree(tmp_path)
+    payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
+    summary = payload["result"]
+    assert summary["total"] == pytest.approx(0.0)
+    assert summary["n_nonzero_bins"] == 0
+    assert summary["min_energy_kev"] is None
+    # With no populated bins the default window stays the standard range.
+    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(0.0)}
+    assert "warning" in summary
+    assert "all zeros" in summary["warning"]
+
+
 def test_real_emittance_reader_end_to_end(tmp_path: Path) -> None:
     """The real ``EmittanceData`` returns total and slices aligned (B1).
 
