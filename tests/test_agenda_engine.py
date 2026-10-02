@@ -10,7 +10,13 @@ import pytest
 
 from pic_agentic.agenda.budget import Budget
 from pic_agentic.agenda.campaign import Campaign
-from pic_agentic.agenda.engine import AgendaEngine, DuplicateSpecError, EnginePolicy, TransientSubmitError
+from pic_agentic.agenda.engine import (
+    MAX_DEFERRED_SUBMIT_ATTEMPTS,
+    AgendaEngine,
+    DuplicateSpecError,
+    EnginePolicy,
+    TransientSubmitError,
+)
 from pic_agentic.agenda.model import AgendaGroup
 from pic_agentic.agenda.store import DEFAULT_CAMPAIGN_FILE, AgendaStore
 
@@ -135,6 +141,85 @@ async def test_lost_ack_does_not_duplicate_after_incremental_save(tmp_path) -> N
     assert len(resumed_calls) == 1
     # The retry reuses the same idempotency key, so the cluster replays.
     assert resumed_calls[0] == deferred_key
+
+
+async def test_lost_ack_is_deferred_not_failed_and_reconciles(tmp_path) -> None:
+    """A lost ack stays planned and is retried, never presented as a failure.
+
+    This is the C2 regression: the server's ``submit`` callable raises
+    ``TransientSubmitError`` for an outcome-unknown ack (a pending idempotency
+    record), and the engine must (a) surface the leaf under ``deferred`` rather
+    than ``failed``, (b) keep it ``planned``, and (c) retry it under the same
+    exactly-once key until the record completes.
+    """
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+
+    keys: list[str] = []
+
+    async def submit_lost(spec: dict, key: str) -> str:
+        keys.append(key)
+        msg = "already_submitted:outcome_unknown"
+        raise TransientSubmitError(msg, error_code="outcome_unknown", sim_id="sim-str")
+
+    engine = AgendaEngine(store=store, submit=submit_lost, observe=dict)
+    result = await engine.tick()
+    assert result.submitted == []
+    assert result.failed == []
+    assert result.deferred == ["a0"]
+    leaf = store.load(Campaign).agenda.entries["a0"]
+    assert leaf.status == "planned"
+    assert leaf.deferred_attempts == 1
+    # The pending record names the job, so cleanup can still reach it.
+    assert leaf.sim_id == "sim-str"
+
+    # The retry (same key) now re-acks the run: the leaf links and the deferral
+    # counter resets.
+    async def submit_ok(spec: dict, key: str) -> str:
+        keys.append(key)
+        return "sim-str"
+
+    engine2 = AgendaEngine(store=store, submit=submit_ok, observe=dict)
+    result2 = await engine2.tick()
+    assert result2.submitted == ["a0"]
+    assert result2.deferred == []
+    reloaded = store.load(Campaign)
+    assert reloaded.agenda.entries["a0"].status == "submitted"
+    assert reloaded.agenda.entries["a0"].deferred_attempts == 0
+    # Both ticks used the same idempotency key (exactly-once retry).
+    assert keys[0] == keys[1]
+
+
+async def test_deferred_submission_gives_up_after_bounded_attempts(tmp_path) -> None:
+    """A never-resolving pending record must not defer forever.
+
+    After ``MAX_DEFERRED_SUBMIT_ATTEMPTS`` consecutive deferrals the leaf is
+    failed with an actionable ``outcome_unknown`` code (not a policy rejection),
+    so the campaign can complete and the agent can clean up the maybe-job.
+    """
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+
+    async def submit(spec: dict, key: str) -> str:
+        msg = "already_submitted:outcome_unknown"
+        raise TransientSubmitError(msg, error_code="outcome_unknown", sim_id="sim-str")
+
+    engine = AgendaEngine(store=store, submit=submit, observe=dict)
+    for attempt in range(1, MAX_DEFERRED_SUBMIT_ATTEMPTS + 1):
+        result = await engine.tick()
+        if attempt < MAX_DEFERRED_SUBMIT_ATTEMPTS:
+            assert result.deferred == ["a0"]
+            assert result.failed == []
+            assert store.load(Campaign).agenda.entries["a0"].status == "planned"
+        else:
+            # The final attempt exhausts the budget: now (and only now) terminal.
+            assert result.deferred == ["a0"]
+            assert result.failed == ["a0"]
+            assert [c.error_code for c in result.callbacks] == ["outcome_unknown"]
+    leaf = store.load(Campaign).agenda.entries["a0"]
+    assert leaf.status == "failed"
+    assert leaf.error_code == "outcome_unknown"
+    assert "cancel_simulation" in (leaf.error or "")
 
 
 async def test_permanent_submit_failure_marks_leaf_failed(tmp_path) -> None:

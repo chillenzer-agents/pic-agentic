@@ -226,6 +226,13 @@ class AgendaSim(BaseModel):
     #: The RCP simulation id once this leaf has been submitted (the engine's
     #: idempotency key: a leaf with a sim_id is never submitted twice).
     sim_id: str | None = None
+    #: Consecutive deferred submissions for this leaf: ticks on which the
+    #: simclient reported the outcome as unknown (a lost ack or a pending
+    #: idempotency record), so the leaf stayed ``planned`` to retry under the
+    #: same exactly-once ``cmd_id``.  Reset to 0 on the first successful ack.
+    #: Bounded by the engine (``MAX_DEFERRED_SUBMIT_ATTEMPTS``) so a pending
+    #: record that never resolves cannot defer forever.
+    deferred_attempts: int = 0
     #: Whether this leaf must be approved before the engine submits it.
     requires_approval: bool = False
     #: Whether a human has pre-approved this leaf (set by the approval tool).

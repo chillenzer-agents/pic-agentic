@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
 from pic_agentic.agenda.engine import (
+    OUTCOME_UNKNOWN_ERROR_CODE,
     ActualUsage,
     AgendaEngine,
     EnginePolicy,
@@ -241,11 +242,8 @@ class AgendaService:
                 # The ack was lost: the job may well be running.  Defer to the
                 # next tick (the stable cmd_id makes the retry exactly-once).
                 msg = f"lost ack: {exc}"
-                raise TransientSubmitError(msg) from exc
-            if not outcome.ok or not outcome.sim_id:
-                msg = outcome.error or "submit failed"
-                raise SubmitFailureError(msg, error_code=outcome.error_code, stage=outcome.stage)
-            return outcome.sim_id
+                raise TransientSubmitError(msg, error_code=OUTCOME_UNKNOWN_ERROR_CODE) from exc
+            return _classify_submit(outcome)
 
         def reuse_key(spec: dict[str, Any]) -> str:
             # Fold the provenance tuple into the reuse key, so identical physics
@@ -1179,6 +1177,44 @@ def _policy_from_config(config: Config) -> EnginePolicy:
         require_approval=config.agenda_require_approval,
         approve_over_est_core_hours=config.agenda_approve_over_est_core_hours,
     )
+
+
+def _classify_submit(outcome: Any) -> str:
+    """Turn one submit ack into a sim_id, a deferral, or a terminal failure.
+
+    Kept out of the ``submit`` closure so the outcome classification reads in
+    one place and the closure stays branch-light.
+
+    Returns:
+        The accepted ``sim_id``.
+
+    Raises:
+        TransientSubmitError: When the outcome is unknown (a lost ack or a
+            pending idempotency record): the job may exist, so the retry under
+            the same ``cmd_id`` is safe and the leaf must stay planned.
+        SubmitFailureError: When the simclient genuinely rejected the spec (a
+            retry would only repeat the rejection).
+
+    """
+    if outcome.outcome_unknown:
+        # The simclient found a pending idempotency record for this exactly-once
+        # cmd_id: it accepted the command but died before recording an outcome,
+        # so the job may exist or be running.  A *terminal* failure here would
+        # strand real work and present a lost ack as a physics failure; defer
+        # and retry instead, under the same cmd_id, so the record's eventual
+        # completion re-acks.
+        msg = outcome.error or "submission outcome unknown"
+        raise TransientSubmitError(
+            msg,
+            error_code=outcome.error_code or OUTCOME_UNKNOWN_ERROR_CODE,
+            sim_id=outcome.sim_id or None,
+        )
+    if not outcome.ok or not outcome.sim_id:
+        # A genuine rejection (bad payload, policy, version drift): a retry
+        # would only repeat it, so this stays terminal.
+        msg = outcome.error or "submit failed"
+        raise SubmitFailureError(msg, error_code=outcome.error_code, stage=outcome.stage)
+    return outcome.sim_id
 
 
 async def _never_submit(_spec: dict[str, Any], _key: str) -> str:  # ruff: ignore[unused-async] - matches SubmitFn
