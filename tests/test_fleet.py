@@ -103,6 +103,35 @@ def test_failure_precedes_stalled() -> None:
     assert [a.kind for a in alerts] == ["failed"]
 
 
+def test_done_empty_run_is_suspect_and_alerted() -> None:
+    records = [_record("a", "results.ready", active=False, suspect="energy_histogram is all zeros")]
+    summary = fleet_summary(records)
+    assert summary.done == 1
+    assert summary.suspect == 1
+    alerts = detect_alerts(records, now=NOW, stall_after_s=60)
+    assert [a.kind for a in alerts] == ["suspect"]
+    assert "all zeros" in alerts[0].detail
+
+
+def test_done_populated_run_is_not_suspect() -> None:
+    records = [_record("a", "results.ready", active=False)]
+    assert fleet_summary(records).suspect == 0
+    assert detect_alerts(records, now=NOW, stall_after_s=60) == []
+
+
+def test_suspect_only_counts_done_runs() -> None:
+    """A running record carrying a stale suspect flag must not be counted."""
+    records = [_record("a", "simulation.job_running", active=True, suspect="stale")]
+    assert fleet_summary(records).suspect == 0
+    assert detect_alerts(records, now=NOW, stall_after_s=60) == []
+
+
+def test_failure_takes_precedence_over_suspect() -> None:
+    records = [_record("a", "simulation.job_failed", active=False, suspect="stale")]
+    alerts = detect_alerts(records, now=NOW, stall_after_s=60)
+    assert [a.kind for a in alerts] == ["failed"]
+
+
 def test_fleet_view_shape() -> None:
     records = [_record("a", "simulation.job_running", active=True, percent=50)]
     view = fleet_view(records, now=NOW, stall_after_s=60)

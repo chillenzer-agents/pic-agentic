@@ -126,6 +126,91 @@ async def test_failed_leaf_callback_carries_the_observed_reason(tmp_path) -> Non
     assert status_leaf["error_code"] == "unsupported"
 
 
+async def test_done_empty_leaf_carries_a_suspect_flag(tmp_path) -> None:
+    """A done leaf whose run is all-zero is flagged, not silently successful (F4)."""
+    from pic_agentic.agenda.engine import SuspectInfo
+
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+    state: dict[str, str] = {}
+    engine = AgendaEngine(store=store, submit=_Runner(state), observe=lambda: dict(state))
+    await engine.tick()
+    sim_id = next(iter(state))
+    state[sim_id] = "results.ready"
+    warning = "energy_histogram is all zeros; the run may have no particles in range"
+    engine = AgendaEngine(
+        store=store,
+        submit=_Runner(state),
+        observe=lambda: dict(state),
+        suspects=lambda: {sim_id: SuspectInfo(warning=warning)},
+    )
+    result = await engine.tick()
+    (callback,) = result.callbacks
+    assert (callback.path, callback.kind) == ("a0", "done")
+    assert callback.error is None
+    assert callback.suspect == warning
+    assert result.suspects == {"a0": warning}
+    # Persisted on the leaf and surfaced by status.
+    leaf = store.load(Campaign).agenda.entries["a0"]
+    assert leaf.suspect == warning
+    status = engine.status()
+    assert status["suspect_count"] == 1
+    assert status["suspects"] == {"a0": warning}
+    status_leaf = next(item for item in status["leaves"] if item["path"] == "a0")
+    assert status_leaf["suspect"] == warning
+
+
+async def test_done_populated_leaf_is_not_suspect(tmp_path) -> None:
+    """A populated run yields no suspect flag anywhere."""
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+    state: dict[str, str] = {}
+    engine = AgendaEngine(store=store, submit=_Runner(state), observe=lambda: dict(state))
+    await engine.tick()
+    sim_id = next(iter(state))
+    state[sim_id] = "results.ready"
+    engine = AgendaEngine(
+        store=store,
+        submit=_Runner(state),
+        observe=lambda: dict(state),
+        suspects=dict,
+    )
+    result = await engine.tick()
+    (callback,) = result.callbacks
+    assert callback.suspect is None
+    assert result.suspects == {}
+    status = engine.status()
+    assert status["suspect_count"] == 0
+    status_leaf = next(item for item in status["leaves"] if item["path"] == "a0")
+    assert status_leaf["suspect"] is None
+
+
+async def test_late_suspect_flag_lands_without_a_second_callback(tmp_path) -> None:
+    """A suspect flag arriving after the done transition updates the leaf only."""
+    from pic_agentic.agenda.engine import SuspectInfo
+
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+    state: dict[str, str] = {}
+    engine = AgendaEngine(store=store, submit=_Runner(state), observe=lambda: dict(state))
+    await engine.tick()
+    sim_id = next(iter(state))
+    state[sim_id] = "results.ready"
+    # First tick marks it done; no suspect observation yet.
+    await engine.tick()
+    warning = "emittance is all zeros"
+    engine = AgendaEngine(
+        store=store,
+        submit=_Runner(state),
+        observe=lambda: dict(state),
+        suspects=lambda: {sim_id: SuspectInfo(warning=warning)},
+    )
+    result = await engine.tick()
+    assert result.callbacks == []  # already done: no re-emit
+    assert result.suspects == {"a0": warning}
+    assert store.load(Campaign).agenda.entries["a0"].suspect == warning
+
+
 async def test_submit_rejection_reason_flows_onto_the_leaf(tmp_path) -> None:
     """A submit callable raising SubmitFailureError surfaces the reason."""
     from pic_agentic.agenda.engine import SubmitFailureError

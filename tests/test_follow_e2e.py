@@ -343,6 +343,47 @@ async def test_get_logs_reads_only_a_bounded_suffix(shared_dir, tmp_path, monkey
     assert ack.payload["total_lines"] < len(lines)
 
 
+async def test_status_pull_probes_vacuity_for_a_promoted_run(shared_dir, tmp_path, monkeypatch) -> None:
+    """A status pull that promotes a run to results.ready probes it (M2).
+
+    The follower is not the only door to ``results.ready``: a late status pull
+    promotes a completed run whose link appeared after the follower stopped.  If
+    that path does not run the vacuity probe, the beta-4 empty run is reported
+    clean; this pins the probe on the ack.
+    """
+    from pic_agentic import results
+    from pic_agentic.simclient.follow import TrackedSim
+
+    warning = "energy_histogram is all zeros"
+    monkeypatch.setattr(results, "probe_vacuity", lambda _sim_id, **_kw: warning)
+    shared, state_dir = shared_dir
+    _mcp_t, sim_t = MemoryTransport.create_pair()
+    client = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared,
+        submit_config=SubmitConfig(setup_root=shared / "sims"),
+    )
+    run = tmp_path / "run"
+    (run / "simOutput").mkdir(parents=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "4711.state").write_text("COMPLETED 0\n", encoding="utf-8")
+    client._tracked["empty123"] = TrackedSim(
+        sim_id="empty123",
+        cmd_id="c",
+        job_id=4711,
+        run_dir=str(run),
+        stdout_path=None,
+        submit_system="sbatch",
+    )
+    ack = await client.handle(build_status_command(sim=SIM, seq=1, sim_id="empty123", cmd_id="s").sign(SECRET))
+    assert ack is not None
+    assert ack.payload["state"] == SimulationState.RESULTS_READY.value
+    assert ack.payload["suspect"] == warning
+
+
 async def test_status_unknown_sim_is_ack_error(shared_dir, tmp_path, fake_runner) -> None:
     shared, _state_dir = shared_dir
     _mcp_t, sim_t = MemoryTransport.create_pair()

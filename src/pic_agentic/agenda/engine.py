@@ -74,6 +74,10 @@ ActualsFn = Callable[[], Mapping[str, "ActualUsage"]]
 #: ``() -> {sim_id: FailureInfo}`` observation callable for failure reasons.
 FailuresFn = Callable[[], Mapping[str, "FailureInfo"]]
 
+#: ``() -> {sim_id: SuspectInfo}`` observation callable for the F4
+#: "successful-but-empty" health flag.
+SuspectsFn = Callable[[], Mapping[str, "SuspectInfo"]]
+
 log = logging.getLogger(__name__)
 
 
@@ -95,6 +99,15 @@ class FailureInfo(BaseModel):
     error: str | None = None
     error_code: str | None = None
     stage: str | None = None
+
+
+class SuspectInfo(BaseModel):
+    """The "successful-but-empty" health detail for one finished run (F4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The all-zero warning text (reused from the plugin reader path).
+    warning: str
 
 
 #: A leaf status that still requires engine action.
@@ -222,6 +235,10 @@ class TickResult(BaseModel):
     #: reason), so the common "N leaves failed identically" case reads as a
     #: sentence rather than N repeated payloads.  None when nothing failed.
     failure_summary: str | None = None
+    #: This tick's "successful-but-empty" walks, keyed by leaf path (F4).  A
+    #: ``done`` leaf that is nonetheless suspect is listed here so an agent can
+    #: tell "physics ran and succeeded" from "physics ran and was empty".
+    suspects: dict[str, str] = Field(default_factory=dict)
     #: The campaign's lifecycle state after this tick.
     state: CampaignState = "running"
     #: Leaves the planner would have submitted but the lifecycle held back.
@@ -245,6 +262,7 @@ class AgendaEngine:
         approve: Callable[[str], bool] | None = None,
         actuals: ActualsFn | None = None,
         failures: FailuresFn | None = None,
+        suspects: SuspectsFn | None = None,
         reuse_lookup: ReuseLookupFn | None = None,
         reuse_record: ReuseRecordFn | None = None,
         reuse_key: ReuseKeyFn | None = None,
@@ -267,6 +285,11 @@ class AgendaEngine:
                 the simclient's reason for a failed run.  When given, a leaf that
                 reaches a failed state has the reason stamped onto its callback
                 and persisted status.
+            suspects: Optional ``() -> {sim_id: SuspectInfo}`` callable supplying
+                the "successful-but-empty" health flag for a finished run (F4).
+                When given, a leaf that newly reaches ``done`` has the warning
+                stamped onto its callback and persisted status, so a zero-physics
+                run is no longer indistinguishable from a real success.
             reuse_lookup: Optional ``(key) -> ReuseRecord | None`` that returns
                 a completed run whose key matches, so the leaf is linked to it
                 instead of being submitted again.  Without it (and without
@@ -286,6 +309,7 @@ class AgendaEngine:
         self.approve = approve
         self.actuals = actuals
         self.failures = failures
+        self.suspects = suspects
         self.reuse_lookup = reuse_lookup
         self.reuse_record = reuse_record
         self.reuse_key = reuse_key or _wire_hash
@@ -304,6 +328,7 @@ class AgendaEngine:
         budget = self.budget_override or campaign.budget
         observed = self.observe()
         failures = self._observe_failures()
+        suspects = self._observe_suspects()
         campaign, steps, reused = self._plan(campaign, budget, observed)
         # Refuse a campaign whose submissions would collide *before* submitting
         # anything: a duplicate payload maps two leaves to one sim_id, so a
@@ -316,8 +341,8 @@ class AgendaEngine:
         # transition durable: if a later submit raises or the process crashes,
         # the callback is already on disk rather than lost (the next tick would
         # see the leaf already terminal and emit nothing).
-        campaign, emitted = self._emit_callbacks(campaign, before, failures)
-        result = TickResult(state=campaign.state, callbacks=list(emitted), reused=list(reused))
+        campaign, emitted, suspects = self._emit_callbacks(campaign, before, failures, suspects)
+        result = TickResult(state=campaign.state, callbacks=list(emitted), reused=list(reused), suspects=dict(suspects))
         self.store.save(campaign)
         campaign = await self._run_steps(campaign, steps, result, budget)
         result.complete = _is_complete(campaign.agenda)
@@ -492,7 +517,8 @@ class AgendaEngine:
         campaign: Campaign,
         before: Mapping[str, str],
         failures: Mapping[str, FailureInfo],
-    ) -> tuple[Campaign, list[Callback]]:
+        observed_suspects: Mapping[str, SuspectInfo],
+    ) -> tuple[Campaign, list[Callback], dict[str, str]]:
         """Append a callback for every leaf that newly reached done/failed.
 
         Edge-triggered against the *persisted* pre-tick statuses, so a restart
@@ -502,15 +528,27 @@ class AgendaEngine:
         so they survive the restart that follows the transition.  A failed
         transition also stamps the observed reason (``error``/``error_code``/
         ``stage``) onto the leaf and its callback, so the campaign can report
-        *why* it failed.
+        *why* it failed.  A ``done`` transition whose run is "successfully empty"
+        stamps the all-zero warning onto the leaf and callback instead (F4), so
+        the decision point itself carries the health flag.
+
+        A suspect flag that arrives *after* the done transition (e.g. a later
+        status pull promoting a linked run) is still written onto the already
+        done leaf - it just does not emit a second callback.
 
         Returns:
-            The campaign with the new callbacks appended, and the new callbacks.
+            The campaign, the new callbacks, and ``{path: warning}`` for every
+            done leaf currently known to be suspect.
 
         """
         emitted: list[Callback] = []
+        suspects: dict[str, str] = {}
         agenda = campaign.agenda.model_copy(deep=True)
         for path, sim in agenda.simulations():
+            warning = observed_suspects.get(sim.sim_id).warning if sim.sim_id in observed_suspects else None
+            if sim.status == "done" and warning is not None:
+                sim.suspect = warning
+                suspects[path] = warning
             if sim.status not in {"done", "failed"} or before.get(path) == sim.status:
                 continue
             failure = failures.get(sim.sim_id) if sim.sim_id else None
@@ -522,11 +560,13 @@ class AgendaEngine:
                 callback = callback.model_copy(
                     update={"error": failure.error, "error_code": failure.error_code, "stage": failure.stage}
                 )
+            if sim.status == "done" and warning is not None:
+                callback = callback.model_copy(update={"suspect": warning})
             emitted.append(callback)
         if not emitted:
-            return campaign, emitted
+            return campaign.model_copy(update={"agenda": agenda}), emitted, suspects
         updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, *emitted]})
-        return updated, emitted
+        return updated, emitted, suspects
 
     def _observe_failures(self) -> Mapping[str, FailureInfo]:
         """Return sim_id -> failure reason for the campaign's known sims.
@@ -545,6 +585,25 @@ class AgendaEngine:
             return self.failures()
         except Exception as exc:  # ruff: ignore[blind-except] - failure lookup must never break a tick
             log.warning("agenda failures lookup failed: %s", exc)
+            return {}
+
+    def _observe_suspects(self) -> Mapping[str, SuspectInfo]:
+        """Return sim_id -> health flag for the campaign's known sims (F4).
+
+        Best-effort: a lookup that raises yields no flag rather than breaking the
+        tick.  Returns an empty mapping when no ``suspects`` callable was
+        injected.
+
+        Returns:
+            The observed "successful-but-empty" flags keyed by ``sim_id``.
+
+        """
+        if self.suspects is None:
+            return {}
+        try:
+            return self.suspects()
+        except Exception as exc:  # ruff: ignore[blind-except] - health lookup must never break a tick
+            log.warning("agenda suspects lookup failed: %s", exc)
             return {}
 
     @staticmethod
@@ -758,10 +817,18 @@ class AgendaEngine:
 
         """
         campaign = self.store.load(Campaign)
+        observed = self._observe_suspects()
         counts = {"planned": 0, "submitted": 0, "running": 0, "done": 0, "failed": 0}
         leaves: list[dict[str, Any]] = []
+        suspects: dict[str, str] = {}
         for path, sim in campaign.agenda.simulations():
             counts[sim.status] = counts.get(sim.status, 0) + 1
+            # Prefer the live probe over the persisted flag, so a leaf already
+            # observed done by the registry is suspect even before a tick stamps
+            # it; fall back to the durable flag otherwise.
+            warning = observed[sim.sim_id].warning if sim.sim_id in observed else sim.suspect
+            if sim.status == "done" and warning:
+                suspects[path] = warning
             leaves.append(
                 {
                     "path": path,
@@ -773,6 +840,7 @@ class AgendaEngine:
                     "error": sim.error,
                     "error_code": sim.error_code,
                     "stage": sim.stage,
+                    "suspect": warning if sim.status == "done" else None,
                 },
             )
         return {
@@ -782,6 +850,8 @@ class AgendaEngine:
             "counts": counts,
             "usage": campaign.usage.model_dump(),
             "leaves": leaves,
+            "suspects": suspects,
+            "suspect_count": len(suspects),
         }
 
     def campaign_report(self) -> dict[str, Any]:
@@ -803,6 +873,7 @@ class AgendaEngine:
                 "error": sim.error,
                 "error_code": sim.error_code,
                 "stage": sim.stage,
+                "suspect": sim.suspect if sim.status == "done" else None,
                 "estimated_core_hours": sim.estimated_core_hours,
                 "actual_core_hours": sim.actual_core_hours,
                 "actual_gpu_hours": sim.actual_gpu_hours,

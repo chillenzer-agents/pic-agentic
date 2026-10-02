@@ -213,6 +213,11 @@ class AgendaSim(BaseModel):
     #: Pipeline stage the failure occurred in (``build``/``prepare``/``submit``/
     #: ``run``), when the simclient reported one.
     stage: str | None = None
+    #: The "successful-but-empty" health flag (F4): the all-zero warning text
+    #: when the leaf completed but its only numeric artifact reads zero.  None
+    #: when the leaf is not suspect or its health was never probed.  A leaf can
+    #: be ``done`` *and* ``suspect`` at once - that is the whole point.
+    suspect: str | None = None
 
     @field_validator("name")
     @classmethod

@@ -1176,8 +1176,42 @@ def _load_data_package(data_dir: str) -> types.ModuleType:
     return package
 
 
+def _plugin_targets(output: Path, params: ResultParams, spec: _PluginReader) -> list[Path]:
+    """Resolve every plugin output file a request refers to.
+
+    A ``path`` narrows the search to exactly that file; otherwise every filename
+    matching the reader's pattern (optionally narrowed by ``species``) is
+    returned in deterministic name order.  For the openPMD-backed plugins the
+    matching entry may be an ADIOS2 series *directory* (``*.bp``/``*.bp5``), so
+    directories are accepted there too.
+
+    Returning *all* matches is what lets :func:`probe_vacuity` honour its
+    "every present artifact" contract on a multi-species run: a single-species
+    read only needs the first entry (:func:`_plugin_target`).
+
+    Returns:
+        The resolved files or series directories; empty when none is found or
+        the path is unsafe.
+
+    """
+    if params.path is not None:
+        try:
+            return [_safe_join(output, params.path)]
+        except ValueError:
+            return []
+    candidates = [
+        path
+        for path, is_dir in _collect_entries(output)
+        if (not is_dir or spec.kind == _KIND_OPENPMD)
+        and spec.pattern.fullmatch(path.name)
+        and _plugin_species_matches(path.name, params, spec)
+    ]
+    candidates.sort(key=lambda path: path.name)
+    return candidates
+
+
 def _plugin_target(output: Path, params: ResultParams, spec: _PluginReader) -> Path | None:
-    """Resolve the plugin output file a request refers to.
+    """Resolve the single plugin output file a request refers to.
 
     A ``path`` narrows the search when given; otherwise the first filename
     matching the reader's pattern (optionally narrowed by ``species``) is used.
@@ -1189,20 +1223,8 @@ def _plugin_target(output: Path, params: ResultParams, spec: _PluginReader) -> P
         path is unsafe.
 
     """
-    if params.path is not None:
-        try:
-            return _safe_join(output, params.path)
-        except ValueError:
-            return None
-    candidates = [
-        path
-        for path, is_dir in _collect_entries(output)
-        if (not is_dir or spec.kind == _KIND_OPENPMD)
-        and spec.pattern.fullmatch(path.name)
-        and _plugin_species_matches(path.name, params, spec)
-    ]
-    candidates.sort(key=lambda path: path.name)
-    return candidates[0] if candidates else None
+    targets = _plugin_targets(output, params, spec)
+    return targets[0] if targets else None
 
 
 def _plugin_filename_groups(spec: _PluginReader, name: str) -> dict[str, str] | None:
@@ -1796,6 +1818,71 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def probe_vacuity(sim_id: str, *, run_dir: Path | str) -> str | None:
+    """Return the all-zero warning when a run's only numeric artifact is empty.
+
+    A beta-4 campaign reached three ``done`` leaves, no failures and no alerts,
+    yet produced *zero* electrons; the only thing that caught it was a reviewer
+    reading an all-zero ``energy_histogram`` by hand.  The autonomy loop needs
+    to be suspicious of "successful runs with nothing in them", so this probe
+    reuses :func:`_annotate_vacuous` - the exact all-zero warning path - to
+    classify a completed run's linked output.
+
+    Each numeric text reader in :data:`_VACUOUS_VALUE_KEYS` is read against the
+    run's ``simOutput`` (best-effort; a missing reader or absent artifact is
+    skipped) and **every** matching artifact of that reader is examined, so the
+    verdict holds on multi-species runs (e.g. ``a_energyHistogram_all.dat`` and
+    ``b_energyHistogram_all.dat``).  The run is *suspect* only when at least one
+    numeric artifact is present and every present one carries the all-zero
+    warning: a single non-empty diagnostic clears it, and a run with no numeric
+    artifact at all cannot be judged (e.g. the optional reader is not installed)
+    and is not flagged.
+
+    Known limitation (deliberately narrow): only the numeric *text* readers are
+    probed.  A run whose energy histogram is all-zero while its (non-numeric)
+    phase space or radiation output is populated is still flagged, because the
+    vacuity signal only ever looked at scalar value arrays; treat the flag as
+    "no particles in the numeric diagnostics", not "no particles at all".
+
+    Args:
+        sim_id: The simulation id.
+        run_dir: The run directory (``simOutput`` lives under it).
+
+    Returns:
+        The all-zero warning text when the run is suspect, else None.
+
+    """
+    warning: str | None = None
+    saw_artifact = False
+    output = Path(run_dir) / _SIM_OUTPUT
+    if not output.is_dir():
+        return None
+    for reader in _VACUOUS_VALUE_KEYS:
+        spec = _PLUGIN_READERS[reader]
+        params = ResultParams(sim_id=sim_id, op=ResultOp.PLUGIN, reader=reader, iteration="last")
+        try:
+            targets = _plugin_targets(output, params, spec)
+        except Exception:  # ruff: ignore[blind-except] - a probe must never break the caller
+            log.debug("vacuity probe enumeration for %r failed", reader)
+            continue
+        for target in targets:
+            try:
+                payload = _read_plugin_target(reader, spec, output, params, target)
+            except Exception:  # ruff: ignore[blind-except] - a probe must never break the caller
+                log.debug("vacuity probe for %r on %r failed", reader, target.name)
+                continue
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                # Reader unavailable or artifact unreadable: this artifact
+                # cannot be judged, so it neither clears nor flags the run.
+                continue
+            saw_artifact = True
+            if "warning" not in result:
+                return None
+            warning = str(result["warning"])
+    return warning if saw_artifact else None
+
+
 def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduction
     instance: Any,
     groups: dict[str, str],
@@ -1962,7 +2049,42 @@ def _bound_plugin(summary: dict[str, Any]) -> dict[str, Any] | None:
     return bounded
 
 
-def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean error
+def _read_plugin_target(
+    reader: str,
+    spec: _PluginReader,
+    output: Path,
+    params: ResultParams,
+    target: Path,
+) -> dict[str, Any]:
+    """Run one reader against one resolved target file or series.
+
+    This is the single I/O site shared by the ``PLUGIN`` request path and the
+    vacuity probe, so a multi-artifact probe reads every present artifact with
+    exactly the semantics a direct read would use.
+
+    Returns:
+        ``{"result": <summary>}`` or a clean error pair.
+
+    """
+    if not (target.is_file() or (spec.kind == _KIND_OPENPMD and target.is_dir())):
+        return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
+    try:
+        summary = _plugin_result(reader, spec, output, params, target)
+    except ResultsUnavailable as exc:
+        return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
+    except _PLUGIN_SOFT_ERRORS as exc:
+        log.debug("plugin reader %r failed: %s", reader, exc)
+        return _error(SimulationErrorCode.NO_RESULTS, str(exc))
+    except Exception as exc:  # ruff: ignore[blind-except] - a reader crash is ack data, never a 500
+        log.debug("plugin reader %r crashed: %s", reader, exc)
+        return _error(SimulationErrorCode.NO_RESULTS, str(exc))
+    bounded = _bound_plugin(summary)
+    if bounded is None:
+        return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"plugin summary exceeds {MAX_RESULT_BYTES} wire bytes")
+    return {"result": bounded}
+
+
+def _plugin(
     params: ResultParams,
     *,
     output: Path,
@@ -1992,22 +2114,9 @@ def _plugin(  # ruff: ignore[too-many-return-statements] - one return per clean 
     if not output.is_dir():
         return _error(SimulationErrorCode.NO_RESULTS, "run has no linked simOutput directory")
     target = _plugin_target(output, params, spec)
-    if target is None or not (target.is_file() or (spec.kind == _KIND_OPENPMD and target.is_dir())):
+    if target is None:
         return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
-    try:
-        summary = _plugin_result(reader, spec, output, params, target)
-    except ResultsUnavailable as exc:
-        return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
-    except _PLUGIN_SOFT_ERRORS as exc:
-        log.debug("plugin reader %r failed: %s", reader, exc)
-        return _error(SimulationErrorCode.NO_RESULTS, str(exc))
-    except Exception as exc:  # ruff: ignore[blind-except] - a reader crash is ack data, never a 500
-        log.debug("plugin reader %r crashed: %s", reader, exc)
-        return _error(SimulationErrorCode.NO_RESULTS, str(exc))
-    bounded = _bound_plugin(summary)
-    if bounded is None:
-        return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"plugin summary exceeds {MAX_RESULT_BYTES} wire bytes")
-    return {"result": bounded}
+    return _read_plugin_target(reader, spec, output, params, target)
 
 
 def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:
@@ -2307,6 +2416,7 @@ def resolve_result(  # ruff: ignore[too-many-return-statements] - one dispatch p
 __all__ = [
     "ResultsReaderError",
     "ResultsUnavailable",
+    "probe_vacuity",
     "read_image",
     "read_slice",
     "read_stats",

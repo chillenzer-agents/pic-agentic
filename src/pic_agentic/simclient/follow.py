@@ -345,6 +345,37 @@ class JobFollower:
             return None
         return manifest.model_dump()
 
+    def _probe_vacuity(self) -> str | None:
+        """Classify a completed run's numeric artifacts as suspect or not (F4).
+
+        A beta-4 campaign reported three ``done`` leaves with no failures while
+        producing zero electrons; only a human reading an all-zero histogram
+        caught it.  Computing the flag here attaches the same all-zero warning
+        that ``read_plugin_result`` already emits to the terminal
+        ``results.ready`` event, so ``get_status``/``fleet_status`` and the
+        agenda callbacks can surface it without opening any result file.
+
+        The probe is imported lazily and guarded exactly like
+        :meth:`_scan_manifest`: a worktree whose results engine is absent (or a
+        run with no numeric artifact / no optional reader installed) simply
+        yields ``None`` (not suspect).  Reading a plugin does open the file, so
+        the caller runs this in a worker thread.
+
+        Returns:
+            The all-zero warning text when the run is suspect, else None.
+
+        """
+        try:
+            from pic_agentic.results import probe_vacuity  # ruff: ignore[import-outside-top-level] - lazy seam
+        except ImportError:
+            return None
+        run_dir = Path(self.tracked.run_dir)
+        try:
+            return probe_vacuity(self.tracked.sim_id, run_dir=run_dir)
+        except Exception:  # ruff: ignore[blind-except] - the health probe is best-effort event data
+            log.warning("vacuity probe failed for sim %s", self.tracked.sim_id)
+            return None
+
     async def _emit_terminal(self, info: JobInfo) -> None:
         """Emit the terminal lifecycle events and stop following.
 
@@ -373,9 +404,12 @@ class JobFollower:
             # ``SimClient._state_for_info`` once the link appears.
             if linked:
                 manifest = self._scan_manifest()
+                suspect = await asyncio.to_thread(self._probe_vacuity)
                 fields: dict[str, object] = {"job_id": self.tracked.job_id, "results_linked": True, **accounting}
                 if manifest is not None:
                     fields["manifest"] = manifest
+                if suspect is not None:
+                    fields["suspect"] = suspect
                 await self.emit(SimulationState.RESULTS_READY, **fields)
             else:
                 await self.emit(
