@@ -81,6 +81,25 @@ def test_format_fleet_with_alerts() -> None:
     assert "stalled" in text
 
 
+def test_format_fleet_reports_suspect_count() -> None:
+    fleet = {"summary": {"total": 1, "active": 0, "terminal": 1, "by_state": {}, "suspect": 1}, "alerts": []}
+    assert "suspect (all-zero output): 1" in format_fleet(fleet)
+
+
+def test_format_leaves_marks_suspect() -> None:
+    status = {
+        "name": "study",
+        "leaves": [{"path": "a", "status": "done", "sim_id": "sim1", "suspect": "all zeros"}],
+    }
+    assert "a: done [sim1] SUSPECT" in format_leaves(status)
+
+
+def test_notification_text_mentions_suspicious_runs() -> None:
+    text = notification_text([{"kind": "done", "suspect": "all zeros"}], [])
+    assert text is not None
+    assert "suspicious" in text
+
+
 def test_format_png_caption() -> None:
     assert format_png_caption("s", None, None) == "sim s: field"
     assert format_png_caption("s", "E", "x") == "sim s: E/x"

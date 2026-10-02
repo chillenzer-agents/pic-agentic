@@ -168,6 +168,9 @@ def format_fleet(fleet: dict) -> str:
         ),
         "  states: " + (", ".join(f"{key}={value}" for key, value in sorted(by_state.items())) or "none"),
     ]
+    suspect = summary.get("suspect", 0)
+    if suspect:
+        lines.append(f"  suspect (all-zero output): {suspect}")
     percent = summary.get("aggregate_percent")
     if percent is not None:
         lines.append(f"  mean progress: {percent:.0f}%")
@@ -199,7 +202,8 @@ def format_leaves(status: dict) -> str:
         sim_id = leaf.get("sim_id") or "-"
         point = leaf.get("point")
         point_text = f" {point}" if point else ""
-        lines.append(f"  {leaf.get('path')}: {leaf.get('status')} [{sim_id}]{point_text}")
+        marker = " SUSPECT" if leaf.get("suspect") else ""
+        lines.append(f"  {leaf.get('path')}: {leaf.get('status')} [{sim_id}]{point_text}{marker}")
     return "\n".join(lines)
 
 
@@ -237,8 +241,11 @@ def notification_text(callbacks: list[dict], alerts: list[dict]) -> str | None:
     parts: list[str] = []
     done = [callback for callback in callbacks if callback.get("kind") == "done"]
     failed = [callback for callback in callbacks if callback.get("kind") == "failed"]
+    suspect = [callback for callback in done if callback.get("suspect")]
     if done:
         parts.append(f"{len(done)} run(s) finished")
+    if suspect:
+        parts.append(f"{len(suspect)} run(s) suspicious (all-zero output)")
     if failed:
         parts.append(f"{len(failed)} run(s) failed")
     if alerts:

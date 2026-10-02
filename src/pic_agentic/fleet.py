@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from pic_agentic.server.simulation import SimRecord
 
 #: Alert kinds the fleet view can raise.
-AlertKind = Literal["stalled", "failed", "cancelled", "nonzero_exit"]
+AlertKind = Literal["stalled", "failed", "cancelled", "nonzero_exit", "suspect"]
 
 
 class FleetSummary(BaseModel):
@@ -41,6 +41,9 @@ class FleetSummary(BaseModel):
     running: int = 0
     done: int = 0
     failed: int = 0
+    #: Done runs whose only numeric artifact reads all-zero (F4): a
+    #: "successful-but-empty" health signal, distinct from a failure.
+    suspect: int = 0
     by_state: dict[str, int] = Field(default_factory=dict)
     #: Mean progress of the records that report a ``percent``, else None.
     aggregate_percent: float | None = None
@@ -88,6 +91,8 @@ def fleet_summary(records: Sequence[SimRecord] | Iterable[SimRecord]) -> FleetSu
             summary.terminal += 1
         if state in _DONE_STATES:
             summary.done += 1
+            if getattr(record, "suspect", None):
+                summary.suspect += 1
         elif state in _FAILED_STATES or state == "simulation.cancelled":
             summary.failed += 1
         if active and state not in _DONE_STATES and state not in _FAILED_STATES:
@@ -140,6 +145,13 @@ def detect_alerts(
                     last_event_ts=last_event_ts,
                 ),
             )
+            continue
+        # A "successful-but-empty" run is done (not failed), so it is reported
+        # after the hard-failure kinds: the run must be neither failed, cancelled
+        # nor a non-zero exit to reach here.
+        suspect = getattr(record, "suspect", None)
+        if state in _DONE_STATES and suspect:
+            alerts.append(FleetAlert(sim_id=sim_id, kind="suspect", detail=str(suspect), last_event_ts=last_event_ts))
             continue
         stalled = _is_stalled(record, now=now, stall_after_s=stall_after_s)
         if stalled is not None:
