@@ -1175,6 +1175,33 @@ class SimClient:
         }
         return mapping[info.state].value
 
+    @staticmethod
+    def _probe_status_suspect(tracked: TrackedSim, state: str) -> str | None:
+        """Probe a status-promoted terminal run for the empty-output flag (F4).
+
+        A status pull does not go through :meth:`JobFollower._emit_terminal`, so
+        without this the beta-4 "successful-but-empty" run would be promoted to
+        ``results.ready`` through the status door with ``suspect`` unset.  The
+        probe is lazy and guarded exactly like the follower's: a missing results
+        engine or a probe failure yields ``None`` (not suspect) rather than
+        breaking the status ack.
+
+        Returns:
+            The all-zero warning when the run is successfully empty, else None.
+
+        """
+        if state != SimulationState.RESULTS_READY.value:
+            return None
+        try:
+            from pic_agentic.results import probe_vacuity  # ruff: ignore[import-outside-top-level] - lazy seam
+        except ImportError:
+            return None
+        try:
+            return probe_vacuity(tracked.sim_id, run_dir=Path(tracked.run_dir))
+        except Exception:  # ruff: ignore[blind-except] - the health probe is best-effort ack data
+            log.warning("vacuity probe failed for sim %s status pull", tracked.sim_id)
+            return None
+
     async def _live_job_state(self, tracked: TrackedSim) -> SlurmJobState | None:
         """Query the tracked simulation's current SLURM state.
 
@@ -1508,6 +1535,11 @@ class SimClient:
                 log.warning("status query failed for sim %s: %s", sim_id, exc)
                 error = f"job_info_failed:{exc}"
                 error_code = "job_info_failed"
+        # A status pull can be the *only* thing that promotes a finished run to
+        # ``results.ready`` (the follower missed the terminal transition).  Run
+        # the same vacuity probe here so the F4 flag cannot be lost through the
+        # status-pull door.
+        suspect = await asyncio.to_thread(self._probe_status_suspect, tracked, state)
         ack = self._build_status_ack(
             message,
             cmd_id=cmd_id,
@@ -1523,6 +1555,7 @@ class SimClient:
             exit_code=exit_code,
             error=error,
             error_code=error_code,
+            suspect=suspect,
         )
         await self.transport.send(ack)
         return ack
@@ -1751,6 +1784,7 @@ class SimClient:
         exit_code: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        suspect: str | None = None,
     ) -> RcpMessage:
         return build_status_ack(
             sim=self.sim,
@@ -1769,6 +1803,7 @@ class SimClient:
             exit_code=exit_code,
             error=error,
             error_code=error_code,
+            suspect=suspect,
         ).sign(self.secret)
 
     def _build_logs_ack(

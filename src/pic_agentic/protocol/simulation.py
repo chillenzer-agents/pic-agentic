@@ -935,8 +935,13 @@ def build_status_ack(
     exit_code: int | None = None,
     error: str | None = None,
     error_code: str | None = None,
+    suspect: str | None = None,
 ) -> RcpMessage:
     """Build the simclient's live-status response (M2b).
+
+    ``suspect`` carries the "successful-but-empty" health flag (F4) when the
+    status pull promotes a completed run to ``results.ready`` without a prior
+    terminal event, so the flag cannot be lost through the status-pull door.
 
     Returns:
         The unsigned ``rcp.status_ack`` message.
@@ -957,6 +962,7 @@ def build_status_ack(
                 ("exit_code", exit_code),
                 ("error", error),
                 ("error_code", error_code),
+                ("suspect", suspect),
             )
             if value is not None
         },
