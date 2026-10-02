@@ -806,6 +806,7 @@ def build_submit_event(
     core_hours: float | None = None,
     gpu_hours: float | None = None,
     manifest: dict[str, Any] | None = None,
+    suspect: str | None = None,
 ) -> RcpMessage:
     """Build one M2 lifecycle event.
 
@@ -829,6 +830,8 @@ def build_submit_event(
         payload["results_linked"] = results_linked
     if manifest is not None:
         payload["manifest"] = manifest
+    if suspect:
+        payload["suspect"] = suspect
     payload.update(
         {
             key: value

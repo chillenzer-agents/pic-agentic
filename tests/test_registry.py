@@ -135,6 +135,35 @@ def test_events_accumulate_into_one_record() -> None:
     assert record.active is True
 
 
+def test_results_ready_projects_the_suspect_flag() -> None:
+    """The registry carries the F4 health flag off the results.ready event."""
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(_event(SimulationState.JOB_FINISHED, seq=2, job_id=1, slurm_state="COMPLETED", exit_code=0))
+    service.on_message(
+        _event(
+            SimulationState.RESULTS_READY,
+            seq=3,
+            job_id=1,
+            results_linked=True,
+            suspect="energy_histogram is all zeros",
+        ),
+    )
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.active is False
+    assert record.suspect == "energy_histogram is all zeros"
+
+
+def test_non_suspect_run_has_no_flag() -> None:
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(_event(SimulationState.RESULTS_READY, seq=2, job_id=1, results_linked=True))
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.suspect is None
+
+
 def test_terminal_state_marks_inactive() -> None:
     service = _service()
     service.on_message(_ack())

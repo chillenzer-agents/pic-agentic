@@ -1888,6 +1888,7 @@ class SimClient:
         core_hours: float | None = None,
         gpu_hours: float | None = None,
         manifest: dict[str, object] | None = None,
+        suspect: str | None = None,
     ) -> RcpMessage:
         return build_submit_event(
             sim=self.sim,
@@ -1911,6 +1912,7 @@ class SimClient:
             core_hours=core_hours,
             gpu_hours=gpu_hours,
             manifest=manifest,
+            suspect=suspect,
         ).sign(self.secret)
 
     def _build_ack(self, message: RcpMessage, *, cmd_id: str, result: HelloResult) -> RcpMessage:

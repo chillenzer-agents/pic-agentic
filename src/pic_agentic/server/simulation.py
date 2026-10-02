@@ -99,6 +99,7 @@ _RECORD_FIELDS = (
     "error",
     "error_code",
     "stage",
+    "suspect",
 )
 
 #: The failure-reason subset of :data:`_RECORD_FIELDS`, projected from a submit
@@ -137,6 +138,10 @@ class SimRecord(BaseModel):
     error_code: str | None = None
     #: Pipeline stage the failure occurred in, when the simclient reported one.
     stage: str | None = None
+    #: The "successful-but-empty" health flag: the all-zero warning text when the
+    #: run completed but its only numeric artifact reads zero (F4).  None when
+    #: the run is not suspect or was never probed.
+    suspect: str | None = None
     last_event_type: str | None = None
     last_event_ts: str | None = None
     active: bool = True
