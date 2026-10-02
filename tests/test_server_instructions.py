@@ -33,3 +33,16 @@ def test_instructions_point_at_the_picongpu_documentation_and_examples() -> None
     # that it needs the LWFA tutorial's plasma species for a non-empty spectrum.
     assert "plasma species" in SERVER_INSTRUCTIONS
     assert "empty spectrum" in SERVER_INSTRUCTIONS
+    # The list-indexed patch_path form is publicised, not only the top-level
+    # sim.time_steps example.
+    assert "sim.laser.0.focus_pos_si.1.component" in SERVER_INSTRUCTIONS
+
+
+async def test_create_campaign_description_publicises_the_list_indexed_path() -> None:
+    # The beta-4 agent found the indexed patch_path form only by reading source;
+    # the tool description must name it so an agent can scan a nested list field.
+    server, _runtime = build_server(Config(rcp_secret=new_secret_hex()), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    description = tools["create_campaign"].description
+    assert "sim.laser.0.focus_pos_si.1.component" in description
+    assert "indexes a list" in description
