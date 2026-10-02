@@ -1055,10 +1055,11 @@ class ResultParams(BaseModel):
     species_filter: str | None = None
     #: Energy-histogram window lower/upper edge [keV] for ``PLUGIN`` with the
     #: ``energy_histogram`` reader.  When unset the reader derives the window
-    #: from the populated bins, so the default is never structurally empty for a
-    #: spectrum that starts above the old fixed 100--1000 keV window (F2).
-    #: Both edges must be given together and the maximum must exceed the
-    #: minimum; they are ignored (and omitted from the wire) for other readers.
+    #: from the populated bins, so the default always covers the populated range
+    #: rather than clipping it to the old fixed 100--1000 keV window (F2).
+    #: Both edges must be given together, be non-negative and have the maximum
+    #: exceed the minimum.  When set they are forwarded on the wire for any
+    #: ``PLUGIN`` reader; readers other than ``energy_histogram`` ignore them.
     min_kev: FiniteFloat | None = None
     max_kev: FiniteFloat | None = None
 
@@ -1070,11 +1071,18 @@ class ResultParams(BaseModel):
             The validated model.
 
         Raises:
-            ValueError: If only one edge is set, or ``max_kev <= min_kev``.
+            ValueError: If only one edge is set, an edge is negative, or
+                ``max_kev <= min_kev``.
 
         """
         if (self.min_kev is None) != (self.max_kev is None):
             msg = "min_kev and max_kev must be set together"
+            raise ValueError(msg)
+        if self.min_kev is not None and self.min_kev < 0:
+            msg = f"min_kev ({self.min_kev}) must be non-negative"
+            raise ValueError(msg)
+        if self.max_kev is not None and self.max_kev < 0:
+            msg = f"max_kev ({self.max_kev}) must be non-negative"
             raise ValueError(msg)
         if self.min_kev is not None and self.max_kev is not None and self.max_kev <= self.min_kev:
             msg = f"max_kev ({self.max_kev}) must be greater than min_kev ({self.min_kev})"

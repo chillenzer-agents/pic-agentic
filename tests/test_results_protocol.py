@@ -149,6 +149,19 @@ def test_result_params_window_requires_increasing_edges() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_kev": -100.0, "max_kev": -50.0},
+        {"min_kev": -100.0, "max_kev": 100.0},
+    ],
+)
+def test_result_params_window_requires_non_negative_edges(kwargs: dict[str, float]) -> None:
+    """A negative energy window is physically meaningless and rejected (F2 Nit)."""
+    with pytest.raises(ValidationError, match="must be non-negative"):
+        ResultParams(sim_id=SIM, op=ResultOp.PLUGIN, reader="energy_histogram", **kwargs)
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
 def test_result_params_window_rejects_non_finite(value: float) -> None:
     with pytest.raises(ValidationError):
