@@ -369,20 +369,23 @@ def _sample_plugin_arrays(summary: dict[str, Any]) -> dict[str, Any]:
     return sampled
 
 
-def _facts(rocrate: Any, metadata: Any, openpmd: Any, plugins: Any = None) -> list[str]:
-    """Build the deterministic fact lines from the four sections.
+def _facts(rocrate: Any, metadata: Any, openpmd: Any) -> list[str]:
+    """Build the deterministic *bookkeeping* fact lines.
+
+    The physics facts are built separately by :func:`_plugin_physics_facts`: a
+    caller must be able to tell "no physics values" from "readers missing", and
+    the reader-unavailable note is not a fact.
 
     Args:
         rocrate: The :func:`read_rocrate` result.
         metadata: The :func:`read_pypicongpu_metadata` result.
         openpmd: The :func:`read_openpmd_summary` result.
-        plugins: The :func:`read_plugin_summaries` result.
 
     Returns:
         Human-readable fact strings (possibly empty).
 
     """
-    return _rocrate_facts(rocrate) + _metadata_facts(metadata) + _openpmd_facts(openpmd) + _plugin_facts(plugins)
+    return _rocrate_facts(rocrate) + _metadata_facts(metadata) + _openpmd_facts(openpmd)
 
 
 def _rocrate_facts(rocrate: Any) -> list[str]:
@@ -445,26 +448,6 @@ def _openpmd_facts(openpmd: Any) -> list[str]:
         facts.append(f"latest openPMD step is {openpmd['latest_step']}")
     if openpmd.get("backends"):
         facts.append("openPMD backends: " + ", ".join(openpmd["backends"]))
-    return facts
-
-
-def _plugin_facts(plugins: Any) -> list[str]:
-    """Fact lines describing the plugin-summary section.
-
-    These are the *physics* facts: a run whose only artifact is a text plugin
-    histogram (no openPMD field output) still yields the populated energy range,
-    the maximum energy and the total count.  A reader that could not run because
-    its optional dependency is absent is reported explicitly, so a caller is
-    never left with metadata only and no explanation.
-
-    Returns:
-        The plugin-summary fact strings.
-
-    """
-    facts = _plugin_physics_facts(plugins)
-    reason = _plugin_unavailable_reason(plugins)
-    if reason:
-        facts.append(f"no plugin reader could summarize the output: {reason}")
     return facts
 
 

@@ -121,7 +121,7 @@ _HISTOGRAM = {
 
 
 def test_plugin_facts_name_the_physics() -> None:
-    facts = analysis._plugin_facts({"energy_histogram": _HISTOGRAM})
+    facts = analysis._plugin_physics_facts({"energy_histogram": _HISTOGRAM})
     joined = "; ".join(facts)
     assert "44" in joined
     assert "17500" in joined
