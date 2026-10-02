@@ -60,6 +60,11 @@ class Callback(BaseModel):
     error_code: str | None = None
     #: Pipeline stage the failure occurred in, when the simclient reported one.
     stage: str | None = None
+    #: The "successful-but-empty" health flag (F4): the all-zero warning text
+    #: when a ``done`` leaf's only numeric artifact reads zero.  A done callback
+    #: can carry both this and no ``error``; the warning is a health signal, not
+    #: a failure.
+    suspect: str | None = None
 
 
 class Campaign(BaseModel):
