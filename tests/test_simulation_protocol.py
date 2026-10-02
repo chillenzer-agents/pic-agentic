@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -33,8 +34,20 @@ from pic_agentic.version import WIRE_FORMAT_VERSION
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pypicongpu_runner.json"
 #: Schema hash of the pinned tree (see pyproject [sim] pin); regenerated when
-#: the pin moves.  Guards against silent picongpu schema drift in CI.
-PINNED_SCHEMA_HASH = "f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9"
+#: the pin moves.  ``test_pinned_schema_hash_matches_the_installed_pin`` asserts
+#: it against the live hash, guarding against silent pypicongpu schema drift.
+PINNED_SCHEMA_HASH = "88fd92131ffdda77dc708e76afbff23c6760ee9520156c87033835e601de330e"
+
+#: Whether the pinned PIConGPU is importable in this interpreter.
+_HAS_PICONGPU = importlib.util.find_spec("picongpu") is not None
+
+
+@pytest.mark.skipif(not _HAS_PICONGPU, reason="needs the pinned pypicongpu schema")
+def test_pinned_schema_hash_matches_the_installed_pin() -> None:
+    """The recorded hash must track the pin, not a past one (drift guard)."""
+    from pic_agentic.version import runner_schema_hash
+
+    assert runner_schema_hash() == PINNED_SCHEMA_HASH
 
 
 def _runner_dump() -> dict:
