@@ -2566,7 +2566,7 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
         return _error(SimulationErrorCode.UNSUPPORTED, str(exc))
     except (ResultsReaderError, KeyError, OSError, ValueError) as exc:
         return _error(SimulationErrorCode.NO_RESULTS, str(exc))
-    return _shape_compute(payload)
+    return _shape_compute(payload, program=program, params=params)
 
 
 def _compute_preflight(params: ResultParams, program: AnalysisProgram, output: Path) -> dict[str, Any] | None:
@@ -2593,12 +2593,89 @@ def _compute_preflight(params: ResultParams, program: AnalysisProgram, output: P
     return None
 
 
-def _shape_compute(payload: dict[str, Any]) -> dict[str, Any]:
+def _referenced_selector_names(program: Any) -> list[str]:
+    """Return every selector name a program references, in first-seen order.
+
+    Mirrors :func:`pic_agentic.analysis_eval._selector_names` for the validated
+    node objects (``output`` plus any ``points``), so a *bare* ``var`` that is
+    not listed in ``selectors`` is still echoed with its unit note rather than
+    being mistaken for a program that reads no data.
+
+    Returns:
+        The referenced selector names (possibly empty).
+
+    """
+    names: list[str] = []
+    roots = [program.output, *([program.points] if program.points is not None else [])]
+    stack = list(roots)
+    while stack:
+        current = stack.pop()
+        if getattr(current, "kind", None) == "var" and current.name not in names:
+            names.append(current.name)
+        for field in ("left", "right", "operand"):
+            child = getattr(current, field, None)
+            if child is not None:
+                stack.append(child)
+    return names
+
+
+def _compute_units(program: Any, params: ResultParams) -> dict[str, Any]:
+    """Describe the units of a compute result truthfully (L4).
+
+    A declarative program is arithmetic over raw openPMD mesh components whose
+    fields carry no unit metadata we can read, so the honest statement is *which*
+    records/components and iteration fed the result plus the code/normalized unit
+    convention - never an invented physical unit.  The selector echo also makes
+    the result reproducible.
+
+    Returns:
+        A ``{"unit_note", "selectors"}`` fragment.
+
+    """
+    referenced = _referenced_selector_names(program)
+    declared = {selector.name: selector for selector in program.selectors}
+    # Echo the declared selectors in declaration order first (the caller's own
+    # listing), then any bare ``var`` the program references without declaring.
+    ordered: list[tuple[str, Any]] = [
+        (selector.name, selector) for selector in program.selectors if selector.name in referenced
+    ]
+    ordered += [(name, None) for name in referenced if name not in declared]
+    selectors = [
+        {
+            "name": name,
+            "record": (selector.record if selector is not None else None) or params.record,
+            "component": (selector.component if selector is not None else None) or params.component,
+            "iteration": (
+                selector.iteration if selector is not None and selector.iteration is not None else params.iteration
+            ),
+        }
+        for name, selector in ordered
+    ]
+    if not selectors:
+        # A constant/pure program reads no mesh data.
+        note = "unitless: the program reads no mesh data (a constant or pure expression)"
+    else:
+        note = (
+            "result is in PIConGPU internal (normalized) code units: the mesh "
+            "components named in `selectors` carry no unit metadata this reader "
+            "can retrieve, so no physical unit is asserted"
+        )
+    return {"unit_note": note, "selectors": selectors}
+
+
+def _shape_compute(
+    payload: dict[str, Any],
+    *,
+    program: Any = None,
+    params: ResultParams | None = None,
+) -> dict[str, Any]:
     """Shape an evaluator payload into the frozen result-ack fields.
 
     The ack carries a fixed key set, so the numeric array travels as ``data``
     (``data_encoding="float"``), a scalar as ``stats["value"]``, and the
-    evaluator's metadata as ``result``.
+    evaluator's metadata as ``result``.  When the program is supplied the
+    result metadata is augmented with a truthful ``unit_note`` and the selector
+    echo (L4).
 
     Returns:
         The shaped ack fields, or a ``RESULT_TOO_LARGE`` error.
@@ -2608,6 +2685,8 @@ def _shape_compute(payload: dict[str, Any]) -> dict[str, Any]:
     metadata: dict[str, Any] = {"result_kind": payload.get("result_kind", "scalar")}
     if "points" in payload:
         metadata["points"] = payload["points"]
+    if program is not None and params is not None:
+        metadata.update(_compute_units(program, params))
     if isinstance(result, list):
         if len(result) > SLICE_MAX_POINTS:
             result = result[:SLICE_MAX_POINTS]

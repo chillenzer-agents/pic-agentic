@@ -93,6 +93,61 @@ def test_compute_scalar_vector_and_histogram(fake_compute: Path) -> None:
     assert spec["result"]["result_kind"] == "array"
 
 
+def test_compute_result_carries_a_truthful_unit_note_and_selector_echo(fake_compute: Path) -> None:
+    """L4: the result states the normalized-unit convention and echoes selectors.
+
+    No physical unit is knowable from the raw openPMD components, so the ack
+    must say so explicitly rather than invent one, and name the record/component/
+    iteration each input came from.
+    """
+    spec = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program()),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = spec["result"]
+    assert "normalized" in metadata["unit_note"]
+    assert metadata["result_kind"] == "array"
+    assert metadata["selectors"] == [
+        {"name": "px", "record": "E", "component": "x", "iteration": None},
+        {"name": "py", "record": "E", "component": "y", "iteration": None},
+    ]
+
+
+def test_compute_bare_var_without_declared_selectors_is_not_called_unitless(fake_compute: Path) -> None:
+    """A bare ``var`` reads mesh data even when ``selectors`` is omitted."""
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            record="E",
+            component="x",
+            program={"output": {"kind": "reduce", "op": "sum", "operand": _var("x")}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = result["result"]
+    assert "unitless" not in metadata["unit_note"]
+    assert metadata["selectors"] == [{"name": "x", "record": "E", "component": "x", "iteration": None}]
+
+
+def test_compute_constant_program_unit_note_says_unitless(fake_compute: Path) -> None:
+    """A program that reads no mesh data is unitless, and the note says so."""
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            program={"output": {"kind": "const", "value": 2.0}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    assert result["stats"]["value"] == pytest.approx(2.0)
+    assert "unitless" in result["result"]["unit_note"]
+    assert result["result"]["selectors"] == []
+
+
 def test_compute_requires_a_program(fake_compute: Path) -> None:
     result = results.resolve_result(
         ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE),
