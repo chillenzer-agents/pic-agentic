@@ -124,6 +124,72 @@ async def test_wait_for_a_non_terminal_target_state() -> None:
     assert outcome.target_states == [SimulationState.JOB_RUNNING.value]
 
 
+async def test_wait_wakes_every_concurrent_waiter_for_a_sim() -> None:
+    """Two overlapping waits on one sim are both woken by the terminal push.
+
+    Guards M2: a single shared ``asyncio.Event`` popped by the first returning
+    waiter left the second to observe the terminal state only on its poll
+    ceiling (or the deadline) instead of on the push.
+    """
+    service = _service()
+    service.on_message(_event(SimulationState.SUBMITTED, seq=1, job_id=JOB_ID))
+
+    # Waiter A resolves on job_running; waiter B watches the terminal set with a
+    # poll ceiling far larger than the test, so only a real wake returns it.
+    # Both must be parked before the transitions are projected.
+    first = asyncio.create_task(
+        service.wait_for_state(
+            SIM_ID,
+            target_states=[SimulationState.JOB_RUNNING.value],
+            timeout_s=5.0,
+            poll_interval_s=100.0,
+        )
+    )
+    await asyncio.sleep(0)  # let A register its wakeup
+    second = asyncio.create_task(service.wait_for_state(SIM_ID, timeout_s=5.0, poll_interval_s=100.0))
+    await asyncio.sleep(0)  # let B register its wakeup
+
+    # A returns on this push and (before the fix) popped the shared event,
+    # stranding B; B must still be woken by the later terminal push.
+    service.on_message(_event(SimulationState.JOB_RUNNING, seq=2, job_id=JOB_ID, slurm_state="RUNNING"))
+    outcome_a = await asyncio.wait_for(first, timeout=1.0)
+    service.on_message(_event(SimulationState.RESULTS_READY, seq=3, job_id=JOB_ID, results_linked=True))
+    outcome_b = await asyncio.wait_for(second, timeout=1.0)
+
+    assert outcome_a.matched is True
+    assert outcome_a.state == SimulationState.JOB_RUNNING.value
+    assert outcome_b.matched is True
+    assert outcome_b.state == SimulationState.RESULTS_READY.value
+    assert outcome_b.waited_s < 1.0
+    # Both waiters are deregistered once they return (no stranded entry).
+    assert SIM_ID not in service._waiters
+
+
+async def test_wait_catches_a_terminal_event_projected_before_it_registers() -> None:
+    """N1: the wake-before-await race -- an event landing at the first await.
+
+    A projector task that yields exactly once projects the terminal event at the
+    first suspension point of the wait (after its pre-loop state check and
+    ``wakeup.clear()``, before it has parked).  The loop re-reads the registry
+    after every wake, so the outcome must match even though the event did not
+    set a parked waiter's event.
+    """
+    service = _service()
+    service.on_message(_event(SimulationState.ACCEPTED, seq=1, job_id=None))
+
+    async def projector() -> None:
+        await asyncio.sleep(0)
+        service.on_message(_event(SimulationState.RESULTS_READY, seq=2, job_id=JOB_ID, results_linked=True))
+
+    task = asyncio.create_task(projector())
+    outcome = await service.wait_for_state(SIM_ID, timeout_s=5.0, poll_interval_s=100.0)
+    await task
+
+    assert outcome.matched is True
+    assert outcome.state == SimulationState.RESULTS_READY.value
+    assert outcome.waited_s < 1.0
+
+
 async def test_wait_terminal_alias_expands_to_the_terminal_set() -> None:
     service = _service()
     service.on_message(_event(SimulationState.FAILED, seq=1, job_id=None, error="boom", error_code="failed"))
