@@ -516,21 +516,36 @@ class HelloRuntime:
     async def add_agenda_leaf(
         self,
         name: str,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None,
         *,
+        spec_path: str | None = None,
         point: dict[str, float | int | str] | None = None,
         depends_on: list[str] | None = None,
         parameter: str | None = None,
     ) -> dict[str, Any]:
         """Add one leaf to the campaign's root group (agent expansion).
 
+        The leaf spec comes either inline (``spec``) or from a staged JSON file
+        (``spec_path``); exactly one must be given.  The by-reference form lets a
+        leaf carry a different whole spec than the campaign's base without
+        re-typing tens of KiB -- the escape hatch for varying more than one spec
+        node.
+
         Returns:
             ``{"ok": True, "path": name}``, or a soft error.
 
         """
+        resolved, error = self._resolve_spec(
+            spec,
+            spec_path,
+            inline_key="spec",
+            error_code="spec_required",
+        )
+        if error is not None:
+            return error
         return await self.agenda_service.add_leaf(
             name,
-            spec,
+            resolved,
             point=point,
             depends_on=depends_on,
             parameter=parameter,
@@ -555,38 +570,56 @@ class HelloRuntime:
             ``{"ok": True, "name": name, "leaves": [...]}``, or a soft error.
 
         """
-        resolved, error = self._resolve_base_spec(base_spec, base_spec_path)
+        resolved, error = self._resolve_spec(
+            base_spec,
+            base_spec_path,
+            inline_key="base_spec",
+            error_code="base_spec_required",
+        )
         if error is not None:
             return error
         return await self.agenda_service.create_campaign(name, resolved, patch_path, values, parameter=parameter)
 
-    def _resolve_base_spec(
+    def _resolve_spec(
         self,
-        base_spec: dict[str, Any] | None,
-        base_spec_path: str | None,
+        spec: dict[str, Any] | None,
+        spec_path: str | None,
+        *,
+        inline_key: str,
+        error_code: str,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """Pick and load the base spec from the inline or path form.
+        """Pick and load a spec from the inline or path form.
 
         Exactly one of the two forms is required.  A path is read only inside
         the staging root (:mod:`~pic_agentic.server.spec_files`), so an
         LLM-supplied path can never reach outside it.
 
+        Args:
+            spec: The inline spec, or ``None``.
+            spec_path: The staged-file path, or ``None``.
+            inline_key: The inline argument's public name, used in the error
+                detail so the caller knows which pair to fix (``base_spec`` for
+                create_campaign, ``spec`` for add_agenda_leaf).
+            error_code: The stable soft-error code when neither/both forms are
+                given.
+
         Returns:
             ``(spec, None)`` on success, else ``(None, soft_error)``.
 
         """
-        if (base_spec is None) == (base_spec_path is None):
+        path_key = f"{inline_key}_path"
+        if (spec is None) == (spec_path is None):
             return None, {
                 "ok": False,
-                "error": "base_spec_required",
-                "detail": "provide exactly one of base_spec (inline) or base_spec_path (staged file)",
+                "error": error_code,
+                "detail": f"provide exactly one of {inline_key} (inline) or {path_key} (staged file)",
             }
-        if base_spec_path is not None:
+        if spec_path is not None:
             try:
-                return read_spec_file(self.config, base_spec_path), None
+                return read_spec_file(self.config, spec_path), None
             except UnsafePathError as exc:
                 return None, {"ok": False, "error": "invalid_spec_path", "detail": self.config.redact(str(exc))}
-        return base_spec, None
+        return spec, None
 
     async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
         """Remove the persisted campaign and its reuse registry (reset).
@@ -732,13 +765,18 @@ class HelloRuntime:
 SERVER_INSTRUCTIONS = (
     "Submit and follow PIConGPU simulations on a remote SLURM cluster. "
     "The 'hello' tool performs an end-to-end connectivity check. "
+    "Which tool: submit_simulation runs a single simulation; to scan one spec "
+    "field across values, use build_spec then create_campaign (one leaf per "
+    "value, same patch_path); to vary more than one spec node, or to give each "
+    "leaf its own whole spec, create the base campaign and add one "
+    "add_agenda_leaf per leaf with an explicit spec. "
     "A simulation is defined either as a PICMI Python script (submit_simulation) "
     "or, for parameter studies, as a pypicongpu Runner spec "
     "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
     "a spec field across values). "
     "A large spec should be passed by reference, not re-typed: call "
     "build_spec(picmi_script, write_to=...) and hand the returned spec_path to "
-    "create_campaign(base_spec_path=...). "
+    "create_campaign(base_spec_path=...) or to add_agenda_leaf(spec_path=...). "
     "create_campaign's patch_path is a dotted Runner-spec path addressed node "
     "by node: a numeric segment is a list index on a list or a dict key on a "
     "dict, so a nested list element is reachable too "
@@ -747,19 +785,45 @@ SERVER_INSTRUCTIONS = (
     "create_campaign refuses to overwrite an existing campaign; to start a fresh "
     "one, remove the old state first with delete_campaign (reset), optionally "
     "after stop_agenda to cancel in-flight jobs. "
-    "For how to write a PICMI input file and how to define or scan multiple "
-    "simulations, see the PyPIConGPU documentation: the page 'Defining Your "
+    "Use the API of the *installed* picongpu package, not the online "
+    "readthedocs pages: they may describe a newer release than the pin. The "
+    "pinned classes are picmi.Cartesian3DGrid, picmi.ElectromagneticSolver, "
+    "picmi.GaussianLaser, picmi.Species, picmi.PseudoRandomLayout, "
+    "picmi.UniformDistribution and picmi.GaussianDistribution, and the "
+    "diagnostics under picmi.diagnostics (e.g. EnergyHistogram, PhaseSpace, "
+    "NativeFieldDump, FieldEnergyMonitor). Names the readthedocs pages use that "
+    "are absent from this pin include FieldDiagnostic and PhaseSpaceDiagnostic. "
+    "Do not build the input yourself with sim.write_input_file(): define the "
+    "simulation and let build_spec/submit_simulation build it. A "
+    "minimal version-matched script is:\n"
+    "from picongpu import picmi\n"
+    "grid = picmi.Cartesian3DGrid(number_of_cells=[32, 32, 32], "
+    "lower_bound=[0.0, 0.0, 0.0], upper_bound=[1e-6, 1e-6, 1e-6], "
+    "lower_boundary_conditions=['open'] * 3, "
+    "upper_boundary_conditions=['open'] * 3)\n"
+    "solver = picmi.ElectromagneticSolver(method='Yee', cfl=0.95, grid=grid)\n"
+    "electrons = picmi.Species(name='electrons', particle_type='electron', "
+    "initial_distribution=picmi.UniformDistribution(density=1e24, "
+    "rms_velocity=[1e6, 1e6, 1e6]))\n"
+    "sim = picmi.Simulation(max_steps=10, solver=solver, species=[electrons], "
+    "layouts=[picmi.PseudoRandomLayout(n_macroparticles_per_cell=2)])\n"
+    "For more, see the PyPIConGPU documentation: the page 'Defining Your "
     "Simulation' under python_package/foundations/defining_simulation "
     "(published at https://picongpu.readthedocs.io/en/latest/python_package/foundations/) "
     "covers simulation definition and static/dynamic parameter scans; the "
     "tutorial and the examples under lib/python/examples/ in the picongpu "
     "source tree show complete setups. Note: the focal example on the "
-    "'Defining Your Simulation' page defines no plasma species, so it yields an "
-    "empty spectrum as written; fold in the LWFA tutorial's plasma species for "
-    "a non-empty result. A run that finishes but whose only numeric plugin "
-    "artifact reads all-zero is reported as `suspect` in advance_agenda, "
-    "agenda_status and fleet_status (and on its done callback); treat such a "
-    "run as inconclusive physics, not as a valid result."
+    "'Defining Your Simulation' page is empty as written, and not only for lack "
+    "of a plasma species: it reuses the LWFA tutorial's pulse timing "
+    "(PULSE_INIT=15, so the pulse starts ~11 um in front of the box) with a "
+    "100-step run, and the pulse never reaches the gas (whose plateau sits "
+    "~80 um downstream). Bridging that needs ~2000 steps. Folding in the plasma "
+    "species is necessary but not sufficient; also make the laser reach the "
+    "plasma within max_steps. A run that finishes "
+    "but whose only numeric plugin artifact reads all-zero is reported as "
+    "`suspect` in advance_agenda, agenda_status and fleet_status (and on its "
+    "done callback); treat such a run as inconclusive physics, not as a valid "
+    "result."
 )
 
 
@@ -1424,20 +1488,41 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Add one simulation leaf to the persisted campaign's root group, so "
             "the next advance_agenda tick can submit it. Used by the agent to "
-            "refine a sweep (e.g. add points around an optimum). `point` is the "
-            "sweep assignment to record; pass `parameter` to label the swept "
-            "quantity in human-readable form (stored as sweep_parameter)."
+            "refine a sweep (e.g. add points around an optimum), and as the "
+            "escape hatch for studies create_campaign cannot express with a "
+            "single patch_path: build the base campaign, then add one leaf per "
+            "point with its own whole spec, varying as many spec nodes as the "
+            "study needs (e.g. grid cells and time_steps together for a "
+            "fixed-physical-size convergence study). Provide the leaf spec "
+            "exactly one way: inline as `spec`, or by reference as `spec_path` "
+            "(a staged JSON spec under the server's spec directory, e.g. the "
+            "`spec_path` build_spec(write_to=...) returned), so a large leaf "
+            "spec need not be re-typed. The staged reference lifts only the "
+            "inline *argument* size; the same 48 KiB escaped wire budget as any "
+            "submission still applies, so an over-cap leaf is refused here "
+            "rather than failing at advance_agenda. `point` is the sweep "
+            "assignment to record; pass `parameter` to label the swept quantity "
+            "in human-readable form (stored as sweep_parameter)."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
     async def add_agenda_leaf(
         name: str,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None = None,
+        *,
+        spec_path: str | None = None,
         point: dict[str, Any] | None = None,
         depends_on: list[str] | None = None,
         parameter: str | None = None,
     ) -> dict[str, Any]:
-        result = await runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on, parameter=parameter)
+        result = await runtime.add_agenda_leaf(
+            name,
+            spec,
+            spec_path=spec_path,
+            point=point,
+            depends_on=depends_on,
+            parameter=parameter,
+        )
         return _redact_dict(runtime, result)
 
     _register_research_tools(server, runtime)

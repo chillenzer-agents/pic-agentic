@@ -20,9 +20,22 @@ that pointer; prompt 2 is meant to test whether the agent can compose a new
 study from the documentation without a verbatim snippet to copy.
 
 Caveat for the pointer (picongpu upstream docs issue, not fixed here): the page's
-focal example defines no plasma species, so it produces an empty spectrum as
-written. The `instructions` now say the example needs the LWFA tutorial's plasma
-species folded in for a non-empty result.
+focal example is empty as written, and not only because it defines no plasma
+species. It reuses the LWFA tutorial's pulse timing (`PULSE_INIT=15`, so the
+pulse starts ~11 µm in front of the box) in a 100-step run, and the pulse never
+reaches the gas (whose plateau sits ~80 µm downstream; bridging that needs
+~2000 steps). Folding in the plasma
+species is necessary but not sufficient; the `instructions` now say both. A
+run that finishes but whose only numeric artifact reads all-zero is the
+`suspect` health signal below.
+
+The `instructions` also warn that the readthedocs pages may describe a
+**newer release than the installed pin**, and carry a minimal version-matched
+snippet built from the pinned classes. The beta-5 agent copied
+`FieldDiagnostic`/`PhaseSpaceDiagnostic`/`write_input_file` from the online pages
+and then had to reverse-engineer `site-packages`; the pin uses
+`picmi.diagnostics.NativeFieldDump`/`DerivedFieldDump`/`PhaseSpace`/
+`EnergyHistogram`/`FieldEnergyMonitor`. The installed package is authoritative.
 
 Independently of *why* a run is empty, a completed run whose only numeric plugin
 artifact reads all-zero is now a first-class **health signal**, not silence:
@@ -79,6 +92,14 @@ plus the resolution at which it converges within a stated tolerance. There is
 no single documentation page to copy: the agent must pick a concrete setup from
 the docs, choose (and justify) an integrated quantity, express the resolution
 sweep, and interpret the result.
+
+This resolution sweep cannot be one `create_campaign` `patch_path`: holding the
+physical box size fixed means the grid cell count **and** `time_steps` must
+co-vary, i.e. two spec nodes. The intended route is the `add_agenda_leaf` escape
+hatch — create the base campaign, then add one leaf per resolution with its own
+whole spec (staged by `spec_path` if large). A transcript in which the agent
+abandons the campaign machinery entirely and hand-runs submissions is the H5
+finding this documents against.
 
 ## Checks common to both prompts
 
