@@ -2320,17 +2320,59 @@ def _build_energy_fields(
     Returns:
         The bounded summary dict.
 
-    Raises:
-        ResultsReaderError: If the file cannot be read or has no parsable rows.
-
     """
     _ = instance, groups, window
+    rows, components, truncated = _read_fields_energy(target)
+    return _summarize_energy_fields(rows, components, iteration, target, truncated=truncated)
+
+
+def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str], bool]:
+    """Read a native text plugin file under a byte cap and parse it once.
+
+    The read is bounded by :data:`_NATIVE_TEXT_MAX_BYTES`, so a pathologically
+    large ``fields_energy.dat`` cannot be pulled wholly into memory despite the
+    cap the comment documents (m1); a chunky read stops just past the cap and
+    the parser then sees only the prefix (excess rows are dropped as malformed,
+    and ``truncated`` says so).
+
+    Returns:
+        ``(rows, component_names, truncated)`` from :func:`_parse_fields_energy`.
+
+    Raises:
+        ResultsReaderError: If the file cannot be read.
+
+    """
     try:
-        text = target.read_text(encoding="utf-8", errors="replace")
+        with target.open("rb") as handle:
+            raw = handle.read(_NATIVE_TEXT_MAX_BYTES + 1)
     except OSError as exc:  # pragma: no cover - target existence is checked earlier
         msg = f"cannot read {target.name}: {exc}"
         raise ResultsReaderError(msg) from exc
-    rows, components, truncated = _parse_fields_energy(text)
+    text = raw.decode("utf-8", errors="replace")
+    return _parse_fields_energy(text)
+
+
+def _summarize_energy_fields(
+    rows: list[_FieldEnergyRow],
+    components: list[str],
+    iteration: int,
+    target: Path,
+    *,
+    truncated: bool,
+) -> dict[str, Any]:
+    """Shape already-parsed ``EnergyFields`` rows into the bounded summary.
+
+    Split from :func:`_build_energy_fields` so the native plugin path can parse
+    the file once and reuse the rows for both the step resolution and the
+    summary (m3).
+
+    Returns:
+        The bounded summary dict.
+
+    Raises:
+        ResultsReaderError: If there are no parsable rows.
+
+    """
     if not rows:
         msg = f"{target.name} has no parsable field-energy rows"
         raise ResultsReaderError(msg)
@@ -2387,18 +2429,14 @@ def _native_plugin_result(
 
     """
     _ = output
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:  # pragma: no cover - target existence is checked earlier
-        msg = f"cannot read {target.name}: {exc}"
-        raise ResultsReaderError(msg) from exc
-    rows, _components, _truncated = _parse_fields_energy(text)
+    rows, components, truncated = _read_fields_energy(target)
     available = [row.step for row in rows]
     if not available:
         msg = f"{target.name} has no parsable field-energy rows"
         raise ResultsReaderError(msg)
     selected = _resolve_plugin_iteration(available, params.iteration)
-    return _annotate_vacuous(reader, _PLUGIN_BUILDERS[reader](None, {}, selected, target))
+    summary = _summarize_energy_fields(rows, components, selected, target, truncated=truncated)
+    return _annotate_vacuous(reader, summary)
 
 
 #: Reader name -> the summary builder that calls the reader instance.  Every
