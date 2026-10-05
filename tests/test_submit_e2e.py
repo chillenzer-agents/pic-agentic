@@ -250,6 +250,31 @@ async def test_submit_spec_stable_cmd_id_replays_without_duplicate(shared_dir, t
     assert len(fake_runner) == 1
 
 
+async def test_submit_pending_record_reports_outcome_unknown_code(shared_dir, tmp_path, fake_runner) -> None:
+    """A pending record's replay carries the stable ``outcome_unknown`` code.
+
+    The C2 fix classifies the lost ack on this code, not a substring: a pending
+    idempotency record (a crash mid-build) must be distinguishable from a real
+    ``rejected_by_policy`` rejection.
+    """
+    from pic_agentic.simclient.client import ProcessedCommand
+
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    key = "b" * 32
+    cmd_id, _payload, command = service._build_spec_payload({"sim": {"time_steps": 4}}, cmd_id=key)
+    assert cmd_id == key
+    # Mimic the pre-execution record a crash leaves behind (unknown outcome).
+    client._persist_processed(
+        ProcessedCommand(cmd_id=key, payload_hash=command.payload["header"]["payload_hash"], sim_id="declared1"),
+    )
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload["error"] == "already_submitted:outcome_unknown"
+    assert ack.payload["error_code"] == "outcome_unknown"
+    # No job was launched.
+    assert fake_runner == []
+
+
 async def test_submit_spec_without_cmd_id_generates_one(shared_dir, tmp_path, fake_runner) -> None:
     _mcp_t, _sim_t, service, _client = _make_pair(shared_dir)
     cmd_id, _payload, _command = service._build_spec_payload({"sim": {"time_steps": 4}})

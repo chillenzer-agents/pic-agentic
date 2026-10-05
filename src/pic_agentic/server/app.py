@@ -1053,7 +1053,14 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
 
     @server.tool(
         title="Cancel a simulation",
-        description="Cancel a simulation's SLURM job immediately (plain scancel).",
+        description=(
+            "Cancel a simulation's SLURM job immediately (plain scancel). For a "
+            "known sim that has not reached a live job yet (accepted but still "
+            "building, or a lost-ack record) the client answers "
+            "`not_signalable` with the state rather than a bare `unknown_sim`, "
+            "so a stranded sim is diagnosable; `unknown_sim` still means the id "
+            "was never submitted."
+        ),
         # destructive: it kills the job outright -- no clean shutdown, and any
         # output since the last checkpoint is lost.
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
@@ -1268,7 +1275,15 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Run one durable tick of the campaign engine stored on the server: "
             "observe the known simulations, plan the next actions and submit "
             "what the budget and the policy allow. Returns the tick result "
-            "(submitted/waiting/done/failed paths and usage). `state` is the "
+            "(submitted/waiting/deferred/done/failed paths and usage). `deferred` "
+            "lists leaves whose submission outcome is unknown (a lost ack or a "
+            "pending cluster record): they stay planned and are retried next "
+            "tick under the same exactly-once command id, so a lost ack is never "
+            "reported as a physics failure. The retry is bounded by elapsed "
+            "wall-clock time (configurable), not by a tick count, so quick "
+            "successive ticks do not fail a still-building job; after the window "
+            "the leaf is failed with an `outcome_unknown` code (the job may still "
+            "exist -- check list_simulations and cancel it). `state` is the "
             "campaign's lifecycle state (running/paused/stopped), or `complete` "
             "once `complete` is true and every leaf has finished; `lifecycle` "
             "always carries the stored lifecycle state (running/paused/stopped), "
@@ -1302,10 +1317,14 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "Report the aggregate status of the persisted campaign: its name, "
             "completion flag, per-status counts, accumulated usage and the "
             "per-leaf view (path, status, sim_id, sweep point and its readable "
-            "sweep_parameter). A ``done`` leaf whose only numeric artifact reads "
-            "all-zero is flagged `suspect` (and counted in "
-            "`suspect_count`/`suspects`), so an empty run is not reported as a "
-            "clean success."
+            "sweep_parameter). A leaf whose submission outcome is unknown (a "
+            "lost ack, still retried) is flagged `deferred` with its "
+            "`deferred_attempts` and `deferred_since`, distinct from a terminal "
+            "`failed`; retrying is bounded by wall-clock time, not by a tick "
+            "count, so quick successive ticks do not fail a still-building job. A ``done`` "
+            "leaf whose only numeric artifact reads all-zero is flagged `suspect` "
+            "(and counted in `suspect_count`/`suspects`), so an empty run is not "
+            "reported as a clean success."
         ),
         annotations=_READ_ONLY,
     )
@@ -1617,9 +1636,15 @@ def _register_lifecycle_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     @server.tool(
         title="Stop the campaign (kill-switch)",
         description=(
-            "Stop the campaign outright and cancel every in-flight job. The "
-            "state is flipped before cancellation, so no tick can submit after "
-            "the switch. This is terminal; it is not resumable."
+            "Stop the campaign outright and cancel every job that may still be "
+            "live -- including a lost-ack/deferred leaf, which stays planned but "
+            "already carries a sim_id. The state is flipped before cancellation, "
+            "so no tick can submit after the switch. Returns `cancelled` (jobs "
+            "the client confirmed killed), `cleared` (leaves that were known but "
+            "had no live job, e.g. an accepted-but-unsubmitted stranded sim: "
+            "resolved, nothing to kill) and `errors` (each with the sim_id and "
+            "the client's reason/code, never a bare 'rejected'). This is "
+            "terminal; it is not resumable."
         ),
         # destructive: it cancels running cluster jobs.
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
@@ -1934,6 +1959,9 @@ def _submit_outcome_dict(runtime: HelloRuntime, outcome: SubmitOutcome) -> dict[
         "state": outcome.state,
         "job_id": outcome.job_id,
         "acked": outcome.acked,
+        # Surface an unknown outcome explicitly: the job may exist, so a caller
+        # must not read a bare ``ok: false`` as a physics/policy failure.
+        "outcome_unknown": outcome.outcome_unknown,
     }
     if outcome.error:
         payload["error"] = redact(outcome.error)
@@ -1960,4 +1988,9 @@ def _outcome_dict(runtime: HelloRuntime, outcome: HelloOutcome) -> dict[str, Any
         payload["client_result_ops"] = sorted(result_ops) if result_ops is not None else None
     if outcome.error:
         payload["error"] = redact(outcome.error)
+    if outcome.error_code:
+        # Symmetry with the submit path: a ``hello`` replay of a pending
+        # idempotency record carries the stable ``outcome_unknown`` code, so the
+        # N3 path is not left with only the confusing sentinel string.
+        payload["error_code"] = outcome.error_code
     return payload

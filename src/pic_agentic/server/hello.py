@@ -34,6 +34,10 @@ class HelloOutcome(BaseModel):
     cluster_output: str | None
     acked: bool
     error: str | None = None
+    #: Stable machine-readable code for a non-``None`` ``error`` (e.g. the
+    #: ``outcome_unknown`` of a pending idempotency record on a ``hello`` replay),
+    #: so a caller need not match on the human-readable string.
+    error_code: str | None = None
     #: The client's advertised capability set, when the client is new enough to
     #: send one.  ``None`` means an old client that predates the handshake.
     capabilities: ClientCapabilities | None = None
@@ -210,6 +214,7 @@ class HelloService:
             cluster_output=ack.payload.get("cluster_output"),
             acked=True,
             error=ack.payload.get("error"),
+            error_code=ack.payload.get("error_code"),
             capabilities=self.capabilities,
         )
 

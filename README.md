@@ -339,6 +339,31 @@ every leaf is terminal; the stored lifecycle is preserved in the `lifecycle`
 field, so a finished **paused**/**stopped** campaign reads `state: "complete"`
 with `lifecycle: "paused"`/`"stopped"` rather than hiding the pause/stop.
 
+### Lost acknowledgements are deferred, not failures
+
+When the simclient accepts a submission but its acknowledgement is lost (or it
+died before recording an outcome), it replays a **pending idempotency record**
+whose error code is `outcome_unknown`. The job may well be running, so the
+engine does **not** mark the leaf failed: it stays `planned` and is retried on
+the next tick under the same exactly-once command id, which re-acks the original
+job instead of submitting a second one. Such a leaf is reported separately in
+the tick's `deferred` list and in `agenda_status` (`deferred: true`, plus
+`deferred_attempts` and `deferred_since`), so a lost acknowledgement is never
+presented as a physics failure. Retrying is bounded by **elapsed wall-clock
+time**, not by a tick count: the pending record only becomes terminal when the
+simclient *finishes the build* (which can take minutes), while an agent can call
+`advance_agenda` several times in seconds. Counting ticks would therefore fail a
+leaf whose job is still building — the very harm the deferral exists to avoid.
+Once `now - deferred_since` exceeds `agenda_deferred_outcome_timeout_s`
+(`PIC_AGENTIC_AGENDA_DEFERRED_OUTCOME_TIMEOUT_S`, default 900 s) the leaf is
+failed with an `outcome_unknown` code (the job may still exist — check
+`list_simulations`/`get_status` and clean it up). That code is forced on the
+deferred/give-up leaf even when an older client still sends
+`rejected_by_policy` alongside the sentinel string, and the same code is
+surfaced on a `hello` replay of a pending record. A *genuine* rejection (bad
+payload, policy, version drift) is terminal immediately and keeps its
+`rejected_by_policy`-style code.
+
 ### Deleting a campaign does not forget its simulations
 
 `delete_campaign` removes only the persisted campaign (and its reuse registry),
