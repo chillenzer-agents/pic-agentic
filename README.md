@@ -363,22 +363,28 @@ distinct study point.
 
 ### Content-addressed reuse
 
-Reuse keys on the **full** wire hash (plus the provenance tuple), not on
-`sim_id`, so an identical spec that already completed is *linked* to that run
-instead of being submitted again. `advance_agenda` reports such leaves under
-`reused`; `agenda_status` marks them with `reused: true` and their `run_id`; the
-RO-Crate flags them `reused`. A **bare `submit_simulation` counts too**: it is
-recorded as pending the moment the cluster accepts it and promoted to reusable
-when its `results.ready` event arrives (only a run whose results exist is
-reused), so a completed ad-hoc run is reused by a later byte-identical campaign
-leaf rather than re-run. The provenance tuple is part of the key, and it names
-the **server's** effective provenance (its configured/local PIConGPU
-revision/schema; a spec-carried revision is only a fallback for a server
-without a local pin). Identical physics therefore does **not** reuse across a
-changed server pin or schema — the result would not be attributable to a run
-the server can vouch for. A revision carried inside a leaf's own spec does not
-change the key when the server has a configured revision, so it cannot be used
-to force a re-run.
+Reuse keys on the **full** content key — the wire payload, the provenance tuple
+and the leaf's **sweep point** — not on `sim_id`, so a spec that already
+completed is *linked* to that run instead of being submitted again.
+`advance_agenda` reports such leaves under `reused`; `agenda_status` marks them
+with `reused: true` and their `run_id`; the RO-Crate flags them `reused`.
+**Reuse requires identical content, provenance and sweep point**: two
+byte-identical specs at *different* points (e.g. `point={"x": 1.0}` and
+`point={"x": 2.0}`) are **different simulations** and never reuse one another,
+so a leaf's provenance cannot attribute its result to a point that never ran.
+Finer-grained reuse (e.g. point-insensitive reuse of the same physics) is future
+work. A **bare `submit_simulation` counts too**, but it has *no* sweep point: it
+is recorded as pending the moment the cluster accepts it and promoted to
+reusable when its `results.ready` event arrives (only a run whose results exist
+is reused), so a completed ad-hoc run is reused by a later point-less,
+otherwise-identical campaign leaf rather than re-run — never by a point-carrying
+leaf. The provenance tuple is part of the key, and it names the **server's**
+effective provenance (its configured/local PIConGPU revision/schema; a
+spec-carried revision is only a fallback for a server without a local pin).
+Identical physics therefore does **not** reuse across a changed server pin or
+schema — the result would not be attributable to a run the server can vouch for.
+A revision carried inside a leaf's own spec does not change the key when the
+server has a configured revision, so it cannot be used to force a re-run.
 
 ## Security model (M1)
 

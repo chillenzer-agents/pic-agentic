@@ -7,9 +7,18 @@
 This is the "same spec, reuse the result" feature.  A simulation's ``sim_id`` is
 only the first 8 hex of its payload hash (32 bits), so two *different* specs can
 share a ``sim_id``; it is a label, not a cache key.  This module keys reuse on
-the **full** wire hash instead and records only runs that finished successfully,
-so a leaf whose spec is byte-identical to a run that already completed can be
-*linked* to that run instead of being submitted again.
+the **full** content key instead and records only runs that finished
+successfully, so a leaf whose content key matches a run that already completed
+can be *linked* to that run instead of being submitted again.
+
+The content key requires identical **content, provenance and sweep point**
+(option A): two byte-identical specs at *different* sweep points (e.g.
+``point={"x": 1.0}`` and ``point={"x": 2.0}``) are different simulations and
+must not reuse one another, otherwise a leaf's provenance could attribute its
+result to a point that never ran.  A direct ``submit_simulation`` has no sweep
+point and therefore keys under the point-less key; it never matches a
+point-carrying campaign leaf.  Finer-grained reuse (e.g. point-insensitive reuse
+of the same physics) is deliberately out of scope here and left to future work.
 
 The registry is plain pydantic data persisted atomically by
 :class:`~pic_agentic.agenda.store.AgendaStore`, so it survives restarts.  The

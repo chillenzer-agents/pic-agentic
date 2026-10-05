@@ -826,8 +826,10 @@ def build_server(config: Config, sim: str) -> tuple[MCPServer, HelloRuntime]:
             "it and it is NOT a run id. Use the returned `run_id` (the "
             "submission's command id) as the identity of this run; two re-runs "
             "of one spec report the same `sim_id` but different `run_id`. "
-            "A completed direct submit is recorded, so a later identical "
-            "campaign leaf is reused instead of re-run."
+            "A completed direct submit is recorded (as point-less, since it "
+            "has no sweep point), so a later byte-identical, point-less campaign "
+            "leaf is reused instead of re-run; a point-carrying leaf is a "
+            "different simulation under reuse and is submitted normally."
         ),
         # write/resource tier: consumes cluster resources, not destructive
         # (design section 6.2).  The server-side MCP client prompts for human
@@ -1304,7 +1306,10 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "only to recover callbacks from earlier ticks, since draining clears "
             "the persisted copy. `reused` lists leaves satisfied by an earlier "
             "identical run (content-addressed reuse: a completed direct "
-            "submit_simulation counts too), so no new job was started for them."
+            "submit_simulation counts too, but only for point-less leaves, since "
+            "reuse requires identical content, provenance AND sweep point -- "
+            "different points are different simulations), so no new job was "
+            "started for them."
         ),
         # write/resource tier: a tick may submit new cluster jobs, so it is not
         # read-only and not idempotent, but it is not destructive.
