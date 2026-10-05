@@ -25,6 +25,7 @@ import pytest
 from plugin_fixtures import (
     calorimeter_h5,
     energy_histogram_dat,
+    fields_energy_dat,
     phase_space_h5,
     png_file,
     radiation_h5,
@@ -84,6 +85,109 @@ def test_scandir_names_the_plugin_reader(tmp_path: Path) -> None:
     formats = {ref.path: ref.format for ref in manifest.files}
     assert formats["e_energyHistogram_all.dat"] == "energy_histogram"
     assert formats["output"] == "binary"
+
+
+def test_sniff_format_names_the_field_energy_monitor() -> None:
+    """H2: ``fields_energy.dat`` is plain text, not ``binary``."""
+    assert results._sniff_format("fields_energy.dat") == "energy_fields"
+    # Only the fixed ``fields_energy.dat`` name is this plugin's output; the
+    # ``EnergyParticles`` plugin's ``<species>_energy_<filter>.dat`` is a
+    # different artifact and must not be mislabelled (m2).
+    assert results._sniff_format("myrun_energy.dat") == "binary"
+    # A name that matches no plugin pattern is still generic/binary.
+    assert results._sniff_format("energy.dat") == "binary"
+    assert results._sniff_format("mystery.dat") == "binary"
+
+
+def test_field_energy_reader_summarizes_a_real_format_file(tmp_path: Path) -> None:
+    """H2: the native ``energy_fields`` reader parses the real file with no PIConGPU."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 1.5e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["step"] == [0, 50, 100]
+    assert summary["total_J"] == pytest.approx([1.0e-5, 2.0e-5, 1.5e-5])
+    assert summary["selected_step"] == 100
+    assert summary["step_first"] == 0
+    assert summary["step_last"] == 100
+    assert summary["n_steps"] == 3
+    assert summary["total_J_min"] == pytest.approx(1.0e-5)
+    assert summary["total_J_max"] == pytest.approx(2.0e-5)
+    assert summary["total_J_last"] == pytest.approx(1.5e-5)
+    assert summary["units_J"] == "Joule"
+    assert summary["component_names"] == ["Bx", "By", "Bz", "Ex", "Ey", "Ez"]
+    assert summary["component_last_J"]["Bx"] == pytest.approx(1.5e-5 / 6)
+    assert summary["source_path"] == "fields_energy.dat"
+    assert summary["source_size_bytes"] > 0
+    assert summary["truncated"] is False
+    assert "warning" not in summary
+
+
+def test_field_energy_reader_selects_an_explicit_step(tmp_path: Path) -> None:
+    """The ``iteration`` selector picks a row of the file's own history."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 1.5e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration=50)
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    summary = payload["result"]
+    assert summary["selected_step"] == 50
+    assert summary["component_last_J"]["Ex"] == pytest.approx(2.0e-5 / 6)
+    # The selected row's total is step 50's 2e-5, not the file's last 1.5e-5
+    # (M1): the two must not be conflated under an explicit iteration.
+    assert summary["total_J_selected"] == pytest.approx(2.0e-5)
+    assert summary["total_J_last"] == pytest.approx(1.5e-5)
+
+    missing = params.model_copy(update={"iteration": 7})
+    gone = results.resolve_result(missing, run_dir=run, sim_id=SIM_ID)
+    assert gone["error_code"] == "no_results"
+
+
+def test_field_energy_physics_fact_names_the_selected_step(tmp_path: Path) -> None:
+    """The H2 physics fact uses the selected row's total, not the latest (M1)."""
+    from pic_agentic import analysis
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 3.0e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration=50)
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    facts = analysis._plugin_physics_facts({"energy_fields": summary})
+    joined = "; ".join(facts)
+    # 2e-5 is step 50's total; 3e-5 is step 100's and must not be tagged as 50.
+    assert "at iteration 50 is 2e-05 J" in joined
+    assert "at iteration 50 is 3e-05" not in joined
+
+
+def test_field_energy_file_reads_as_a_bounded_text_tail(tmp_path: Path) -> None:
+    """H2: ``read_result`` no longer rejects ``fields_energy.dat`` as binary."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run)
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.READ, path="fields_energy.dat", tail=10)
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert payload["data_encoding"] == "text"
+    assert payload["data"][0].startswith("#step")
+
+
+def test_field_energy_is_in_describe_and_analyze(tmp_path: Path) -> None:
+    """H2: the artifact is labelled and summarized by ``describe``/``analyze``."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run)
+    manifest = results.scan_output(run / "simOutput", sim_id=SIM_ID, run_dir=str(run))
+    formats = {ref.path: ref.format for ref in manifest.files}
+    assert formats["fields_energy.dat"] == "energy_fields"
+
+    from pic_agentic import analysis
+
+    summaries = analysis.read_plugin_summaries(run / "simOutput")
+    assert summaries["energy_fields"]["total_J_last"] == pytest.approx(1.5e-5)
+    answer = analysis.synthesize_answer("what is the total field energy?", {}, {}, {}, summaries)
+    assert "field energy" in answer
 
 
 def test_sniff_format_is_a_documented_filename_heuristic(tmp_path: Path) -> None:
@@ -530,6 +634,42 @@ def test_real_nonzero_histogram_survives_the_real_reader(tmp_path: Path) -> None
     assert "warning" not in summary
 
 
+def test_real_nonzero_histogram_with_a_nonzero_minimum(tmp_path: Path) -> None:
+    """A non-zero ``minEnergy`` histogram reports its real edges and window (B1).
+
+    ``EnergyHistogramData`` returns only upper edges, so the first bin's lower
+    edge is the header's ``minEnergy`` - not a hard-coded ``0``.  The reviewer's
+    real-pin repro used a single populated low bin; here the header starts at
+    1000 keV, so a hard-coded 0 would mis-place every edge and undercount.
+    """
+    pytest.importorskip("picongpu")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    # ``min_kev=1000`` over a 1000 keV span in 10 bins: the fixture populates
+    # bin 0 [1000, 1100), bin 4 [1400, 1500) and bin 9 [1900, 2000).
+    energy_histogram_dat(run, species="e", min_kev=1000.0, max_kev=2000.0, peak_bin=4, peak_count=5, iterations=(0,))
+    payload = results.resolve_result(_params(species="e", iteration=0), run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    # The first bin's lower edge is the header's 1000 keV, not 0.
+    assert summary["min_energy_kev"] == pytest.approx(1000.0)
+    assert summary["max_energy_kev"] == pytest.approx(2000.0)
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(1000.0)
+    assert summary["count_in_window"]["max_kev"] == pytest.approx(2000.0)
+    assert summary["count_in_window"]["count"] == pytest.approx(7.0)
+    assert summary["total"] == pytest.approx(7.0)
+
+    # The exact physical first-window [1000, 1100) counts the first bin (1),
+    # not a spurious 0 from a mis-placed 0 edge.
+    first = results.resolve_result(
+        _params(species="e", iteration=0, min_kev=1000.0, max_kev=1100.0),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert first["result"]["count_in_window"]["count"] == pytest.approx(1.0)
+
+
 def test_real_probe_vacuity_aggregates_every_species(tmp_path: Path) -> None:
     """The real reader path probes *all* species, not the first (B1).
 
@@ -631,11 +771,14 @@ def test_energy_histogram_default_window_tracks_a_high_energy_spectrum(
     run = _high_energy_run(tmp_path, monkeypatch)
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
-    assert summary["count_in_window"]["min_kev"] == pytest.approx(5000.0)
+    # Half-open bins: the lowest populated bin is [2500, 5000) keV, so the
+    # populated range starts at its lower edge (2500), and the derived window
+    # [2500, 20000) counts all three populated bins.
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(2500.0)
     assert summary["count_in_window"]["max_kev"] == pytest.approx(20000.0)
     assert summary["count_in_window"]["count"] == pytest.approx(2.0e8)
     assert summary["n_nonzero_bins"] == 3
-    assert summary["min_energy_kev"] == pytest.approx(5000.0)
+    assert summary["min_energy_kev"] == pytest.approx(2500.0)
     assert summary["max_energy_kev"] == pytest.approx(20000.0)
     # A populated spectrum with a matching default is not a mis-window.
     assert "warning" not in summary
@@ -644,21 +787,47 @@ def test_energy_histogram_default_window_tracks_a_high_energy_spectrum(
 def test_energy_histogram_prefers_the_standard_window_when_populated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The preferred window is kept when it contains particles (F2 no-regression)."""
-    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubReader)
-    run = _tree(tmp_path)
+    """The preferred window is kept when the populated span fits (F2 no-regression)."""
+
+    class _WindowedHistogram:
+        """A spectrum whose lowest populated bin is [100, 200) keV.
+
+        Bin 0 ([0, 100)) is empty, so the populated half-open span is
+        [100, 1000), which fits in the preferred 100--1000 keV window.
+        """
+
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            bins = [100.0 * (i + 1) for i in range(10)]
+            counts = [0.0] * 10
+            counts[1] = 42.0
+            counts[-1] = 1.0
+            return counts, bins, [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _WindowedHistogram)
+    run = _high_energy_tree(tmp_path)
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
-    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(44.0)}
-    assert summary["n_nonzero_bins"] == 3
+    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(43.0)}
+    assert summary["n_nonzero_bins"] == 2
 
 
 class _SpanningHistogram:
     """A spectrum that spans the 100--1000 keV window to 20 MeV (F2 Major).
 
-    One populated edge lies inside the preferred window while all of the
-    weight sits above it, so "any populated bin inside" would silently return
-    a count of 1 and hide ~1e8 electrons.
+    Its lowest populated bin is [0, 900) keV and it reaches 20 MeV, so the
+    populated half-open span [0, 20000) is not contained in the preferred
+    100--1000 keV window; "any populated bin inside" would silently return a
+    count of 1 and hide ~1e8 electrons.
     """
 
     _EDGES: ClassVar[list[float]] = [900.0, 20000.0]
@@ -683,16 +852,16 @@ def test_energy_histogram_default_window_covers_a_spanning_spectrum(
 ) -> None:
     """A default that only partially covers the data must widen, not clip (F2).
 
-    The spectrum's lowest populated edge (900 keV) lies inside 100--1000 keV,
-    but the population reaches 20000 keV.  The derived window must capture the
-    whole range (and thus the whole count), not return the sliver inside the
-    preferred window.
+    The spectrum's lowest populated bin is [0, 900) keV and the population
+    reaches 20000 keV, so the populated span is not inside 100--1000 keV.  The
+    derived window must capture the whole range (and thus the whole count), not
+    return the sliver inside the preferred window.
     """
     monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _SpanningHistogram)
     run = _high_energy_tree(tmp_path)
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
-    assert summary["count_in_window"]["min_kev"] == pytest.approx(900.0)
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(0.0)
     assert summary["count_in_window"]["max_kev"] == pytest.approx(20000.0)
     assert summary["count_in_window"]["count"] == pytest.approx(1.0e8 + 1.0)
     assert summary["total"] == pytest.approx(1.0e8 + 1.0)
@@ -706,18 +875,19 @@ def test_energy_histogram_explicit_partial_window_warns(tmp_path: Path, monkeypa
     a tiny fraction of the total must still be flagged rather than presented as
     the electron count.
     """
-    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _SpanningHistogram)
-    run = _high_energy_tree(tmp_path)
+    run = _high_energy_run(tmp_path, monkeypatch)
+    # Bins are [0,2500),[2500,5000),[5000,10000),[10000,20000) keV. The
+    # half-open window [2500, 5000) counts only the [2500,5000) bin (1e8).
     payload = results.resolve_result(
-        _params(species="e", min_kev=100.0, max_kev=1000.0),
+        _params(species="e", min_kev=2500.0, max_kev=5000.0),
         run_dir=run,
         sim_id=SIM_ID,
     )
     summary = payload["result"]
-    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(1.0)}
-    assert summary["n_nonzero_bins"] == 2
+    assert summary["count_in_window"] == {"min_kev": 2500.0, "max_kev": 5000.0, "count": pytest.approx(1.0e8)}
+    assert summary["total"] == pytest.approx(2.0e8)
     assert "warning" in summary
-    assert "count_in_window is 1 of 1e+08" in summary["warning"]
+    assert "count_in_window is 1e+08 of 2e+08" in summary["warning"]
 
 
 def test_energy_histogram_single_bin_default_is_not_degenerate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -742,7 +912,10 @@ def test_energy_histogram_single_bin_default_is_not_degenerate(tmp_path: Path, m
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
     window = summary["count_in_window"]
-    assert window["min_kev"] == pytest.approx(2500.0)
+    # Half-open: the single bin is [0, 2500) keV, so the derived window is
+    # [0, 2500) and counts the bin.
+    assert window["min_kev"] == pytest.approx(0.0)
+    assert window["max_kev"] == pytest.approx(2500.0)
     assert window["max_kev"] > window["min_kev"]
     assert window["count"] == pytest.approx(7.0)
     # The window is one the wire model would accept if requested.
@@ -771,7 +944,7 @@ def test_energy_histogram_requestable_window_below_data(tmp_path: Path, monkeypa
     summary = payload["result"]
     assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(0.0)}
     assert summary["n_nonzero_bins"] == 3
-    assert summary["min_energy_kev"] == pytest.approx(5000.0)
+    assert summary["min_energy_kev"] == pytest.approx(2500.0)
     assert "warning" in summary
     assert "count_in_window is 0" in summary["warning"]
 
@@ -797,12 +970,14 @@ def test_energy_histogram_requestable_window_selects_a_subrange(
     """A requested window that covers part of the range counts only that part (F2)."""
     run = _high_energy_run(tmp_path, monkeypatch)
     payload = results.resolve_result(
-        _params(species="e", min_kev=4000.0, max_kev=15000.0),
+        _params(species="e", min_kev=2500.0, max_kev=10000.0),
         run_dir=run,
         sim_id=SIM_ID,
     )
     summary = payload["result"]
-    # 5000 and 10000 keV edges are inside; the 20000 keV edge is outside.
+    # Bins [2500,5000), [5000,10000), [10000,20000) have lower edges 2500,
+    # 5000, 10000. The half-open window [2500,10000) selects the first two
+    # (1e8 + 9e7); the [10000,20000) bin's lower edge 10000 is excluded.
     assert summary["count_in_window"]["count"] == pytest.approx(1.9e8)
     assert "warning" not in summary
 

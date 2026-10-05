@@ -27,6 +27,7 @@ itself.
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import importlib
 import importlib.util
@@ -165,6 +166,12 @@ class _PluginReader:
     submodule: str
     kind: str
     needs: str
+    #: ``True`` for a reader the engine parses itself (stdlib) rather than a
+    #: shipped ``picongpu.extra.plugins.data`` class.  A native reader has no
+    #: ``module``/``submodule``/``needs`` and needs no PIConGPU install: only the
+    #: run's plain-text output.  It is still a ``kind="text"`` reader for target
+    #: discovery (a regular file, never an openPMD series directory).
+    native: bool = False
 
 
 #: Filename patterns for the shipped readers.  The ``species``/``species_filter``
@@ -182,6 +189,22 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
         "energy_histogram",
         _KIND_TEXT,
         "picongpu",
+    ),
+    # The EnergyFields plugin writers emit exactly ``fields_energy.dat``
+    # (``EnergyFields.x.cpp`` hard-codes ``pluginPrefix = "fields_energy"``, so
+    # there is no per-run prefix).  Unlike the ``*_energyHistogram_*.dat``
+    # family this ships no reader in ``picongpu.extra.plugins.data``; the engine
+    # parses it natively (stdlib), so the integrated field-energy artifact is no
+    # longer labelled ``binary``/unreadable (H2).  (The ``EnergyParticles``
+    # plugin's ``<species>_energy_<filter>.dat`` is a *different* artifact with
+    # a species filter and is deliberately not matched.)
+    "energy_fields": _PluginReader(
+        re.compile(r"^fields_energy\.dat$"),
+        "",
+        "",
+        _KIND_TEXT,
+        "picongpu",
+        native=True,
     ),
     "emittance": _PluginReader(
         re.compile(r"^(?P<species>[A-Za-z0-9_]+)_emittance_(?P<filter>[A-Za-z0-9_]+)\.dat$"),
@@ -240,6 +263,14 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
         "imageio",
     ),
 }
+
+
+#: The sniffed ``format`` labels that name a *plain-text* plugin artifact.  A
+#: ``read`` of such a file serves its text tail (bounded) rather than rejecting
+#: it as "not a text result": ``fields_energy.dat`` is plain text with no shipped
+#: reader, so before H2 it was unreachable through either the plugin or the text
+#: path.
+_NATIVE_TEXT_FORMATS = frozenset(reader for reader, spec in _PLUGIN_READERS.items() if spec.kind == _KIND_TEXT)
 
 
 class ResultsUnavailable(RuntimeError):  # ruff: ignore[error-suffix-on-exception-name] - contract-frozen name
@@ -793,6 +824,60 @@ def _load_dataset(path: Path, record: str | None, component: str | None, iterati
     return _flatten(chunk)
 
 
+def _dataset_unit_info(
+    path: Path,
+    record: str | None,
+    component: str | None,
+    iteration: int | str | None,
+) -> dict[str, Any]:
+    """Read the resolved mesh component's openPMD unit metadata, best-effort.
+
+    openPMD records expose ``Record_Component.unit_SI`` (a scale factor to SI)
+    and ``Mesh.unit_dimension`` (the seven SI base exponents); PIConGPU sets both
+    for E/B fields (L4/M3).  The same allow-listed record/component resolution as
+    :func:`_load_dataset` is used, so the reported units describe exactly the
+    component the program read.
+
+    Returns:
+        ``{"unit_SI": float, "unit_dimension": [float, ...]}`` with whichever
+        keys the backend exposes; ``{}`` when neither is present.
+
+    Raises:
+        ResultsReaderError: If the series/record/component cannot be resolved.
+
+    """
+    series = _open_series(path)
+    try:
+        step = series.iterations[_select_iteration(series, iteration)]
+    except (KeyError, IndexError) as exc:
+        msg = f"iteration {iteration!r} not found in the series"
+        raise ResultsReaderError(msg) from exc
+    names = list(step.meshes)
+    if not names:
+        msg = "openPMD iteration has no meshes"
+        raise ResultsReaderError(msg)
+    name = record or names[0]
+    if name not in names:
+        msg = f"record {name!r} not found; available: {', '.join(names)}"
+        raise ResultsReaderError(msg)
+    mesh = step.meshes[name]
+    components = [c for c in _record_components(mesh) if c != _SCALAR_COMPONENT]
+    selected = component or (components[0] if components else None)
+    if selected is not None and components and selected not in components:
+        msg = f"component {selected!r} not found; available: {', '.join(components)}"
+        raise ResultsReaderError(msg)
+    dataset = mesh[selected] if selected is not None and components else mesh
+    info: dict[str, Any] = {}
+    unit_si = getattr(dataset, "unit_SI", None)
+    if unit_si is not None:
+        info["unit_SI"] = float(unit_si)
+    dimension = getattr(mesh, "unit_dimension", None)
+    if dimension is not None:
+        with contextlib.suppress(TypeError, ValueError):  # an odd backend value is simply skipped
+            info["unit_dimension"] = [float(exponent) for exponent in dimension]
+    return info
+
+
 def read_slice(
     path: Path | str,
     *,
@@ -1082,7 +1167,7 @@ def _read(params: ResultParams, *, run_dir: Path, output: Path) -> dict[str, Any
     # The captured stdout/stderr streams have no filename suffix; treat the
     # known capture paths as text so the advertised stream read works.
     from_stream = params.path is None and params.stream in {"stdout", "stderr"}
-    if not from_stream and _sniff_format(target.name) != "text":
+    if not from_stream and _sniff_format(target.name) not in {"text", *_NATIVE_TEXT_FORMATS}:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, "not a text result; use an openPMD operation")
     if _entry_size(target) > RESULT_TEXT_MAX_BYTES:
         return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"text result exceeds {RESULT_TEXT_MAX_BYTES} bytes")
@@ -1115,6 +1200,11 @@ def _import_plugin_reader(name: str) -> type:
 
     """
     spec = _PLUGIN_READERS[name]
+    if spec.native:
+        # A native reader is parsed by the engine; there is no shipped class to
+        # import and no PIConGPU install is required.
+        msg = f"{name} is parsed natively and has no shipped reader class"
+        raise ResultsUnavailable(msg)
     try:
         importlib.import_module("picongpu.extra.plugins")
     except ImportError as exc:
@@ -1262,7 +1352,10 @@ def _plugin_species_matches(name: str, params: ResultParams, spec: _PluginReader
     groups = _plugin_filename_groups(spec, name)
     if groups is None:
         return False
-    if params.species is not None and groups.get("species") != params.species:
+    # A reader whose filename carries no species component (the field-energy
+    # monitor) cannot be narrowed by one: a requested species is honour-neutral
+    # there rather than turning every match into a miss.
+    if "species" in spec.pattern.groupindex and params.species is not None and groups.get("species") != params.species:
         return False
     # An unset filter means PIConGPU's default "all"; only an explicit
     # non-default filter narrows the match.  A reader without a filter component
@@ -1841,34 +1934,92 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _default_window(populated: list[float]) -> tuple[float, float]:
+def _histogram_min_energy_kev(target: Path) -> float:
+    """Read the histogram's first lower edge (``minEnergy``) from the file header.
+
+    The shipped ``EnergyHistogramData`` returns only the **upper** edges, so the
+    first bin's lower bound is unrecoverable from the reader alone.  PIConGPU's
+    ``BinEnergyParticles`` writes it as the first number inside the header's
+    ``#step <minEnergy ... >maxEnergy count`` bracket
+    (``BinEnergyParticles.x.cpp``).  ``minEnergy`` is a supported non-zero
+    configuration, so hard-coding ``0.0`` misplaces every edge and undercounts
+    the exact ``[minEnergy, first_upper)`` window; the header is the authority.
+
+    Returns:
+        The parsed lower bound [keV], or ``0.0`` when the header is absent or
+        unparsable (the historical default).
+
+    """
+    try:
+        with target.open("r", encoding="utf-8", errors="replace") as handle:
+            first = handle.readline()
+    except OSError:  # pragma: no cover - target existence is checked earlier
+        return 0.0
+    match = re.match(r"\s*#step\s*<\s*(\S+)", first)
+    if match is None:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _histogram_lower_edges(upper_edges: list[float], *, first_lower: float = 0.0) -> list[float]:
+    """Reconstruct a histogram's per-bin lower edges from its reported upper edges.
+
+    The shipped ``EnergyHistogramData`` returns one **upper** edge per count
+    (``bins[i]`` bounds the bin whose count is ``counts[i]``); the lower edge of
+    bin ``i`` is the previous reported edge.  The first bin's lower bound is the
+    histogram's configured ``minEnergy``, read from the file header (B1); it is
+    not necessarily 0 keV.  Bins are therefore half-open ``[lower_i, upper_i)``,
+    which is what makes the ``count_in_window`` comparison exact at the window's
+    upper edge (L1: a bin ending at 5 MeV must not be counted in a ">= 5 MeV"
+    window).
+
+    Args:
+        upper_edges: The reader's reported upper edges [keV].
+        first_lower: The first bin's lower edge [keV] (``minEnergy``); defaults
+            to ``0.0`` for a header-less source.
+
+    Returns:
+        The lower edge per bin, same length as ``upper_edges``.
+
+    """
+    return [first_lower, *upper_edges[:-1]]
+
+
+def _default_window(
+    populated_lower: list[float],
+    populated_upper: list[float],
+) -> tuple[float, float]:
     """Pick the ``count_in_window`` window when the request leaves it unset.
 
-    The preferred 100--1000 keV window is kept only when the populated range
-    lies wholly inside it, so the reported number never changes for the common
-    case.  A spectrum that reaches outside it (an LWFA spectrum starting at
-    2500 keV, or one spanning 900--20000 keV) is instead covered end to end, so
-    the default captures the whole population rather than clipping it to a
-    sliver (F2).  A single populated bin yields a one-bin window, widened by
-    one edge so it is never the degenerate ``max == min`` that ``ResultParams``
-    would reject if requested.
+    The preferred 100--1000 keV window is kept only when the whole populated
+    range ``[min(populated_lower), max(populated_upper))`` lies inside it, so
+    the reported number never changes for the common case.  A spectrum that
+    reaches outside it (an LWFA spectrum starting at 2500 keV, or one spanning
+    0--20000 keV) is instead covered end to end, so the default captures the
+    whole population rather than clipping it to a sliver (F2).  The window is
+    always at least as wide as one bin (max > min), so it is never the
+    degenerate ``max == min`` that ``ResultParams`` would reject if requested.
 
     Returns:
         ``(min_kev, max_kev)`` for the summary's ``count_in_window``.
 
     """
     low, high = _DEFAULT_WINDOW_KEV
-    if not populated or (min(populated) >= low and max(populated) <= high):
+    if not populated_lower or (min(populated_lower) >= low and max(populated_upper) <= high):
         return low, high
-    span_low, span_high = min(populated), max(populated)
-    if span_low == span_high:
+    span_low, span_high = min(populated_lower), max(populated_upper)
+    if span_low >= span_high:
         return span_low, span_low + 1.0
     return span_low, span_high
 
 
 def _energy_window(
     requested: tuple[float, float] | None,
-    populated: list[float],
+    populated_lower: list[float],
+    populated_upper: list[float],
 ) -> tuple[float, float]:
     """Return the explicit request window or a derived, non-empty default.
 
@@ -1878,7 +2029,7 @@ def _energy_window(
     """
     if requested is not None:
         return requested
-    return _default_window(populated)
+    return _default_window(populated_lower, populated_upper)
 
 
 def probe_vacuity(sim_id: str, *, run_dir: Path | str) -> str | None:
@@ -1959,6 +2110,16 @@ def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduc
     ``window`` is the caller's requested ``(min_kev, max_kev)`` or ``None`` to
     derive a non-empty default from the populated bins (F2).
 
+    The window is **half-open** ``[min_kev, max_kev)`` and a bin is counted when
+    its *lower* edge lies in that interval: bins are ``[lower_i, upper_i)``, so
+    a bin whose upper edge is exactly ``max_kev`` is not counted (L1: a bin
+    ending at 5 MeV must not satisfy a ">= 5 MeV" window, which instead starts
+    at the 5 MeV bin's lower edge).  The first bin's lower edge is the file's
+    configured ``minEnergy`` (read from the header, B1), not necessarily 0.
+    ``min_energy_kev``/``max_energy_kev`` are the populated lower/upper edges,
+    i.e. the half-open span ``[min_energy_kev, max_energy_kev)`` covers exactly
+    the populated bins.
+
     Returns:
         Bins (keV), counts, the count in the window and scalars.
 
@@ -1977,13 +2138,16 @@ def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduc
     # ``zip(strict=True)`` crash on such a parse.
     paired = min(len(bins), len(counts))
     upper_edges = bins[:paired]
+    lower_edges = _histogram_lower_edges(upper_edges, first_lower=_histogram_min_energy_kev(target))
     counts = counts[:paired]
-    # ``max_energy_kev`` is the highest bin edge that actually holds particles,
-    # not the modal (argmax-count) edge: the high-energy tail is the number the
-    # caller is after.
-    populated = [bin_kev for bin_kev, count in zip(upper_edges, counts, strict=True) if count > 0]
-    low, high = _energy_window(window, populated)
-    in_window = sum(count for bin_kev, count in zip(upper_edges, counts, strict=True) if low <= bin_kev <= high)
+    # ``max_energy_kev`` is the upper edge of the highest populated bin, not the
+    # modal (argmax-count) edge: the high-energy tail is the number the caller
+    # is after.  The matching lower edges make the half-open span explicit.
+    populated_bins = [index for index, count in enumerate(counts) if count > 0]
+    populated_lower = [lower_edges[index] for index in populated_bins]
+    populated_upper = [upper_edges[index] for index in populated_bins]
+    low, high = _energy_window(window, populated_lower, populated_upper)
+    in_window = sum(count for lower, count in zip(lower_edges, counts, strict=True) if low <= lower < high)
     strided_bins, downsampled = _stride(upper_edges)
     strided_counts, _ = _stride(counts)
     total = sum(counts)
@@ -1996,18 +2160,18 @@ def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduc
         # self-evidently a mis-window: ``n_nonzero_bins``/``min``/``max`` next
         # to a ``count_in_window`` far below ``total`` shows the window missed
         # the data (F2).
-        "n_nonzero_bins": len(populated),
-        "min_energy_kev": min(populated) if populated else None,
-        "max_energy_kev": max(populated) if populated else None,
+        "n_nonzero_bins": len(populated_bins),
+        "min_energy_kev": min(populated_lower) if populated_lower else None,
+        "max_energy_kev": max(populated_upper) if populated_upper else None,
         **_plugin_source(target, iteration),
         "downsampled": downsampled,
     }
-    if populated and total > 0 and in_window < _WINDOW_COVERAGE_WARNING * total:
+    if populated_bins and total > 0 and in_window < _WINDOW_COVERAGE_WARNING * total:
         summary["warning"] = (
-            f"energy_histogram has {len(populated)} populated bins "
-            f"({min(populated):g}-{max(populated):g} keV) but count_in_window is {in_window:g} "
-            f"of {total:g} for the {low:g}-{high:g} keV window; the window does not cover the "
-            f"populated range"
+            f"energy_histogram has {len(populated_bins)} populated bins "
+            f"({min(populated_lower):g}-{max(populated_upper):g} keV, half-open) but count_in_window "
+            f"is {in_window:g} of {total:g} for the [{low:g}, {high:g}) keV window; the window does "
+            f"not cover the populated range"
         )
     return summary
 
@@ -2098,12 +2262,248 @@ def _build_transition_radiation(
     }
 
 
+#: Canonical column names of the ``EnergyFields`` plugin output, used when the
+#: ``#step total[Joule] Bx[Joule] ...`` header is missing or unrecognised.  The
+#: C++ writer emits exactly these (``EnergyFields.x.cpp``).
+_FIELD_ENERGY_COLUMNS = ("total", "Bx", "By", "Bz", "Ex", "Ey", "Ez")
+
+#: Byte cap on a native text plugin file the engine parses itself.  The
+#: ``fields_energy.dat`` history is one short row per output step; 8 MiB bounds a
+#: pathological file without truncating any realistic run.
+_NATIVE_TEXT_MAX_BYTES = 8 * 1024 * 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class _FieldEnergyRow:
+    """One ``fields_energy.dat`` row: a step and its field energies [Joule]."""
+
+    step: int
+    total: float
+    components: list[float]
+
+
+def _field_energy_header(line: str) -> list[str]:
+    """Parse the ``#step total[Joule] Bx[Joule] ...`` header into column names.
+
+    The bracket unit suffix is stripped, so ``Bx[Joule]`` becomes ``Bx``.  The
+    leading ``#step`` token is dropped.  A header whose token count does not
+    match :data:`_FIELD_ENERGY_COLUMNS` is rejected (the caller falls back to
+    the canonical names), so a corrupted header cannot mislabel the columns.
+
+    Returns:
+        The six component column names, or ``[]`` when the header is unusable.
+
+    """
+    tokens = line.lstrip("#").split()
+    if not tokens or tokens[0] != "step":
+        return []
+    names = [re.sub(r"\[[^\]]*\]$", "", token) for token in tokens[1:]]
+    if len(names) != len(_FIELD_ENERGY_COLUMNS) or names[0] != "total":
+        return []
+    return names[1:]
+
+
+def _parse_fields_energy(text: str) -> tuple[list[_FieldEnergyRow], list[str], bool]:
+    """Parse an ``EnergyFields`` plain-text artifact.
+
+    The format (pinned ``EnergyFields.x.cpp``) is a ``#``-prefixed header
+    ``#step total[Joule] Bx[Joule] By[Joule] Bz[Joule] Ex[Joule] Ey[Joule]
+    Ez[Joule]`` followed by one whitespace-separated row per output step:
+    ``<step> <total[J]> <Bx> <By> <Bz> <Ex> <Ey> <Ez>``, each ``std::scientific``
+    with ~17 significant digits.  The parser is tolerant of a missing header
+    (falls back to :data:`_FIELD_ENERGY_COLUMNS`) and skips malformed rows rather
+    than failing the whole read.
+
+    Args:
+        text: The decoded file text.
+
+    Returns:
+        ``(rows, component_names, truncated)``.  ``truncated`` is True when a
+        row was dropped as malformed, so the summary can say so.
+
+    """
+    rows: list[_FieldEnergyRow] = []
+    components = list(_FIELD_ENERGY_COLUMNS[1:])
+    seen_header = False
+    truncated = False
+    # A data row is ``<step> <total> <one value per component>``.
+    expected = len(components) + 2
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            if not seen_header:
+                parsed = _field_energy_header(line)
+                if parsed:
+                    components = parsed
+                    expected = len(parsed) + 2
+                seen_header = True
+            continue
+        if not seen_header:
+            # A missing/corrupt header still parses; the space after the comment
+            # is optional, so fall back to the canonical names and full width.
+            seen_header = True
+        tokens = line.split()
+        if len(tokens) < expected:
+            truncated = True
+            continue
+        try:
+            step = int(float(tokens[0]))
+            values = [float(token) for token in tokens[1:expected]]
+        except ValueError:
+            truncated = True
+            continue
+        rows.append(_FieldEnergyRow(step=step, total=values[0], components=values[1:]))
+    return rows, components, truncated
+
+
+def _build_energy_fields(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+    *,
+    window: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    """Reduce an ``EnergyFields`` (``fields_energy.dat``) history to a summary.
+
+    The file is the integrated electromagnetic field energy versus step - the
+    natural convergence artifact for a field-energy study - but it ships no
+    ``picongpu.extra.plugins.data`` reader, so it is parsed natively.  The
+    summary carries the total-energy trajectory (strided) plus scalar min/max/last
+    values for the total and for each field component, so the trend is visible
+    without shipping the whole history.
+
+    Returns:
+        The bounded summary dict.
+
+    """
+    _ = instance, groups, window
+    rows, components, truncated = _read_fields_energy(target)
+    return _summarize_energy_fields(rows, components, iteration, target, truncated=truncated)
+
+
+def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str], bool]:
+    """Read a native text plugin file under a byte cap and parse it once.
+
+    The read is bounded by :data:`_NATIVE_TEXT_MAX_BYTES`, so a pathologically
+    large ``fields_energy.dat`` cannot be pulled wholly into memory despite the
+    cap the comment documents (m1); a chunky read stops just past the cap and
+    the parser then sees only the prefix (excess rows are dropped as malformed,
+    and ``truncated`` says so).
+
+    Returns:
+        ``(rows, component_names, truncated)`` from :func:`_parse_fields_energy`.
+
+    Raises:
+        ResultsReaderError: If the file cannot be read.
+
+    """
+    try:
+        with target.open("rb") as handle:
+            raw = handle.read(_NATIVE_TEXT_MAX_BYTES + 1)
+    except OSError as exc:  # pragma: no cover - target existence is checked earlier
+        msg = f"cannot read {target.name}: {exc}"
+        raise ResultsReaderError(msg) from exc
+    text = raw.decode("utf-8", errors="replace")
+    return _parse_fields_energy(text)
+
+
+def _summarize_energy_fields(
+    rows: list[_FieldEnergyRow],
+    components: list[str],
+    iteration: int,
+    target: Path,
+    *,
+    truncated: bool,
+) -> dict[str, Any]:
+    """Shape already-parsed ``EnergyFields`` rows into the bounded summary.
+
+    Split from :func:`_build_energy_fields` so the native plugin path can parse
+    the file once and reuse the rows for both the step resolution and the
+    summary (m3).
+
+    Returns:
+        The bounded summary dict.
+
+    Raises:
+        ResultsReaderError: If there are no parsable rows.
+
+    """
+    if not rows:
+        msg = f"{target.name} has no parsable field-energy rows"
+        raise ResultsReaderError(msg)
+    steps = [row.step for row in rows]
+    totals = [row.total for row in rows]
+    index = steps.index(iteration) if iteration in steps else len(rows) - 1
+    component_values = [[row.components[position] for row in rows] for position in range(len(components))]
+    strided_steps, downsampled = _stride([float(step) for step in steps])
+    strided_totals, _ = _stride(totals)
+    return {
+        "step": [int(step) for step in strided_steps],
+        "total_J": strided_totals,
+        "component_names": list(components),
+        "component_last_J": {name: values[index] for name, values in zip(components, component_values, strict=True)},
+        "component_min_J": {name: min(values) for name, values in zip(components, component_values, strict=True)},
+        "component_max_J": {name: max(values) for name, values in zip(components, component_values, strict=True)},
+        "selected_step": steps[index],
+        "step_first": steps[0],
+        "step_last": steps[-1],
+        "n_steps": len(rows),
+        "total_J_min": min(totals),
+        "total_J_max": max(totals),
+        "total_J_last": totals[-1],
+        # The ``iteration`` selector picks one row; ``total_J_last`` is always
+        # the file's *latest* step, so a selected row also carries its own total
+        # (M1).
+        "total_J_selected": totals[index],
+        "units_J": "Joule",
+        **_plugin_source(target, steps[index]),
+        "truncated": truncated,
+        "downsampled": downsampled,
+    }
+
+
+def _native_plugin_result(
+    reader: str,
+    output: Path,
+    params: ResultParams,
+    target: Path,
+) -> dict[str, Any]:
+    """Run a native (engine-parsed) text plugin reader against one file.
+
+    Unlike the shipped-reader path this needs no PIConGPU install and no
+    per-iteration filenames: the step lives *inside* the file.  The iteration
+    selector therefore picks a row of the file's own history (``last`` by
+    default), and an unknown selector is a clean ``no_results``.
+
+    Returns:
+        The bounded summary dict.
+
+    Raises:
+        ResultsReaderError: If the file cannot be parsed or the iteration is
+            not present.
+
+    """
+    _ = output
+    rows, components, truncated = _read_fields_energy(target)
+    available = [row.step for row in rows]
+    if not available:
+        msg = f"{target.name} has no parsable field-energy rows"
+        raise ResultsReaderError(msg)
+    selected = _resolve_plugin_iteration(available, params.iteration)
+    summary = _summarize_energy_fields(rows, components, selected, target, truncated=truncated)
+    return _annotate_vacuous(reader, summary)
+
+
 #: Reader name -> the summary builder that calls the reader instance.  Every
 #: builder shares the signature ``(instance, groups, iteration, target, *,
 #: window)`` so the openPMD/image readers can reach their extra selector
 #: components; only the energy-histogram builder uses ``window``.
 _PLUGIN_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "energy_histogram": _build_energy_histogram,
+    "energy_fields": _build_energy_fields,
     "emittance": _build_emittance,
     "transition_radiation": _build_transition_radiation,
     "phase_space": _build_phase_space,
@@ -2159,7 +2559,10 @@ def _read_plugin_target(
     if not (target.is_file() or (spec.kind == _KIND_OPENPMD and target.is_dir())):
         return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
     try:
-        summary = _plugin_result(reader, spec, output, params, target)
+        if spec.native:
+            summary = _native_plugin_result(reader, output, params, target)
+        else:
+            summary = _plugin_result(reader, spec, output, params, target)
     except ResultsUnavailable as exc:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
     except _PLUGIN_SOFT_ERRORS as exc:
@@ -2245,7 +2648,7 @@ def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:
     )
 
 
-def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: ignore[too-many-return-statements] - one return per clean error
+def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: ignore[too-many-return-statements,complex-structure] - one return per clean error
     """Answer a ``COMPUTE`` request by evaluating a validated analysis program.
 
     Each ``var`` selector in the program is resolved to one openPMD mesh
@@ -2275,6 +2678,8 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
     if preflight is not None:
         return preflight
 
+    units_by_selector: dict[str, dict[str, Any]] = {}
+
     def resolve(selector: Any) -> list[float]:
         # A selector resolves to one mesh component; the reader applies the
         # same validation the slice path uses.  A selector that omits
@@ -2291,7 +2696,18 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
         if series is None:
             msg = "no openPMD output found for this run"
             raise ResultsReaderError(msg)
-        return _load_dataset(series, record, component, iteration)
+        values = _load_dataset(series, record, component, iteration)
+        # The same resolution is reused to read the component's unit metadata.
+        # This is best-effort: a backend that exposes none, or a stubbed reader
+        # used in tests, simply yields no keys and the note falls back to the
+        # internal/normalized convention (M3).
+        try:
+            info = _dataset_unit_info(series, record, component, iteration)
+        except (ResultsUnavailable, ResultsReaderError, KeyError, OSError, ValueError):
+            info = {}
+        if info:
+            units_by_selector[selector.name] = info
+        return values
 
     try:
         payload = evaluate(program, resolve)
@@ -2301,7 +2717,7 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
         return _error(SimulationErrorCode.UNSUPPORTED, str(exc))
     except (ResultsReaderError, KeyError, OSError, ValueError) as exc:
         return _error(SimulationErrorCode.NO_RESULTS, str(exc))
-    return _shape_compute(payload)
+    return _shape_compute(payload, program=program, params=params, units_by_selector=units_by_selector)
 
 
 def _compute_preflight(params: ResultParams, program: AnalysisProgram, output: Path) -> dict[str, Any] | None:
@@ -2328,12 +2744,105 @@ def _compute_preflight(params: ResultParams, program: AnalysisProgram, output: P
     return None
 
 
-def _shape_compute(payload: dict[str, Any]) -> dict[str, Any]:
+def _referenced_selector_names(program: Any) -> list[str]:
+    """Return every selector name a program references, in first-seen order.
+
+    Mirrors :func:`pic_agentic.analysis_eval._selector_names` for the validated
+    node objects (``output`` plus any ``points``), so a *bare* ``var`` that is
+    not listed in ``selectors`` is still echoed with its unit note rather than
+    being mistaken for a program that reads no data.
+
+    Returns:
+        The referenced selector names (possibly empty).
+
+    """
+    names: list[str] = []
+    roots = [program.output, *([program.points] if program.points is not None else [])]
+    stack = list(roots)
+    while stack:
+        current = stack.pop()
+        if getattr(current, "kind", None) == "var" and current.name not in names:
+            names.append(current.name)
+        for field in ("left", "right", "operand"):
+            child = getattr(current, field, None)
+            if child is not None:
+                stack.append(child)
+    return names
+
+
+def _compute_units(
+    program: Any,
+    params: ResultParams,
+    units_by_selector: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Describe the units of a compute result truthfully (L4/M3).
+
+    openPMD records *do* expose unit metadata - ``Record_Component.unit_SI`` (a
+    scale factor to SI) and ``Mesh.unit_dimension`` - which the reader can reach,
+    so the note must not claim otherwise.  The selector echo therefore carries
+    each resolved component's ``unit_SI``/``unit_dimension`` where the file
+    records them, and the note points at those fields rather than asserting a
+    physical unit for the *derived* result (which is the program's arithmetic,
+    not any single component's raw unit).  Only when no selector has any unit
+    metadata does the note fall back to the internal/normalized convention.
+
+    Returns:
+        A ``{"unit_note", "selectors"}`` fragment.
+
+    """
+    units_by_selector = units_by_selector or {}
+    referenced = _referenced_selector_names(program)
+    declared = {selector.name: selector for selector in program.selectors}
+    # Echo the declared selectors in declaration order first (the caller's own
+    # listing), then any bare ``var`` the program references without declaring.
+    ordered: list[tuple[str, Any]] = [
+        (selector.name, selector) for selector in program.selectors if selector.name in referenced
+    ]
+    ordered += [(name, None) for name in referenced if name not in declared]
+    selectors = [
+        {
+            "name": name,
+            "record": (selector.record if selector is not None else None) or params.record,
+            "component": (selector.component if selector is not None else None) or params.component,
+            "iteration": (
+                selector.iteration if selector is not None and selector.iteration is not None else params.iteration
+            ),
+            **units_by_selector.get(name, {}),
+        }
+        for name, selector in ordered
+    ]
+    if not selectors:
+        # A constant/pure program reads no mesh data.
+        note = "unitless: the program reads no mesh data (a constant or pure expression)"
+    elif any("unit_SI" in selector or "unit_dimension" in selector for selector in selectors):
+        note = (
+            "result is computed from the raw openPMD mesh components named in `selectors`: the values are "
+            "in each component's internal units, and `unit_SI` (the scale factor to SI) and `unit_dimension` "
+            "(the seven SI base exponents) are echoed per selector where the file records them; the derived "
+            "result's unit follows the program's arithmetic, so it is not asserted here"
+        )
+    else:
+        note = (
+            "result is in PIConGPU internal (normalized) code units: the file records no unit metadata "
+            "for the mesh components named in `selectors`, so no physical unit is asserted"
+        )
+    return {"unit_note": note, "selectors": selectors}
+
+
+def _shape_compute(
+    payload: dict[str, Any],
+    *,
+    program: Any = None,
+    params: ResultParams | None = None,
+    units_by_selector: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Shape an evaluator payload into the frozen result-ack fields.
 
     The ack carries a fixed key set, so the numeric array travels as ``data``
     (``data_encoding="float"``), a scalar as ``stats["value"]``, and the
-    evaluator's metadata as ``result``.
+    evaluator's metadata as ``result``.  When the program is supplied the
+    result metadata is augmented with a truthful ``unit_note`` and the selector
+    echo (L4/M3).
 
     Returns:
         The shaped ack fields, or a ``RESULT_TOO_LARGE`` error.
@@ -2343,6 +2852,8 @@ def _shape_compute(payload: dict[str, Any]) -> dict[str, Any]:
     metadata: dict[str, Any] = {"result_kind": payload.get("result_kind", "scalar")}
     if "points" in payload:
         metadata["points"] = payload["points"]
+    if program is not None and params is not None:
+        metadata.update(_compute_units(program, params, units_by_selector))
     if isinstance(result, list):
         if len(result) > SLICE_MAX_POINTS:
             result = result[:SLICE_MAX_POINTS]

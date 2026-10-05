@@ -421,6 +421,39 @@ def png_file(
     return path
 
 
+def fields_energy_dat(
+    run_dir: Path,
+    *,
+    steps: tuple[int, ...] = (0, 50, 100),
+    totals: tuple[float, ...] = (1.0e-5, 2.0e-5, 1.5e-5),
+    components: tuple[tuple[float, ...], ...] | None = None,
+) -> Path:
+    """Write a ``fields_energy.dat`` the EnergyFields plugin produces.
+
+    Mirrors ``EnergyFields.x.cpp``: a ``#step total[Joule] Bx[Joule] By[Joule]
+    Bz[Joule] Ex[Joule] Ey[Joule] Ez[Joule]`` header (trailing space before the
+    newline) followed by one ``<step> <total> <Bx> <By> <Bz> <Ex> <Ey> <Ez>``
+    row per notification, each ``std::scientific``.  ``components`` defaults to
+    six equal columns split evenly from the total.
+
+    Returns:
+        The written file's path.
+
+    """
+    sim_output = Path(run_dir) / "simOutput"
+    sim_output.mkdir(parents=True, exist_ok=True)
+    header = "#step total[Joule] Bx[Joule] By[Joule] Bz[Joule] Ex[Joule] Ey[Joule] Ez[Joule] \n"
+    if components is None:
+        components = tuple(tuple(total / 6.0 for _ in range(6)) for total in totals)
+    lines = [header.rstrip("\n")]
+    for step, total, row in zip(steps, totals, components, strict=True):
+        tokens = [str(step), f"{total:.17e}", *(f"{value:.17e}" for value in row)]
+        lines.append(" ".join(tokens))
+    path = sim_output / "fields_energy.dat"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def _numpy() -> object:
     """Import ``numpy`` (already required by the openPMD/PNG readers).
 
