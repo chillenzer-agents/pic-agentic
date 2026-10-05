@@ -798,6 +798,19 @@ class SubmitService:
                     observed = record.state
                     break
                 remaining = deadline - asyncio.get_running_loop().time()
+                # A terminal run that is not a requested target can never reach
+                # one (terminal is monotonic), so return at once instead of
+                # burning the whole deadline (M3).
+                if record is not None and record.state in TERMINAL_STATES:
+                    return self._wait_outcome(
+                        sim_id,
+                        state=record.state,
+                        matched=False,
+                        timed_out=False,
+                        waited_s=asyncio.get_running_loop().time() - started,
+                        targets=sorted(targets),
+                        terminal_only=terminal_only,
+                    )
                 if remaining <= 0:
                     observed = record.state if record is not None else ""
                     return self._wait_outcome(
@@ -859,7 +872,7 @@ class SubmitService:
             target_states=targets,
             events=events,
             last_status=_record_status(record) if record is not None else {},
-            note=_wait_note(record, timed_out=timed_out, terminal_only=terminal_only),
+            note=_wait_note(record, matched=matched, timed_out=timed_out, terminal_only=terminal_only),
         )
 
     def _outcome_from_ack(self, cmd_id: str, ack: RcpMessage) -> SubmitOutcome:
@@ -1408,7 +1421,13 @@ def _record_phase(record: SimRecord) -> str | None:
     return "queued"
 
 
-def _wait_note(record: SimRecord | None, *, timed_out: bool, terminal_only: bool) -> str | None:
+def _wait_note(
+    record: SimRecord | None,
+    *,
+    matched: bool,
+    timed_out: bool,
+    terminal_only: bool,
+) -> str | None:
     """Phrase the human-readable note for a wait outcome.
 
     A timeout during the build/queue window is deliberately called out: a
@@ -1417,6 +1436,7 @@ def _wait_note(record: SimRecord | None, *, timed_out: bool, terminal_only: bool
 
     Args:
         record: The latest-run record, if known.
+        matched: Whether the wait resolved on a requested target.
         timed_out: Whether the wait hit its deadline.
         terminal_only: Whether the caller waited only for terminal states.
 
@@ -1425,6 +1445,13 @@ def _wait_note(record: SimRecord | None, *, timed_out: bool, terminal_only: bool
 
     """
     if not timed_out:
+        # The only non-timeout return that needs a note: the run is already
+        # terminal but not a requested target, so it can never reach one.
+        if not matched and record is not None and record.state in TERMINAL_STATES:
+            return (
+                f"the run reached terminal state {record.state!r}, which is not one "
+                "of the requested targets; no further state transition is expected"
+            )
         return None
     if record is None:
         return "unsupported: the simulation is not in the registry"
