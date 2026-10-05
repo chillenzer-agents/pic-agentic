@@ -323,6 +323,21 @@ The seeded `instructions` carry a minimal, verified snippet using
 `picmi.Simulation`, so an agent has a compiling starting point without reading
 the pin's source.
 
+### Multi-node studies need explicit leaves (H5)
+
+`create_campaign` expresses a **single-path** sweep: one `patch_path`, one list
+of values. A resolution convergence study must co-vary more than one spec node
+(e.g. the grid cell count **and** `time_steps`, holding the physical box size
+fixed) and so cannot be one `patch_path`. `add_agenda_leaf` is the escape hatch:
+create the base campaign, then add one leaf per study point carrying its own
+whole spec, so any number of nodes can differ between leaves. A leaf spec may be
+inline (`spec=`) or, for a large spec, staged by reference
+(`add_agenda_leaf(name, spec_path=...)`) exactly like
+`create_campaign(base_spec_path=...)` — the same safe staging root, the same
+4 MiB cap, and no 48 KiB inline limit, so the leaf spec never has to be re-typed
+or truncated. `point`/`parameter` record the assignment and its human-readable
+label, as for a `create_campaign` leaf.
+
 ### Campaign sweeps are self-describing
 
 A campaign leaf records the sweep assignment in `point` as

@@ -92,6 +92,14 @@ no single documentation page to copy: the agent must pick a concrete setup from
 the docs, choose (and justify) an integrated quantity, express the resolution
 sweep, and interpret the result.
 
+This resolution sweep cannot be one `create_campaign` `patch_path`: holding the
+physical box size fixed means the grid cell count **and** `time_steps` must
+co-vary, i.e. two spec nodes. The intended route is the `add_agenda_leaf` escape
+hatch — create the base campaign, then add one leaf per resolution with its own
+whole spec (staged by `spec_path` if large). A transcript in which the agent
+abandons the campaign machinery entirely and hand-runs submissions is the H5
+finding this documents against.
+
 ## Checks common to both prompts
 
 - The agent never needs to edit pic-agentic or the PIConGPU sources; it works
