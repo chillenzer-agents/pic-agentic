@@ -1026,7 +1026,9 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "+ sleep loop after submit_simulation: it wakes on the pushed "
             "lifecycle event, so it returns as soon as the run finishes. On "
             "timeout it returns `timed_out: true` with the last-known status and "
-            "events (NOT an error); call it again to keep waiting. A PIConGPU "
+            "events (NOT an error); call it again to keep waiting. If the run is "
+            "already terminal in a state you did not request, it returns at once "
+            "with `timed_out: false`/`matched: false` and a note. A PIConGPU "
             "compile can take 15-20 min, so the default `timeout_s` (1800 s) "
             "covers the build plus the start of the queue wait; `timeout_s` is "
             "validated to lie within [0.1, 3600] s, so longer builds need repeat "
@@ -1078,9 +1080,10 @@ async def _wait_tool(
 ) -> dict[str, Any]:
     """Wait for one simulation, degrading a bad argument to a soft error.
 
-    A timeout is returned as data (``ok: true`` with ``timed_out: true``): the
-    wait is a convenience, and "not yet" must not be reported as a failure.  An
-    unknown simulation or target state is a soft ``ok: false``.
+    A timeout is returned as data (``ok: true`` with ``timed_out: true`` and
+    ``matched: false``): the wait is a convenience, and "not yet" must not be
+    reported as a failure.  An unknown simulation or target state is a soft
+    ``ok: false`` with an ``error``.
 
     Returns:
         The redacted :class:`WaitOutcome` dict, or a soft ``error`` dict.

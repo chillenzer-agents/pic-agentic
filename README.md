@@ -365,9 +365,12 @@ transport need not be started -- a wait only reads the registry.
   `simulation.cancelled`); the alias `"terminal"` expands to it. Pass explicit
   names (e.g. `["simulation.job_running"]`) to return earlier. An unknown name
   is a soft error.
-- On timeout the tool returns `timed_out: true` with the **last-known** status
-  and the condensed event history -- this is data, not an error. Call it again
-  to keep waiting.
+- On timeout the tool returns `timed_out: true` (`ok: true`, `matched: false`)
+  with the **last-known** status and the condensed event history -- this is data,
+  not an error. Call it again to keep waiting. If the run is already terminal but
+  in a state you did not request (e.g. `simulation.failed` while waiting for
+  `results.ready`), the call returns immediately (`timed_out: false`,
+  `matched: false`) with a note that no requested state is reachable.
 - `timeout_s` is bounded to `[0.1, 3600]` s and validated, not silently
   clamped. The default (1800 s) accommodates the 15-20 min PIConGPU compile plus
   the start of the queue wait; longer waits repeat the call.
