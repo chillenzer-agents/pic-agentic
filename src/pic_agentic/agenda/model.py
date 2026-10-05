@@ -226,13 +226,19 @@ class AgendaSim(BaseModel):
     #: The RCP simulation id once this leaf has been submitted (the engine's
     #: idempotency key: a leaf with a sim_id is never submitted twice).
     sim_id: str | None = None
-    #: Consecutive deferred submissions for this leaf: ticks on which the
-    #: simclient reported the outcome as unknown (a lost ack or a pending
-    #: idempotency record), so the leaf stayed ``planned`` to retry under the
-    #: same exactly-once ``cmd_id``.  Reset to 0 on the first successful ack.
-    #: Bounded by the engine (``MAX_DEFERRED_SUBMIT_ATTEMPTS``) so a pending
-    #: record that never resolves cannot defer forever.
+    #: Deferred submissions for this leaf so far: how many times the simclient
+    #: reported the outcome as unknown (a lost ack or a pending idempotency
+    #: record), so the leaf stayed ``planned`` to retry under the same
+    #: exactly-once ``cmd_id``.  Reset to 0 on the first successful ack.  This is
+    #: a counter for observability only; the retry bound is *elapsed time*
+    #: (``deferred_since`` plus the policy's ``deferred_outcome_timeout_s``), not
+    #: a tick count, so fast successive ticks cannot fail a still-building job.
     deferred_attempts: int = 0
+    #: ISO-8601 UTC timestamp of the first deferral in the current consecutive
+    #: run, or None when the leaf is not deferred.  The engine gives up only once
+    #: ``now - deferred_since`` exceeds the policy's ``deferred_outcome_timeout_s``
+    #: (so a pending record whose build is still running is not failed early).
+    deferred_since: str | None = None
     #: Whether this leaf must be approved before the engine submits it.
     requires_approval: bool = False
     #: Whether a human has pre-approved this leaf (set by the approval tool).

@@ -30,6 +30,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -141,20 +142,25 @@ class DuplicateSpecError(RuntimeError):
     """
 
 
-#: Consecutive deferred (outcome-unknown) submissions a leaf may accumulate
-#: before the engine stops retrying and marks it failed with an actionable
-#: reason.  A pending idempotency record (a simclient that died mid-build) leaves
-#: the leaf ``planned`` so the retry can re-ack once the outcome is known, but a
-#: record that *never* resolves must not retry forever and hold the campaign
-#: open: after this many consecutive deferrals the leaf is failed as
-#: ``outcome_unknown`` (the job may still exist; ``list_simulations``/``get_status``
-#: can reach it), which the operator can then cancel.
-MAX_DEFERRED_SUBMIT_ATTEMPTS = 5
+#: Wall-clock window (seconds) a leaf may stay deferred before the engine stops
+#: retrying and marks it failed with an actionable reason.  A pending
+#: idempotency record (a simclient that died mid-build) leaves the leaf
+#: ``planned`` so the retry can re-ack once the outcome is known, but a record
+#: that *never* resolves must not retry forever and hold the campaign open.
+#:
+#: The bound is **elapsed time, not a tick count**: the pending record only
+#: becomes ``completed`` when the simclient *finishes the build*, which can take
+#: minutes (``execute_submit`` runs ``generate()`` + the CWL workflow), and an
+#: agent can trigger ``advance_agenda`` several times in seconds.  Counting ticks
+#: would therefore fail a leaf whose job is still building -- the very harm the
+#: deferral exists to avoid.  Default 900 s (15 min), overridable per campaign
+#: via :attr:`EnginePolicy.deferred_outcome_timeout_s`.
+DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S = 900.0
 
 #: The leaf error code stamped when a deferred submission exhausts
-#: :data:`MAX_DEFERRED_SUBMIT_ATTEMPTS`.  Distinct from a policy rejection so an
-#: agent can tell "the ack was lost and never reconciled" from "the simclient
-#: refused the spec".
+#: :data:`DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S`.  Distinct from a policy rejection
+#: so an agent can tell "the ack was lost and never reconciled" from "the
+#: simclient refused the spec".
 OUTCOME_UNKNOWN_ERROR_CODE = "outcome_unknown"
 
 
@@ -223,6 +229,12 @@ class EnginePolicy(BaseModel):
     require_approval: bool = False
     #: Gate submissions whose estimated core-hours exceed this threshold.
     approve_over_est_core_hours: float | None = None
+    #: Wall-clock seconds a leaf may stay deferred (outcome-unknown) before the
+    #: engine stops retrying and marks it failed with an ``outcome_unknown``
+    #: code.  A pending idempotency record only resolves when the simclient
+    #: finishes the build, so an operator whose builds take longer than the
+    #: default should raise this.  See :data:`DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S`.
+    deferred_outcome_timeout_s: float = DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S
 
 
 class FailureGroup(BaseModel):
@@ -318,6 +330,7 @@ class AgendaEngine:
         reuse_lookup: ReuseLookupFn | None = None,
         reuse_record: ReuseRecordFn | None = None,
         reuse_key: ReuseKeyFn | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         """Create an engine.
 
@@ -351,6 +364,9 @@ class AgendaEngine:
             reuse_key: Optional ``(spec) -> key`` content key.  Defaults to the
                 wire hash; the server folds in the provenance tuple so a result
                 from a different PIConGPU revision is not reused.
+            clock: Optional ``() -> datetime`` (UTC) used to time the deferred
+                outcome window.  Defaults to the real clock; injectable so a
+                test can advance time without sleeping.
 
         """
         self.store = store
@@ -365,6 +381,7 @@ class AgendaEngine:
         self.reuse_lookup = reuse_lookup
         self.reuse_record = reuse_record
         self.reuse_key = reuse_key or _wire_hash
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     async def tick(self) -> TickResult:
         """Run one durable, idempotent engine tick.
@@ -516,19 +533,23 @@ class AgendaEngine:
     ) -> tuple[Campaign, Callback | None, bool]:
         """Submit one leaf, classifying a failure as deferred or terminal.
 
-        A transient failure (a lost ack) leaves the leaf ``planned`` for a retry,
-        but the consecutive-deferral count is persisted and bounded (see
-        :data:`MAX_DEFERRED_SUBMIT_ATTEMPTS`): once a leaf has deferred that many
-        ticks its outcome is still unknown, so it is marked ``failed`` with an
-        actionable ``outcome_unknown`` reason rather than retried forever.  Any
-        other submission failure is terminal immediately.  Neither raises out of
-        :meth:`tick`, so one bad leaf cannot block every leaf after it.
+        A transient failure (a lost ack) leaves the leaf ``planned`` for a retry.
+        The deferral is bounded by *elapsed wall-clock time* (see
+        :data:`DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S`, overridable via
+        :attr:`EnginePolicy.deferred_outcome_timeout_s`): once a leaf has been
+        deferred longer than that window with the outcome still unknown it is
+        marked ``failed`` with an actionable ``outcome_unknown`` reason rather
+        than retried forever.  Bounding ticks would fail a still-building job
+        after a few fast ``advance_agenda`` calls, which is the very harm the
+        deferral exists to avoid.  Any other submission failure is terminal
+        immediately.  Neither raises out of :meth:`tick`, so one bad leaf cannot
+        block every leaf after it.
 
         Returns:
             ``(campaign, callback, deferred)``: on success ``(campaign, None,
             False)``; on a deferred submission ``(campaign, None, True)`` while
-            under budget, or ``(campaign, callback, True)`` once the retry budget
-            is exhausted (the callback is the terminal ``outcome_unknown``
+            within the timeout, or ``(campaign, callback, True)`` once the
+            timeout has elapsed (the callback is the terminal ``outcome_unknown``
             failure); on an immediate terminal failure
             ``(campaign, callback, False)``.
 
@@ -536,7 +557,7 @@ class AgendaEngine:
         try:
             return await self._do_submit(campaign, path, step), None, False
         except TransientSubmitError as exc:
-            updated, callback = self._record_deferral(campaign, path, exc)
+            updated, callback = self._record_deferral(campaign, path, exc, now=self.clock())
             if callback is not None:
                 return updated, callback, True
             return updated, None, True
@@ -564,25 +585,34 @@ class AgendaEngine:
             updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
             return updated, callback, False
 
-    @staticmethod
     def _record_deferral(
+        self,
         campaign: Campaign,
         path: str,
         exc: TransientSubmitError,
+        *,
+        now: datetime,
     ) -> tuple[Campaign, Callback | None]:
         """Persist one deferred (outcome-unknown) submission attempt.
 
         The leaf stays ``planned`` so the next tick retries it under the same
-        exactly-once ``cmd_id``; only the consecutive-attempt counter and the
-        reason are updated.  Once the counter reaches
-        :data:`MAX_DEFERRED_SUBMIT_ATTEMPTS` the outcome is still unknown, so the
-        leaf is marked ``failed`` with an ``outcome_unknown`` error code and a
-        callback is emitted -- a bounded escape hatch so a never-resolving
-        pending record cannot defer forever and hold the campaign open.
+        exactly-once ``cmd_id``; the attempt counter, the wall-clock start of the
+        deferral and the reason are updated.  Once the leaf has been deferred for
+        longer than :attr:`EnginePolicy.deferred_outcome_timeout_s` with the
+        outcome still unknown, it is marked ``failed`` with an
+        ``outcome_unknown`` error code and a callback is emitted -- a bounded
+        escape hatch so a never-resolving pending record cannot defer forever and
+        hold the campaign open.
+
+        Args:
+            campaign: The campaign to update.
+            path: The leaf path.
+            exc: The transient failure that deferred the leaf.
+            now: The current UTC time (injected so tests can advance it).
 
         Returns:
             ``(campaign, callback)``: the callback is non-``None`` only on the
-            terminal (budget-exhausted) attempt.
+            terminal (timeout-exhausted) attempt.
 
         """
         agenda = campaign.agenda.model_copy(deep=True)
@@ -595,28 +625,34 @@ class AgendaEngine:
         # instead of reporting an unknown sim for a real (possibly running) one.
         if exc.sim_id and not leaf.sim_id:
             leaf.sim_id = exc.sim_id
+        if leaf.deferred_since is None:
+            leaf.deferred_since = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         error_code = exc.error_code or OUTCOME_UNKNOWN_ERROR_CODE
-        if leaf.deferred_attempts < MAX_DEFERRED_SUBMIT_ATTEMPTS:
-            # Still within budget: leave the leaf planned and record only why it
-            # is deferred.  No callback: this is not a decision point yet.
+        elapsed_s = _elapsed_seconds(leaf.deferred_since, now)
+        if elapsed_s < self.policy.deferred_outcome_timeout_s:
+            # Within the window: leave the leaf planned and record only why it is
+            # deferred.  No callback: this is not a decision point yet.  A few
+            # quick ticks therefore never fail a still-building job.
             leaf.error = str(exc)
             leaf.error_code = error_code
             log.warning(
-                "agenda submit deferred for %s (%d/%d): %s",
+                "agenda submit deferred for %s (attempt %d, %.0fs/%gs): %s",
                 path,
                 leaf.deferred_attempts,
-                MAX_DEFERRED_SUBMIT_ATTEMPTS,
+                elapsed_s,
+                self.policy.deferred_outcome_timeout_s,
                 exc,
             )
             return campaign.model_copy(update={"agenda": agenda}), None
-        # Budget exhausted: the job may still exist (the pending record was
+        # Window exhausted: the job may still exist (the pending record was
         # written before execution), so fail with an actionable code rather than
         # pretending the physics failed.  The leaf keeps its sim_id (if any).
         leaf.status = "failed"
         message = (
-            f"submission outcome still unknown after {leaf.deferred_attempts} deferred attempts "
-            f"({error_code}); the job may have been accepted -- check list_simulations/get_status "
-            f"and cancel_simulation before resubmitting: {exc}"
+            f"submission outcome still unknown after {elapsed_s:.0f}s and "
+            f"{leaf.deferred_attempts} deferred attempts ({error_code}); the job may have been "
+            f"accepted -- check list_simulations/get_status and cancel_simulation before "
+            f"resubmitting: {exc}"
         )
         leaf.error = message
         leaf.error_code = error_code
@@ -628,7 +664,12 @@ class AgendaEngine:
             error=message,
             error_code=error_code,
         )
-        log.warning("agenda submit gave up for %s after %d deferrals", path, leaf.deferred_attempts)
+        log.warning(
+            "agenda submit gave up for %s after %.0fs (%d deferrals)",
+            path,
+            elapsed_s,
+            leaf.deferred_attempts,
+        )
         updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
         return updated, callback
 
@@ -940,11 +981,15 @@ class AgendaEngine:
         if leaf is not None:
             leaf.sim_id = sim_id
             leaf.status = "submitted"
-            # A clean ack resolves any prior deferral: the retry budget resets so
-            # a later, unrelated lost ack gets a fresh allowance.
+            # A clean ack resolves any prior deferral: the retry window resets so
+            # a later, unrelated lost ack gets a fresh allowance, and the stale
+            # stage/error of the lost-ack attempt is cleared (it described the
+            # deferral, not this accepted submission).
             leaf.deferred_attempts = 0
+            leaf.deferred_since = None
             leaf.error = None
             leaf.error_code = None
+            leaf.stage = None
             # Stamp what we reserved so a later reconciliation can correct it.
             leaf.estimated_core_hours = request.est_core_hours
             leaf.estimated_gpu_hours = request.est_gpu_hours
@@ -1005,6 +1050,7 @@ class AgendaEngine:
                     # it is being retried (distinct from a terminal failure).
                     "deferred": sim.status == "planned" and sim.deferred_attempts > 0,
                     "deferred_attempts": sim.deferred_attempts,
+                    "deferred_since": sim.deferred_since,
                     "suspect": warning if sim.status == "done" else None,
                 },
             )
@@ -1042,6 +1088,7 @@ class AgendaEngine:
                 "stage": sim.stage,
                 "deferred": sim.status == "planned" and sim.deferred_attempts > 0,
                 "deferred_attempts": sim.deferred_attempts,
+                "deferred_since": sim.deferred_since,
                 "suspect": sim.suspect if sim.status == "done" else None,
                 "estimated_core_hours": sim.estimated_core_hours,
                 "actual_core_hours": sim.actual_core_hours,
@@ -1076,6 +1123,26 @@ def leaf_at(agenda: AgendaGroup, path: str) -> AgendaSim | None:
             return None
     leaf = node.entries.get(parts[-1]) if isinstance(node, AgendaGroup) else None
     return leaf if isinstance(leaf, AgendaSim) else None
+
+
+def _elapsed_seconds(since: str | None, now: datetime) -> float:
+    """Return whole seconds between an ISO-8601 ``Z`` timestamp and ``now``.
+
+    A missing/unparseable timestamp means "just started deferring" (0 s), so a
+    legacy campaign persisted before ``deferred_since`` existed is retried
+    rather than failed on sight.
+
+    Returns:
+        The elapsed seconds (never negative).
+
+    """
+    if not since:
+        return 0.0
+    try:
+        started = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return 0.0
+    return max(0.0, (now - started).total_seconds())
 
 
 def _truncate(text: str, limit: int = FAILURE_MESSAGE_MAX_CHARS) -> str:
@@ -1186,8 +1253,14 @@ def _reject_duplicate_specs(campaign: Campaign, submit_paths: list[str]) -> None
     for index, (path, sim) in enumerate(pending):
         digest = _wire_hash(sim.spec)
         for other_path, other in [*submitted, *pending[:index]]:
-            # A deferred (lost-ack) leaf carries a sim_id *and* is still planned
-            # to resubmit under that same id -- that is a retry, not a collision.
+            # A deferred (lost-ack) leaf carries a sim_id *and* is still
+            # planned, so it appears in both ``submitted`` and ``pending``;
+            # resubmitting it under its own id is a retry, not a collision.
+            # This guard is live (not dead): the deferred leaf is the only
+            # entry in ``submitted`` for its own path, so without it the
+            # retry tick would collide with itself.  ``pending[:index]``
+            # excludes the current index but *not* the same path from
+            # ``submitted``, which the standalone case exercises.
             if other_path == path:
                 continue
             if _wire_hash(other.spec) == digest:

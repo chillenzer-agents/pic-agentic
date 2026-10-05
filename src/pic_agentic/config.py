@@ -50,6 +50,7 @@ ENV_MAP = {
     "agenda_file": "PIC_AGENTIC_AGENDA_FILE",
     "agenda_require_approval": "PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL",
     "agenda_approve_over_est_core_hours": "PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS",
+    "agenda_deferred_outcome_timeout_s": "PIC_AGENTIC_AGENDA_DEFERRED_OUTCOME_TIMEOUT_S",
     "fleet_stall_after_s": "PIC_AGENTIC_FLEET_STALL_AFTER_S",
     "human_room_id": "PIC_AGENTIC_HUMAN_ROOM_ID",
     "notify": "PIC_AGENTIC_NOTIFY",
@@ -125,6 +126,11 @@ class Config(BaseModel):
     agenda_require_approval: bool = False
     #: Gate agenda submissions whose estimated core-hours exceed this threshold.
     agenda_approve_over_est_core_hours: float | None = None
+    #: Wall-clock seconds a leaf may stay deferred (outcome-unknown) before the
+    #: engine fails it with an ``outcome_unknown`` code.  Raise it for clusters
+    #: whose builds take longer than the 15-minute default (kept equal to
+    #: ``pic_agentic.agenda.engine.DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S``).
+    agenda_deferred_outcome_timeout_s: float = 900.0
     #: How long an active simulation may go without a lifecycle event before the
     #: fleet view reports it as stalled.
     fleet_stall_after_s: float = 900.0

@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from pic_agentic.agenda.budget import Budget
 from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.engine import (
-    MAX_DEFERRED_SUBMIT_ATTEMPTS,
+    DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S,
     AgendaEngine,
     DuplicateSpecError,
     EnginePolicy,
@@ -190,12 +192,26 @@ async def test_lost_ack_is_deferred_not_failed_and_reconciles(tmp_path) -> None:
     assert keys[0] == keys[1]
 
 
-async def test_deferred_submission_gives_up_after_bounded_attempts(tmp_path) -> None:
-    """A never-resolving pending record must not defer forever.
+class _Clock:
+    """A mutable UTC clock for driving the deferred-outcome window."""
 
-    After ``MAX_DEFERRED_SUBMIT_ATTEMPTS`` consecutive deferrals the leaf is
-    failed with an actionable ``outcome_unknown`` code (not a policy rejection),
-    so the campaign can complete and the agent can clean up the maybe-job.
+    def __init__(self) -> None:
+        self.now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+async def test_quick_ticks_do_not_fail_a_still_building_job(tmp_path) -> None:
+    """The deferral bound is elapsed time, not ticks.
+
+    Regression for the beta-5 review: a pending record only resolves when the
+    simclient *finishes the build* (minutes), so several quick ``advance_agenda``
+    calls inside the timeout window must keep the leaf deferred -- failing it
+    after 5 fast ticks would strand a live job (the C2 harm again).
     """
     store = _store(tmp_path)
     store.save(Campaign(name="c", agenda=_agenda(1)))
@@ -204,22 +220,78 @@ async def test_deferred_submission_gives_up_after_bounded_attempts(tmp_path) -> 
         msg = "already_submitted:outcome_unknown"
         raise TransientSubmitError(msg, error_code="outcome_unknown", sim_id="sim-str")
 
-    engine = AgendaEngine(store=store, submit=submit, observe=dict)
-    for attempt in range(1, MAX_DEFERRED_SUBMIT_ATTEMPTS + 1):
+    clock = _Clock()
+    engine = AgendaEngine(store=store, submit=submit, observe=dict, clock=clock)
+    # Far more ticks than the old MAX_DEFERRED_SUBMIT_ATTEMPTS, all within the
+    # window (the clock advances 1s per tick): still deferred, never failed.
+    for _ in range(20):
+        clock.advance(1.0)
         result = await engine.tick()
-        if attempt < MAX_DEFERRED_SUBMIT_ATTEMPTS:
-            assert result.deferred == ["a0"]
-            assert result.failed == []
-            assert store.load(Campaign).agenda.entries["a0"].status == "planned"
-        else:
-            # The final attempt exhausts the budget: now (and only now) terminal.
-            assert result.deferred == ["a0"]
-            assert result.failed == ["a0"]
-            assert [c.error_code for c in result.callbacks] == ["outcome_unknown"]
+        assert result.deferred == ["a0"]
+        assert result.failed == []
+        assert store.load(Campaign).agenda.entries["a0"].status == "planned"
+    leaf = store.load(Campaign).agenda.entries["a0"]
+    assert leaf.deferred_attempts == 20
+    assert leaf.deferred_since is not None
+
+
+async def test_deferred_submission_gives_up_after_timeout(tmp_path) -> None:
+    """A never-resolving pending record is failed once the window elapses.
+
+    Once ``now - deferred_since`` exceeds the policy timeout the leaf is failed
+    with an actionable ``outcome_unknown`` code (not a policy rejection), so the
+    campaign can complete and the agent can clean up the maybe-job.
+    """
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+
+    async def submit(spec: dict, key: str) -> str:
+        msg = "already_submitted:outcome_unknown"
+        raise TransientSubmitError(msg, error_code="outcome_unknown", sim_id="sim-str")
+
+    clock = _Clock()
+    engine = AgendaEngine(store=store, submit=submit, observe=dict, clock=clock)
+    first = await engine.tick()
+    assert first.deferred == ["a0"]
+    assert first.failed == []
+    # Advance just under the timeout: still deferred.
+    clock.advance(DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S - 1)
+    under = await engine.tick()
+    assert under.deferred == ["a0"]
+    assert under.failed == []
+    # Cross the timeout: now (and only now) terminal.
+    clock.advance(2.0)
+    over = await engine.tick()
+    assert over.deferred == ["a0"]
+    assert over.failed == ["a0"]
+    assert [c.error_code for c in over.callbacks] == ["outcome_unknown"]
     leaf = store.load(Campaign).agenda.entries["a0"]
     assert leaf.status == "failed"
     assert leaf.error_code == "outcome_unknown"
     assert "cancel_simulation" in (leaf.error or "")
+
+
+async def test_deferred_timeout_is_configurable(tmp_path) -> None:
+    """A shorter policy timeout fails the leaf sooner (operator knob)."""
+    store = _store(tmp_path)
+    store.save(Campaign(name="c", agenda=_agenda(1)))
+
+    async def submit(spec: dict, key: str) -> str:
+        msg = "already_submitted:outcome_unknown"
+        raise TransientSubmitError(msg, error_code="outcome_unknown", sim_id="s")
+
+    clock = _Clock()
+    engine = AgendaEngine(
+        store=store,
+        submit=submit,
+        observe=dict,
+        policy=EnginePolicy(deferred_outcome_timeout_s=30.0),
+        clock=clock,
+    )
+    await engine.tick()
+    clock.advance(31.0)
+    result = await engine.tick()
+    assert result.failed == ["a0"]
 
 
 async def test_permanent_submit_failure_marks_leaf_failed(tmp_path) -> None:

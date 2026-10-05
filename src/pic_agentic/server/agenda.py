@@ -1220,6 +1220,7 @@ def _policy_from_config(config: Config) -> EnginePolicy:
     return EnginePolicy(
         require_approval=config.agenda_require_approval,
         approve_over_est_core_hours=config.agenda_approve_over_est_core_hours,
+        deferred_outcome_timeout_s=config.agenda_deferred_outcome_timeout_s,
     )
 
 
