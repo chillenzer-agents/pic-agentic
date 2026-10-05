@@ -90,7 +90,7 @@ async def test_wait_times_out_with_the_last_status_not_an_error() -> None:
     outcome = await service.wait_for_state(SIM_ID, timeout_s=0.2, poll_interval_s=0.05)
 
     assert outcome.timed_out is True
-    assert outcome.ok is False  # ok mirrors "not timed out"
+    assert outcome.ok is True  # a timeout is data, not an error
     assert outcome.matched is False
     assert outcome.state == SimulationState.JOB_RUNNING.value
     assert outcome.last_status["state"] == SimulationState.JOB_RUNNING.value
