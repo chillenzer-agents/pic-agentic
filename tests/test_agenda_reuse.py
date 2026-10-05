@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 from pathlib import Path
+
+import pytest
 
 from pic_agentic.agenda.campaign import Campaign
 from pic_agentic.agenda.engine import AgendaEngine
@@ -32,6 +35,12 @@ from pic_agentic.transport.memory import MemoryTransport
 _SECRET = new_secret_hex()
 _SIM = "7f3a2b1c"
 _RUNNER = Path(__file__).parent / "fixtures" / "pypicongpu_runner.json"
+
+#: Whether the pinned PIConGPU is importable in this interpreter.  The
+#: carried-provenance fallback only exists on a server without the pinned
+#: PIConGPU; with a real install its provenance wins (see
+#: :func:`pic_agentic.server.simulation._spec_provenance`).
+_HAS_PICONGPU = importlib.util.find_spec("picongpu") is not None
 
 
 def _store(tmp_path) -> AgendaStore:
@@ -554,12 +563,22 @@ async def test_direct_submission_pending_promotes_across_a_restart(tmp_path) -> 
     assert record.run_id == outcome.cmd_id
 
 
+@pytest.mark.skipif(
+    _HAS_PICONGPU,
+    reason="carried-provenance fallback only applies without a pinned picongpu",
+)
 async def test_direct_submission_under_a_different_revision_is_not_reused(tmp_path) -> None:
     """A different provenance tuple must not match: reuse stays attributable.
 
-    With no configured revision the key falls back to the spec-carried
-    provenance, so a leaf whose physics is attributed to another PIConGPU
-    revision does not reuse the direct run and is submitted normally.
+    With no configured revision and no pinned PIConGPU the key falls back to
+    the spec-carried provenance, so a leaf whose physics is attributed to
+    another PIConGPU revision does not reuse the direct run and is submitted
+    normally.
+
+    The precedence is deliberately the other way round once a real PIConGPU is
+    installed (the installed revision wins over a carried one); that case is
+    pinned by
+    ``test_direct_submission_carried_revision_yields_to_an_installed_pin``.
     """
     agenda, service, built = _direct_service(tmp_path, picongpu_revision="")
     mcp_t, sim_t = MemoryTransport.create_pair()
@@ -584,6 +603,56 @@ async def test_direct_submission_under_a_different_revision_is_not_reused(tmp_pa
         assert tick["reused"] == []
         assert tick["submitted"] == ["leaf"]
         assert len(responder.commands) == 2
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+@pytest.mark.skipif(
+    not _HAS_PICONGPU,
+    reason="requires the pinned picongpu so its installed provenance can win",
+)
+async def test_direct_submission_carried_revision_yields_to_an_installed_pin(tmp_path) -> None:
+    """A carried revision cannot override the installed PIConGPU revision.
+
+    ``_spec_provenance`` prefers this install's
+    :func:`~pic_agentic.version.local_provenance` over a ``provenance`` mapping
+    carried in the spec.  On a host with the pinned PIConGPU both the direct run
+    and a leaf carrying ``other-rev`` therefore resolve to the same installed
+    revision and *do* reuse; only the installed revision decides.
+    """
+    from pic_agentic.version import local_provenance
+
+    agenda, service, built = _direct_service(tmp_path, picongpu_revision="")
+    installed_revision = local_provenance()["picongpu_revision"]
+    assert installed_revision, "a pinned picongpu must report its revision"
+
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    responder = _DirectResponder(sim_t)
+    tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
+    try:
+        outcome = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        service.on_message(
+            build_submit_event(
+                sim=_SIM,
+                seq=999,
+                cmd_id=outcome.cmd_id,
+                sim_id=outcome.sim_id,
+                state=SimulationState.RESULTS_READY,
+            ).sign(_SECRET),
+        )
+        # The leaf carries a different revision, but the installed pin wins.
+        leaf_spec = {"sim": built.runner["sim"], "provenance": {"picongpu_revision": "other-rev"}}
+        group = AgendaGroup(name="g").add(leaf=AgendaSim(name="leaf", spec=leaf_spec))
+        AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="camp", agenda=group))
+        tick = await agenda.advance(mcp_t.send)
+        assert tick["reused"] == ["leaf"]
+        assert tick["submitted"] == []
+        assert len(responder.commands) == 1  # no second cluster job
+        leaf = agenda.store.load(Campaign).agenda.entries["leaf"]
+        assert leaf.run_id == outcome.cmd_id
     finally:
         for task in tasks:
             task.cancel()
