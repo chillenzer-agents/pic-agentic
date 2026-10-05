@@ -201,13 +201,16 @@ class ResultOp(StrEnum):
 
 
 #: Registered PIConGPU plugin readers, by the name carried in
-#: :attr:`ResultParams.reader`.  The first three are the text plugins; the last
-#: four are the openPMD/image readers (phase space, radiation, calorimeter, PNG).
-#: The full registry (filename pattern, reader class, allowed kwargs) lives in
+#: :attr:`ResultParams.reader`.  The first four are the text plugins (the field
+#: energy monitor is parsed by the engine's own stdlib parser, not a shipped
+#: ``picongpu.extra.plugins.data`` reader); the last four are the openPMD/image
+#: readers (phase space, radiation, calorimeter, PNG).  The full registry
+#: (filename pattern, reader class, allowed kwargs) lives in
 #: :mod:`pic_agentic.results`; the names are frozen here so the wire model can
 #: validate ``reader`` without importing the optional engine.
 PLUGIN_READER_NAMES = (
     "energy_histogram",
+    "energy_fields",
     "emittance",
     "transition_radiation",
     "phase_space",

@@ -165,6 +165,12 @@ class _PluginReader:
     submodule: str
     kind: str
     needs: str
+    #: ``True`` for a reader the engine parses itself (stdlib) rather than a
+    #: shipped ``picongpu.extra.plugins.data`` class.  A native reader has no
+    #: ``module``/``submodule``/``needs`` and needs no PIConGPU install: only the
+    #: run's plain-text output.  It is still a ``kind="text"`` reader for target
+    #: discovery (a regular file, never an openPMD series directory).
+    native: bool = False
 
 
 #: Filename patterns for the shipped readers.  The ``species``/``species_filter``
@@ -182,6 +188,19 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
         "energy_histogram",
         _KIND_TEXT,
         "picongpu",
+    ),
+    # The EnergyFields plugin (``fields_energy.dat``) writes plain text but,
+    # unlike the ``*_energyHistogram_*.dat`` family, ships no reader in
+    # ``picongpu.extra.plugins.data``.  The engine parses it natively (stdlib),
+    # so this plugin's integrated field-energy artifact is no longer labelled
+    # ``binary``/unreadable (H2).
+    "energy_fields": _PluginReader(
+        re.compile(r"^(?:fields_energy|[A-Za-z0-9_]+_energy)\.dat$"),
+        "",
+        "",
+        _KIND_TEXT,
+        "picongpu",
+        native=True,
     ),
     "emittance": _PluginReader(
         re.compile(r"^(?P<species>[A-Za-z0-9_]+)_emittance_(?P<filter>[A-Za-z0-9_]+)\.dat$"),
@@ -240,6 +259,14 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
         "imageio",
     ),
 }
+
+
+#: The sniffed ``format`` labels that name a *plain-text* plugin artifact.  A
+#: ``read`` of such a file serves its text tail (bounded) rather than rejecting
+#: it as "not a text result": ``fields_energy.dat`` is plain text with no shipped
+#: reader, so before H2 it was unreachable through either the plugin or the text
+#: path.
+_NATIVE_TEXT_FORMATS = frozenset(reader for reader, spec in _PLUGIN_READERS.items() if spec.kind == _KIND_TEXT)
 
 
 class ResultsUnavailable(RuntimeError):  # ruff: ignore[error-suffix-on-exception-name] - contract-frozen name
@@ -1082,7 +1109,7 @@ def _read(params: ResultParams, *, run_dir: Path, output: Path) -> dict[str, Any
     # The captured stdout/stderr streams have no filename suffix; treat the
     # known capture paths as text so the advertised stream read works.
     from_stream = params.path is None and params.stream in {"stdout", "stderr"}
-    if not from_stream and _sniff_format(target.name) != "text":
+    if not from_stream and _sniff_format(target.name) not in {"text", *_NATIVE_TEXT_FORMATS}:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, "not a text result; use an openPMD operation")
     if _entry_size(target) > RESULT_TEXT_MAX_BYTES:
         return _error(SimulationErrorCode.RESULT_TOO_LARGE, f"text result exceeds {RESULT_TEXT_MAX_BYTES} bytes")
@@ -1115,6 +1142,11 @@ def _import_plugin_reader(name: str) -> type:
 
     """
     spec = _PLUGIN_READERS[name]
+    if spec.native:
+        # A native reader is parsed by the engine; there is no shipped class to
+        # import and no PIConGPU install is required.
+        msg = f"{name} is parsed natively and has no shipped reader class"
+        raise ResultsUnavailable(msg)
     try:
         importlib.import_module("picongpu.extra.plugins")
     except ImportError as exc:
@@ -1262,7 +1294,10 @@ def _plugin_species_matches(name: str, params: ResultParams, spec: _PluginReader
     groups = _plugin_filename_groups(spec, name)
     if groups is None:
         return False
-    if params.species is not None and groups.get("species") != params.species:
+    # A reader whose filename carries no species component (the field-energy
+    # monitor) cannot be narrowed by one: a requested species is honour-neutral
+    # there rather than turning every match into a miss.
+    if "species" in spec.pattern.groupindex and params.species is not None and groups.get("species") != params.species:
         return False
     # An unset filter means PIConGPU's default "all"; only an explicit
     # non-default filter narrows the match.  A reader without a filter component
@@ -2098,12 +2133,206 @@ def _build_transition_radiation(
     }
 
 
+#: Canonical column names of the ``EnergyFields`` plugin output, used when the
+#: ``#step total[Joule] Bx[Joule] ...`` header is missing or unrecognised.  The
+#: C++ writer emits exactly these (``EnergyFields.x.cpp``).
+_FIELD_ENERGY_COLUMNS = ("total", "Bx", "By", "Bz", "Ex", "Ey", "Ez")
+
+#: Byte cap on a native text plugin file the engine parses itself.  The
+#: ``fields_energy.dat`` history is one short row per output step; 8 MiB bounds a
+#: pathological file without truncating any realistic run.
+_NATIVE_TEXT_MAX_BYTES = 8 * 1024 * 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class _FieldEnergyRow:
+    """One ``fields_energy.dat`` row: a step and its field energies [Joule]."""
+
+    step: int
+    total: float
+    components: list[float]
+
+
+def _field_energy_header(line: str) -> list[str]:
+    """Parse the ``#step total[Joule] Bx[Joule] ...`` header into column names.
+
+    The bracket unit suffix is stripped, so ``Bx[Joule]`` becomes ``Bx``.  The
+    leading ``#step`` token is dropped.  A header whose token count does not
+    match :data:`_FIELD_ENERGY_COLUMNS` is rejected (the caller falls back to
+    the canonical names), so a corrupted header cannot mislabel the columns.
+
+    Returns:
+        The six component column names, or ``[]`` when the header is unusable.
+
+    """
+    tokens = line.lstrip("#").split()
+    if not tokens or tokens[0] != "step":
+        return []
+    names = [re.sub(r"\[[^\]]*\]$", "", token) for token in tokens[1:]]
+    if len(names) != len(_FIELD_ENERGY_COLUMNS) or names[0] != "total":
+        return []
+    return names[1:]
+
+
+def _parse_fields_energy(text: str) -> tuple[list[_FieldEnergyRow], list[str], bool]:
+    """Parse an ``EnergyFields`` plain-text artifact.
+
+    The format (pinned ``EnergyFields.x.cpp``) is a ``#``-prefixed header
+    ``#step total[Joule] Bx[Joule] By[Joule] Bz[Joule] Ex[Joule] Ey[Joule]
+    Ez[Joule]`` followed by one whitespace-separated row per output step:
+    ``<step> <total[J]> <Bx> <By> <Bz> <Ex> <Ey> <Ez>``, each ``std::scientific``
+    with ~17 significant digits.  The parser is tolerant of a missing header
+    (falls back to :data:`_FIELD_ENERGY_COLUMNS`) and skips malformed rows rather
+    than failing the whole read.
+
+    Args:
+        text: The decoded file text.
+
+    Returns:
+        ``(rows, component_names, truncated)``.  ``truncated`` is True when a
+        row was dropped as malformed, so the summary can say so.
+
+    """
+    rows: list[_FieldEnergyRow] = []
+    components = list(_FIELD_ENERGY_COLUMNS[1:])
+    seen_header = False
+    truncated = False
+    # A data row is ``<step> <total> <one value per component>``.
+    expected = len(components) + 2
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            if not seen_header:
+                parsed = _field_energy_header(line)
+                if parsed:
+                    components = parsed
+                    expected = len(parsed) + 2
+                seen_header = True
+            continue
+        if not seen_header:
+            # A missing/corrupt header still parses; the space after the comment
+            # is optional, so fall back to the canonical names and full width.
+            seen_header = True
+        tokens = line.split()
+        if len(tokens) < expected:
+            truncated = True
+            continue
+        try:
+            step = int(float(tokens[0]))
+            values = [float(token) for token in tokens[1:expected]]
+        except ValueError:
+            truncated = True
+            continue
+        rows.append(_FieldEnergyRow(step=step, total=values[0], components=values[1:]))
+    return rows, components, truncated
+
+
+def _build_energy_fields(
+    instance: Any,
+    groups: dict[str, str],
+    iteration: int,
+    target: Path,
+    *,
+    window: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    """Reduce an ``EnergyFields`` (``fields_energy.dat``) history to a summary.
+
+    The file is the integrated electromagnetic field energy versus step - the
+    natural convergence artifact for a field-energy study - but it ships no
+    ``picongpu.extra.plugins.data`` reader, so it is parsed natively.  The
+    summary carries the total-energy trajectory (strided) plus scalar min/max/last
+    values for the total and for each field component, so the trend is visible
+    without shipping the whole history.
+
+    Returns:
+        The bounded summary dict.
+
+    Raises:
+        ResultsReaderError: If the file cannot be read or has no parsable rows.
+
+    """
+    _ = instance, groups, window
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:  # pragma: no cover - target existence is checked earlier
+        msg = f"cannot read {target.name}: {exc}"
+        raise ResultsReaderError(msg) from exc
+    rows, components, truncated = _parse_fields_energy(text)
+    if not rows:
+        msg = f"{target.name} has no parsable field-energy rows"
+        raise ResultsReaderError(msg)
+    steps = [row.step for row in rows]
+    totals = [row.total for row in rows]
+    index = steps.index(iteration) if iteration in steps else len(rows) - 1
+    component_values = [[row.components[position] for row in rows] for position in range(len(components))]
+    strided_steps, downsampled = _stride([float(step) for step in steps])
+    strided_totals, _ = _stride(totals)
+    return {
+        "step": [int(step) for step in strided_steps],
+        "total_J": strided_totals,
+        "component_names": list(components),
+        "component_last_J": {name: values[index] for name, values in zip(components, component_values, strict=True)},
+        "component_min_J": {name: min(values) for name, values in zip(components, component_values, strict=True)},
+        "component_max_J": {name: max(values) for name, values in zip(components, component_values, strict=True)},
+        "selected_step": steps[index],
+        "step_first": steps[0],
+        "step_last": steps[-1],
+        "n_steps": len(rows),
+        "total_J_min": min(totals),
+        "total_J_max": max(totals),
+        "total_J_last": totals[-1],
+        "units_J": "Joule",
+        **_plugin_source(target, steps[index]),
+        "truncated": truncated,
+        "downsampled": downsampled,
+    }
+
+
+def _native_plugin_result(
+    reader: str,
+    output: Path,
+    params: ResultParams,
+    target: Path,
+) -> dict[str, Any]:
+    """Run a native (engine-parsed) text plugin reader against one file.
+
+    Unlike the shipped-reader path this needs no PIConGPU install and no
+    per-iteration filenames: the step lives *inside* the file.  The iteration
+    selector therefore picks a row of the file's own history (``last`` by
+    default), and an unknown selector is a clean ``no_results``.
+
+    Returns:
+        The bounded summary dict.
+
+    Raises:
+        ResultsReaderError: If the file cannot be parsed or the iteration is
+            not present.
+
+    """
+    _ = output
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:  # pragma: no cover - target existence is checked earlier
+        msg = f"cannot read {target.name}: {exc}"
+        raise ResultsReaderError(msg) from exc
+    rows, _components, _truncated = _parse_fields_energy(text)
+    available = [row.step for row in rows]
+    if not available:
+        msg = f"{target.name} has no parsable field-energy rows"
+        raise ResultsReaderError(msg)
+    selected = _resolve_plugin_iteration(available, params.iteration)
+    return _annotate_vacuous(reader, _PLUGIN_BUILDERS[reader](None, {}, selected, target))
+
+
 #: Reader name -> the summary builder that calls the reader instance.  Every
 #: builder shares the signature ``(instance, groups, iteration, target, *,
 #: window)`` so the openPMD/image readers can reach their extra selector
 #: components; only the energy-histogram builder uses ``window``.
 _PLUGIN_BUILDERS: dict[str, Callable[..., dict[str, Any]]] = {
     "energy_histogram": _build_energy_histogram,
+    "energy_fields": _build_energy_fields,
     "emittance": _build_emittance,
     "transition_radiation": _build_transition_radiation,
     "phase_space": _build_phase_space,
@@ -2159,7 +2388,10 @@ def _read_plugin_target(
     if not (target.is_file() or (spec.kind == _KIND_OPENPMD and target.is_dir())):
         return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
     try:
-        summary = _plugin_result(reader, spec, output, params, target)
+        if spec.native:
+            summary = _native_plugin_result(reader, output, params, target)
+        else:
+            summary = _plugin_result(reader, spec, output, params, target)
     except ResultsUnavailable as exc:
         return _error(SimulationErrorCode.READER_UNAVAILABLE, str(exc))
     except _PLUGIN_SOFT_ERRORS as exc:

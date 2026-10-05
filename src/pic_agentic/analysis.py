@@ -42,6 +42,7 @@ _SECRET_KEY_RE = re.compile(r"secret|token|password|key", re.IGNORECASE)
 #: that is not installed or has no matching file is simply skipped.
 _PLUGIN_SUMMARY_READERS = (
     "energy_histogram",
+    "energy_fields",
     "phase_space",
     "emittance",
     "transition_radiation",
@@ -706,6 +707,22 @@ def _radiation_physics(summary: dict[str, Any], where: str, step: str) -> list[s
     return facts
 
 
+def _energy_fields_physics(summary: dict[str, Any], where: str, step: str) -> list[str]:
+    """Physics facts for the ``energy_fields`` (integrated field energy) summary.
+
+    Returns:
+        The fact strings for this reader (possibly empty).
+
+    """
+    facts: list[str] = []
+    if (last := summary.get("total_J_last")) is not None and (maximum := summary.get("total_J_max")) is not None:
+        facts.append(
+            f"integrated field energy{where}{step} is {last:.6g} J (peak {maximum:.6g} J over "
+            f"{summary.get('n_steps')} output steps)",
+        )
+    return facts
+
+
 def _calorimeter_physics(summary: dict[str, Any], where: str, step: str) -> list[str]:
     """Physics facts for the ``calorimeter`` summary.
 
@@ -726,6 +743,7 @@ def _calorimeter_physics(summary: dict[str, Any], where: str, step: str) -> list
 #: contributes its warning (if any) but no physics prose.
 _PLUGIN_FACT_BUILDERS: dict[str, Callable[[dict[str, Any], str, str], list[str]]] = {
     "energy_histogram": _energy_histogram_physics,
+    "energy_fields": _energy_fields_physics,
     "emittance": _emittance_physics,
     "transition_radiation": _transition_radiation_physics,
     "phase_space": _phase_space_physics,

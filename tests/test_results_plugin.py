@@ -25,6 +25,7 @@ import pytest
 from plugin_fixtures import (
     calorimeter_h5,
     energy_histogram_dat,
+    fields_energy_dat,
     phase_space_h5,
     png_file,
     radiation_h5,
@@ -84,6 +85,89 @@ def test_scandir_names_the_plugin_reader(tmp_path: Path) -> None:
     formats = {ref.path: ref.format for ref in manifest.files}
     assert formats["e_energyHistogram_all.dat"] == "energy_histogram"
     assert formats["output"] == "binary"
+
+
+def test_sniff_format_names_the_field_energy_monitor() -> None:
+    """H2: ``fields_energy.dat`` is plain text, not ``binary``."""
+    assert results._sniff_format("fields_energy.dat") == "energy_fields"
+    # A non-default prefix (``<name>_energy.dat``) is recognised too.  Like the
+    # other plugin patterns this is a filename-only heuristic, so a coincidental
+    # name is labelled and the native reader then rejects it cleanly.
+    assert results._sniff_format("myrun_energy.dat") == "energy_fields"
+    # A name that matches no plugin pattern is still generic/binary.
+    assert results._sniff_format("energy.dat") == "binary"
+    assert results._sniff_format("mystery.dat") == "binary"
+
+
+def test_field_energy_reader_summarizes_a_real_format_file(tmp_path: Path) -> None:
+    """H2: the native ``energy_fields`` reader parses the real file with no PIConGPU."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 1.5e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    assert summary["step"] == [0, 50, 100]
+    assert summary["total_J"] == pytest.approx([1.0e-5, 2.0e-5, 1.5e-5])
+    assert summary["selected_step"] == 100
+    assert summary["step_first"] == 0
+    assert summary["step_last"] == 100
+    assert summary["n_steps"] == 3
+    assert summary["total_J_min"] == pytest.approx(1.0e-5)
+    assert summary["total_J_max"] == pytest.approx(2.0e-5)
+    assert summary["total_J_last"] == pytest.approx(1.5e-5)
+    assert summary["units_J"] == "Joule"
+    assert summary["component_names"] == ["Bx", "By", "Bz", "Ex", "Ey", "Ez"]
+    assert summary["component_last_J"]["Bx"] == pytest.approx(1.5e-5 / 6)
+    assert summary["source_path"] == "fields_energy.dat"
+    assert summary["source_size_bytes"] > 0
+    assert summary["truncated"] is False
+    assert "warning" not in summary
+
+
+def test_field_energy_reader_selects_an_explicit_step(tmp_path: Path) -> None:
+    """The ``iteration`` selector picks a row of the file's own history."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 1.5e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration=50)
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    summary = payload["result"]
+    assert summary["selected_step"] == 50
+    assert summary["component_last_J"]["Ex"] == pytest.approx(2.0e-5 / 6)
+
+    missing = params.model_copy(update={"iteration": 7})
+    gone = results.resolve_result(missing, run_dir=run, sim_id=SIM_ID)
+    assert gone["error_code"] == "no_results"
+
+
+def test_field_energy_file_reads_as_a_bounded_text_tail(tmp_path: Path) -> None:
+    """H2: ``read_result`` no longer rejects ``fields_energy.dat`` as binary."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run)
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.READ, path="fields_energy.dat", tail=10)
+    payload = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)
+    assert payload["data_encoding"] == "text"
+    assert payload["data"][0].startswith("#step")
+
+
+def test_field_energy_is_in_describe_and_analyze(tmp_path: Path) -> None:
+    """H2: the artifact is labelled and summarized by ``describe``/``analyze``."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run)
+    manifest = results.scan_output(run / "simOutput", sim_id=SIM_ID, run_dir=str(run))
+    formats = {ref.path: ref.format for ref in manifest.files}
+    assert formats["fields_energy.dat"] == "energy_fields"
+
+    from pic_agentic import analysis
+
+    summaries = analysis.read_plugin_summaries(run / "simOutput")
+    assert summaries["energy_fields"]["total_J_last"] == pytest.approx(1.5e-5)
+    answer = analysis.synthesize_answer("what is the total field energy?", {}, {}, {}, summaries)
+    assert "field energy" in answer
 
 
 def test_sniff_format_is_a_documented_filename_heuristic(tmp_path: Path) -> None:
