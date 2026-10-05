@@ -44,6 +44,7 @@ from pic_agentic.protocol.simulation import (
     build_submit_command,
     client_capability_mismatch,
     payload_wire_size,
+    simulation_phase,
 )
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 from pic_agentic.server.hello import AckTimeoutError, SendFn
@@ -145,6 +146,22 @@ class SimRecord(BaseModel):
     last_event_type: str | None = None
     last_event_ts: str | None = None
     active: bool = True
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def phase(self) -> str:
+        """The coarse run phase (H4): build vs queue vs run.
+
+        Derived from :attr:`state` and :attr:`job_id` so a caller polling the
+        registry can tell a long build/queue wait apart from a genuinely idle
+        running job.  See
+        :func:`~pic_agentic.protocol.simulation.simulation_phase`.
+
+        Returns:
+            One of the ``SimulationPhase`` values.
+
+        """
+        return simulation_phase(self.state, self.job_id)
 
 
 def condense_events(
