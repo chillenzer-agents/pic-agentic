@@ -96,7 +96,8 @@ async def test_wait_times_out_with_the_last_status_not_an_error() -> None:
     assert outcome.last_status["state"] == SimulationState.JOB_RUNNING.value
     assert outcome.last_status["job_id"] == JOB_ID
     assert outcome.last_status["phase"] == "running"
-    assert outcome.note is not None and "not terminal" in outcome.note
+    assert outcome.note is not None
+    assert "not terminal" in outcome.note
     assert outcome.waited_s >= 0.1
 
 
@@ -150,7 +151,8 @@ async def test_wait_reports_the_build_phase_without_inventing_a_state() -> None:
     assert outcome.last_status["state"] == SimulationState.ACCEPTED.value
     assert outcome.last_status["job_id"] is None
     assert outcome.last_status["phase"] == "building"
-    assert outcome.note is not None and "build/queue phase" in outcome.note
+    assert outcome.note is not None
+    assert "build/queue phase" in outcome.note
 
 
 async def test_wait_unknown_simulation_raises_keyerror() -> None:
