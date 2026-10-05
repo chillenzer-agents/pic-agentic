@@ -298,6 +298,31 @@ symlinks resolved on both sides) and refused otherwise; a path such as
 (`MAX_SPEC_FILE_BYTES`) — larger than the 48 KiB inline cap because the bytes
 are server-local and never cross the homeserver.
 
+### Use the pinned API, not the online docs (H9)
+
+An agent writing a PICMI script must target the **installed** `picongpu`
+package, whose version is the pinned commit in `pyproject.toml` (see the
+`picongpu_revision` in every build result). The readthedocs pages can describe a
+newer release than the pin, and the beta-5 transcripts show an agent
+reverse-engineering `site-packages` after copying names that do not exist
+there. In particular, on the beta-5 pin
+
+- the diagnostics are `picmi.diagnostics.NativeFieldDump`,
+  `DerivedFieldDump`, `PhaseSpace`, `EnergyHistogram`, `FieldEnergyMonitor`,
+  `Checkpoint`, `MacroParticleCount`, … — **not** the readthedocs
+  `FieldDiagnostic` / `PhaseSpaceDiagnostic`;
+- do not build the input by hand with `sim.write_input_file()`; define the
+  `picmi.Simulation` and let the `build_spec` / `submit_simulation` tools build
+  it (`sim.picongpu_run()` is the equivalent in-script entry point);
+- distributions keep the PICMI names (`picmi.UniformDistribution(density=...,
+  rms_velocity=[...])`, `picmi.GaussianDistribution(...)`).
+
+The seeded `instructions` carry a minimal, verified snippet using
+`picmi.Cartesian3DGrid`, `picmi.ElectromagneticSolver`, `picmi.Species`,
+`picmi.UniformDistribution`, `picmi.PseudoRandomLayout` and
+`picmi.Simulation`, so an agent has a compiling starting point without reading
+the pin's source.
+
 ### Campaign sweeps are self-describing
 
 A campaign leaf records the sweep assignment in `point` as

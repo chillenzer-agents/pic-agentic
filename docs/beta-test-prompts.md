@@ -20,9 +20,21 @@ that pointer; prompt 2 is meant to test whether the agent can compose a new
 study from the documentation without a verbatim snippet to copy.
 
 Caveat for the pointer (picongpu upstream docs issue, not fixed here): the page's
-focal example defines no plasma species, so it produces an empty spectrum as
-written. The `instructions` now say the example needs the LWFA tutorial's plasma
-species folded in for a non-empty result.
+focal example is empty as written, and not only because it defines no plasma
+species. It reuses the LWFA tutorial's pulse timing (`PULSE_INIT=15`, the pulse
+peak ~11 µm in front of the box) in a 100-step run, so the pulse never reaches
+the gas ~80 µm downstream (that needs ~2000 steps). Folding in the plasma
+species is necessary but not sufficient; the `instructions` now say both. A
+run that finishes but whose only numeric artifact reads all-zero is the
+`suspect` health signal below.
+
+The `instructions` also warn that the readthedocs pages may describe a
+**newer release than the installed pin**, and carry a minimal version-matched
+snippet built from the pinned classes. The beta-5 agent copied
+`FieldDiagnostic`/`PhaseSpaceDiagnostic`/`write_input_file` from the online pages
+and then had to reverse-engineer `site-packages`; the pin uses
+`picmi.diagnostics.NativeFieldDump`/`DerivedFieldDump`/`PhaseSpace`/
+`EnergyHistogram`/`FieldEnergyMonitor`. The installed package is authoritative.
 
 Independently of *why* a run is empty, a completed run whose only numeric plugin
 artifact reads all-zero is now a first-class **health signal**, not silence:
