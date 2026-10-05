@@ -1067,17 +1067,25 @@ class AgendaService:
         *input* file cap (4 MiB), never the 48 KiB wire cap every submission
         still meets.
 
+        The name collision is checked *first*: a duplicate name is the caller's
+        most direct error and must be reported as ``duplicate_leaf`` even when
+        the supplied spec is also invalid, preserving the long-standing contract
+        that an existing entry is never silently re-validated or replaced.
+
         The new leaf is built as an :class:`AgendaSim` and validated *before* it
         is inserted, so its ``depends_on`` goes through the model validator
         (a duplicate or path-style dependency is rejected rather than persisted
         into an unloadable campaign).
 
         Returns:
-            ``{"ok": True, "path": name}``, or the ``_validate_leaf_spec`` soft
-            error when the spec could never be submitted.
+            ``{"ok": True, "path": name}``, the ``duplicate_leaf`` soft error, or
+            the ``_validate_leaf_spec`` soft error when the spec could never be
+            submitted.
 
         """
         campaign = self.store.load(Campaign)
+        if name in campaign.agenda.entries:
+            return {"ok": False, "error": "duplicate_leaf", "path": name}
         invalid = self._validate_leaf_spec(spec)
         if invalid is not None:
             return invalid
