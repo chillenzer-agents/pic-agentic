@@ -202,3 +202,64 @@ def test_build_spec_write_to_outside_root_is_an_error(tmp_path) -> None:
         return
     msg = "expected UnsafePathError"
     raise AssertionError(msg)
+
+
+async def test_add_agenda_leaf_from_a_staged_path(tmp_path) -> None:
+    """A leaf can carry its own whole spec by reference (multi-node studies)."""
+    config = _config(tmp_path)
+    base = _runner_dump()
+    write_spec_file(config, "base.json", base)
+    created = await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec_path": "base.json", "patch_path": "sim.time_steps", "values": [50]},
+    )
+    assert created["ok"] is True
+
+    # A different whole spec, staged under the same root, becomes the leaf spec
+    # without re-typing or the inline cap applying.
+    alt = _runner_dump()
+    alt["sim"]["time_steps"] = 7
+    leaf_path = write_spec_file(config, "leaf.json", alt)
+    result = await _call(
+        config,
+        "add_agenda_leaf",
+        {"name": "extra", "spec_path": str(leaf_path), "point": {"time_steps": 7}, "parameter": "steps"},
+    )
+    assert result == {"ok": True, "path": "extra"}
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["extra"].spec["sim"]["time_steps"] == 7
+    assert campaign.agenda.entries["extra"].sweep_parameter == "steps"
+
+
+async def test_add_agenda_leaf_requires_exactly_one_spec_form(tmp_path) -> None:
+    config = _config(tmp_path)
+    write_spec_file(config, "base.json", _runner_dump())
+    await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec_path": "base.json", "patch_path": "sim.time_steps", "values": [50]},
+    )
+    neither = await _call(config, "add_agenda_leaf", {"name": "x"})
+    assert neither["ok"] is False
+    assert neither["error"] == "spec_required"
+    assert "spec_path" in neither["detail"]
+
+    both = await _call(config, "add_agenda_leaf", {"name": "x", "spec": {"sim": {}}, "spec_path": "base.json"})
+    assert both["ok"] is False
+    assert both["error"] == "spec_required"
+
+
+async def test_add_agenda_leaf_refuses_a_path_outside_the_root(tmp_path) -> None:
+    config = _config(tmp_path)
+    write_spec_file(config, "base.json", _runner_dump())
+    await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec_path": "base.json", "patch_path": "sim.time_steps", "values": [50]},
+    )
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"sim": {}}))
+    result = await _call(config, "add_agenda_leaf", {"name": "x", "spec_path": str(outside)})
+    assert result["ok"] is False
+    assert result["error"] == "invalid_spec_path"

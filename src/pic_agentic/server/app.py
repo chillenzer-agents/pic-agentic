@@ -516,21 +516,36 @@ class HelloRuntime:
     async def add_agenda_leaf(
         self,
         name: str,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None,
         *,
+        spec_path: str | None = None,
         point: dict[str, float | int | str] | None = None,
         depends_on: list[str] | None = None,
         parameter: str | None = None,
     ) -> dict[str, Any]:
         """Add one leaf to the campaign's root group (agent expansion).
 
+        The leaf spec comes either inline (``spec``) or from a staged JSON file
+        (``spec_path``); exactly one must be given.  The by-reference form lets a
+        leaf carry a different whole spec than the campaign's base without
+        re-typing tens of KiB -- the escape hatch for varying more than one spec
+        node.
+
         Returns:
             ``{"ok": True, "path": name}``, or a soft error.
 
         """
+        resolved, error = self._resolve_spec(
+            spec,
+            spec_path,
+            inline_key="spec",
+            error_code="spec_required",
+        )
+        if error is not None:
+            return error
         return await self.agenda_service.add_leaf(
             name,
-            spec,
+            resolved,
             point=point,
             depends_on=depends_on,
             parameter=parameter,
@@ -555,38 +570,56 @@ class HelloRuntime:
             ``{"ok": True, "name": name, "leaves": [...]}``, or a soft error.
 
         """
-        resolved, error = self._resolve_base_spec(base_spec, base_spec_path)
+        resolved, error = self._resolve_spec(
+            base_spec,
+            base_spec_path,
+            inline_key="base_spec",
+            error_code="base_spec_required",
+        )
         if error is not None:
             return error
         return await self.agenda_service.create_campaign(name, resolved, patch_path, values, parameter=parameter)
 
-    def _resolve_base_spec(
+    def _resolve_spec(
         self,
-        base_spec: dict[str, Any] | None,
-        base_spec_path: str | None,
+        spec: dict[str, Any] | None,
+        spec_path: str | None,
+        *,
+        inline_key: str,
+        error_code: str,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """Pick and load the base spec from the inline or path form.
+        """Pick and load a spec from the inline or path form.
 
         Exactly one of the two forms is required.  A path is read only inside
         the staging root (:mod:`~pic_agentic.server.spec_files`), so an
         LLM-supplied path can never reach outside it.
 
+        Args:
+            spec: The inline spec, or ``None``.
+            spec_path: The staged-file path, or ``None``.
+            inline_key: The inline argument's public name, used in the error
+                detail so the caller knows which pair to fix (``base_spec`` for
+                create_campaign, ``spec`` for add_agenda_leaf).
+            error_code: The stable soft-error code when neither/both forms are
+                given.
+
         Returns:
             ``(spec, None)`` on success, else ``(None, soft_error)``.
 
         """
-        if (base_spec is None) == (base_spec_path is None):
+        path_key = f"{inline_key}_path"
+        if (spec is None) == (spec_path is None):
             return None, {
                 "ok": False,
-                "error": "base_spec_required",
-                "detail": "provide exactly one of base_spec (inline) or base_spec_path (staged file)",
+                "error": error_code,
+                "detail": f"provide exactly one of {inline_key} (inline) or {path_key} (staged file)",
             }
-        if base_spec_path is not None:
+        if spec_path is not None:
             try:
-                return read_spec_file(self.config, base_spec_path), None
+                return read_spec_file(self.config, spec_path), None
             except UnsafePathError as exc:
                 return None, {"ok": False, "error": "invalid_spec_path", "detail": self.config.redact(str(exc))}
-        return base_spec, None
+        return spec, None
 
     async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
         """Remove the persisted campaign and its reuse registry (reset).
@@ -1424,20 +1457,38 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         description=(
             "Add one simulation leaf to the persisted campaign's root group, so "
             "the next advance_agenda tick can submit it. Used by the agent to "
-            "refine a sweep (e.g. add points around an optimum). `point` is the "
-            "sweep assignment to record; pass `parameter` to label the swept "
-            "quantity in human-readable form (stored as sweep_parameter)."
+            "refine a sweep (e.g. add points around an optimum), and as the "
+            "escape hatch for studies create_campaign cannot express with a "
+            "single patch_path: build the base campaign, then add one leaf per "
+            "point with its own whole spec, varying as many spec nodes as the "
+            "study needs (e.g. grid cells and time_steps together for a "
+            "fixed-physical-size convergence study). Provide the leaf spec "
+            "exactly one way: inline as `spec`, or by reference as `spec_path` "
+            "(a staged JSON spec under the server's spec directory, e.g. the "
+            "`spec_path` build_spec(write_to=...) returned), so a large leaf "
+            "spec need not be re-typed or inline-sized. `point` is the sweep "
+            "assignment to record; pass `parameter` to label the swept quantity "
+            "in human-readable form (stored as sweep_parameter)."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
     async def add_agenda_leaf(
         name: str,
-        spec: dict[str, Any],
+        spec: dict[str, Any] | None = None,
+        *,
+        spec_path: str | None = None,
         point: dict[str, Any] | None = None,
         depends_on: list[str] | None = None,
         parameter: str | None = None,
     ) -> dict[str, Any]:
-        result = await runtime.add_agenda_leaf(name, spec, point=point, depends_on=depends_on, parameter=parameter)
+        result = await runtime.add_agenda_leaf(
+            name,
+            spec,
+            spec_path=spec_path,
+            point=point,
+            depends_on=depends_on,
+            parameter=parameter,
+        )
         return _redact_dict(runtime, result)
 
     _register_research_tools(server, runtime)
