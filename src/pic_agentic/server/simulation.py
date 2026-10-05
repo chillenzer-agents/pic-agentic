@@ -287,8 +287,15 @@ class WaitOutcome(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def ok(self) -> bool:
-        """Whether the wait reached a target without timing out."""
-        return not self.timed_out
+        """Whether the wait executed (a timeout is data, not a failure).
+
+        Always True for a constructed outcome: the only failure mode -- a bad
+        ``sim_id`` or target -- is rejected before a :class:`WaitOutcome` is
+        built (the tool then returns ``ok: false`` with an ``error``).  Use
+        ``matched``/``timed_out`` to distinguish a reached target from a
+        deadline, never ``ok``.
+        """
+        return True
 
 
 class BuiltSpec(BaseModel):
