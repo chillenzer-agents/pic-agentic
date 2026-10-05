@@ -237,6 +237,24 @@ class SubmitOutcome(BaseModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def run_id(self) -> str:
+        """The run-batch identity of this submission.
+
+        Distinct from :attr:`sim_id`: ``sim_id`` is a **spec label** (the first
+        8 hex of the payload hash, shared by every identical spec and every
+        re-run), while ``run_id`` is the submission's stable command id and
+        names *this* run.  Two re-runs of the same spec therefore report the
+        same ``sim_id`` but different ``run_id`` -- the identity a user needs to
+        tell a re-run from a distinct study point.
+
+        Returns:
+            The submission's command id (32 lowercase hex).
+
+        """
+        return self.cmd_id
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def ok(self) -> bool:
         """Whether the command was accepted without an error."""
         return not self.error
@@ -337,6 +355,17 @@ class SubmitService:
         #: ``get_events``/``condense_events`` read from.
         self.event_log: list[RcpMessage] = []
         self.registry: dict[str, SimRecord] = {}
+        #: Optional callback ``(spec, sim_id, run_id) -> None`` invoked when a
+        #: bare ``submit_simulation`` is accepted, so the run can be recorded as
+        #: pending reuse (H7).  ``spec`` is the wire payload's simulation mapping
+        #: (``{"sim": ...}``); ``run_id`` is the submission's stable command id.
+        self.on_direct_submission: Callable[..., None] | None = None
+        #: Optional callback invoked with a run's stable command id (its
+        #: run-batch identity) when its ``results.ready`` event is projected.
+        #: The agenda service uses it to promote a direct submission's pending
+        #: reuse entry once the result exists; the command id -- not the spec --
+        #: is carried by the event, so the attribution survives a restart.
+        self.on_run_ready: Callable[[str], None] | None = None
         #: Latest capability set the simclient advertised over the ``hello``
         #: handshake; None until a hello runs or the client predates the probe.
         self.client_capabilities: ClientCapabilities | None = None
@@ -581,6 +610,16 @@ class SubmitService:
         record.last_event_ts = message.ts
         record.active = state not in TERMINAL_STATES
         self.registry[sim_id] = record
+        if state == SimulationState.RESULTS_READY.value and self.on_run_ready is not None:
+            # The result now exists, so the run is reusable.  Keyed by the run's
+            # command id (its run-batch identity), which the event carries, so a
+            # direct submission's pending reuse entry can be promoted without
+            # the spec -- including on a post-restart backfill.  Best-effort:
+            # a hook failure must never break event projection.
+            try:
+                self.on_run_ready(cmd_id)
+            except Exception as exc:  # ruff: ignore[blind-except] - a hook must never break projection
+                log.warning("on_run_ready hook failed for %s: %s", sim_id, exc)
 
     def _project_ack(self, message: RcpMessage) -> None:
         """Register the simulation named by a submit ack, before its first event.
@@ -730,8 +769,19 @@ class SubmitService:
             :meth:`_dispatch`.
 
         """
-        cmd_id, _payload, command = await self.build_payload(script_path, params=params)
-        return await self._dispatch(send, cmd_id, command)
+        cmd_id, payload, command = await self.build_payload(script_path, params=params)
+        outcome = await self._dispatch(send, cmd_id, command)
+        if outcome.ok and self.on_direct_submission is not None:
+            # H7: a bare submit_simulation must be recorded so a later identical
+            # campaign leaf is reused instead of re-run.  The spec's wire form
+            # is the same ``{"sim": ...}`` the campaign holds, so the content
+            # key agrees.  Best-effort: registry bookkeeping must never fail a
+            # submission that the simclient already accepted.
+            try:
+                self.on_direct_submission(payload.simulation, sim_id=outcome.sim_id, run_id=cmd_id)
+            except Exception as exc:  # ruff: ignore[blind-except] - bookkeeping is best-effort
+                log.warning("direct reuse record failed for sim %s: %s", outcome.sim_id, exc)
+        return outcome
 
     async def submit_spec(
         self,

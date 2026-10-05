@@ -103,6 +103,38 @@ def test_analysis_linkage() -> None:
     assert action["object"] == {"@id": "#leaf0"}
 
 
+def test_run_id_is_recorded_distinct_from_the_spec_label() -> None:
+    """The lineage carries the run-batch identity, not just the spec label.
+
+    ``sim_id`` (``identifier``) is shared by every identical spec and every
+    re-run; ``runId`` names the actual run, so two re-runs of one spec stay
+    distinguishable.
+    """
+    group = AgendaGroup(name="g").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, sim_id="e8484fcd", run_id="run-abc"),
+    )
+    leaf = _by_id(campaign_rocrate(Campaign(name="study", agenda=group)), "#leaf")
+    assert leaf["identifier"] == "e8484fcd"
+    assert leaf["runId"] == "run-abc"
+
+
+def test_reused_leaf_is_flagged_in_the_crate() -> None:
+    """A reused leaf is marked, so "executed here" is distinguishable from reuse."""
+    group = AgendaGroup(name="g").add(
+        leaf=AgendaSim(
+            name="leaf",
+            spec={"sim": {"replica": 0}},
+            sim_id="e8484fcd",
+            run_id="run-original",
+            status="done",
+            reused=True,
+        )
+    )
+    leaf = _by_id(campaign_rocrate(Campaign(name="study", agenda=group)), "#leaf")
+    assert leaf["reused"] is True
+    assert leaf["runId"] == "run-original"
+
+
 def test_revision_override_and_spec_carried() -> None:
     crate = campaign_rocrate(_campaign({"sim": {"replica": 0}}), revision="deadbeef")
     assert _by_id(crate, "#picongpu")["version"] == "deadbeef"

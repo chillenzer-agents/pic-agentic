@@ -223,8 +223,10 @@ class AgendaSim(BaseModel):
     sweep_parameter: str | None = None
     status: Literal["planned", "submitted", "running", "done", "failed"] = "planned"
     depends_on: list[str] = Field(default_factory=list)
-    #: The RCP simulation id once this leaf has been submitted (the engine's
-    #: idempotency key: a leaf with a sim_id is never submitted twice).
+    #: The RCP simulation id once this leaf has been submitted: a **spec
+    #: label** -- the first 8 hex of the payload hash, so identical specs share
+    #: it and re-runs of the same spec keep it -- *not* a run id and not the
+    #: idempotency key (see :attr:`run_id`).
     sim_id: str | None = None
     #: Deferred submissions for this leaf so far: how many times the simclient
     #: reported the outcome as unknown (a lost ack or a pending idempotency
@@ -239,6 +241,11 @@ class AgendaSim(BaseModel):
     #: ``now - deferred_since`` exceeds the policy's ``deferred_outcome_timeout_s``
     #: (so a pending record whose build is still running is not failed early).
     deferred_since: str | None = None
+    #: The run-batch identity of the run this leaf is linked to: the
+    #: submission's stable command id (``_idempotency_key``), distinct from the
+    #: spec's ``sim_id``.  Set on submission and on reuse; None until then.  Two
+    #: re-runs of the same spec share a ``sim_id`` but have distinct run ids.
+    run_id: str | None = None
     #: Whether this leaf must be approved before the engine submits it.
     requires_approval: bool = False
     #: Whether a human has pre-approved this leaf (set by the approval tool).

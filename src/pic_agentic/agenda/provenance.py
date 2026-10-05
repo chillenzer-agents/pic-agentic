@@ -112,6 +112,17 @@ def campaign_rocrate(
             "about": {"@id": software_id},
             "instrument": {"@id": software_id},
         }
+        # ``identifier`` is the spec label (``sim_id``), *not* a run id: it is
+        # shared by every identical spec and every re-run.  Record the actual
+        # run-batch identity separately so lineage distinguishes runs of the
+        # same spec.
+        if sim.run_id:
+            leaf["runId"] = sim.run_id
+        # A reused leaf did not run in this campaign: it is linked to an earlier
+        # identical run.  Flag the link, so a lineage reader can tell "executed
+        # here" from "satisfied by reuse".
+        if sim.reused:
+            leaf["reused"] = True
         # The point is the sweep assignment this leaf ran at; record it for
         # every leaf that has one, regardless of whether a readable label was
         # set, so the crate is not asymmetric between labelled and unlabelled
