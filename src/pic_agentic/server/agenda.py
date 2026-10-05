@@ -213,8 +213,11 @@ class AgendaService:
         yet, so it is not reusable, and the entry is attributed by ``run_id``
         (the submission's stable command id) so the later ``results.ready``
         event can promote it **even across a server restart** (the signed-room
-        replay carries the command id, not the spec).  Best-effort: registry
-        bookkeeping must never fail a submission.
+        replay carries the command id, not the spec).  A direct submission has
+        no sweep point, so the record is keyed under ``point=None``: it only
+        ever reuses against another point-less run, never against a
+        point-carrying campaign leaf (a different simulation under option A).
+        Best-effort: registry bookkeeping must never fail a submission.
 
         Args:
             spec: The submitted wire spec (``{"sim": ...}``).
@@ -269,7 +272,13 @@ class AgendaService:
             arrive back to back, so the result may beat this bookkeeping).
 
         """
-        key = _reuse_key(spec, self.submit_service.picongpu_revision)
+        # A direct submission has no sweep point, so it is keyed under the
+        # point-less key (``point=None``); a point-carrying campaign leaf is a
+        # *different* simulation under option A and never shares this record.
+        # This is deliberate: ``remember_direct_spec``/``_direct_reuse_record``
+        # are the point-less path, and the campaign engine passes the leaf's
+        # actual point through :func:`_reuse_key`.
+        key = _reuse_key(spec, self.submit_service.picongpu_revision, None)
         existing = registry.records.get(key)
         # A replayed submission (e.g. ingest_backfill after a restart) must not
         # demote an already-promoted record back to pending.
@@ -381,8 +390,8 @@ class AgendaService:
                 raise SubmitFailureError(msg, error_code=outcome.error_code, stage=outcome.stage)
             return outcome.sim_id
 
-        def reuse_key(spec: dict[str, Any]) -> str:
-            return _reuse_key(spec, self.submit_service.picongpu_revision)
+        def reuse_key(spec: dict[str, Any], point: dict[str, Any] | None) -> str:
+            return _reuse_key(spec, self.submit_service.picongpu_revision, point)
 
         def reuse_lookup(key: str) -> ReuseRecord | None:
             return self._load_reuse().lookup(key)
@@ -1311,28 +1320,56 @@ def _policy_from_config(config: Config) -> EnginePolicy:
     )
 
 
-def _reuse_key(spec: dict[str, Any], fallback_revision: str) -> str:
+def _reuse_key(spec: dict[str, Any], fallback_revision: str, point: Mapping[str, Any] | None) -> str:
     """Return the content key under which a spec's completed result is reused.
 
-    The key folds the provenance tuple in with the wire payload, so identical
-    physics authored for a different PIConGPU revision/schema is *not* reused
-    (the result would not be attributable to the campaign's revision).  Shared
-    by the campaign engine's lookup/record hooks and by the direct
-    ``submit_simulation`` record path, so a direct run and a later identical
-    campaign leaf agree on the key.
+    The key folds the **sweep point** in with the provenanced wire payload, so
+    reuse requires identical content, provenance *and* point: two byte-identical
+    specs at different sweep points (e.g. ``point={"x": 1.0}`` and
+    ``point={"x": 2.0}``) are *different simulations* under option A and never
+    share a record.  Without this, two identical specs at different points
+    collapse onto one run and a leaf's provenance can attribute its result to a
+    point that never ran.  Finer-grained reuse (e.g. point-insensitive reuse of
+    the same physics) is deliberately out of scope here and left to future work.
+
+    The provenance tuple is still folded in, so identical physics authored for a
+    different PIConGPU revision/schema is not reused (the result would not be
+    attributable to the campaign's revision).  Shared by the campaign engine's
+    lookup/record hooks and by the direct ``submit_simulation`` record path.
+    A direct submission has no sweep point and passes ``point=None``: it only
+    reuses against another point-less run, never against a point-carrying
+    campaign leaf.
 
     Args:
         spec: A wire spec (``{"sim": ...}``, optionally carrying ``provenance``).
         fallback_revision: The server's configured ``picongpu_revision``.
+        point: The leaf's sweep point (``{parameter: value}``), or None for a
+            point-less direct submission.
 
     Returns:
-        The sha256 hex digest of the canonical ``{sim, provenance}`` payload.
+        The sha256 hex digest of the canonical ``{sim, provenance, point}``
+        payload.
 
     """
     provenance = _spec_provenance(spec, fallback_revision)
-    payload = {"sim": spec.get("sim"), "provenance": provenance}
+    payload = {"sim": spec.get("sim"), "provenance": provenance, "point": _canonical_point(point)}
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _canonical_point(point: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return a JSON-normalised copy of ``point`` for the reuse payload, or None.
+
+    The point may arrive from pydantic (``dict[str, float | int | str]``) or a
+    plain mapping; a shallow dict copy is enough to serialise it canonically
+    (``json.dumps(..., sort_keys=True)`` orders the keys), and None stays None so
+    a point-less direct run keys distinctly from every point-carrying leaf.
+
+    Returns:
+        A plain ``dict`` copy of the point, or None when no point is given.
+
+    """
+    return None if point is None else dict(point)
 
 
 async def _never_submit(_spec: dict[str, Any], _key: str) -> str:  # ruff: ignore[unused-async] - matches SubmitFn

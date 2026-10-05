@@ -65,10 +65,13 @@ ReuseLookupFn = Callable[[str], "ReuseRecord | None"]
 #: registry so a reused leaf can name the run it was linked to.
 ReuseRecordFn = Callable[[str, str, str, "str | None"], None]
 
-#: ``(spec) -> key``: the content key for reuse.  Defaults to the wire hash
-#: (``{"sim": ...}``); the server overrides it to fold in the provenance tuple,
-#: so a result produced under a different PIConGPU revision is not reused.
-ReuseKeyFn = Callable[[Mapping[str, Any]], str]
+#: ``(spec, point) -> key``: the content key for reuse.  ``point`` is the
+#: leaf's sweep point (or None); it is folded into the key so two identical
+#: specs at *different* points are different simulations and do not reuse each
+#: other.  Defaults to the wire hash; the server overrides it to fold in the
+#: provenance tuple and the point, so a result produced under a different
+#: PIConGPU revision or a different sweep point is not reused.
+ReuseKeyFn = Callable[[Mapping[str, Any], "dict | None"], str]
 
 #: ``() -> {sim_id: ActualUsage}`` actual-cost observation callable (gap 4).
 ActualsFn = Callable[[], Mapping[str, "ActualUsage"]]
@@ -309,9 +312,10 @@ class AgendaEngine:
                 a leaf finishes successfully, so a later identical spec can reuse
                 it.  ``run_id`` is the submission's stable command id (the run
                 identity, distinct from the content-addressed ``sim_id``).
-            reuse_key: Optional ``(spec) -> key`` content key.  Defaults to the
-                wire hash; the server folds in the provenance tuple so a result
-                from a different PIConGPU revision is not reused.
+            reuse_key: Optional ``(spec, point) -> key`` content key.  Defaults
+                to the wire hash; the server folds in the provenance tuple and
+                the leaf's sweep point so a result from a different PIConGPU
+                revision or a different sweep point is not reused.
 
         """
         self.store = store
@@ -538,7 +542,7 @@ class AgendaEngine:
             # derives the same value and the entry stays attributable.
             run_id = _idempotency_key_for(campaign, path, sim.spec)
             try:
-                self.reuse_record(self.reuse_key(sim.spec), sim.sim_id or sim_id, "done", run_id)
+                self.reuse_record(self.reuse_key(sim.spec, sim.point), sim.sim_id or sim_id, "done", run_id)
             except Exception:  # ruff: ignore[blind-except] - recording is best-effort
                 log.warning("reuse record failed for sim %s", sim.sim_id)
 
@@ -728,7 +732,7 @@ class AgendaEngine:
         for path, sim in updated.simulations():
             if sim.status != "planned":
                 continue
-            record = self.reuse_lookup(self.reuse_key(sim.spec))
+            record = self.reuse_lookup(self.reuse_key(sim.spec, sim.point))
             if record is None:
                 continue
             sim.sim_id = record.sim_id
@@ -1127,7 +1131,7 @@ def _spec_hash(spec: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _wire_hash(spec: Mapping[str, Any]) -> str:
+def _wire_hash(spec: Mapping[str, Any], point: Mapping[str, Any] | None = None) -> str:
     """Return the hash of the *wire payload* a leaf submission produces.
 
     Mirrors :func:`pic_agentic.protocol.simulation.
@@ -1136,12 +1140,22 @@ def _wire_hash(spec: Mapping[str, Any]) -> str:
     only) so this module stays extraction-ready, and used so duplicate detection
     matches exactly the bytes the ``sim_id`` uses.
 
+    When called as the engine's default ``reuse_key``, ``point`` is the leaf's
+    sweep point and is folded in as well, so the default key reproduces the
+    point-scoped reuse rule (``{"sim": ..., "point": ...}``) without the server
+    override.  Direct calls (duplicate detection) omit it; the wire payload they
+    compare (and the cluster's ``sim_id``) is point-independent by design -- the
+    sweep point is provenance, not part of the submitted simulation.
+
     Returns:
-        The sha256 hex digest of the canonical ``{"sim": ...}`` encoding.
+        The sha256 hex digest of the canonical ``{"sim": ...[, "point": ...]}``
+        encoding.
 
     """
     sim = spec.get("sim")
     payload = {"sim": sim} if sim is not None else dict(spec)
+    if point is not None:
+        payload["point"] = dict(point)
     return _spec_hash(payload)
 
 
