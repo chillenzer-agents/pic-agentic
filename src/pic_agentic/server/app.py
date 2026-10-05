@@ -1124,10 +1124,12 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
             "Return the light manifest (files, formats, sizes, records) of a "
             "simulation's linked simOutput directory. `format` names the likely "
             "reader for each file: `openpmd-adios2`/`openpmd-hdf5` for field "
-            "series, a plugin reader name (`energy_histogram`, `emittance`, "
-            "`transition_radiation`, `phase_space`, `radiation`, `calorimeter`, "
-            "`png`) for plugin output, or `text`/`dir`/`binary`. The scan never "
-            "opens a file and needs no openPMD reader."
+            "series, a plugin reader name (`energy_histogram`, `energy_fields`, "
+            "`emittance`, `transition_radiation`, `phase_space`, `radiation`, "
+            "`calorimeter`, `png`) for plugin output, or `text`/`dir`/`binary`. "
+            "`energy_fields` is the EnergyFields plugin's plain-text "
+            "`fields_energy.dat` (integrated E/B field energy vs step). The scan "
+            "never opens a file and needs no openPMD reader."
         ),
         annotations=_READ_ONLY,
     )
@@ -1217,16 +1219,22 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
     @server.tool(
         title="Read a PIConGPU plugin result",
         description=(
-            "Run one of PIConGPU's shipped plugin readers over a simulation's "
+            "Run one of PIConGPU's plugin readers over a simulation's "
             "simOutput and return a bounded numeric summary. `reader` is one of "
-            "'energy_histogram', 'emittance', 'transition_radiation', "
-            "'phase_space', 'radiation', 'calorimeter' or 'png'; `species` and "
-            "`species_filter` select the output, and `iteration` picks a step "
-            "('last' by default). For `energy_histogram`, `min_kev`/`max_kev` "
-            "set the `count_in_window` energy window; when omitted it is derived "
-            "from the populated bins, and the summary always reports the window, "
-            "`n_nonzero_bins` and the populated min/max so a mismatched window is "
-            "obvious. The PNG reader returns image metadata only "
+            "'energy_histogram', 'energy_fields', 'emittance', "
+            "'transition_radiation', 'phase_space', 'radiation', 'calorimeter' "
+            "or 'png'; `species` and `species_filter` select the output, and "
+            "`iteration` picks a step ('last' by default). `energy_fields` reads "
+            "the EnergyFields plugin's plain-text `fields_energy.dat` (integrated "
+            "E/B field energy in Joule vs step; `iteration` selects one reported "
+            "step) and needs no optional reader. For `energy_histogram`, "
+            "`min_kev`/`max_kev` set the `count_in_window` energy window; a bin is "
+            "counted when its lower edge is in the half-open interval [min_kev, "
+            "max_kev), so a bin ending exactly at `max_kev` is excluded (e.g. a "
+            ">= 5 MeV window starts at the 5 MeV bin, not at 4.9 MeV). When the "
+            "window is omitted it is derived from the populated bins, and the "
+            "summary always reports the window, `n_nonzero_bins` and the populated "
+            "min/max so a mismatched window is obvious. The PNG reader returns image metadata only "
             "(dimensions, iteration, path); fetch the image with "
             "`export_results`. Use `describe_results` to see which plugin files "
             "exist. Requires the picongpu readers (and, for the openPMD/image "
@@ -1277,6 +1285,11 @@ def _register_control_result_tools(  # ruff: ignore[complex-structure] - one reg
             "readers to summarize the physics (energy histogram, phase space, "
             "radiation, ...), plus the RO-Crate experiment metadata, the "
             "(redacted) pypicongpu run metadata and an openPMD output summary. "
+            "To keep the answer readable the two bulk metadata sections "
+            "(`rc_params`, `rendering_context`) are returned as a summary "
+            "(`_trimmed: true` with the field `fields` and their `n_fields`) "
+            "rather than their values; the simulation's `pypicongpu_runner.json` "
+            "and all other metadata are returned in full. "
             "The deterministic natural-language answer is physics-first: a "
             "`query` about the spectrum or energy is answered from the plugin "
             "summary values and never from bookkeeping that merely shares a "
@@ -1611,7 +1624,15 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             '"left": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "px"}, '
             '"right": {"kind": "var", "name": "px"}}, '
             '"right": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "py"}, '
-            '"right": {"kind": "var", "name": "py"}}}}}'
+            '"right": {"kind": "var", "name": "py"}}}}}\n'
+            "Units: `result.selectors` echoes the record/component/iteration each "
+            "input was read from, together with that component's openPMD unit "
+            "metadata (`unit_SI`, the factor to SI, and `unit_dimension`, the "
+            "seven SI base exponents) wherever the file records it. "
+            "`result.unit_note` explains the convention and never asserts a "
+            "physical unit for the derived result; when the file records no unit "
+            "metadata it states that the raw values are in PIConGPU internal "
+            "(normalized) code units."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )
@@ -1741,14 +1762,17 @@ async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None
             answer = analysis.synthesize_answer(query, rocrate, metadata, openpmd, plugins)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
             return _soft_error(runtime, sim_id, op.value, exc)
+    # ``answer`` first: it is the useful product, and the (already trimmed, L3)
+    # bookkeeping sections follow so a reader does not have to scan past bulky
+    # metadata to find the physics.
     result = {
         "ok": True,
         "sim_id": sim_id,
+        "answer": answer,
         "rocrate": rocrate,
         "metadata": metadata,
         "openpmd": openpmd,
         "plugins": plugins,
-        "answer": answer,
     }
     return _redact_dict(runtime, result)
 

@@ -150,6 +150,28 @@ async def test_analyze_tool_no_physics_is_explicit() -> None:
     assert "Cannot answer the physics question" in payload["answer"]
 
 
+async def test_analyze_tool_answer_is_first_and_bulky_metadata_trimmed() -> None:
+    """L3: the answer is prominent and the huge rc_params blob does not ride along."""
+    bulk = "Z" * 120_000
+    sections = {
+        **_SECTIONS,
+        "metadata": {
+            "runner": {"run_dir": "/x/run"},
+            "rc_params": {"_trimmed": True, "n_fields": 48, "fields": ["build_jobs", "profile_template_content"]},
+            "rendering_context": {"_trimmed": True, "n_fields": 2, "fields": ["grid", "species"]},
+        },
+    }
+    payload = await _call_tool(
+        Config(rcp_secret=SECRET),
+        "analyze_output",
+        {"sim_id": SIM_ID, "query": "openpmd iterations"},
+        sections=sections,
+    )
+    assert list(payload)[:3] == ["ok", "sim_id", "answer"]
+    assert bulk not in str(payload)
+    assert payload["metadata"]["rc_params"]["_trimmed"] is True
+
+
 async def test_analyze_tool_error_is_soft() -> None:
     payload = await _call_tool(Config(rcp_secret=SECRET), "analyze_output", {"sim_id": SIM_ID}, error_code="no_results")
     assert payload["ok"] is False

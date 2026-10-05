@@ -140,6 +140,88 @@ def test_compute_honours_attrs_on_var(tmp_path: Path, monkeypatch: pytest.Monkey
     assert ("E", "z", 536) in seen
 
 
+def test_compute_result_carries_a_truthful_unit_note_and_selector_echo(fake_compute: Path) -> None:
+    """L4: the result states the normalized-unit convention and echoes selectors.
+
+    No physical unit is knowable from the raw openPMD components, so the ack
+    must say so explicitly rather than invent one, and name the record/component/
+    iteration each input came from.
+    """
+    spec = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program()),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = spec["result"]
+    assert "normalized" in metadata["unit_note"]
+    assert metadata["result_kind"] == "array"
+    assert metadata["selectors"] == [
+        {"name": "px", "record": "E", "component": "x", "iteration": None},
+        {"name": "py", "record": "E", "component": "y", "iteration": None},
+    ]
+
+
+def test_compute_reports_real_unit_metadata_when_the_file_records_it(
+    fake_compute: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3: openPMD unit metadata is surfaced, not denied.
+
+    The reviewer showed that ``Record_Component.unit_SI`` and
+    ``Mesh.unit_dimension`` *are* reachable; the note must not claim the reader
+    cannot retrieve them.  Here the reader is stubbed to expose them and the ack
+    must echo them per selector and drop the false negative claim.
+    """
+    monkeypatch.setattr(
+        results,
+        "_dataset_unit_info",
+        lambda *_args, **_kwargs: {"unit_SI": 100000.0, "unit_dimension": [1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0]},
+    )
+    spec = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program()),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = spec["result"]
+    assert "unit metadata for the mesh components" not in metadata["unit_note"]
+    assert metadata["selectors"][0]["unit_SI"] == pytest.approx(100000.0)
+    assert metadata["selectors"][0]["unit_dimension"] == [1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0]
+    assert "unit_SI" in metadata["unit_note"]
+
+
+def test_compute_bare_var_without_declared_selectors_is_not_called_unitless(fake_compute: Path) -> None:
+    """A bare ``var`` reads mesh data even when ``selectors`` is omitted."""
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            record="E",
+            component="x",
+            program={"output": {"kind": "reduce", "op": "sum", "operand": _var("x")}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = result["result"]
+    assert "unitless" not in metadata["unit_note"]
+    assert metadata["selectors"] == [{"name": "x", "record": "E", "component": "x", "iteration": None}]
+
+
+def test_compute_constant_program_unit_note_says_unitless(fake_compute: Path) -> None:
+    """A program that reads no mesh data is unitless, and the note says so."""
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            program={"output": {"kind": "const", "value": 2.0}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    assert result["stats"]["value"] == pytest.approx(2.0)
+    assert "unitless" in result["result"]["unit_note"]
+    assert result["result"]["selectors"] == []
+
+
 def test_compute_requires_a_program(fake_compute: Path) -> None:
     result = results.resolve_result(
         ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE),
@@ -275,3 +357,49 @@ def test_compute_against_a_real_openpmd_series(tmp_path: Path) -> None:
     payload = evaluate(program, resolve)
     # |(3,4)| + |(0,0)| + |(1,0)| + |(0,0)| = 5 + 0 + 1 + 0 = 6.
     assert payload["result"] == pytest.approx(6.0)
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("openpmd_api") is None,
+    reason="openpmd_api not installed",
+)
+def test_compute_units_are_read_from_a_real_openpmd_series(tmp_path: Path) -> None:
+    """M3: a real series' ``unit_SI``/``unit_dimension`` are surfaced.
+
+    The reviewer showed the reader *can* reach the unit metadata, so the tool
+    must echo it rather than claim otherwise.  This reproduces the reviewer's
+    real-pin probe through :func:`results._dataset_unit_info` and the full
+    ``run_analysis`` ack.
+    """
+    import numpy as np
+    import openpmd_api as api
+
+    run = tmp_path / "run"
+    out = run / "simOutput"
+    out.mkdir(parents=True)
+    series = api.Series(str(out / "fields.h5"), api.Access.create)
+    mesh = series.iterations[0].meshes["E"]
+    mesh.unit_dimension = np.array([1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0])
+    mesh["x"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [2]))
+    mesh["x"].store_chunk(np.array([1.0, 2.0]))
+    mesh["x"].unit_SI = 100000.0
+    series.close()
+
+    info = results._dataset_unit_info(out / "fields.h5", "E", "x", None)
+    assert info["unit_SI"] == pytest.approx(100000.0)
+    assert info["unit_dimension"] == [1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0]
+
+    spec = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            record="E",
+            component="x",
+            program={"output": {"kind": "reduce", "op": "sum", "operand": _var("x")}},
+        ),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    metadata = spec["result"]
+    assert metadata["selectors"][0]["unit_SI"] == pytest.approx(100000.0)
+    assert "unit metadata for the mesh components" not in metadata["unit_note"]

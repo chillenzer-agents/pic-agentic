@@ -518,6 +518,7 @@ the same 48 KiB wire budget as the other results) and returns a bounded summary:
 | Reader | Output | Summary |
 |--------|--------|---------|
 | `energy_histogram` | `*_energyHistogram_*.dat` | bins/counts (keV), window count, `n_nonzero_bins`, populated `min_energy_kev`/`max_energy_kev` |
+| `energy_fields` | `fields_energy.dat` | integrated E/B field energy [J] vs step, per-component min/max/last |
 | `emittance` | `*_emittance_*.dat` | slice positions/emittances, total, peak |
 | `transition_radiation` | `*_transRad_<iter>.dat` | omega/intensity spectrum, peak |
 | `phase_space` | `PhaseSpace_<sp>_<filter>_<ps>_<iter>.h5` | axis ranges, projected marginals, peak bin |
@@ -525,17 +526,36 @@ the same 48 KiB wire budget as the other results) and returns a bounded summary:
 | `calorimeter` | `*_calorimeter_<filter>_<iter>.h5` | yaw/pitch marginals, energy edges |
 | `png` | `*_png_<axis>_<slice>_<iter>.png` | metadata only (dimensions, path); image via `export` |
 
+The `energy_fields` reader reads the `EnergyFields` plugin's plain-text
+`fields_energy.dat` (header `#step total[Joule] Bx[Joule] ... Ez[Joule]`) with the
+engine's own parser — the file ships no `picongpu.extra.plugins.data` reader, so
+before this reader existed `describe_results` mislabelled it `binary` and
+`read_result` refused it. Its summary carries the total-energy trajectory
+(`step`/`total_J`) plus per-component `component_{last,min,max}_J`, scalar
+min/max/last totals, the selected row's own `total_J_selected`, and the step
+range; `iteration` selects one reported step
+(`last` by default). No optional reader is needed. `read_result` serves the file
+directly as a bounded text tail as well.
+
 The `energy_histogram` reader reports `count_in_window` for a [keV] window that
 is **requestable** with `min_kev`/`max_kev` (both or neither, non-negative,
-`max_kev > min_kev`). When they are omitted the window is derived from the
-populated bins: the common 100--1000 keV window is kept only when the whole
-populated range lies inside it, and otherwise it is widened to exactly the
-populated range, so the default always captures the whole population instead of
-clipping a spectrum that starts above or spans past 1000 keV (e.g. an LWFA
+`max_kev > min_kev`). Bins are half-open `[lower, upper)`, so a bin is counted
+when its **lower** edge lies in the window `[min_kev, max_kev)`: a bin ending
+exactly at `max_kev` is excluded, i.e. a ">= 5 MeV" window starts at the 5 MeV
+bin's lower edge rather than counting the 4.9--5.0 MeV bin (L1). The first bin's
+lower edge is the histogram's configured `minEnergy`, read from the file header,
+so a non-zero-minimum histogram (e.g. 1--2 MeV) reports its real edges and the
+exact `[minEnergy, first_upper)` window is not miscounted by assuming a 0 keV
+start. When the window
+is omitted it is derived from the populated bins: the common 100--1000 keV window
+is kept only when the whole populated span lies inside it, and otherwise it is
+widened to that span, so the default always captures the whole population instead
+of clipping a spectrum that starts above or spans past 1000 keV (e.g. an LWFA
 spectrum beginning at a few MeV). The summary always carries `n_nonzero_bins`
-plus the populated `min_energy_kev`/`max_energy_kev`, and warns whenever
-`count_in_window` captures less than 90% of the total (including `0`), so a
-partial or mis-window is obvious rather than a silent undercount.
+plus the populated `min_energy_kev`/`max_energy_kev` (the half-open span's lower
+edge and upper edge), and warns whenever `count_in_window` captures less than 90%
+of the total (including `0`), so a partial or mis-window is obvious rather than a
+silent undercount.
 
 All openPMD readers accept the `h5` and `bp`/`bp5` suffixes. `species_filter`
 is honoured where the reader's filename carries a filter component; the
@@ -550,7 +570,12 @@ readers degrade independently, so `png` still works without `openpmd_api`.
 the same bounded plugin summaries as `read_plugin_result` — so a run whose only
 artifact is a text plugin histogram still reports the populated energy range,
 the maximum energy and the counts — and only then adds the RO-Crate, run-metadata
-and openPMD bookkeeping. When no openPMD output **and** no plugin histogram exist
+and openPMD bookkeeping. To keep the ack small the two bulk run-metadata
+sections (`rc_params`, `rendering_context`) are returned **trimmed**: their values
+are replaced by `{"_trimmed": true, "n_fields": <count>, "fields": [...]}`, the
+field *names* only, which is all the answer's provenance needs. The
+`pypicongpu_runner.json` section and all other metadata are returned in full.
+When no openPMD output **and** no plugin histogram exist
 (or the optional readers are not installed), the answer says so explicitly
 instead of falling back to metadata alone.
 

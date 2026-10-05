@@ -107,6 +107,11 @@ async def test_run_analysis_description_documents_the_program() -> None:
     # The precedence of node attrs over declared selectors is stated unambiguously.
     assert "authoritative" in description
     assert "falls back" in description
+    # L4: the description must state the normalized-unit convention and the
+    # selector echo, so a caller is not left guessing the result's units.
+    assert "normalized" in description
+    assert "unit_note" in description
+    assert "selectors" in description
 
 
 async def test_run_analysis_worked_example_is_valid_and_parses() -> None:
