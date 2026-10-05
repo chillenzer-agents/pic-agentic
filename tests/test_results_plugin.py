@@ -715,11 +715,14 @@ def test_energy_histogram_default_window_tracks_a_high_energy_spectrum(
     run = _high_energy_run(tmp_path, monkeypatch)
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
-    assert summary["count_in_window"]["min_kev"] == pytest.approx(5000.0)
+    # Half-open bins: the lowest populated bin is [2500, 5000) keV, so the
+    # populated range starts at its lower edge (2500), and the derived window
+    # [2500, 20000) counts all three populated bins.
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(2500.0)
     assert summary["count_in_window"]["max_kev"] == pytest.approx(20000.0)
     assert summary["count_in_window"]["count"] == pytest.approx(2.0e8)
     assert summary["n_nonzero_bins"] == 3
-    assert summary["min_energy_kev"] == pytest.approx(5000.0)
+    assert summary["min_energy_kev"] == pytest.approx(2500.0)
     assert summary["max_energy_kev"] == pytest.approx(20000.0)
     # A populated spectrum with a matching default is not a mis-window.
     assert "warning" not in summary
@@ -728,21 +731,47 @@ def test_energy_histogram_default_window_tracks_a_high_energy_spectrum(
 def test_energy_histogram_prefers_the_standard_window_when_populated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The preferred window is kept when it contains particles (F2 no-regression)."""
-    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _StubReader)
-    run = _tree(tmp_path)
+    """The preferred window is kept when the populated span fits (F2 no-regression)."""
+
+    class _WindowedHistogram:
+        """A spectrum whose lowest populated bin is [100, 200) keV.
+
+        Bin 0 ([0, 100)) is empty, so the populated half-open span is
+        [100, 1000), which fits in the preferred 100--1000 keV window.
+        """
+
+        def __init__(self, run_directory: str) -> None:
+            _ = run_directory
+
+        @staticmethod
+        def get_iterations(species: str, species_filter: str = "all") -> list[int]:
+            _ = (species, species_filter)
+            return [0]
+
+        @staticmethod
+        def get(iteration: int, species: str, species_filter: str = "all", **kwargs: object) -> tuple:
+            _ = (species, species_filter, kwargs)
+            bins = [100.0 * (i + 1) for i in range(10)]
+            counts = [0.0] * 10
+            counts[1] = 42.0
+            counts[-1] = 1.0
+            return counts, bins, [iteration], 1e-16
+
+    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _WindowedHistogram)
+    run = _high_energy_tree(tmp_path)
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
-    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(44.0)}
-    assert summary["n_nonzero_bins"] == 3
+    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(43.0)}
+    assert summary["n_nonzero_bins"] == 2
 
 
 class _SpanningHistogram:
     """A spectrum that spans the 100--1000 keV window to 20 MeV (F2 Major).
 
-    One populated edge lies inside the preferred window while all of the
-    weight sits above it, so "any populated bin inside" would silently return
-    a count of 1 and hide ~1e8 electrons.
+    Its lowest populated bin is [0, 900) keV and it reaches 20 MeV, so the
+    populated half-open span [0, 20000) is not contained in the preferred
+    100--1000 keV window; "any populated bin inside" would silently return a
+    count of 1 and hide ~1e8 electrons.
     """
 
     _EDGES: ClassVar[list[float]] = [900.0, 20000.0]
@@ -767,16 +796,16 @@ def test_energy_histogram_default_window_covers_a_spanning_spectrum(
 ) -> None:
     """A default that only partially covers the data must widen, not clip (F2).
 
-    The spectrum's lowest populated edge (900 keV) lies inside 100--1000 keV,
-    but the population reaches 20000 keV.  The derived window must capture the
-    whole range (and thus the whole count), not return the sliver inside the
-    preferred window.
+    The spectrum's lowest populated bin is [0, 900) keV and the population
+    reaches 20000 keV, so the populated span is not inside 100--1000 keV.  The
+    derived window must capture the whole range (and thus the whole count), not
+    return the sliver inside the preferred window.
     """
     monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _SpanningHistogram)
     run = _high_energy_tree(tmp_path)
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
-    assert summary["count_in_window"]["min_kev"] == pytest.approx(900.0)
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(0.0)
     assert summary["count_in_window"]["max_kev"] == pytest.approx(20000.0)
     assert summary["count_in_window"]["count"] == pytest.approx(1.0e8 + 1.0)
     assert summary["total"] == pytest.approx(1.0e8 + 1.0)
@@ -790,18 +819,19 @@ def test_energy_histogram_explicit_partial_window_warns(tmp_path: Path, monkeypa
     a tiny fraction of the total must still be flagged rather than presented as
     the electron count.
     """
-    monkeypatch.setattr(results, "_import_plugin_reader", lambda _name: _SpanningHistogram)
-    run = _high_energy_tree(tmp_path)
+    run = _high_energy_run(tmp_path, monkeypatch)
+    # Bins are [0,2500),[2500,5000),[5000,10000),[10000,20000) keV. The
+    # half-open window [2500, 5000) counts only the [2500,5000) bin (1e8).
     payload = results.resolve_result(
-        _params(species="e", min_kev=100.0, max_kev=1000.0),
+        _params(species="e", min_kev=2500.0, max_kev=5000.0),
         run_dir=run,
         sim_id=SIM_ID,
     )
     summary = payload["result"]
-    assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(1.0)}
-    assert summary["n_nonzero_bins"] == 2
+    assert summary["count_in_window"] == {"min_kev": 2500.0, "max_kev": 5000.0, "count": pytest.approx(1.0e8)}
+    assert summary["total"] == pytest.approx(2.0e8)
     assert "warning" in summary
-    assert "count_in_window is 1 of 1e+08" in summary["warning"]
+    assert "count_in_window is 1e+08 of 2e+08" in summary["warning"]
 
 
 def test_energy_histogram_single_bin_default_is_not_degenerate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -826,7 +856,10 @@ def test_energy_histogram_single_bin_default_is_not_degenerate(tmp_path: Path, m
     payload = results.resolve_result(_params(species="e"), run_dir=run, sim_id=SIM_ID)
     summary = payload["result"]
     window = summary["count_in_window"]
-    assert window["min_kev"] == pytest.approx(2500.0)
+    # Half-open: the single bin is [0, 2500) keV, so the derived window is
+    # [0, 2500) and counts the bin.
+    assert window["min_kev"] == pytest.approx(0.0)
+    assert window["max_kev"] == pytest.approx(2500.0)
     assert window["max_kev"] > window["min_kev"]
     assert window["count"] == pytest.approx(7.0)
     # The window is one the wire model would accept if requested.
@@ -855,7 +888,7 @@ def test_energy_histogram_requestable_window_below_data(tmp_path: Path, monkeypa
     summary = payload["result"]
     assert summary["count_in_window"] == {"min_kev": 100.0, "max_kev": 1000.0, "count": pytest.approx(0.0)}
     assert summary["n_nonzero_bins"] == 3
-    assert summary["min_energy_kev"] == pytest.approx(5000.0)
+    assert summary["min_energy_kev"] == pytest.approx(2500.0)
     assert "warning" in summary
     assert "count_in_window is 0" in summary["warning"]
 
@@ -881,12 +914,14 @@ def test_energy_histogram_requestable_window_selects_a_subrange(
     """A requested window that covers part of the range counts only that part (F2)."""
     run = _high_energy_run(tmp_path, monkeypatch)
     payload = results.resolve_result(
-        _params(species="e", min_kev=4000.0, max_kev=15000.0),
+        _params(species="e", min_kev=2500.0, max_kev=10000.0),
         run_dir=run,
         sim_id=SIM_ID,
     )
     summary = payload["result"]
-    # 5000 and 10000 keV edges are inside; the 20000 keV edge is outside.
+    # Bins [2500,5000), [5000,10000), [10000,20000) have lower edges 2500,
+    # 5000, 10000. The half-open window [2500,10000) selects the first two
+    # (1e8 + 9e7); the [10000,20000) bin's lower edge 10000 is excluded.
     assert summary["count_in_window"]["count"] == pytest.approx(1.9e8)
     assert "warning" not in summary
 
