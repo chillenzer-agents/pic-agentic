@@ -438,7 +438,8 @@ engine's own parser — the file ships no `picongpu.extra.plugins.data` reader, 
 before this reader existed `describe_results` mislabelled it `binary` and
 `read_result` refused it. Its summary carries the total-energy trajectory
 (`step`/`total_J`) plus per-component `component_{last,min,max}_J`, scalar
-min/max/last totals and the step range; `iteration` selects one reported step
+min/max/last totals, the selected row's own `total_J_selected`, and the step
+range; `iteration` selects one reported step
 (`last` by default). No optional reader is needed. `read_result` serves the file
 directly as a bounded text tail as well.
 
@@ -475,7 +476,12 @@ readers degrade independently, so `png` still works without `openpmd_api`.
 the same bounded plugin summaries as `read_plugin_result` — so a run whose only
 artifact is a text plugin histogram still reports the populated energy range,
 the maximum energy and the counts — and only then adds the RO-Crate, run-metadata
-and openPMD bookkeeping. When no openPMD output **and** no plugin histogram exist
+and openPMD bookkeeping. To keep the ack small the two bulk run-metadata
+sections (`rc_params`, `rendering_context`) are returned **trimmed**: their values
+are replaced by `{"_trimmed": true, "n_fields": <count>, "fields": [...]}`, the
+field *names* only, which is all the answer's provenance needs. The
+`pypicongpu_runner.json` section and all other metadata are returned in full.
+When no openPMD output **and** no plugin histogram exist
 (or the optional readers are not installed), the answer says so explicitly
 instead of falling back to metadata alone.
 
