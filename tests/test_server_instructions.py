@@ -29,10 +29,27 @@ def test_instructions_point_at_the_picongpu_documentation_and_examples() -> None
     assert "create_campaign" in SERVER_INSTRUCTIONS
     # The reset path for starting a fresh campaign is named too.
     assert "delete_campaign" in SERVER_INSTRUCTIONS
-    # The documented focal example is not runnable as written; the pointer warns
-    # that it needs the LWFA tutorial's plasma species for a non-empty spectrum.
+    # H5: the add_agenda_leaf escape hatch for multi-node/varying-node studies
+    # and its by-reference spec_path form are named.
+    assert "add_agenda_leaf" in SERVER_INSTRUCTIONS
+    assert "spec_path=..." in SERVER_INSTRUCTIONS
+    # L5: the "which tool when" front-door line is present.
+    assert "Which tool" in SERVER_INSTRUCTIONS
+    # H8: the documented focal example is empty for timing/geometry reasons, not
+    # merely a missing plasma species; the corrected caveat names both and the
+    # actionable fix. Assert the invariant semantics rather than exact prose, so
+    # the wording can be tightened without breaking the test.
     assert "plasma species" in SERVER_INSTRUCTIONS
-    assert "empty spectrum" in SERVER_INSTRUCTIONS
+    assert "gas" in SERVER_INSTRUCTIONS
+    assert "max_steps" in SERVER_INSTRUCTIONS
+    assert "necessary but not sufficient" in SERVER_INSTRUCTIONS
+    # H9: the pinned API is authoritative over readthedocs; the mismatched names
+    # and the version-matched classes are named.
+    assert "installed" in SERVER_INSTRUCTIONS
+    assert "picongpu" in SERVER_INSTRUCTIONS
+    assert "FieldDiagnostic" in SERVER_INSTRUCTIONS
+    assert "picmi.Cartesian3DGrid" in SERVER_INSTRUCTIONS
+    assert "picmi.UniformDistribution" in SERVER_INSTRUCTIONS
     # The list-indexed patch_path form is publicised, not only the top-level
     # sim.time_steps example.
     assert "sim.laser.0.focus_pos_si.1.component" in SERVER_INSTRUCTIONS
@@ -51,3 +68,15 @@ async def test_create_campaign_description_publicises_the_list_indexed_path() ->
     # contradict ``_patch_spec`` and ``test_create_campaign_reaches_a_numeric_dict_key``.
     assert "a list index on a list, or a " in description
     assert "dict key on a dict" in description
+
+
+async def test_add_agenda_leaf_description_publicises_the_escape_hatch() -> None:
+    # H5: a study that must vary more than one spec node cannot use create_campaign's
+    # single patch_path; add_agenda_leaf is the documented escape hatch and takes a
+    # whole spec by reference.
+    server, _runtime = build_server(Config(rcp_secret=new_secret_hex()), SIM)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    description = tools["add_agenda_leaf"].description
+    assert "escape hatch" in description
+    assert "spec_path" in description
+    assert "grid cells and time_steps" in description

@@ -1058,16 +1058,29 @@ class AgendaService:
     ) -> dict[str, Any]:
         """Load, add the leaf and save (may raise).
 
+        The leaf spec is validated through the *same* submission path
+        ``create_campaign`` and ``submit_spec`` use
+        (:meth:`_validate_leaf_spec`: allow-list, pinned-schema round-trip and
+        the escaped inline-size cap), so a leaf that could never be submitted is
+        refused here rather than surfacing a bare error at ``advance_agenda``.
+        This matters most for the by-reference form: staging relaxes only the
+        *input* file cap (4 MiB), never the 48 KiB wire cap every submission
+        still meets.
+
         The new leaf is built as an :class:`AgendaSim` and validated *before* it
         is inserted, so its ``depends_on`` goes through the model validator
         (a duplicate or path-style dependency is rejected rather than persisted
         into an unloadable campaign).
 
         Returns:
-            ``{"ok": True, "path": name}``.
+            ``{"ok": True, "path": name}``, or the ``_validate_leaf_spec`` soft
+            error when the spec could never be submitted.
 
         """
         campaign = self.store.load(Campaign)
+        invalid = self._validate_leaf_spec(spec)
+        if invalid is not None:
+            return invalid
         leaf = AgendaSim(
             name=name,
             spec=spec,
