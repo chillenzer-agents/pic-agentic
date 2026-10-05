@@ -124,6 +124,54 @@ async def test_outcome_unknown_defers_then_reconciles(tmp_path) -> None:
         await sim_t.close()
 
 
+async def test_legacy_client_unknown_sentinel_is_forced_to_outcome_unknown(tmp_path) -> None:
+    """A pre-fix client's sentinel must not stamp ``rejected_by_policy``.
+
+    A rolling upgrade has a newer server talk to an older client that still
+    sends ``error_code: rejected_by_policy`` *with* the
+    ``already_submitted:outcome_unknown`` sentinel (the exact C2 confusion).
+    The server must force the stable ``outcome_unknown`` code on the deferred
+    leaf, not persist the misleading legacy code.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    mcp_t, sim_t, server, runtime = _runtime(config)
+
+    async def responder() -> None:
+        counter = 0
+        async for command in sim_t.receive():
+            if command.type != SimulationType.COMMAND:
+                continue
+            counter += 1
+            # Legacy client: sentinel string but the old (misleading) code.
+            ack = build_submit_ack(
+                sim=SIM,
+                seq=counter,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id="stranded1",
+                state=SimulationState.FAILED,
+                error="already_submitted:outcome_unknown",
+                error_code="rejected_by_policy",
+                in_reply_to=command.transport_event_id,
+            )
+            await sim_t.send(ack.sign(SECRET))
+
+    responder_task = asyncio.create_task(responder())
+    pump_task = await _pump(mcp_t, runtime.submit_service)
+    try:
+        result = (await server.call_tool("advance_agenda", {})).structured_content
+        assert result["deferred"] == ["leaf0"]
+        assert result["failed"] == []
+        status = (await server.call_tool("agenda_status", {})).structured_content
+        (leaf,) = status["leaves"]
+        assert leaf["status"] == "planned"
+        assert leaf["error_code"] == "outcome_unknown"
+    finally:
+        for task in (responder_task, pump_task):
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
 async def test_genuine_rejection_still_fails_terminally(tmp_path) -> None:
     """A policy rejection is terminal and carries its code (not treated as transient)."""
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))

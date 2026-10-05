@@ -1249,9 +1249,14 @@ def _classify_submit(outcome: Any) -> str:
         # and retry instead, under the same cmd_id, so the record's eventual
         # completion re-acks.
         msg = outcome.error or "submission outcome unknown"
+        # Force the stable code rather than trusting the ack's ``error_code``: a
+        # pre-fix client still returns ``error_code: rejected_by_policy`` with
+        # the sentinel string (that is exactly the C2 confusion).  During a
+        # rolling upgrade the server must not persist that misleading code on
+        # the deferred leaf or its eventual give-up callback.
         raise TransientSubmitError(
             msg,
-            error_code=outcome.error_code or OUTCOME_UNKNOWN_ERROR_CODE,
+            error_code=OUTCOME_UNKNOWN_ERROR_CODE,
             sim_id=outcome.sim_id or None,
         )
     if not outcome.ok or not outcome.sim_id:
