@@ -148,12 +148,42 @@ class AgendaService:
         #: Content-addressed reuse registry beside the campaign, so a spec that
         #: already completed can be linked instead of re-submitted.
         self.reuse_store = AgendaStore(self.store.root, filename=DEFAULT_REUSE_FILE)
+        #: Run ids of *direct* submissions still awaiting their ``results.ready``.
+        #: ``on_run_ready`` fires for every completing run (including campaign
+        #: runs whose engine writes the ``done`` record directly), so this set
+        #: lets :meth:`promote_reuse` skip the whole-registry disk read for a run
+        #: that has no pending direct entry.  Hydrated once from the registry so
+        #: a post-restart backfilled ``results.ready`` still promotes.
+        self._pending_direct_run_ids: set[str] = set()
+        self._hydrate_pending_direct_run_ids()
         #: Serialise every campaign read-modify-write (advance and the lifecycle
         #: mutators) on one lock.  Without this, a tick's incremental save can
         #: clobber a concurrent add_leaf/approve/drain, and -- worst -- a stop
         #: issued mid-tick is overwritten by the tick's stale in-memory campaign,
         #: resurrecting the campaign and letting it keep submitting.
         self._lock = asyncio.Lock()
+
+    def _hydrate_pending_direct_run_ids(self) -> None:
+        """Seed the in-memory pending-direct set from the persisted registry.
+
+        Called once at construction so a post-restart backfilled
+        ``results.ready`` (whose run id is only known from the persisted
+        ``pending`` record) is still promoted.  Best-effort.
+
+        """
+        try:
+            registry = self._load_reuse()
+        except Exception as exc:  # ruff: ignore[blind-except] - hydration must never block startup
+            log.warning("reuse hydration failed: %s", exc)
+            return
+        ids: set[str] = set()
+        for record in registry.records.values():
+            if record.state != PENDING_STATE:
+                continue
+            if record.run_id:
+                ids.add(record.run_id)
+            ids.update(record.pending_run_ids)
+        self._pending_direct_run_ids = ids
 
     def _load_reuse(self) -> ReuseRegistry:
         """Load the reuse registry, or an empty one when absent/corrupt.
@@ -193,17 +223,45 @@ class AgendaService:
 
         """
         try:
-            record = self._direct_reuse_record(spec, sim_id=sim_id, run_id=run_id)
-        except Exception as exc:  # ruff: ignore[blind-except] - registry bookkeeping is best-effort
-            log.warning("reuse remember failed for sim %s: %s", sim_id, exc)
-            return
-        try:
-            self.reuse_store.save(self._load_reuse().remember(record))
+            self._remember_direct(spec, sim_id=sim_id, run_id=run_id)
         except Exception as exc:  # ruff: ignore[blind-except] - registry bookkeeping is best-effort
             log.warning("reuse remember failed for sim %s: %s", sim_id, exc)
 
-    def _direct_reuse_record(self, spec: dict[str, Any], *, sim_id: str, run_id: str) -> ReuseRecord:
+    def _remember_direct(self, spec: dict[str, Any], *, sim_id: str, run_id: str) -> None:
+        """Persist one direct submission's reuse record and sync the pending set.
+
+        ``_load_reuse`` is called once here (the submit-path parse the review
+        flagged), and the record is merged with :meth:`ReuseRegistry.record_direct`
+        so a second identical submission never demotes a completed entry.
+
+        """
+        registry = self._load_reuse()
+        record = self._direct_reuse_record(registry, spec, sim_id=sim_id, run_id=run_id)
+        updated = registry.record_direct(record)
+        if updated is not registry:
+            self.reuse_store.save(updated)
+        merged = updated.records.get(record.wire_hash, record)
+        if merged.state == PENDING_STATE:
+            self._pending_direct_run_ids.add(run_id)
+        else:
+            self._pending_direct_run_ids.discard(run_id)
+
+    def _direct_reuse_record(
+        self,
+        registry: ReuseRegistry,
+        spec: dict[str, Any],
+        *,
+        sim_id: str,
+        run_id: str,
+    ) -> ReuseRecord:
         """Build the registry entry for an accepted direct submission.
+
+        Args:
+            registry: The already-loaded reuse registry (single parse on the
+                submit path).
+            spec: The submitted wire spec (``{"sim": ...}``).
+            sim_id: The spec's payload label.
+            run_id: The submission's stable command id (the run identity).
 
         Returns:
             The entry: ``pending`` normally, or ``done`` when the run's
@@ -212,7 +270,7 @@ class AgendaService:
 
         """
         key = _reuse_key(spec, self.submit_service.picongpu_revision)
-        existing = self._load_reuse().records.get(key)
+        existing = registry.records.get(key)
         # A replayed submission (e.g. ingest_backfill after a restart) must not
         # demote an already-promoted record back to pending.
         state = existing.state if existing is not None and existing.state != PENDING_STATE else PENDING_STATE
@@ -228,17 +286,24 @@ class AgendaService:
         one event that guarantees ``run_dir/simOutput`` exists, so it is the
         point at which the run becomes reusable (matching the engine's own
         ``results.ready``-only rule).  The event carries the command id, so the
-        record is found by identity even after a restart.  Best-effort.
+        record is found by identity even after a restart.  This hook fires for
+        *every* completing run -- including campaign runs whose engine already
+        wrote the ``done`` record -- so the in-memory pending-direct set short-
+        circuits a run that has no pending direct entry, avoiding a whole-file
+        registry read (and reload) per completion.  Best-effort.
 
         Args:
             run_id: The submission's stable command id.
 
         """
+        if run_id not in self._pending_direct_run_ids:
+            return
         try:
             registry = self._load_reuse()
             promoted = registry.promote(run_id)
             if promoted is not registry:
                 self.reuse_store.save(promoted)
+                self._pending_direct_run_ids.discard(run_id)
         except Exception as exc:  # ruff: ignore[blind-except] - registry bookkeeping is best-effort
             log.warning("reuse promote failed for run %s: %s", run_id, exc)
 

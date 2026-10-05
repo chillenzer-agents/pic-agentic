@@ -59,6 +59,14 @@ class ReuseRecord(BaseModel):
     #: re-projects the signed room after a restart; the ``done`` entry keeps it
     #: for provenance.
     run_id: str | None = None
+    #: Run-batch identities still awaiting their ``results.ready``.  A second
+    #: identical submission must not repoint :attr:`run_id` at the new, unready
+    #: run: the completed run would be orphaned (its event could no longer
+    #: promote the record) *and* the surfaced identity would name a run that may
+    #: never finish.  The pending ids are accumulated so **any** of the
+    #: outstanding runs can promote the record once it completes; ``run_id``
+    #: itself always names the run that actually produced the reusable result.
+    pending_run_ids: list[str] = Field(default_factory=list)
 
 
 class ReuseRegistry(BaseModel):
@@ -92,14 +100,61 @@ class ReuseRegistry(BaseModel):
         """
         return self.model_copy(update={"records": {**self.records, record.wire_hash: record}})
 
+    def record_direct(self, record: ReuseRecord) -> ReuseRegistry:
+        """Record an accepted direct submission without orphaning a result.
+
+        Direct ``submit_simulation`` calls can arrive back to back for the *same
+        spec*: a ``submit -> inspect -> re-submit`` iteration, or two identical
+        study points.  A naive last-write-wins would repoint the entry's
+        :attr:`ReuseRecord.run_id` at the newest, still-unfinished run, so the
+        already-completed run's ``results.ready`` could no longer promote the
+        record (its id no longer matches) and the surfaced run identity would
+        name a run that may never finish.  Instead:
+
+        - no existing record: store the new ``pending`` record;
+        - existing ``pending``: accumulate the run id so **any** of the
+          outstanding runs can promote the record, whichever completes first;
+        - existing reusable (``done``): keep it untouched -- a later run of the
+          same content must not demote a completed result.
+
+        Returns:
+            The updated registry (a new object; the input is not mutated).
+
+        """
+        existing = self.records.get(record.wire_hash)
+        if existing is None:
+            return self.remember(record)
+        if existing.state in REUSABLE_STATES:
+            return self
+        if record.state in REUSABLE_STATES:
+            # The ack and the run's ``results.ready`` arrived back to back, so
+            # the incoming record is already promotable: promote the existing
+            # entry with the run that actually produced the result.
+            promoted = existing.model_copy(
+                update={"state": record.state, "run_id": record.run_id, "pending_run_ids": []},
+            )
+            return self.remember(promoted)
+        pending_ids = list(existing.pending_run_ids)
+        for run_id in (existing.run_id, record.run_id):
+            if run_id and run_id not in pending_ids:
+                pending_ids.append(run_id)
+        if pending_ids == existing.pending_run_ids:
+            return self
+        merged = existing.model_copy(update={"pending_run_ids": pending_ids})
+        return self.remember(merged)
+
     def promote(self, run_id: str, *, state: str = "done") -> ReuseRegistry:
         """Mark the pending record accepted by ``run_id`` as reusable.
 
         Called when a ``results.ready`` event arrives: the event carries the
         submission's stable command id (the run-batch identity), not the spec,
         so the matching record is found by identity rather than by re-deriving
-        the content key.  An already-``done`` record is left untouched, so a
-        replayed event is idempotent.
+        the content key.  A record may have accumulated several pending run ids
+        (identical repeated submissions); the promoting run becomes the
+        record's :attr:`ReuseRecord.run_id` -- the run that actually produced
+        the reusable result -- and the remaining pending ids are cleared.  An
+        already-``done`` record is left untouched, so a replayed event is
+        idempotent.
 
         Args:
             run_id: The run-batch identity (the submission's command id).
@@ -113,9 +168,14 @@ class ReuseRegistry(BaseModel):
         if not run_id:
             return self
         for wire_hash, record in self.records.items():
-            if record.state != PENDING_STATE or record.run_id != run_id:
+            if record.state != PENDING_STATE:
                 continue
-            promoted = record.model_copy(update={"state": state})
+            candidates = {record.run_id, *record.pending_run_ids}
+            if run_id not in candidates:
+                continue
+            promoted = record.model_copy(
+                update={"state": state, "run_id": run_id, "pending_run_ids": []},
+            )
             return self.model_copy(update={"records": {**self.records, wire_hash: promoted}})
         return self
 

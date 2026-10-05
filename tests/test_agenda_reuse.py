@@ -409,6 +409,49 @@ async def test_direct_submission_is_reused_by_an_identical_campaign_leaf(tmp_pat
         await sim_t.close()
 
 
+async def test_direct_submission_pending_promotes_across_a_restart(tmp_path) -> None:
+    """The in-memory pending-direct guard must survive a restart.
+
+    ``promote_reuse`` now short-circuits a run with no in-memory pending entry,
+    so the set must be hydrated from the persisted registry at construction:
+    a fresh server that only replays the signed ``results.ready`` event (the
+    command id is all the event carries) must still promote the pending record.
+    """
+    from pic_agentic.server.agenda import _reuse_key
+
+    agenda, service, built = _direct_service(tmp_path)
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    responder = _DirectResponder(sim_t)
+    tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
+    try:
+        outcome = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        assert agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test")) is None
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+    # A new process over the same files: only the signed event is replayed.
+    fresh_service = SubmitService(sim=_SIM, secret=_SECRET, picongpu_revision="rev-test")
+    fresh = AgendaService(Config(rcp_secret=_SECRET, agenda_file=str(tmp_path / "campaign.json")), fresh_service)
+    fresh_service.on_run_ready = fresh.promote_reuse
+    fresh_service.ingest_backfill(
+        [
+            build_submit_event(
+                sim=_SIM,
+                seq=999,
+                cmd_id=outcome.cmd_id,
+                sim_id=outcome.sim_id,
+                state=SimulationState.RESULTS_READY,
+            ).sign(_SECRET),
+        ],
+    )
+    record = fresh._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test"))
+    assert record is not None
+    assert record.run_id == outcome.cmd_id
+
+
 async def test_direct_submission_under_a_different_revision_is_not_reused(tmp_path) -> None:
     """A different provenance tuple must not match: reuse stays attributable.
 
@@ -444,6 +487,76 @@ async def test_direct_submission_under_a_different_revision_is_not_reused(tmp_pa
             task.cancel()
         await mcp_t.close()
         await sim_t.close()
+
+
+async def test_two_direct_submissions_do_not_orphan_the_first_result(tmp_path) -> None:
+    """A re-submit of an identical spec must not clobber a completed record.
+
+    The ``submit -> inspect -> re-submit same script -> then campaign`` iteration
+    submits the same spec twice.  The second (still-unfinished) run must not
+    repoint the record's ``run_id`` away from the first, completed run -- doing
+    so would orphan its result (its ``results.ready`` could no longer promote
+    the record) and block the campaign leaf from reusing it.
+    """
+    from pic_agentic.server.agenda import _reuse_key
+
+    agenda, service, built = _direct_service(tmp_path)
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    responder = _DirectResponder(sim_t)
+    tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
+    try:
+        run1 = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        run2 = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        assert run1.sim_id == run2.sim_id
+        assert run1.cmd_id != run2.cmd_id
+
+        # The first run's result arrives *after* the second was accepted.
+        service.on_message(
+            build_submit_event(
+                sim=_SIM,
+                seq=999,
+                cmd_id=run1.cmd_id,
+                sim_id=run1.sim_id,
+                state=SimulationState.RESULTS_READY,
+            ).sign(_SECRET),
+        )
+        record = agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test"))
+        assert record is not None, "first completed run must remain reusable"
+        assert record.run_id == run1.cmd_id  # the run that produced the result
+
+        # The campaign leaf reuses the completed run; no third job is launched.
+        group = AgendaGroup(name="g").add(leaf=AgendaSim(name="leaf", spec={"sim": built.runner["sim"]}))
+        AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="camp", agenda=group))
+        tick = await agenda.advance(mcp_t.send)
+        assert tick["reused"] == ["leaf"]
+        assert tick["submitted"] == []
+        assert len(responder.commands) == 2  # only the two direct submits
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+def test_record_direct_never_demotes_a_done_record() -> None:
+    """Unit-level pin: a later submission of a done content key is a no-op."""
+    key = engine_key({"replica": 0})
+    done = ReuseRecord(wire_hash=key, sim_id="s1", state="done", run_id="run-1")
+    registry = ReuseRegistry().remember(done)
+    incoming = ReuseRecord(wire_hash=key, sim_id="s1", state=PENDING_STATE, run_id="run-2")
+    assert registry.record_direct(incoming) is registry
+
+    # A second pending run accumulates so *either* result can promote it.
+    pending = ReuseRegistry().remember(
+        ReuseRecord(wire_hash=key, sim_id="s1", state=PENDING_STATE, run_id="run-1"),
+    )
+    merged = pending.record_direct(incoming)
+    assert merged.records[key].pending_run_ids == ["run-1", "run-2"]
+    assert merged.records[key].run_id == "run-1"
+    # Either run promotes; the promoting run becomes the surfaced identity.
+    promoted = merged.promote("run-2")
+    assert promoted.lookup(key).run_id == "run-2"  # type: ignore[union-attr]
+    assert promoted.records[key].pending_run_ids == []
 
 
 async def test_reused_leaf_records_the_run_it_was_linked_to(tmp_path) -> None:
