@@ -1981,4 +1981,9 @@ def _outcome_dict(runtime: HelloRuntime, outcome: HelloOutcome) -> dict[str, Any
         payload["client_result_ops"] = sorted(result_ops) if result_ops is not None else None
     if outcome.error:
         payload["error"] = redact(outcome.error)
+    if outcome.error_code:
+        # Symmetry with the submit path: a ``hello`` replay of a pending
+        # idempotency record carries the stable ``outcome_unknown`` code, so the
+        # N3 path is not left with only the confusing sentinel string.
+        payload["error_code"] = outcome.error_code
     return payload
