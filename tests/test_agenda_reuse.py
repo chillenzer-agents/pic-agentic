@@ -249,6 +249,64 @@ async def test_two_identical_leaves_with_a_registry_hit_both_reuse(tmp_path) -> 
     assert tick.complete is True
 
 
+def _campaign_at_point(spec: dict, point: dict) -> Campaign:
+    group = AgendaGroup(name="sweep").add(a0=AgendaSim(name="a0", spec=spec, point=point))
+    return Campaign(name="c", agenda=group).with_created_ts()
+
+
+async def test_identical_specs_at_different_points_do_not_reuse(tmp_path) -> None:
+    """Option A: the sweep point is part of the key; different points re-run.
+
+    Regression for the open question on PR #36: the key used to be content-only
+    (``sha256({sim, provenance})``), so two byte-identical specs at different
+    points shared one run and a leaf's provenance could attribute a result to a
+    point that never ran.  They are different simulations and must each be
+    submitted.
+    """
+    store = _store(tmp_path)
+    spec = {"replica": 0}
+    store.save(_campaign_at_point(spec, {"x": 1.0}))
+    registry: dict[str, ReuseRecord] = {}
+    observed: dict[str, str] = {}
+    submit = _Submitter()
+    engine = _engine(store, submit, registry, observed)
+    await engine.tick()
+    observed["sim001"] = "results.ready"
+    await engine.tick()
+    assert registry, "the x=1.0 run should be recorded"
+
+    # Same content, different point: a different simulation, so it is submitted
+    # (in a fresh campaign, so it cannot collide with the first leaf).
+    store.save(_campaign_at_point(spec, {"x": 2.0}))
+    fresh = _engine(store, submit, registry, observed)
+    tick = await fresh.tick()
+    assert tick.reused == []
+    assert tick.submitted == ["a0"]
+    assert submit.calls == 2  # two cluster jobs, one per point
+
+
+async def test_identical_specs_at_the_same_point_reuse(tmp_path) -> None:
+    """Option A: identical content, provenance *and* point still reuse."""
+    store = _store(tmp_path)
+    spec = {"replica": 0}
+    store.save(_campaign_at_point(spec, {"x": 1.0}))
+    registry: dict[str, ReuseRecord] = {}
+    observed: dict[str, str] = {}
+    submit = _Submitter()
+    engine = _engine(store, submit, registry, observed)
+    await engine.tick()
+    observed["sim001"] = "results.ready"
+    await engine.tick()
+    assert registry
+
+    store.save(_campaign_at_point(spec, {"x": 1.0}))
+    fresh = _engine(store, submit, registry, observed)
+    tick = await fresh.tick()
+    assert tick.reused == ["a0"]
+    assert tick.submitted == []
+    assert submit.calls == 1  # no second cluster job
+
+
 async def test_engine_without_reuse_callables_behaves_as_before(tmp_path) -> None:
     """Omitting the reuse hooks disables reuse entirely (offline default)."""
     store = _store(tmp_path)
@@ -367,6 +425,10 @@ async def test_direct_submission_is_reused_by_an_identical_campaign_leaf(tmp_pat
     from the registry and an identical campaign leaf re-ran it.  It is now
     recorded (pending) on acceptance and promoted on results.ready, so the
     campaign leaf links to it with no second cluster job.
+
+    Under option A both sides must be point-less: the direct run has no sweep
+    point and the leaf here carries none, so their keys match.  A point-carrying
+    leaf is covered by ``test_point_carrying_leaf_does_not_reuse_a_direct_run``.
     """
     from pic_agentic.server.agenda import _reuse_key
 
@@ -388,7 +450,7 @@ async def test_direct_submission_is_reused_by_an_identical_campaign_leaf(tmp_pat
                 state=SimulationState.RESULTS_READY,
             ).sign(_SECRET),
         )
-        record = agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test"))
+        record = agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test", None))
         assert record is not None
         assert record.run_id == outcome.cmd_id
 
@@ -402,6 +464,46 @@ async def test_direct_submission_is_reused_by_an_identical_campaign_leaf(tmp_pat
         leaf = agenda.store.load(Campaign).agenda.entries["leaf"]
         assert leaf.reused is True
         assert leaf.run_id == outcome.cmd_id
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_point_carrying_leaf_does_not_reuse_a_direct_run(tmp_path) -> None:
+    """Option A: a point-less direct run is not reused by a point-carrying leaf.
+
+    The direct submission has no sweep point and is keyed under ``point=None``;
+    a campaign leaf at ``point={"x": 1.0}`` is a different simulation and is
+    submitted normally rather than linked to the ad-hoc run.
+    """
+    agenda, service, built = _direct_service(tmp_path)
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    responder = _DirectResponder(sim_t)
+    tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
+    try:
+        outcome = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        assert outcome.ok
+        service.on_message(
+            build_submit_event(
+                sim=_SIM,
+                seq=999,
+                cmd_id=outcome.cmd_id,
+                sim_id=outcome.sim_id,
+                state=SimulationState.RESULTS_READY,
+            ).sign(_SECRET),
+        )
+        # The direct run is recorded (point-less) and reusable...
+        group = AgendaGroup(name="g").add(
+            leaf=AgendaSim(name="leaf", spec={"sim": built.runner["sim"]}, point={"x": 1.0}),
+        )
+        AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="camp", agenda=group))
+        tick = await agenda.advance(mcp_t.send)
+        # ...but the point-carrying leaf keys differently and is submitted.
+        assert tick["reused"] == []
+        assert tick["submitted"] == ["leaf"]
+        assert len(responder.commands) == 2  # the direct submit plus the new job
     finally:
         for task in tasks:
             task.cancel()
@@ -425,7 +527,7 @@ async def test_direct_submission_pending_promotes_across_a_restart(tmp_path) -> 
     tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
     try:
         outcome = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
-        assert agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test")) is None
+        assert agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test", None)) is None
     finally:
         for task in tasks:
             task.cancel()
@@ -447,7 +549,7 @@ async def test_direct_submission_pending_promotes_across_a_restart(tmp_path) -> 
             ).sign(_SECRET),
         ],
     )
-    record = fresh._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test"))
+    record = fresh._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test", None))
     assert record is not None
     assert record.run_id == outcome.cmd_id
 
@@ -500,13 +602,22 @@ def test_direct_submission_key_follows_the_configured_revision(tmp_path) -> None
     from pic_agentic.server.agenda import _reuse_key
 
     _agenda, _service, built = _direct_service(tmp_path, picongpu_revision="rev-a")
-    direct = _reuse_key({"sim": built.runner["sim"]}, "rev-a")
+    direct = _reuse_key({"sim": built.runner["sim"]}, "rev-a", None)
     carried = _reuse_key(
         {"sim": built.runner["sim"], "provenance": {"picongpu_revision": "other-rev"}},
         "rev-a",
+        None,
     )
     assert direct == carried  # the configured revision wins over the carried one
-    assert direct != _reuse_key({"sim": built.runner["sim"]}, "rev-b")  # a changed pin does not reuse
+    assert direct != _reuse_key({"sim": built.runner["sim"]}, "rev-b", None)  # a changed pin does not reuse
+    # The point is part of the key: identical content at different points keys
+    # differently, and a point-less key never matches a point-carrying one.
+    assert direct != _reuse_key({"sim": built.runner["sim"]}, "rev-a", {"x": 1.0})
+    assert _reuse_key({"sim": built.runner["sim"]}, "rev-a", {"x": 1.0}) == _reuse_key(
+        {"sim": built.runner["sim"]},
+        "rev-a",
+        {"x": 1.0},
+    )
 
 
 async def test_reuse_follows_the_configured_revision_pin(tmp_path) -> None:
@@ -576,7 +687,7 @@ async def test_two_direct_submissions_do_not_orphan_the_first_result(tmp_path) -
                 state=SimulationState.RESULTS_READY,
             ).sign(_SECRET),
         )
-        record = agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test"))
+        record = agenda._load_reuse().lookup(_reuse_key({"sim": built.runner["sim"]}, "rev-test", None))
         assert record is not None, "first completed run must remain reusable"
         assert record.run_id == run1.cmd_id  # the run that produced the result
 
