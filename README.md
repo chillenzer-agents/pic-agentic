@@ -370,7 +370,8 @@ field (`building`/`queued`/`running`/`done`/`failed`/`cancelled`):
 
 `get_status`, `list_simulations` and `get_events` report `phase`; the
 `fleet_status` summary reports `by_phase`, and `get_events` adds a `note`
-explaining an empty event list (build window vs filter).
+explaining an empty event list (build/queue window, finished run, or an
+excluding filter).
 
 `fleet_status`'s `stalled` alert fires only for a `running` record that has gone
 `fleet_stall_after_s` (default 900 s) without a lifecycle event. A

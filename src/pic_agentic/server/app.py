@@ -977,8 +977,8 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "list is not an error: between `accepted` and the SLURM job the "
             "simclient reports no lifecycle event for the multi-minute local "
             "build, so read `phase` from get_status/list_simulations to tell "
-            "`building`/`queued` apart; `note` says which case an empty result "
-            "is."
+            "`building`/`queued` apart; `note` explains the empty result "
+            "(build window, finished run, or excluding filter)."
         ),
         annotations=_READ_ONLY,
     )
@@ -995,7 +995,7 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         if record is not None:
             result["phase"] = record.phase
         if not events:
-            result["note"] = _empty_events_note(record)
+            result["note"] = _empty_events_note(record, filtered=bool(since) or bool(types))
         return _redact_dict(runtime, result)
 
     @server.tool(
@@ -1829,13 +1829,15 @@ def _merge_status(projection: dict[str, Any], live: dict[str, Any]) -> None:
     projection["phase"] = simulation_phase(str(projection.get("state", "")), projection.get("job_id"))
 
 
-def _empty_events_note(record: SimRecord | None) -> str:
+def _empty_events_note(record: SimRecord | None, *, filtered: bool) -> str:
     """Explain an empty ``get_events`` result (H4: latency opacity).
 
     An empty list is normal either because the simclient reports no lifecycle
-    event during the multi-minute local build/queue window or because a
-    ``since``/``types`` filter excluded every row.  The note names which case
-    applies so an empty result is not mistaken for "started but silent".
+    event during the multi-minute local build/queue window, because the run has
+    already finished, or because a ``since``/``types`` filter excluded every
+    row.  The note names which case applies so an empty result is not mistaken
+    for "started but silent"; ``filtered`` records whether the caller actually
+    passed a filter, so a terminal result is not dishonestly blamed on one.
 
     Returns:
         A short human-readable explanation.
@@ -1855,7 +1857,20 @@ def _empty_events_note(record: SimRecord | None) -> str:
             "no lifecycle event recorded yet for this running run; progress events are emitted "
             "only every 25% of the run, so a long-running job can be between events"
         )
-    return "no lifecycle event matches the requested filters; widen `since`/`types` or omit them"
+    if phase in {"done", "failed", "cancelled"}:
+        if filtered:
+            return (
+                f"the run is finished ({phase}); no retained lifecycle event matches the requested "
+                "filters, so widen `since`/`types` or omit them"
+            )
+        return (
+            f"the run is finished ({phase}) and no lifecycle event is retained for it; there is nothing more to report"
+        )
+    return (
+        "no lifecycle event matches the requested filters; widen `since`/`types` or omit them"
+        if filtered
+        else "no lifecycle event recorded for this simulation"
+    )
 
 
 def _since_last_event_s(ts: str | None) -> int | None:
