@@ -36,10 +36,13 @@ def test_instructions_point_at_the_picongpu_documentation_and_examples() -> None
     # L5: the "which tool when" front-door line is present.
     assert "Which tool" in SERVER_INSTRUCTIONS
     # H8: the documented focal example is empty for timing/geometry reasons, not
-    # merely a missing plasma species; the corrected caveat says both.
+    # merely a missing plasma species; the corrected caveat names both and the
+    # actionable fix. Assert the invariant semantics rather than exact prose, so
+    # the wording can be tightened without breaking the test.
     assert "plasma species" in SERVER_INSTRUCTIONS
-    assert "never reaches the gas" in SERVER_INSTRUCTIONS
-    assert "PULSE_INIT=15" in SERVER_INSTRUCTIONS
+    assert "gas" in SERVER_INSTRUCTIONS
+    assert "max_steps" in SERVER_INSTRUCTIONS
+    assert "necessary but not sufficient" in SERVER_INSTRUCTIONS
     # H9: the pinned API is authoritative over readthedocs; the mismatched names
     # and the version-matched classes are named.
     assert "installed" in SERVER_INSTRUCTIONS

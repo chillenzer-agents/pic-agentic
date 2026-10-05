@@ -21,9 +21,10 @@ study from the documentation without a verbatim snippet to copy.
 
 Caveat for the pointer (picongpu upstream docs issue, not fixed here): the page's
 focal example is empty as written, and not only because it defines no plasma
-species. It reuses the LWFA tutorial's pulse timing (`PULSE_INIT=15`, the pulse
-peak ~11 µm in front of the box) in a 100-step run, so the pulse never reaches
-the gas ~80 µm downstream (that needs ~2000 steps). Folding in the plasma
+species. It reuses the LWFA tutorial's pulse timing (`PULSE_INIT=15`, so the
+pulse starts ~11 µm in front of the box) in a 100-step run, and the pulse never
+reaches the gas (whose plateau sits ~80 µm downstream; bridging that needs
+~2000 steps). Folding in the plasma
 species is necessary but not sufficient; the `instructions` now say both. A
 run that finishes but whose only numeric artifact reads all-zero is the
 `suspect` health signal below.
