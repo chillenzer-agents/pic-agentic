@@ -614,6 +614,42 @@ def test_real_nonzero_histogram_survives_the_real_reader(tmp_path: Path) -> None
     assert "warning" not in summary
 
 
+def test_real_nonzero_histogram_with_a_nonzero_minimum(tmp_path: Path) -> None:
+    """A non-zero ``minEnergy`` histogram reports its real edges and window (B1).
+
+    ``EnergyHistogramData`` returns only upper edges, so the first bin's lower
+    edge is the header's ``minEnergy`` - not a hard-coded ``0``.  The reviewer's
+    real-pin repro used a single populated low bin; here the header starts at
+    1000 keV, so a hard-coded 0 would mis-place every edge and undercount.
+    """
+    pytest.importorskip("picongpu")
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    # ``min_kev=1000`` over a 1000 keV span in 10 bins: the fixture populates
+    # bin 0 [1000, 1100), bin 4 [1400, 1500) and bin 9 [1900, 2000).
+    energy_histogram_dat(run, species="e", min_kev=1000.0, max_kev=2000.0, peak_bin=4, peak_count=5, iterations=(0,))
+    payload = results.resolve_result(_params(species="e", iteration=0), run_dir=run, sim_id=SIM_ID)
+    assert "result" in payload, payload
+    summary = payload["result"]
+    # The first bin's lower edge is the header's 1000 keV, not 0.
+    assert summary["min_energy_kev"] == pytest.approx(1000.0)
+    assert summary["max_energy_kev"] == pytest.approx(2000.0)
+    assert summary["count_in_window"]["min_kev"] == pytest.approx(1000.0)
+    assert summary["count_in_window"]["max_kev"] == pytest.approx(2000.0)
+    assert summary["count_in_window"]["count"] == pytest.approx(7.0)
+    assert summary["total"] == pytest.approx(7.0)
+
+    # The exact physical first-window [1000, 1100) counts the first bin (1),
+    # not a spurious 0 from a mis-placed 0 edge.
+    first = results.resolve_result(
+        _params(species="e", iteration=0, min_kev=1000.0, max_kev=1100.0),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert first["result"]["count_in_window"]["count"] == pytest.approx(1.0)
+
+
 def test_real_probe_vacuity_aggregates_every_species(tmp_path: Path) -> None:
     """The real reader path probes *all* species, not the first (B1).
 

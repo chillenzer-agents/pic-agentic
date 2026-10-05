@@ -447,7 +447,11 @@ is **requestable** with `min_kev`/`max_kev` (both or neither, non-negative,
 `max_kev > min_kev`). Bins are half-open `[lower, upper)`, so a bin is counted
 when its **lower** edge lies in the window `[min_kev, max_kev)`: a bin ending
 exactly at `max_kev` is excluded, i.e. a ">= 5 MeV" window starts at the 5 MeV
-bin's lower edge rather than counting the 4.9--5.0 MeV bin (L1). When the window
+bin's lower edge rather than counting the 4.9--5.0 MeV bin (L1). The first bin's
+lower edge is the histogram's configured `minEnergy`, read from the file header,
+so a non-zero-minimum histogram (e.g. 1--2 MeV) reports its real edges and the
+exact `[minEnergy, first_upper)` window is not miscounted by assuming a 0 keV
+start. When the window
 is omitted it is derived from the populated bins: the common 100--1000 keV window
 is kept only when the whole populated span lies inside it, and otherwise it is
 widened to that span, so the default always captures the whole population instead

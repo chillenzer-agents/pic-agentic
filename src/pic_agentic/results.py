@@ -1876,22 +1876,58 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _histogram_lower_edges(upper_edges: list[float]) -> list[float]:
+def _histogram_min_energy_kev(target: Path) -> float:
+    """Read the histogram's first lower edge (``minEnergy``) from the file header.
+
+    The shipped ``EnergyHistogramData`` returns only the **upper** edges, so the
+    first bin's lower bound is unrecoverable from the reader alone.  PIConGPU's
+    ``BinEnergyParticles`` writes it as the first number inside the header's
+    ``#step <minEnergy ... >maxEnergy count`` bracket
+    (``BinEnergyParticles.x.cpp``).  ``minEnergy`` is a supported non-zero
+    configuration, so hard-coding ``0.0`` misplaces every edge and undercounts
+    the exact ``[minEnergy, first_upper)`` window; the header is the authority.
+
+    Returns:
+        The parsed lower bound [keV], or ``0.0`` when the header is absent or
+        unparsable (the historical default).
+
+    """
+    try:
+        with target.open("r", encoding="utf-8", errors="replace") as handle:
+            first = handle.readline()
+    except OSError:  # pragma: no cover - target existence is checked earlier
+        return 0.0
+    match = re.match(r"\s*#step\s*<\s*(\S+)", first)
+    if match is None:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _histogram_lower_edges(upper_edges: list[float], *, first_lower: float = 0.0) -> list[float]:
     """Reconstruct a histogram's per-bin lower edges from its reported upper edges.
 
     The shipped ``EnergyHistogramData`` returns one **upper** edge per count
     (``bins[i]`` bounds the bin whose count is ``counts[i]``); the lower edge of
-    bin ``i`` is the previous reported edge.  PIConGPU energy histograms start
-    at 0 keV, so the first bin's lower bound is taken as 0.0.  Bins are
-    therefore half-open ``[lower_i, upper_i)``, which is what makes the
-    ``count_in_window`` comparison exact at the window's upper edge (L1: a bin
-    ending at 5 MeV must not be counted in a ">= 5 MeV" window).
+    bin ``i`` is the previous reported edge.  The first bin's lower bound is the
+    histogram's configured ``minEnergy``, read from the file header (B1); it is
+    not necessarily 0 keV.  Bins are therefore half-open ``[lower_i, upper_i)``,
+    which is what makes the ``count_in_window`` comparison exact at the window's
+    upper edge (L1: a bin ending at 5 MeV must not be counted in a ">= 5 MeV"
+    window).
+
+    Args:
+        upper_edges: The reader's reported upper edges [keV].
+        first_lower: The first bin's lower edge [keV] (``minEnergy``); defaults
+            to ``0.0`` for a header-less source.
 
     Returns:
         The lower edge per bin, same length as ``upper_edges``.
 
     """
-    return [0.0, *upper_edges[:-1]]
+    return [first_lower, *upper_edges[:-1]]
 
 
 def _default_window(
@@ -2020,9 +2056,11 @@ def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduc
     its *lower* edge lies in that interval: bins are ``[lower_i, upper_i)``, so
     a bin whose upper edge is exactly ``max_kev`` is not counted (L1: a bin
     ending at 5 MeV must not satisfy a ">= 5 MeV" window, which instead starts
-    at the 5 MeV bin's lower edge).  ``min_energy_kev``/``max_energy_kev`` are
-    the populated lower/upper edges, i.e. the half-open span
-    ``[min_energy_kev, max_energy_kev)`` covers exactly the populated bins.
+    at the 5 MeV bin's lower edge).  The first bin's lower edge is the file's
+    configured ``minEnergy`` (read from the header, B1), not necessarily 0.
+    ``min_energy_kev``/``max_energy_kev`` are the populated lower/upper edges,
+    i.e. the half-open span ``[min_energy_kev, max_energy_kev)`` covers exactly
+    the populated bins.
 
     Returns:
         Bins (keV), counts, the count in the window and scalars.
@@ -2042,7 +2080,7 @@ def _build_energy_histogram(  # ruff: ignore[too-many-locals] - one linear reduc
     # ``zip(strict=True)`` crash on such a parse.
     paired = min(len(bins), len(counts))
     upper_edges = bins[:paired]
-    lower_edges = _histogram_lower_edges(upper_edges)
+    lower_edges = _histogram_lower_edges(upper_edges, first_lower=_histogram_min_energy_kev(target))
     counts = counts[:paired]
     # ``max_energy_kev`` is the upper edge of the highest populated bin, not the
     # modal (argmax-count) edge: the high-energy tail is the number the caller
