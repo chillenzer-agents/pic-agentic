@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from pic_agentic.agenda.campaign import Campaign, CampaignState
 from pic_agentic.agenda.engine import (
+    OUTCOME_UNKNOWN_ERROR_CODE,
     ActualUsage,
     AgendaEngine,
     EnginePolicy,
@@ -50,6 +51,7 @@ from pic_agentic.protocol.simulation import (
 )
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
+from pic_agentic.simclient.simulation import SimulationErrorCode
 from pic_agentic.simulation_build import check_spec_round_trip
 
 if TYPE_CHECKING:
@@ -83,6 +85,11 @@ _IN_FLIGHT_STATUSES = frozenset({"planned", "submitted", "running"})
 
 #: A dotted patch-path segment that indexes a list rather than a dict key.
 _LIST_INDEX_RE = re.compile(r"-?\d+")
+
+#: Control-ack codes that mean "the sim is known but has no live job to kill":
+#: the requested cancellation is satisfied by clearing it, not an error.
+_NOT_SIGNALABLE_CODE = SimulationErrorCode.NOT_SIGNALABLE.value
+_NOT_TERMINAL_CODE = SimulationErrorCode.NOT_TERMINAL.value
 
 
 def no_campaign_error() -> dict[str, Any]:
@@ -241,11 +248,8 @@ class AgendaService:
                 # The ack was lost: the job may well be running.  Defer to the
                 # next tick (the stable cmd_id makes the retry exactly-once).
                 msg = f"lost ack: {exc}"
-                raise TransientSubmitError(msg) from exc
-            if not outcome.ok or not outcome.sim_id:
-                msg = outcome.error or "submit failed"
-                raise SubmitFailureError(msg, error_code=outcome.error_code, stage=outcome.stage)
-            return outcome.sim_id
+                raise TransientSubmitError(msg, error_code=OUTCOME_UNKNOWN_ERROR_CODE) from exc
+            return _classify_submit(outcome)
 
         def reuse_key(spec: dict[str, Any]) -> str:
             # Fold the provenance tuple into the reuse key, so identical physics
@@ -503,17 +507,26 @@ class AgendaService:
         in-flight tick to finish (whose final save would otherwise overwrite the
         stop) and then blocks every later tick.  The state is set to ``stopped``
         and persisted *before* any cancellation, so a crash mid-cancellation
-        still leaves the campaign stopped.  Only cancellations the simclient
-        confirmed (``ok`` and no error) are reported as ``cancelled``;
-        everything else -- a timeout, a rejection, an exception -- is collected
-        in ``errors`` and never raised.
+        still leaves the campaign stopped.
+
+        Every non-terminal leaf carrying a ``sim_id`` is targeted, not only
+        ``submitted``/``running`` ones: a lost-ack submission stays ``planned``
+        but has already been stamped with a ``sim_id``, so leaving it out would
+        orphan a job that may well be running.  A cancellation the simclient
+        confirmed (``ok`` and no error) is reported as ``cancelled``; a
+        ``not_signalable``/``not_terminal`` answer means the sim is known but has
+        no live job, so it is reported as ``cleared`` (resolved, nothing to
+        kill); everything else -- a timeout, a rejection, an exception -- is
+        collected in ``errors`` with its ``error_code`` and message (never a
+        bare ``rejected``) and never raised.
 
         Args:
             send: Async RCP sender from the running transport.
 
         Returns:
             ``{"ok": True, "state": "stopped", "cancelled": [...],
-            "errors": [...]}``, or a soft error when no transport/campaign.
+            "cleared": [...], "errors": [...]}``, or a soft error when no
+            transport/campaign.
 
         """
         if not self.store.exists():
@@ -525,24 +538,53 @@ class AgendaService:
             except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
                 log.warning("agenda stop failed: %s", exc)
                 return {"ok": False, "error": self.config.redact(str(exc))}
+            # Any non-terminal leaf with a sim_id may have a live job: include
+            # ``planned`` so a deferred/lost-ack leaf is not stranded.
             in_flight = [
                 sim.sim_id
                 for _, sim in campaign.agenda.simulations()
-                if sim.status in {"submitted", "running"} and sim.sim_id
+                if sim.status in _IN_FLIGHT_STATUSES and sim.sim_id
             ]
             cancelled: list[str] = []
+            cleared: list[str] = []
             errors: list[dict[str, str]] = []
             for sim_id in in_flight:
                 try:
                     ack = await self.submit_service.control(send, sim_id, SimulationOp.CANCEL)
                 except Exception as exc:  # ruff: ignore[blind-except] - collect, never raise
-                    errors.append({"sim_id": sim_id, "error": self.config.redact(str(exc))})
+                    errors.append(
+                        {
+                            "sim_id": sim_id,
+                            "error": "cancellation request failed",
+                            "detail": self.config.redact(str(exc)),
+                        },
+                    )
                     continue
                 if ack.get("ok") and not ack.get("error"):
                     cancelled.append(sim_id)
-                else:
-                    errors.append({"sim_id": sim_id, "error": self.config.redact(str(ack.get("error", "rejected")))})
-        return {"ok": True, "state": "stopped", "cancelled": cancelled, "errors": errors}
+                    continue
+                code = ack.get("error_code")
+                if code in {_NOT_SIGNALABLE_CODE, _NOT_TERMINAL_CODE}:
+                    # Known sim, but no live job to cancel (never started, or
+                    # already finished): the orphan is resolved by recording it,
+                    # not an error.  No longer leave it lingering in ``errors``.
+                    cleared.append(sim_id)
+                    continue
+                errors.append(
+                    {
+                        "sim_id": sim_id,
+                        "error": "cancellation rejected",
+                        "detail": self.config.redact(str(ack.get("error") or "the simclient reported no reason")),
+                        "error_code": self.config.redact(str(code)) if code else "",
+                    },
+                )
+        return {
+            "ok": True,
+            "state": "stopped",
+            "cancelled": cancelled,
+            "cleared": cleared,
+            "errors": errors,
+        }
 
     async def take_callbacks(self) -> dict[str, Any]:
         """Return and durably clear the pending decision-point callbacks.
@@ -1178,7 +1220,51 @@ def _policy_from_config(config: Config) -> EnginePolicy:
     return EnginePolicy(
         require_approval=config.agenda_require_approval,
         approve_over_est_core_hours=config.agenda_approve_over_est_core_hours,
+        deferred_outcome_timeout_s=config.agenda_deferred_outcome_timeout_s,
     )
+
+
+def _classify_submit(outcome: Any) -> str:
+    """Turn one submit ack into a sim_id, a deferral, or a terminal failure.
+
+    Kept out of the ``submit`` closure so the outcome classification reads in
+    one place and the closure stays branch-light.
+
+    Returns:
+        The accepted ``sim_id``.
+
+    Raises:
+        TransientSubmitError: When the outcome is unknown (a lost ack or a
+            pending idempotency record): the job may exist, so the retry under
+            the same ``cmd_id`` is safe and the leaf must stay planned.
+        SubmitFailureError: When the simclient genuinely rejected the spec (a
+            retry would only repeat the rejection).
+
+    """
+    if outcome.outcome_unknown:
+        # The simclient found a pending idempotency record for this exactly-once
+        # cmd_id: it accepted the command but died before recording an outcome,
+        # so the job may exist or be running.  A *terminal* failure here would
+        # strand real work and present a lost ack as a physics failure; defer
+        # and retry instead, under the same cmd_id, so the record's eventual
+        # completion re-acks.
+        msg = outcome.error or "submission outcome unknown"
+        # Force the stable code rather than trusting the ack's ``error_code``: a
+        # pre-fix client still returns ``error_code: rejected_by_policy`` with
+        # the sentinel string (that is exactly the C2 confusion).  During a
+        # rolling upgrade the server must not persist that misleading code on
+        # the deferred leaf or its eventual give-up callback.
+        raise TransientSubmitError(
+            msg,
+            error_code=OUTCOME_UNKNOWN_ERROR_CODE,
+            sim_id=outcome.sim_id or None,
+        )
+    if not outcome.ok or not outcome.sim_id:
+        # A genuine rejection (bad payload, policy, version drift): a retry
+        # would only repeat it, so this stays terminal.
+        msg = outcome.error or "submit failed"
+        raise SubmitFailureError(msg, error_code=outcome.error_code, stage=outcome.stage)
+    return outcome.sim_id
 
 
 async def _never_submit(_spec: dict[str, Any], _key: str) -> str:  # ruff: ignore[unused-async] - matches SubmitFn

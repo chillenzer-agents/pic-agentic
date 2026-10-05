@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from pic_agentic.protocol.hello import HelloType, build_hello_ack
 from pic_agentic.rcp import new_secret_hex
+from pic_agentic.server.app import _outcome_dict
 from pic_agentic.server.hello import AckTimeoutError, HelloService
 from pic_agentic.simclient import SimClient
 from pic_agentic.simclient.client import ProcessedCommand
@@ -288,7 +291,56 @@ async def test_crash_before_result_is_not_resubmitted(shared_dir) -> None:
     ack = await second.handle(command)
     assert ack is not None
     assert ack.payload["error"] == "already_submitted:outcome_unknown"
+    # The stable code lets a caller classify this as transient, not a rejection.
+    assert ack.payload["error_code"] == "outcome_unknown"
     assert not list((shared_dir / "out").glob("*.out"))
+
+
+async def test_hello_replay_outcome_unknown_surfaces_error_code(shared_dir) -> None:
+    """A pending-record ``hello`` ack carries the code through to the outcome.
+
+    The ack already carried ``error_code`` but ``HelloOutcome``/``_outcome_dict``
+    dropped it, leaving only the sentinel string.  Drive a real service exchange
+    whose ack is the pending-record one and assert the code survives.
+    """
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    service = HelloService(sim=SIM, secret=SECRET, message_dir=shared_dir, ack_timeout_s=5.0)
+
+    async def respond() -> None:
+        # The command arrives on the simulation side; reply there with the
+        # pending-record ack (the shape a crashed mid-build client replays).
+        async for msg in sim_t.receive():
+            if msg.type != HelloType.COMMAND:
+                continue
+            ack = build_hello_ack(
+                sim=SIM,
+                seq=msg.seq,
+                cmd_id=str(msg.payload["cmd_id"]),
+                in_reply_to=msg.transport_event_id,
+                job_id=None,
+                cluster_output=None,
+                error="already_submitted:outcome_unknown",
+                error_code="outcome_unknown",
+            )
+            await sim_t.send(ack.sign(SECRET))
+
+    async def pump() -> None:
+        async for msg in mcp_t.receive():
+            service.on_message(msg)
+
+    respond_task = asyncio.create_task(respond())
+    pump_task = asyncio.create_task(pump())
+    try:
+        outcome = await service.hello(mcp_t.send, "hi")
+    finally:
+        for task in (respond_task, pump_task):
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+    assert outcome.error_code == "outcome_unknown"
+    payload = _outcome_dict(SimpleNamespace(config=SimpleNamespace(redact=lambda text: text)), outcome)
+    assert payload["error_code"] == "outcome_unknown"
 
 
 async def test_rejects_command_from_unexpected_transport_sender(shared_dir) -> None:

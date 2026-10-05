@@ -120,6 +120,137 @@ async def test_stop_cancels_in_flight_leaves(tmp_path) -> None:
         await sim_t.close()
 
 
+async def test_stop_cancels_a_deferred_lost_ack_leaf(tmp_path) -> None:
+    """A planned leaf with a sim_id (a lost ack) is targeted, not orphaned.
+
+    The ``planned`` leaf was stamped with a ``sim_id`` by the lost-ack
+    submission, so ``stop_agenda`` must include it in the cancellation sweep --
+    excluding it would leave a possibly-running job with no cleanup path.
+    """
+    agenda = AgendaGroup(name="group").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, status="planned", sim_id="stranded1"),
+    )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    mcp_t, sim_t, server, runtime = _runtime(config)
+
+    seen: list[str] = []
+
+    async def responder() -> None:
+        counter = 0
+        async for command in sim_t.receive():
+            if command.type != SimulationType.CONTROL_COMMAND:
+                continue
+            counter += 1
+            seen.append(str(command.payload.get("sim_id")))
+            ack = build_control_ack(
+                sim=SIM,
+                seq=counter,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id=str(command.payload.get("sim_id", "")),
+                op=SimulationOp(command.payload["op"]),
+                ok=True,
+                in_reply_to=command.transport_event_id,
+            ).sign(SECRET)
+            await sim_t.send(ack)
+
+    responder_task = asyncio.create_task(responder())
+    pump = await _pump(mcp_t, runtime.submit_service)
+    try:
+        result = (await server.call_tool("stop_agenda", {})).structured_content
+        assert result["cancelled"] == ["stranded1"]
+        assert seen == ["stranded1"]
+    finally:
+        for task in (responder_task, pump):
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_stop_reports_a_known_but_unsignalable_orphan_as_cleared(tmp_path) -> None:
+    """A ``not_signalable`` cancel (no live job) is resolved, not a bare error."""
+    agenda = AgendaGroup(name="group").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, status="planned", sim_id="stranded1"),
+    )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    mcp_t, sim_t, server, runtime = _runtime(config)
+
+    async def responder() -> None:
+        async for command in sim_t.receive():
+            if command.type != SimulationType.CONTROL_COMMAND:
+                continue
+            ack = build_control_ack(
+                sim=SIM,
+                seq=1,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id=str(command.payload.get("sim_id", "")),
+                op=SimulationOp(command.payload["op"]),
+                ok=False,
+                error="not_signalable: no live job",
+                error_code="not_signalable",
+                in_reply_to=command.transport_event_id,
+            ).sign(SECRET)
+            await sim_t.send(ack)
+
+    responder_task = asyncio.create_task(responder())
+    pump = await _pump(mcp_t, runtime.submit_service)
+    try:
+        result = (await server.call_tool("stop_agenda", {})).structured_content
+        # Resolved (nothing to kill), not an un-actionable bare "rejected".
+        assert result["cancelled"] == []
+        assert result["cleared"] == ["stranded1"]
+        assert result["errors"] == []
+    finally:
+        for task in (responder_task, pump):
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
+async def test_stop_reports_cancellation_failure_with_detail(tmp_path) -> None:
+    """An unexplained rejection surfaces its detail/code, never a bare ``rejected``."""
+    agenda = AgendaGroup(name="group").add(
+        leaf=AgendaSim(name="leaf", spec={"sim": {"replica": 0}}, status="submitted", sim_id="sim0001"),
+    )
+    AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="c", agenda=agenda))
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    mcp_t, sim_t, server, runtime = _runtime(config)
+
+    async def responder() -> None:
+        async for command in sim_t.receive():
+            if command.type != SimulationType.CONTROL_COMMAND:
+                continue
+            ack = build_control_ack(
+                sim=SIM,
+                seq=1,
+                cmd_id=str(command.payload.get("cmd_id", "")),
+                sim_id=str(command.payload.get("sim_id", "")),
+                op=SimulationOp(command.payload["op"]),
+                ok=False,
+                error="scancel: invalid job id",
+                error_code="run_failed",
+                in_reply_to=command.transport_event_id,
+            ).sign(SECRET)
+            await sim_t.send(ack)
+
+    responder_task = asyncio.create_task(responder())
+    pump = await _pump(mcp_t, runtime.submit_service)
+    try:
+        result = (await server.call_tool("stop_agenda", {})).structured_content
+        assert result["cancelled"] == []
+        (error,) = result["errors"]
+        assert error["sim_id"] == "sim0001"
+        assert error["error"] != "rejected"
+        assert "scancel: invalid job id" in error["detail"]
+        assert error["error_code"] == "run_failed"
+    finally:
+        for task in (responder_task, pump):
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
 async def test_stop_without_campaign_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "missing.json"))
     mcp_t, sim_t, server, _ = _runtime(config)

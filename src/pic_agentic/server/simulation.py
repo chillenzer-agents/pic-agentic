@@ -47,6 +47,7 @@ from pic_agentic.protocol.simulation import (
 )
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 from pic_agentic.server.hello import AckTimeoutError, SendFn
+from pic_agentic.simclient.simulation import SimulationErrorCode
 from pic_agentic.simulation_build import BuiltSimulation, SimulationBuildError, build_runner_dump
 from pic_agentic.version import local_provenance
 
@@ -222,6 +223,23 @@ class SubmitOutcome(BaseModel):
     def ok(self) -> bool:
         """Whether the command was accepted without an error."""
         return not self.error
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def outcome_unknown(self) -> bool:
+        """Whether the ack reported the submission outcome as unknown.
+
+        True when the simclient found a *pending* idempotency record (it died
+        after accepting the command but before recording an outcome): the job
+        may exist or be running, and the exactly-once ``cmd_id`` makes a retry
+        safe.  Callers must treat this as transient (defer and retry), not as a
+        rejection.  Keyed on the stable :data:`SimulationErrorCode.OUTCOME_UNKNOWN`
+        code, with the legacy error string as a fallback for an older client
+        that does not yet carry the code.
+        """
+        return self.error_code == SimulationErrorCode.OUTCOME_UNKNOWN.value or bool(
+            self.error and self.error.startswith("already_submitted:outcome_unknown"),
+        )
 
 
 class BuiltSpec(BaseModel):
@@ -562,6 +580,22 @@ class SubmitService:
         record = self._record_for(sim_id, cmd_id=cmd_id, ts=message.ts)
         # A replayed ack from an older run must not touch the latest record.
         if cmd_id and cmd_id != record.cmd_id:
+            return
+        # An outcome-unknown ack (a pending idempotency record) is *not* a
+        # lifecycle state: the job may be running, and the exactly-once cmd_id
+        # makes the next tick's retry re-ack it.  Projecting the ack's
+        # ``state=failed``/``error`` here would falsely mark the sim failed in
+        # the registry, the observation would then fold the leaf terminal, and
+        # the retry (which is the whole point) could never run.  Register the sim
+        # as known but leave its state/error untouched.
+        ack_error_code = payload.get("error_code")
+        ack_error = payload.get("error")
+        if ack_error_code == SimulationErrorCode.OUTCOME_UNKNOWN.value or (
+            isinstance(ack_error, str) and ack_error.startswith("already_submitted:outcome_unknown")
+        ):
+            if record.last_event_ts is None:
+                record.last_event_ts = message.ts
+            self.registry[sim_id] = record
             return
         # The ack seeds a fresh record only: a late or re-delivered ack must
         # never regress a state already projected from a later event.

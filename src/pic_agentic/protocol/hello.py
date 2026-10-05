@@ -69,6 +69,7 @@ def build_hello_ack(
     job_id: int | None,
     cluster_output: str | None,
     error: str | None = None,
+    error_code: str | None = None,
     capabilities: ClientCapabilities | None = None,
 ) -> RcpMessage:
     """Build the simclient-to-room acknowledgement of a ``hello`` command.
@@ -90,6 +91,8 @@ def build_hello_ack(
         payload["capabilities"] = capabilities.model_dump(mode="json")
     if error:
         payload["error"] = error
+    if error_code:
+        payload["error_code"] = error_code
     return RcpMessage(
         sim=sim,
         kind=Kind.ACK,
