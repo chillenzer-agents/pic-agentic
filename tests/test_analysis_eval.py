@@ -157,6 +157,88 @@ def test_pow_requires_a_constant_exponent() -> None:
         _run({"kind": "binop", "op": "pow", "left": _var("x"), "right": _var("y")}, {"x": [1.0], "y": [2.0]})
 
 
+def test_node_attributes_are_authoritative_for_resolution() -> None:
+    """The advertised attrs-on-var form must drive record/component/iteration.
+
+    Regression for C1: ``_typecheck`` used to rebuild a bare ``VarRef(name=...)``
+    and silently drop node attributes, so resolution fell back to the
+    first-record/first-component/last-iteration defaults.
+    """
+    program = AnalysisProgram.model_validate(
+        {
+            "output": _reduce(
+                "sum",
+                {
+                    "kind": "var",
+                    "name": "Ez",
+                    "record": "E",
+                    "component": "z",
+                    "iteration": 536,
+                },
+            ),
+        },
+    )
+    seen: list[object] = []
+
+    def resolve(selector: object) -> list[float]:
+        seen.append(selector)
+        return [1.0, 2.0]
+
+    from pic_agentic.analysis_eval import evaluate
+
+    evaluate(program, resolve)
+    (selector,) = seen
+    assert selector.record == "E"
+    assert selector.component == "z"
+    assert selector.iteration == 536
+
+
+def test_declared_selectors_apply_when_node_attrs_are_bare() -> None:
+    """The selectors+bare form keeps working: attrs come from the declaration."""
+    program = AnalysisProgram.model_validate(
+        {
+            "selectors": [{"kind": "var", "name": "Ez", "record": "E", "component": "z", "iteration": 536}],
+            "output": _reduce("sum", _var("Ez")),
+        },
+    )
+    seen: list[object] = []
+
+    def resolve(selector: object) -> list[float]:
+        seen.append(selector)
+        return [1.0]
+
+    from pic_agentic.analysis_eval import evaluate
+
+    evaluate(program, resolve)
+    (selector,) = seen
+    assert selector.record == "E"
+    assert selector.component == "z"
+    assert selector.iteration == 536
+
+
+def test_node_attrs_fall_back_field_by_field() -> None:
+    """An omitted node attribute falls back to the declared selector's value."""
+    program = AnalysisProgram.model_validate(
+        {
+            "selectors": [{"kind": "var", "name": "Ez", "record": "E"}],
+            "output": _reduce("sum", {"kind": "var", "name": "Ez", "component": "x", "iteration": 536}),
+        },
+    )
+    seen: list[object] = []
+
+    def resolve(selector: object) -> list[float]:
+        seen.append(selector)
+        return [1.0]
+
+    from pic_agentic.analysis_eval import evaluate
+
+    evaluate(program, resolve)
+    (selector,) = seen
+    assert selector.record == "E"  # node omits record -> declaration
+    assert selector.component == "x"  # node wins
+    assert selector.iteration == 536  # node wins
+
+
 def test_resolve_error_is_wrapped() -> None:
     program = AnalysisProgram.model_validate({"output": _reduce("mean", _var("x"))})
 

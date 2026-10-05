@@ -93,6 +93,53 @@ def test_compute_scalar_vector_and_histogram(fake_compute: Path) -> None:
     assert spec["result"]["result_kind"] == "array"
 
 
+def test_compute_honours_attrs_on_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """C1 regression: attrs-on-var must resolve the named record/component/iteration.
+
+    The P2 console built ``{"kind": "var", "record": "E", "component": "x",
+    "iteration": 536}`` nodes; ``_typecheck`` used to drop those and resolve the
+    first record/component at the last iteration, giving a plausible wrong value.
+    """
+    run = tmp_path / "run"
+    out = run / "simOutput"
+    out.mkdir(parents=True)
+    (out / "fields.bp").write_bytes(b"x")
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    seen: list[tuple[object, object, object]] = []
+
+    def fake_load(_path: Path, record: str | None, component: str | None, iteration: object) -> list[float]:
+        seen.append((record, component, iteration))
+        table = {("E", "x"): [1.0, 2.0, 3.0], ("E", "y"): [4.0], ("E", "z"): [5.0, 6.0, 7.0]}
+        return table[record, component]
+
+    monkeypatch.setattr(results, "_load_dataset", fake_load)
+
+    def var(name: str, component: str) -> dict:
+        return {"kind": "var", "name": name, "record": "E", "component": component, "iteration": 536}
+
+    program = {
+        "output": {
+            "kind": "reduce",
+            "op": "sum",
+            "operand": {
+                "kind": "binop",
+                "op": "add",
+                "left": {"kind": "binop", "op": "mul", "left": var("Ex", "x"), "right": var("Ex", "x")},
+                "right": {"kind": "binop", "op": "mul", "left": var("Ez", "z"), "right": var("Ez", "z")},
+            },
+        },
+    }
+    result = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=program),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert result["stats"]["value"] == pytest.approx(1 + 4 + 9 + 25 + 36 + 49)
+    # Each selector was read with its own attrs, not the first/last defaults.
+    assert ("E", "x", 536) in seen
+    assert ("E", "z", 536) in seen
+
+
 def test_compute_requires_a_program(fake_compute: Path) -> None:
     result = results.resolve_result(
         ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE),
