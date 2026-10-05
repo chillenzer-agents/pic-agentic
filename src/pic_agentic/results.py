@@ -2354,6 +2354,10 @@ def _build_energy_fields(
         "total_J_min": min(totals),
         "total_J_max": max(totals),
         "total_J_last": totals[-1],
+        # The ``iteration`` selector picks one row; ``total_J_last`` is always
+        # the file's *latest* step, so a selected row also carries its own total
+        # (M1).
+        "total_J_selected": totals[index],
         "units_J": "Joule",
         **_plugin_source(target, steps[index]),
         "truncated": truncated,

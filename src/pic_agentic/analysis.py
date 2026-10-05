@@ -766,14 +766,25 @@ def _radiation_physics(summary: dict[str, Any], where: str, step: str) -> list[s
 def _energy_fields_physics(summary: dict[str, Any], where: str, step: str) -> list[str]:
     """Physics facts for the ``energy_fields`` (integrated field energy) summary.
 
+    The fact names the *selected* step's total (``total_J_selected``), not the
+    file's latest: an explicit ``iteration`` selects one row, and tagging the
+    last row's value with that step's iteration would be false (M1).  The peak
+    is reported over the whole history and is labelled as such.
+
     Returns:
         The fact strings for this reader (possibly empty).
 
     """
     facts: list[str] = []
-    if (last := summary.get("total_J_last")) is not None and (maximum := summary.get("total_J_max")) is not None:
+    selected = summary.get("total_J_selected")
+    if selected is None:
+        # A summary from before ``total_J_selected`` existed: fall back to the
+        # last total only when no explicit step was selected.
+        selected = summary.get("total_J_last")
+    maximum = summary.get("total_J_max")
+    if selected is not None and maximum is not None:
         facts.append(
-            f"integrated field energy{where}{step} is {last:.6g} J (peak {maximum:.6g} J over "
+            f"integrated field energy{where}{step} is {selected:.6g} J (peak {maximum:.6g} J over "
             f"{summary.get('n_steps')} output steps)",
         )
     return facts

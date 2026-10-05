@@ -136,10 +136,30 @@ def test_field_energy_reader_selects_an_explicit_step(tmp_path: Path) -> None:
     summary = payload["result"]
     assert summary["selected_step"] == 50
     assert summary["component_last_J"]["Ex"] == pytest.approx(2.0e-5 / 6)
+    # The selected row's total is step 50's 2e-5, not the file's last 1.5e-5
+    # (M1): the two must not be conflated under an explicit iteration.
+    assert summary["total_J_selected"] == pytest.approx(2.0e-5)
+    assert summary["total_J_last"] == pytest.approx(1.5e-5)
 
     missing = params.model_copy(update={"iteration": 7})
     gone = results.resolve_result(missing, run_dir=run, sim_id=SIM_ID)
     assert gone["error_code"] == "no_results"
+
+
+def test_field_energy_physics_fact_names_the_selected_step(tmp_path: Path) -> None:
+    """The H2 physics fact uses the selected row's total, not the latest (M1)."""
+    from pic_agentic import analysis
+
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 3.0e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration=50)
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    facts = analysis._plugin_physics_facts({"energy_fields": summary})
+    joined = "; ".join(facts)
+    # 2e-5 is step 50's total; 3e-5 is step 100's and must not be tagged as 50.
+    assert "at iteration 50 is 2e-05 J" in joined
+    assert "at iteration 50 is 3e-05" not in joined
 
 
 def test_field_energy_file_reads_as_a_bounded_text_tail(tmp_path: Path) -> None:
