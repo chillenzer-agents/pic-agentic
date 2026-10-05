@@ -371,9 +371,14 @@ RO-Crate flags them `reused`. A **bare `submit_simulation` counts too**: it is
 recorded as pending the moment the cluster accepts it and promoted to reusable
 when its `results.ready` event arrives (only a run whose results exist is
 reused), so a completed ad-hoc run is reused by a later byte-identical campaign
-leaf rather than re-run. Because the provenance tuple is part of the key,
-identical physics attributed to a different PIConGPU revision/schema is **not**
-reused — the result would not be attributable to the campaign's revision.
+leaf rather than re-run. The provenance tuple is part of the key, and it names
+the **server's** effective provenance (its configured/local PIConGPU
+revision/schema; a spec-carried revision is only a fallback for a server
+without a local pin). Identical physics therefore does **not** reuse across a
+changed server pin or schema — the result would not be attributable to a run
+the server can vouch for. A revision carried inside a leaf's own spec does not
+change the key when the server has a configured revision, so it cannot be used
+to force a re-run.
 
 ## Security model (M1)
 

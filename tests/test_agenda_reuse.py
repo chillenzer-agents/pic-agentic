@@ -489,6 +489,62 @@ async def test_direct_submission_under_a_different_revision_is_not_reused(tmp_pa
         await sim_t.close()
 
 
+def test_direct_submission_key_follows_the_configured_revision(tmp_path) -> None:
+    """The key names the *server's* effective provenance, not the leaf's.
+
+    A configured revision wins over a revision carried in the leaf's spec (the
+    latter is only a fallback for a server without a local pin), so a carried
+    revision cannot force a re-run.  The sensitivity that matters is the
+    server's own pin: changing it changes the key and disables reuse.
+    """
+    from pic_agentic.server.agenda import _reuse_key
+
+    _agenda, _service, built = _direct_service(tmp_path, picongpu_revision="rev-a")
+    direct = _reuse_key({"sim": built.runner["sim"]}, "rev-a")
+    carried = _reuse_key(
+        {"sim": built.runner["sim"], "provenance": {"picongpu_revision": "other-rev"}},
+        "rev-a",
+    )
+    assert direct == carried  # the configured revision wins over the carried one
+    assert direct != _reuse_key({"sim": built.runner["sim"]}, "rev-b")  # a changed pin does not reuse
+
+
+async def test_reuse_follows_the_configured_revision_pin(tmp_path) -> None:
+    """A replay under a changed server pin must submit, not reuse (Major #2).
+
+    The direct run was recorded under ``rev-a``; the same spec replayed under
+    ``rev-b`` keys differently and is submitted normally.  This pins the
+    configured-revision case the content-key-only test left open.
+    """
+    agenda, service, built = _direct_service(tmp_path, picongpu_revision="rev-a")
+    mcp_t, sim_t = MemoryTransport.create_pair()
+    responder = _DirectResponder(sim_t)
+    tasks = [asyncio.create_task(responder.run()), await _pump_into(mcp_t, service)]
+    try:
+        outcome = await service.submit(mcp_t.send, Path("/tmp/anything.py"))
+        service.on_message(
+            build_submit_event(
+                sim=_SIM,
+                seq=999,
+                cmd_id=outcome.cmd_id,
+                sim_id=outcome.sim_id,
+                state=SimulationState.RESULTS_READY,
+            ).sign(_SECRET),
+        )
+        service.picongpu_revision = "rev-b"  # the server pin moved
+        group = AgendaGroup(name="g").add(leaf=AgendaSim(name="leaf", spec={"sim": built.runner["sim"]}))
+        AgendaStore(tmp_path, filename="campaign.json").save(Campaign(name="camp", agenda=group))
+        tick = await agenda.advance(mcp_t.send)
+        assert tick["reused"] == []
+        assert tick["submitted"] == ["leaf"]
+        assert len(responder.commands) == 2
+    finally:
+        for task in tasks:
+            task.cancel()
+        await mcp_t.close()
+        await sim_t.close()
+
+
 async def test_two_direct_submissions_do_not_orphan_the_first_result(tmp_path) -> None:
     """A re-submit of an identical spec must not clobber a completed record.
 
