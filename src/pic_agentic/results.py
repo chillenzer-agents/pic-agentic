@@ -189,13 +189,16 @@ _PLUGIN_READERS: dict[str, _PluginReader] = {
         _KIND_TEXT,
         "picongpu",
     ),
-    # The EnergyFields plugin (``fields_energy.dat``) writes plain text but,
-    # unlike the ``*_energyHistogram_*.dat`` family, ships no reader in
-    # ``picongpu.extra.plugins.data``.  The engine parses it natively (stdlib),
-    # so this plugin's integrated field-energy artifact is no longer labelled
-    # ``binary``/unreadable (H2).
+    # The EnergyFields plugin writers emit exactly ``fields_energy.dat``
+    # (``EnergyFields.x.cpp`` hard-codes ``pluginPrefix = "fields_energy"``, so
+    # there is no per-run prefix).  Unlike the ``*_energyHistogram_*.dat``
+    # family this ships no reader in ``picongpu.extra.plugins.data``; the engine
+    # parses it natively (stdlib), so the integrated field-energy artifact is no
+    # longer labelled ``binary``/unreadable (H2).  (The ``EnergyParticles``
+    # plugin's ``<species>_energy_<filter>.dat`` is a *different* artifact with
+    # a species filter and is deliberately not matched.)
     "energy_fields": _PluginReader(
-        re.compile(r"^(?:fields_energy|[A-Za-z0-9_]+_energy)\.dat$"),
+        re.compile(r"^fields_energy\.dat$"),
         "",
         "",
         _KIND_TEXT,

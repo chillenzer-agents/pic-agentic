@@ -90,10 +90,10 @@ def test_scandir_names_the_plugin_reader(tmp_path: Path) -> None:
 def test_sniff_format_names_the_field_energy_monitor() -> None:
     """H2: ``fields_energy.dat`` is plain text, not ``binary``."""
     assert results._sniff_format("fields_energy.dat") == "energy_fields"
-    # A non-default prefix (``<name>_energy.dat``) is recognised too.  Like the
-    # other plugin patterns this is a filename-only heuristic, so a coincidental
-    # name is labelled and the native reader then rejects it cleanly.
-    assert results._sniff_format("myrun_energy.dat") == "energy_fields"
+    # Only the fixed ``fields_energy.dat`` name is this plugin's output; the
+    # ``EnergyParticles`` plugin's ``<species>_energy_<filter>.dat`` is a
+    # different artifact and must not be mislabelled (m2).
+    assert results._sniff_format("myrun_energy.dat") == "binary"
     # A name that matches no plugin pattern is still generic/binary.
     assert results._sniff_format("energy.dat") == "binary"
     assert results._sniff_format("mystery.dat") == "binary"
