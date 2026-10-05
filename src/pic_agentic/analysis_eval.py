@@ -111,10 +111,11 @@ def _typecheck(program: AnalysisProgram, node: Any, resolve: Any) -> dict[str, V
 
     Attributes carried directly on a ``var`` node (``record``/``component``/
     ``iteration``) are authoritative and honoured: the tool description
-    advertises that form.  Each attribute falls back to the matching declared
-    selector's value and then to ``None`` (name-only resolution).  The cache is
-    keyed by selector name, so a name is resolved once even when it appears in
-    several expression nodes.
+    advertises that form.  Each attribute falls back to the declared selector's
+    value and then to ``None`` (name-only resolution).  The cache is keyed by
+    the selector name, so a name referenced by several expression nodes is
+    resolved once; validation guarantees those references agree on their
+    attributes.
 
     Returns:
         A ``selector name -> value`` cache.
@@ -123,10 +124,10 @@ def _typecheck(program: AnalysisProgram, node: Any, resolve: Any) -> dict[str, V
         ProgramError: If a selector cannot be resolved.
 
     """
+    declared = program.declared_by_name()
     data: dict[str, Value] = {}
     for name, ref in _selector_refs(node).items():
-        declared = next((item for item in program.selectors if item.name == name), None)
-        selector = _merge_ref(ref, declared)
+        selector = _merge_ref(ref, declared.get(name))
         try:
             values = resolve(selector)
         except ProgramError:
@@ -165,8 +166,9 @@ def _selector_refs(node: Any) -> dict[str, VarRef]:
 
     The full ``var`` node is captured (not just its name), so node-level
     ``record``/``component``/``iteration`` survive to :func:`_merge_ref`.  A
-    name appears once, in first-seen traversal order; if the same name is
-    referenced by several nodes the first is used.
+    name appears once, in first-seen traversal order; validation guarantees that
+    every reference to a name carries identical attributes, so keeping the first
+    is lossless.
 
     Returns:
         ``selector name -> var node`` in first-seen order.
