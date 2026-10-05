@@ -1496,7 +1496,10 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "exactly one way: inline as `spec`, or by reference as `spec_path` "
             "(a staged JSON spec under the server's spec directory, e.g. the "
             "`spec_path` build_spec(write_to=...) returned), so a large leaf "
-            "spec need not be re-typed or inline-sized. `point` is the sweep "
+            "spec need not be re-typed. The staged reference lifts only the "
+            "inline *argument* size; the same 48 KiB escaped wire budget as any "
+            "submission still applies, so an over-cap leaf is refused here "
+            "rather than failing at advance_agenda. `point` is the sweep "
             "assignment to record; pass `parameter` to label the swept quantity "
             "in human-readable form (stored as sweep_parameter)."
         ),

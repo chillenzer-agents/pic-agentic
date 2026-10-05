@@ -313,7 +313,9 @@ there. In particular, on the beta-5 pin
   `FieldDiagnostic` / `PhaseSpaceDiagnostic`;
 - do not build the input by hand with `sim.write_input_file()`; define the
   `picmi.Simulation` and let the `build_spec` / `submit_simulation` tools build
-  it (`sim.picongpu_run()` is the equivalent in-script entry point);
+  it (`sim.write_input_file()` is the build-only equivalent in-script;
+  `sim.picongpu_run()` builds **and** runs it locally, which is not what the
+  tools do — they build a Runner spec and submit it to the cluster);
 - distributions keep the PICMI names (`picmi.UniformDistribution(density=...,
   rms_velocity=[...])`, `picmi.GaussianDistribution(...)`).
 
@@ -333,9 +335,12 @@ create the base campaign, then add one leaf per study point carrying its own
 whole spec, so any number of nodes can differ between leaves. A leaf spec may be
 inline (`spec=`) or, for a large spec, staged by reference
 (`add_agenda_leaf(name, spec_path=...)`) exactly like
-`create_campaign(base_spec_path=...)` — the same safe staging root, the same
-4 MiB cap, and no 48 KiB inline limit, so the leaf spec never has to be re-typed
-or truncated. `point`/`parameter` record the assignment and its human-readable
+`create_campaign(base_spec_path=...)` — the same safe staging root and the same
+4 MiB *input file* cap. Staging lifts only the input-side (re-typing) limit: the
+leaf spec is still validated through the submission path, so the same 48 KiB
+escaped wire budget as any `submit_spec` applies and an over-cap leaf is refused
+at add time with `spec_exceeds_inline_limit`. Staging avoids re-typing, not the
+wire cap. `point`/`parameter` record the assignment and its human-readable
 label, as for a `create_campaign` leaf.
 
 ### Campaign sweeps are self-describing

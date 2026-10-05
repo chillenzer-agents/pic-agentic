@@ -263,3 +263,54 @@ async def test_add_agenda_leaf_refuses_a_path_outside_the_root(tmp_path) -> None
     result = await _call(config, "add_agenda_leaf", {"name": "x", "spec_path": str(outside)})
     assert result["ok"] is False
     assert result["error"] == "invalid_spec_path"
+
+
+async def test_add_agenda_leaf_refuses_a_non_sim_spec(tmp_path) -> None:
+    """A leaf that is not a Runner spec must be refused at add time.
+
+    ``create_campaign`` already validates through the submission path; the
+    by-reference leaf path must not be the one hole that persists a spec every
+    later ``advance_agenda`` tick can only fail on.
+    """
+    config = _config(tmp_path)
+    write_spec_file(config, "base.json", _runner_dump())
+    await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec_path": "base.json", "patch_path": "sim.time_steps", "values": [50]},
+    )
+    result = await _call(config, "add_agenda_leaf", {"name": "bad", "spec": {"not_sim": 1}})
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    # Nothing invalid was persisted: the campaign still holds only its leaf000.
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert "bad" not in campaign.agenda.entries
+
+
+async def test_add_agenda_leaf_refuses_an_over_cap_staged_spec(tmp_path, monkeypatch) -> None:
+    """A staged leaf over the 48 KiB wire cap is refused at add time.
+
+    Staging lifts the input file cap (4 MiB), not the escaped wire cap every
+    ``submit_spec`` still meets; the leaf path must surface that early rather
+    than at the next tick.  The pinned-schema round-trip is stubbed out so the
+    size check is exercised deterministically with or without the pin.
+    """
+    from pic_agentic.server import agenda as agenda_module
+
+    monkeypatch.setattr(agenda_module, "check_spec_round_trip", lambda _dump: None)
+    config = _config(tmp_path)
+    base = _runner_dump()
+    write_spec_file(config, "base.json", base)
+    await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec_path": "base.json", "patch_path": "sim.time_steps", "values": [50]},
+    )
+    oversized = {"sim": {**base["sim"], "walltime": "a" * 60000}}
+    leaf_path = write_spec_file(config, "big.json", oversized)
+    result = await _call(config, "add_agenda_leaf", {"name": "big", "spec_path": str(leaf_path)})
+    assert result["ok"] is False
+    assert result["error"] == "spec_exceeds_inline_limit"
+    assert result["inline_limit_bytes"] == 48 * 1024
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert "big" not in campaign.agenda.entries
