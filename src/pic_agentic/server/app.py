@@ -47,10 +47,13 @@ from pic_agentic.protocol.simulation import (
 from pic_agentic.server.agenda import AgendaService, no_campaign_error
 from pic_agentic.server.hello import AckTimeoutError, HelloOutcome, HelloService
 from pic_agentic.server.simulation import (
+    DEFAULT_WAIT_POLL_S,
+    DEFAULT_WAIT_TIMEOUT_S,
     BuiltSpec,
     SimRecord,
     SubmitOutcome,
     SubmitService,
+    WaitOutcome,
     condense_events,
     resolve_script,
 )
@@ -445,6 +448,38 @@ class HelloRuntime:
             return {}
         return await self.submit_service.fetch_status(self._transport.send, sim_id)
 
+    async def wait_for_simulation(
+        self,
+        sim_id: str,
+        *,
+        target_states: list[str] | None = None,
+        timeout_s: float = DEFAULT_WAIT_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_WAIT_POLL_S,
+    ) -> WaitOutcome:
+        """Wait for a simulation to reach a target state, bounded by a deadline.
+
+        Event-driven over the registry the simclient's pushed events feed, so it
+        returns on the terminal transition rather than a sleep loop.  The
+        transport need not be started: a wait only reads the registry.
+
+        Args:
+            sim_id: The simulation to wait on.
+            target_states: State names to wait for (default: terminal).
+            timeout_s: Bounded wait, in seconds (validated by the service).
+            poll_interval_s: Wakeup ceiling, in seconds.
+
+        Returns:
+            The :class:`WaitOutcome`.  A bad ``sim_id`` or target state
+            propagates the service's ``KeyError``/``ValueError``.
+
+        """
+        return await self.submit_service.wait_for_state(
+            sim_id,
+            target_states=target_states,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+
     async def fetch_logs(self, sim_id: str, *, stream: str = "stdout", tail: int = 100) -> dict[str, Any]:
         """Run a log pull, if the transport is started.
 
@@ -782,6 +817,10 @@ SERVER_INSTRUCTIONS = (
     "or, for parameter studies, as a pypicongpu Runner spec "
     "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
     "a spec field across values). "
+    "After submit_simulation, use wait_for_simulation to block until the run "
+    "reaches a terminal state (or a target state such as job_running) instead of "
+    "polling get_status with sleeps; a wait that returns `timed_out: true` is "
+    "not an error -- call it again to keep waiting. "
     "A large spec should be passed by reference, not re-typed: call "
     "build_spec(picmi_script, write_to=...) and hand the returned spec_path to "
     "create_campaign(base_spec_path=...) or to add_agenda_leaf(spec_path=...). "
@@ -1081,12 +1120,87 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         return _redact_dict(runtime, result)
 
     @server.tool(
+        title="Wait for a simulation to finish",
+        description=(
+            "Block until one simulation reaches a target lifecycle state (by "
+            "default a terminal one: results.ready/failed/job_failed/cancelled), "
+            "or until `timeout_s` elapses. Use this instead of a poll get_status "
+            "+ sleep loop after submit_simulation: it wakes on the pushed "
+            "lifecycle event, so it returns as soon as the run finishes. On "
+            "timeout it returns `timed_out: true` with the last-known status and "
+            "events (NOT an error); call it again to keep waiting. If the run is "
+            "already terminal in a state you did not request, it returns at once "
+            "with `timed_out: false`/`matched: false` and a note. A PIConGPU "
+            "compile can take 15-20 min, so the default `timeout_s` (1800 s) "
+            "covers the build plus the start of the queue wait; `timeout_s` is "
+            "validated to lie within [0.1, 3600] s, so longer builds need repeat "
+            "calls. `last_status.phase` is `building` while the simclient has "
+            "not yet reported a scheduler job id (compile/prepare), else "
+            "`queued`/`running`/`finalizing` (job done, linking results); no "
+            "state is ever invented. Pass "
+            "`target_states=[...]` (any of accepted, simulation.submitted, "
+            "workflow.finished, simulation.job_running, simulation.job_finished, "
+            "simulation.step_finished, results.ready, simulation.failed, "
+            "simulation.cancelled, or the alias `terminal`) to return earlier, "
+            "e.g. on `simulation.job_running`. A long wait needs the MCP client "
+            "timeout to exceed `timeout_s` (the shipped install uses 120 s by "
+            "default; raise `PIC_AGENTIC_MCP_TIMEOUT_MS` for long waits)."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def wait_for_simulation(
+        sim_id: str,
+        *,
+        target_states: list[str] | None = None,
+        timeout_s: float = DEFAULT_WAIT_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_WAIT_POLL_S,
+    ) -> dict[str, Any]:
+        return await _wait_tool(
+            runtime,
+            sim_id,
+            target_states=target_states,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+
+    @server.tool(
         title="Get simulation logs",
         description="Return up to `tail` lines of a simulation's stdout, stderr or workflow log stream.",
         annotations=_READ_ONLY,
     )
     async def get_logs(sim_id: str, *, stream: str = "stdout", tail: int = 100) -> dict[str, Any]:
         return await _logs_tool(runtime, sim_id, stream=stream, tail=tail)
+
+
+async def _wait_tool(
+    runtime: HelloRuntime,
+    sim_id: str,
+    *,
+    target_states: list[str] | None,
+    timeout_s: float,
+    poll_interval_s: float,
+) -> dict[str, Any]:
+    """Wait for one simulation, degrading a bad argument to a soft error.
+
+    A timeout is returned as data (``ok: true`` with ``timed_out: true`` and
+    ``matched: false``): the wait is a convenience, and "not yet" must not be
+    reported as a failure.  An unknown simulation or target state is a soft
+    ``ok: false`` with an ``error``.
+
+    Returns:
+        The redacted :class:`WaitOutcome` dict, or a soft ``error`` dict.
+
+    """
+    try:
+        outcome = await runtime.wait_for_simulation(
+            sim_id,
+            target_states=target_states,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+    except (KeyError, ValueError) as exc:
+        return {"sim_id": sim_id, "ok": False, "error": runtime.config.redact(str(exc))}
+    return _redact_dict(runtime, {"sim_id": sim_id, **outcome.model_dump(mode="json")})
 
 
 async def _logs_tool(runtime: HelloRuntime, sim_id: str, *, stream: str, tail: int) -> dict[str, Any]:

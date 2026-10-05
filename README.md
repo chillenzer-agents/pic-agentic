@@ -488,6 +488,43 @@ schema — the result would not be attributable to a run the server can vouch fo
 A revision carried inside a leaf's own spec does not change the key when the
 server has a configured revision, so it cannot be used to force a re-run.
 
+### Waiting for a simulation, not polling
+
+`wait_for_simulation(sim_id, target_states=None, timeout_s=1800, poll_interval_s=2)`
+blocks until a simulation reaches a target lifecycle state, so an agent does not
+have to spin on `get_status`/`list_simulations` with `sleep` after a
+`submit_simulation`. The wait is **event-driven** over the fleet registry (the
+simclient's pushed lifecycle events wake it), so it returns on the terminal
+transition rather than on the poll cadence; `poll_interval_s` is only the
+ceiling on a wakeup, which keeps a dropped event from wedging the call. The
+transport need not be started -- a wait only reads the registry.
+
+- The default `target_states` is the terminal set
+  (`results.ready`/`simulation.failed`/`simulation.job_failed`/
+  `simulation.cancelled`); the alias `"terminal"` expands to it. Pass explicit
+  names (e.g. `["simulation.job_running"]`) to return earlier. An unknown name
+  is a soft error.
+- On timeout the tool returns `timed_out: true` (`ok: true`, `matched: false`)
+  with the **last-known** status and the condensed event history -- this is data,
+  not an error. Call it again to keep waiting. If the run is already terminal but
+  in a state you did not request (e.g. `simulation.failed` while waiting for
+  `results.ready`), the call returns immediately (`timed_out: false`,
+  `matched: false`) with a note that no requested state is reachable.
+- `timeout_s` is bounded to `[0.1, 3600]` s and validated, not silently
+  clamped. The default (1800 s) accommodates the 15-20 min PIConGPU compile plus
+  the start of the queue wait; longer waits repeat the call.
+- `last_status.phase` is a derived label over what the event stream already
+  reported: `building` while the simclient has not yet emitted a scheduler
+  `job_id` (the compile/prepare window), else `queued`/`running`/`finalizing`.
+  No lifecycle state is ever invented; a timeout during the build phase says so
+  explicitly.
+
+A single MCP tool call cannot hold the connection indefinitely, so the wait is
+bounded by `timeout_s` **and** by the MCP client's request timeout. The shipped
+installer registers the server with a 120 s request budget; for a long wait,
+raise `PIC_AGENTIC_MCP_TIMEOUT_MS` so the client timeout exceeds `timeout_s`
+(the same budget the async result path already relies on).
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path
