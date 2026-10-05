@@ -380,9 +380,11 @@ class SubmitService:
         #: handshake; None until a hello runs or the client predates the probe.
         self.client_capabilities: ClientCapabilities | None = None
         #: Wakeup queues for live :meth:`wait_for_state` callers, keyed by
-        #: ``sim_id``.  A projected event sets the ``asyncio.Event`` so a wait
-        #: returns on the terminal transition instead of burning a sleep loop.
-        self._waiters: dict[str, asyncio.Event] = {}
+        #: ``sim_id``.  Each waiter owns its own ``asyncio.Event`` so a
+        #: projected event wakes *every* concurrent waiter for the sim; a
+        #: returning waiter removes only its own event and cannot strand a
+        #: sibling (M2).
+        self._waiters: dict[str, set[asyncio.Event]] = {}
 
     def set_client_capabilities(self, capabilities: ClientCapabilities | None) -> None:
         """Record the client capabilities learned from the ``hello`` handshake.
@@ -734,8 +736,7 @@ class SubmitService:
             sim_id: The simulation whose record just advanced.
 
         """
-        event = self._waiters.get(sim_id)
-        if event is not None:
+        for event in self._waiters.get(sim_id, set()):
             event.set()
 
     async def wait_for_state(
@@ -786,7 +787,8 @@ class SubmitService:
             msg = f"unknown simulation {sim_id!r}"
             raise KeyError(msg)
         interval = max(poll_interval_s, MIN_WAIT_POLL_S)
-        wakeup = self._waiters.setdefault(sim_id, asyncio.Event())
+        wakeup = asyncio.Event()
+        self._waiters.setdefault(sim_id, set()).add(wakeup)
         started = asyncio.get_running_loop().time()
         deadline = started + timeout
         try:
@@ -811,7 +813,11 @@ class SubmitService:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(wakeup.wait(), timeout=min(interval, remaining))
         finally:
-            self._waiters.pop(sim_id, None)
+            waiters = self._waiters.get(sim_id)
+            if waiters is not None:
+                waiters.discard(wakeup)
+                if not waiters:
+                    self._waiters.pop(sim_id, None)
         return self._wait_outcome(
             sim_id,
             state=observed,
