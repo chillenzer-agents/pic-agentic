@@ -104,6 +104,9 @@ async def test_run_analysis_description_documents_the_program() -> None:
         assert keyword in description, keyword
     assert '"op": "histogram"' in description
     assert description.index("Worked example") < description.index('"selectors"')
+    # The precedence of node attrs over declared selectors is stated unambiguously.
+    assert "authoritative" in description
+    assert "falls back" in description
 
 
 async def test_run_analysis_worked_example_is_valid_and_parses() -> None:

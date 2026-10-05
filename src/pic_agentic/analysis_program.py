@@ -205,6 +205,15 @@ class AnalysisProgram(BaseModel):
     selectors, an array); an optional ``selectors`` list documents the named
     inputs.  Reductions turn an array into a scalar, so the common case is a
     program whose ``output`` is a ``reduce`` node over a ``var`` selector.
+
+    A ``var`` node may carry ``record``/``component``/``iteration`` directly;
+    those attributes are authoritative (a missing one falls back to the matching
+    declared selector, then to name-only resolution).  A node attribute that
+    *contradicts* the declared selector is rejected at validation time rather
+    than silently preferring one, because a conflict means the program says two
+    different things about the same input.  For the same reason declared
+    selector names must be unique, and one name may not be referenced by two
+    ``var`` nodes whose attributes differ.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -218,18 +227,29 @@ class AnalysisProgram(BaseModel):
     @field_validator("selectors")
     @classmethod
     def _selector_cap(cls, value: list[VarRef]) -> list[VarRef]:
-        """Bound the number of declared selectors.
+        """Bound the number of declared selectors and enforce unique names.
+
+        A duplicate name would make "the declared selector" ambiguous: the
+        conflict checker and the evaluator must agree on which declaration
+        applies, so duplicates are rejected outright rather than resolved by an
+        accidental last- or first-wins rule.
 
         Returns:
             The validated selector list.
 
         Raises:
-            ValueError: If too many selectors are declared.
+            ValueError: If too many selectors are declared or a name repeats.
 
         """
         if len(value) > MAX_SELECTORS:
             msg = f"at most {MAX_SELECTORS} selectors are allowed, got {len(value)}"
             raise ValueError(msg)
+        seen: set[str] = set()
+        for selector in value:
+            if selector.name in seen:
+                msg = f"duplicate selector name {selector.name!r}; selector names must be unique"
+                raise ValueError(msg)
+            seen.add(selector.name)
         return value
 
     @model_validator(mode="after")
@@ -256,7 +276,83 @@ class AnalysisProgram(BaseModel):
             if exponent > MAX_EXPONENT:
                 msg = f"exponent {exponent} exceeds {MAX_EXPONENT}"
                 raise ValueError(msg)
+        self._reject_attribute_conflicts()
         return self
+
+    def declared_by_name(self) -> dict[str, VarRef]:
+        """Return the declared selectors keyed by name.
+
+        Selector names are unique (see :meth:`_selector_cap`), so this mapping
+        is unambiguous and both the conflict checker and the evaluator can share
+        one lookup instead of drifting apart.
+
+        Returns:
+            ``selector name -> declared VarRef``.
+
+        """
+        return {selector.name: selector for selector in self.selectors}
+
+    def _reject_attribute_conflicts(self) -> None:
+        """Reject ambiguous selector references.
+
+        Two situations are rejected because the program would otherwise state
+        two different things about the same input while one is silently dropped:
+
+        * A ``var`` attribute that *contradicts* its declared selector (node
+          attributes are authoritative, but a disagreement is a mistake).
+        * The same name referenced by several ``var`` nodes with different
+          attributes and no declaration to reconcile them; the evaluator caches
+          per name, so only one would drive resolution.
+
+        """
+        declared = self.declared_by_name()
+        seen: dict[str, VarRef] = {}
+        for expression in self._expressions():
+            for ref in _iter_var_refs(expression):
+                self._check_declared_conflict(ref, declared)
+                self._check_same_name_conflict(ref, seen)
+
+    @staticmethod
+    def _check_declared_conflict(ref: VarRef, declared: dict[str, VarRef]) -> None:
+        """Reject a ``var`` attribute that contradicts its declared selector.
+
+        Raises:
+            ValueError: If the node contradicts the declaration.
+
+        """
+        selector = declared.get(ref.name)
+        if selector is None:
+            return
+        for field in ("record", "component", "iteration"):
+            node_value = getattr(ref, field)
+            declared_value = getattr(selector, field)
+            if node_value is not None and declared_value is not None and node_value != declared_value:
+                msg = (
+                    f"var {ref.name!r} sets {field}={node_value!r} but its declared selector "
+                    f"sets {field}={declared_value!r}"
+                )
+                raise ValueError(msg)
+
+    @staticmethod
+    def _check_same_name_conflict(ref: VarRef, seen: dict[str, VarRef]) -> None:
+        """Reject two ``var`` nodes sharing a name but not their attributes.
+
+        Raises:
+            ValueError: If the name was already seen with different attributes.
+
+        """
+        previous = seen.get(ref.name)
+        if previous is None:
+            seen[ref.name] = ref
+            return
+        if _ref_attrs(previous) != _ref_attrs(ref):
+            msg = (
+                f"selector {ref.name!r} is referenced with different attributes "
+                f"({previous.record!r}, {previous.component!r}, {previous.iteration!r}) and "
+                f"({ref.record!r}, {ref.component!r}, {ref.iteration!r}); give one "
+                f"reference or use distinct names"
+            )
+            raise ValueError(msg)
 
     def _expressions(self) -> list[Any]:
         """Return the root expressions of this program.
@@ -266,6 +362,33 @@ class AnalysisProgram(BaseModel):
 
         """
         return [self.output, self.points] if self.points is not None else [self.output]
+
+
+def _ref_attrs(ref: VarRef) -> tuple[str | None, str | None, int | str | None]:
+    """Return a ``var`` node's ``(record, component, iteration)`` triple.
+
+    Returns:
+        The three attributes, so two references can be compared for equality.
+
+    """
+    return (ref.record, ref.component, ref.iteration)
+
+
+def _iter_var_refs(node: Any) -> list[VarRef]:
+    """Collect every ``var`` node under ``node``, in traversal order.
+
+    Returns:
+        The referenced ``VarRef`` nodes.
+
+    """
+    refs: list[VarRef] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if getattr(current, "kind", None) == "var":
+            refs.append(current)
+        stack.extend(getattr(current, field) for field in _CHILDREN.get(getattr(current, "kind", None), ()))
+    return refs
 
 
 def _measure(node: Any, depth: int = 1) -> tuple[int, int, int]:
