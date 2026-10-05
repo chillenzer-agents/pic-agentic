@@ -1548,11 +1548,14 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             '"right": {"kind": "var", "name": "px"}}, '
             '"right": {"kind": "binop", "op": "mul", "left": {"kind": "var", "name": "py"}, '
             '"right": {"kind": "var", "name": "py"}}}}}\n'
-            "Units: results are in PIConGPU internal (normalized) code units; the "
-            "mesh components carry no unit metadata the reader can retrieve, so "
-            "`result.unit_note` states 'normalized code units - not a physical "
-            "unit' explicitly and `result.selectors` echoes the "
-            "record/component/iteration each input was read from."
+            "Units: `result.selectors` echoes the record/component/iteration each "
+            "input was read from, together with that component's openPMD unit "
+            "metadata (`unit_SI`, the factor to SI, and `unit_dimension`, the "
+            "seven SI base exponents) wherever the file records it. "
+            "`result.unit_note` explains the convention and never asserts a "
+            "physical unit for the derived result; when the file records no unit "
+            "metadata it states that the raw values are in PIConGPU internal "
+            "(normalized) code units."
         ),
         annotations=_CONTROL_ANNOTATIONS,
     )

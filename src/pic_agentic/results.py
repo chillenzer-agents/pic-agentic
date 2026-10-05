@@ -27,6 +27,7 @@ itself.
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import importlib
 import importlib.util
@@ -821,6 +822,60 @@ def _load_dataset(path: Path, record: str | None, component: str | None, iterati
         msg = f"cannot read record {name!r}: {exc}"
         raise ResultsReaderError(msg) from exc
     return _flatten(chunk)
+
+
+def _dataset_unit_info(
+    path: Path,
+    record: str | None,
+    component: str | None,
+    iteration: int | str | None,
+) -> dict[str, Any]:
+    """Read the resolved mesh component's openPMD unit metadata, best-effort.
+
+    openPMD records expose ``Record_Component.unit_SI`` (a scale factor to SI)
+    and ``Mesh.unit_dimension`` (the seven SI base exponents); PIConGPU sets both
+    for E/B fields (L4/M3).  The same allow-listed record/component resolution as
+    :func:`_load_dataset` is used, so the reported units describe exactly the
+    component the program read.
+
+    Returns:
+        ``{"unit_SI": float, "unit_dimension": [float, ...]}`` with whichever
+        keys the backend exposes; ``{}`` when neither is present.
+
+    Raises:
+        ResultsReaderError: If the series/record/component cannot be resolved.
+
+    """
+    series = _open_series(path)
+    try:
+        step = series.iterations[_select_iteration(series, iteration)]
+    except (KeyError, IndexError) as exc:
+        msg = f"iteration {iteration!r} not found in the series"
+        raise ResultsReaderError(msg) from exc
+    names = list(step.meshes)
+    if not names:
+        msg = "openPMD iteration has no meshes"
+        raise ResultsReaderError(msg)
+    name = record or names[0]
+    if name not in names:
+        msg = f"record {name!r} not found; available: {', '.join(names)}"
+        raise ResultsReaderError(msg)
+    mesh = step.meshes[name]
+    components = [c for c in _record_components(mesh) if c != _SCALAR_COMPONENT]
+    selected = component or (components[0] if components else None)
+    if selected is not None and components and selected not in components:
+        msg = f"component {selected!r} not found; available: {', '.join(components)}"
+        raise ResultsReaderError(msg)
+    dataset = mesh[selected] if selected is not None and components else mesh
+    info: dict[str, Any] = {}
+    unit_si = getattr(dataset, "unit_SI", None)
+    if unit_si is not None:
+        info["unit_SI"] = float(unit_si)
+    dimension = getattr(mesh, "unit_dimension", None)
+    if dimension is not None:
+        with contextlib.suppress(TypeError, ValueError):  # an odd backend value is simply skipped
+            info["unit_dimension"] = [float(exponent) for exponent in dimension]
+    return info
 
 
 def read_slice(
@@ -2593,7 +2648,7 @@ def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:
     )
 
 
-def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: ignore[too-many-return-statements] - one return per clean error
+def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: ignore[too-many-return-statements,complex-structure] - one return per clean error
     """Answer a ``COMPUTE`` request by evaluating a validated analysis program.
 
     Each ``var`` selector in the program is resolved to one openPMD mesh
@@ -2623,6 +2678,8 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
     if preflight is not None:
         return preflight
 
+    units_by_selector: dict[str, dict[str, Any]] = {}
+
     def resolve(selector: Any) -> list[float]:
         # A selector resolves to one mesh component; the reader applies the
         # same validation the slice path uses.  A selector that omits
@@ -2639,7 +2696,18 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
         if series is None:
             msg = "no openPMD output found for this run"
             raise ResultsReaderError(msg)
-        return _load_dataset(series, record, component, iteration)
+        values = _load_dataset(series, record, component, iteration)
+        # The same resolution is reused to read the component's unit metadata.
+        # This is best-effort: a backend that exposes none, or a stubbed reader
+        # used in tests, simply yields no keys and the note falls back to the
+        # internal/normalized convention (M3).
+        try:
+            info = _dataset_unit_info(series, record, component, iteration)
+        except (ResultsUnavailable, ResultsReaderError, KeyError, OSError, ValueError):
+            info = {}
+        if info:
+            units_by_selector[selector.name] = info
+        return values
 
     try:
         payload = evaluate(program, resolve)
@@ -2649,7 +2717,7 @@ def _compute(params: ResultParams, *, output: Path) -> dict[str, Any]:  # ruff: 
         return _error(SimulationErrorCode.UNSUPPORTED, str(exc))
     except (ResultsReaderError, KeyError, OSError, ValueError) as exc:
         return _error(SimulationErrorCode.NO_RESULTS, str(exc))
-    return _shape_compute(payload, program=program, params=params)
+    return _shape_compute(payload, program=program, params=params, units_by_selector=units_by_selector)
 
 
 def _compute_preflight(params: ResultParams, program: AnalysisProgram, output: Path) -> dict[str, Any] | None:
@@ -2702,19 +2770,27 @@ def _referenced_selector_names(program: Any) -> list[str]:
     return names
 
 
-def _compute_units(program: Any, params: ResultParams) -> dict[str, Any]:
-    """Describe the units of a compute result truthfully (L4).
+def _compute_units(
+    program: Any,
+    params: ResultParams,
+    units_by_selector: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Describe the units of a compute result truthfully (L4/M3).
 
-    A declarative program is arithmetic over raw openPMD mesh components whose
-    fields carry no unit metadata we can read, so the honest statement is *which*
-    records/components and iteration fed the result plus the code/normalized unit
-    convention - never an invented physical unit.  The selector echo also makes
-    the result reproducible.
+    openPMD records *do* expose unit metadata - ``Record_Component.unit_SI`` (a
+    scale factor to SI) and ``Mesh.unit_dimension`` - which the reader can reach,
+    so the note must not claim otherwise.  The selector echo therefore carries
+    each resolved component's ``unit_SI``/``unit_dimension`` where the file
+    records them, and the note points at those fields rather than asserting a
+    physical unit for the *derived* result (which is the program's arithmetic,
+    not any single component's raw unit).  Only when no selector has any unit
+    metadata does the note fall back to the internal/normalized convention.
 
     Returns:
         A ``{"unit_note", "selectors"}`` fragment.
 
     """
+    units_by_selector = units_by_selector or {}
     referenced = _referenced_selector_names(program)
     declared = {selector.name: selector for selector in program.selectors}
     # Echo the declared selectors in declaration order first (the caller's own
@@ -2731,17 +2807,24 @@ def _compute_units(program: Any, params: ResultParams) -> dict[str, Any]:
             "iteration": (
                 selector.iteration if selector is not None and selector.iteration is not None else params.iteration
             ),
+            **units_by_selector.get(name, {}),
         }
         for name, selector in ordered
     ]
     if not selectors:
         # A constant/pure program reads no mesh data.
         note = "unitless: the program reads no mesh data (a constant or pure expression)"
+    elif any("unit_SI" in selector or "unit_dimension" in selector for selector in selectors):
+        note = (
+            "result is computed from the raw openPMD mesh components named in `selectors`: the values are "
+            "in each component's internal units, and `unit_SI` (the scale factor to SI) and `unit_dimension` "
+            "(the seven SI base exponents) are echoed per selector where the file records them; the derived "
+            "result's unit follows the program's arithmetic, so it is not asserted here"
+        )
     else:
         note = (
-            "result is in PIConGPU internal (normalized) code units: the mesh "
-            "components named in `selectors` carry no unit metadata this reader "
-            "can retrieve, so no physical unit is asserted"
+            "result is in PIConGPU internal (normalized) code units: the file records no unit metadata "
+            "for the mesh components named in `selectors`, so no physical unit is asserted"
         )
     return {"unit_note": note, "selectors": selectors}
 
@@ -2751,6 +2834,7 @@ def _shape_compute(
     *,
     program: Any = None,
     params: ResultParams | None = None,
+    units_by_selector: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Shape an evaluator payload into the frozen result-ack fields.
 
@@ -2758,7 +2842,7 @@ def _shape_compute(
     (``data_encoding="float"``), a scalar as ``stats["value"]``, and the
     evaluator's metadata as ``result``.  When the program is supplied the
     result metadata is augmented with a truthful ``unit_note`` and the selector
-    echo (L4).
+    echo (L4/M3).
 
     Returns:
         The shaped ack fields, or a ``RESULT_TOO_LARGE`` error.
@@ -2769,7 +2853,7 @@ def _shape_compute(
     if "points" in payload:
         metadata["points"] = payload["points"]
     if program is not None and params is not None:
-        metadata.update(_compute_units(program, params))
+        metadata.update(_compute_units(program, params, units_by_selector))
     if isinstance(result, list):
         if len(result) > SLICE_MAX_POINTS:
             result = result[:SLICE_MAX_POINTS]
