@@ -58,7 +58,7 @@ OPENCODE_JSON="${OPENCODE_JSON:-$HOME/.config/opencode/opencode.json}"
 AGENDA_FILE="${AGENDA_FILE:-$HOME/.config/pic-agentic/campaign.json}"
 PY="${PYTHON:-python3}"
 # Tool-surface guard: the onboarding surface this installer is verified against.
-EXPECTED_TOOLS="${PIC_AGENTIC_EXPECTED_TOOLS:-32}"
+EXPECTED_TOOLS="${PIC_AGENTIC_EXPECTED_TOOLS:-36}"
 # Seconds to wait for the room backfill in the preflight.
 ROOM_PREFLIGHT_TIMEOUT_S="${PIC_AGENTIC_ROOM_PREFLIGHT_TIMEOUT_S:-60}"
 # mcp server request timeout (ms).  Conservatively high: the simclient's async
