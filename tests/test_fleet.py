@@ -152,6 +152,14 @@ def test_checkpoint_record_is_still_stalled() -> None:
     assert [a.kind for a in alerts] == ["stalled"]
 
 
+def test_invalid_duck_typed_phase_falls_back_to_derivation() -> None:
+    """A bogus ``phase`` string must not leak into ``by_phase`` (Nit)."""
+    from types import SimpleNamespace
+
+    record = SimpleNamespace(state="simulation.job_running", active=True, job_id=2, phase="bogus")
+    assert fleet_summary([record]).by_phase == {"running": 1}
+
+
 def test_active_without_timestamp_is_not_stalled() -> None:
     records = [_record("a", "simulation.submitted", active=True)]
     assert detect_alerts(records, now=NOW, stall_after_s=60) == []

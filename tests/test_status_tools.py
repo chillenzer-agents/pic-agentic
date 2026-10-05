@@ -387,6 +387,42 @@ async def test_get_events_explains_an_empty_building_phase() -> None:
     assert "SLURM job" in payload["note"]
 
 
+async def test_get_events_terminal_note_does_not_blame_filters() -> None:
+    """A finished, unfiltered empty result must not point at `since`/`types`."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.RESULTS_READY.value
+    record.active = False
+
+    payload = (await server.call_tool("get_events", {"sim_id": SIM_ID})).structured_content
+    assert payload["events"] == []
+    assert payload["phase"] == "done"
+    assert "finished" in payload["note"]
+    assert "filters" not in payload["note"]
+
+
+async def test_get_events_terminal_note_with_filter_mentions_filters() -> None:
+    """A finished run whose filter excluded everything says so honestly."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.RESULTS_READY.value
+    record.active = False
+
+    payload = (
+        await server.call_tool("get_events", {"sim_id": SIM_ID, "types": ["simulation.job_running"]})
+    ).structured_content
+    assert payload["events"] == []
+    assert "filters" in payload["note"]
+
+
 async def test_get_status_redacts_secrets() -> None:
     from pic_agentic.config import Config
     from pic_agentic.server.app import build_server

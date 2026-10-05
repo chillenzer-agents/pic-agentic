@@ -70,6 +70,10 @@ _DONE_STATES = frozenset({"results.ready", "simulation.job_finished"})
 #: States that mean a run failed.
 _FAILED_STATES = frozenset({"simulation.failed", "simulation.job_failed"})
 
+#: The valid phase values; a duck-typed record's ``phase`` is trusted only when
+#: it is one of these, so a wrong string cannot leak into ``by_phase``.
+_KNOWN_PHASES = frozenset(member.value for member in SimulationPhase)
+
 
 def fleet_summary(records: Sequence[SimRecord] | Iterable[SimRecord]) -> FleetSummary:
     """Aggregate the fleet into counts and a mean progress percentage.
@@ -210,7 +214,7 @@ def _phase_of(record: SimRecord) -> str:
 
     """
     phase = getattr(record, "phase", None)
-    if isinstance(phase, str) and phase:
+    if isinstance(phase, str) and phase in _KNOWN_PHASES:
         return phase
     return simulation_phase(
         str(getattr(record, "state", "") or ""),
