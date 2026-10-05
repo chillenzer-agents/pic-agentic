@@ -16,6 +16,7 @@ lifecycle events (``simulation.submitted``/``workflow.finished``/
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
@@ -23,7 +24,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from pic_agentic.protocol.simulation import (
     LOG_STREAMS,
@@ -64,6 +65,31 @@ TERMINAL_STATES = frozenset(
         SimulationState.CANCELLED.value,
     },
 )
+
+#: Every state name a caller may name as a wait target, plus the special
+#: ``"terminal"`` alias that expands to :data:`TERMINAL_STATES`.
+_KNOWN_WAIT_STATES = frozenset(state.value for state in SimulationState)
+
+#: Default bound for :meth:`SubmitService.wait_for_state`.  Deliberately large
+#: enough to cover a 15-20 min PIConGPU compile plus the queue wait; a caller
+#: that needs longer calls again (the tool returns ``timed_out``, never an
+#: error).
+DEFAULT_WAIT_TIMEOUT_S = 1800.0
+
+#: Floor for ``timeout_s`` (rejects zero/negative); small enough for tests.
+MIN_WAIT_TIMEOUT_S = 0.1
+
+#: Ceiling for ``timeout_s``: a single MCP tool call must not hold the
+#: connection indefinitely.  Callers wait in bounded slices.
+MAX_WAIT_TIMEOUT_S = 3600.0
+
+#: Default wakeup cadence.  The wait is event-driven (it wakes as soon as a
+#: lifecycle event is projected); the poll is only the ceiling for a wakeup so a
+#: lost event cannot wedge the call until the deadline.
+DEFAULT_WAIT_POLL_S = 2.0
+
+#: Floor for ``poll_interval_s``.
+MIN_WAIT_POLL_S = 0.05
 
 #: Cap on the retained event log (the registry is projected from it and, on a
 #: fresh start, from the signed-room backfill).
@@ -224,6 +250,54 @@ class SubmitOutcome(BaseModel):
         return not self.error
 
 
+class WaitOutcome(BaseModel):
+    """The result of one bounded wait for a simulation to reach a state.
+
+    A timeout is data (``timed_out=True``) carrying the last-known record, not
+    an error: the wait is a convenience over the event stream, so "not yet"
+    must never be reported as a failure.  The caller decides whether to wait
+    again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    #: The state the wait resolved on (the requested target, or the last-known
+    #: state on a timeout).
+    state: str
+    #: Whether ``state`` is one the caller asked to wait for.
+    matched: bool
+    #: True iff the deadline elapsed before any target was reached.
+    timed_out: bool
+    #: Seconds actually waited (bounded by the deadline).
+    waited_s: float
+    #: The target states the wait was watching (the expanded set for
+    #: ``"terminal"``), so a caller can see what it was waiting for.
+    target_states: list[str] = Field(default_factory=list)
+    #: The terminal/requested events observed for this simulation in the
+    #: registry's event log, oldest first (bounded by ``condense_events``).
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    #: The last-known registry projection at return time (progress and failure
+    #: detail); never invented -- it is exactly what the event stream says.
+    last_status: dict[str, Any] = Field(default_factory=dict)
+    #: A build/queue-phase note when no scheduler job id is known yet, so a
+    #: timeout during the 15-20 min compile/queue window is not read as a hang.
+    note: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        """Whether the wait executed (a timeout is data, not a failure).
+
+        Always True for a constructed outcome: the only failure mode -- a bad
+        ``sim_id`` or target -- is rejected before a :class:`WaitOutcome` is
+        built (the tool then returns ``ok: false`` with an ``error``).  Use
+        ``matched``/``timed_out`` to distinguish a reached target from a
+        deadline, never ``ok``.
+        """
+        return True
+
+
 class BuiltSpec(BaseModel):
     """A dry-run build result: a Runner spec plus the size it would occupy.
 
@@ -305,6 +379,12 @@ class SubmitService:
         #: Latest capability set the simclient advertised over the ``hello``
         #: handshake; None until a hello runs or the client predates the probe.
         self.client_capabilities: ClientCapabilities | None = None
+        #: Wakeup queues for live :meth:`wait_for_state` callers, keyed by
+        #: ``sim_id``.  Each waiter owns its own ``asyncio.Event`` so a
+        #: projected event wakes *every* concurrent waiter for the sim; a
+        #: returning waiter removes only its own event and cannot strand a
+        #: sibling (M2).
+        self._waiters: dict[str, set[asyncio.Event]] = {}
 
     def set_client_capabilities(self, capabilities: ClientCapabilities | None) -> None:
         """Record the client capabilities learned from the ``hello`` handshake.
@@ -546,6 +626,7 @@ class SubmitService:
         record.last_event_ts = message.ts
         record.active = state not in TERMINAL_STATES
         self.registry[sim_id] = record
+        self._wake_waiters(sim_id)
 
     def _project_ack(self, message: RcpMessage) -> None:
         """Register the simulation named by a submit ack, before its first event.
@@ -644,6 +725,155 @@ class SubmitService:
         if active_only:
             return [record for record in records if record.active]
         return records
+
+    def _wake_waiters(self, sim_id: str) -> None:
+        """Wake every live :meth:`wait_for_state` caller for ``sim_id``.
+
+        Called after an event is projected so a wait returns promptly on the
+        transition it is watching instead of on its poll ceiling.
+
+        Args:
+            sim_id: The simulation whose record just advanced.
+
+        """
+        for event in self._waiters.get(sim_id, set()):
+            event.set()
+
+    async def wait_for_state(
+        self,
+        sim_id: str,
+        *,
+        target_states: Iterable[str] | None = None,
+        timeout_s: float = DEFAULT_WAIT_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_WAIT_POLL_S,
+    ) -> WaitOutcome:
+        """Block until ``sim_id`` reaches a target state, or the deadline.
+
+        The wait is **event-driven**: :meth:`_project_event` sets a wakeup
+        when a lifecycle event for this simulation is projected, so the call
+        returns on the terminal transition rather than on the poll cadence.
+        ``poll_interval_s`` is only the ceiling on a wakeup (and bounds how
+        often the pending status is re-read), so a dropped event cannot wedge
+        the call past the deadline.
+
+        This does not itself pull from the cluster: it waits on the registry the
+        simclient's pushed events feed.  For the build/queue phase in which the
+        simclient has not yet emitted a scheduler job id, the outcome's
+        ``last_status.phase`` reads ``"building"`` (never an invented lifecycle
+        state); the wait then keeps watching until the deadline.
+
+        Args:
+            sim_id: The simulation to wait on.
+            target_states: State names to wait for.  Defaults to the terminal
+                set (:data:`TERMINAL_STATES`); the special name ``"terminal"``
+                expands to that set.  Unknown names are rejected.
+            timeout_s: Bounded wait, in seconds.  Must lie within
+                ``[MIN_WAIT_TIMEOUT_S, MAX_WAIT_TIMEOUT_S]``, else a
+                ``ValueError`` is raised.
+            poll_interval_s: Wakeup ceiling, in seconds.  Clamped to at least
+                :data:`MIN_WAIT_POLL_S`.
+
+        Returns:
+            The :class:`WaitOutcome`; a deadline elapse yields
+            ``timed_out=True`` with the last-known status, never an error.
+
+        Raises:
+            KeyError: If ``sim_id`` is unknown to the registry.
+
+        """
+        targets, terminal_only = _resolve_wait_targets(target_states)
+        timeout = _validate_timeout(timeout_s)
+        if self.get(sim_id) is None:
+            msg = f"unknown simulation {sim_id!r}"
+            raise KeyError(msg)
+        interval = max(poll_interval_s, MIN_WAIT_POLL_S)
+        wakeup = asyncio.Event()
+        self._waiters.setdefault(sim_id, set()).add(wakeup)
+        started = asyncio.get_running_loop().time()
+        deadline = started + timeout
+        try:
+            while True:
+                record = self.get(sim_id)
+                if record is not None and record.state in targets:
+                    observed = record.state
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                # A terminal run that is not a requested target can never reach
+                # one (terminal is monotonic), so return at once instead of
+                # burning the whole deadline (M3).
+                if record is not None and record.state in TERMINAL_STATES:
+                    return self._wait_outcome(
+                        sim_id,
+                        state=record.state,
+                        matched=False,
+                        timed_out=False,
+                        waited_s=asyncio.get_running_loop().time() - started,
+                        targets=sorted(targets),
+                        terminal_only=terminal_only,
+                    )
+                if remaining <= 0:
+                    observed = record.state if record is not None else ""
+                    return self._wait_outcome(
+                        sim_id,
+                        state=observed,
+                        matched=False,
+                        timed_out=True,
+                        waited_s=asyncio.get_running_loop().time() - started,
+                        targets=sorted(targets),
+                        terminal_only=terminal_only,
+                    )
+                wakeup.clear()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(wakeup.wait(), timeout=min(interval, remaining))
+        finally:
+            waiters = self._waiters.get(sim_id)
+            if waiters is not None:
+                waiters.discard(wakeup)
+                if not waiters:
+                    self._waiters.pop(sim_id, None)
+        return self._wait_outcome(
+            sim_id,
+            state=observed,
+            matched=True,
+            timed_out=False,
+            waited_s=asyncio.get_running_loop().time() - started,
+            targets=sorted(targets),
+            terminal_only=terminal_only,
+        )
+
+    def _wait_outcome(
+        self,
+        sim_id: str,
+        *,
+        state: str,
+        matched: bool,
+        timed_out: bool,
+        waited_s: float,
+        targets: list[str],
+        terminal_only: bool,
+    ) -> WaitOutcome:
+        """Assemble a :class:`WaitOutcome` from the current registry state.
+
+        Returns:
+            The outcome, its events/status taken verbatim from the event log
+            and registry projection (never invented).
+
+        """
+        record = self.get(sim_id)
+        # The whole condensed history (all states), so the caller sees the path
+        # to the matched state, not only the target rows.
+        events = condense_events(self.event_log, sim_id=sim_id, limit=MAX_EVENT_PAGE)
+        return WaitOutcome(
+            sim_id=sim_id,
+            state=state,
+            matched=matched,
+            timed_out=timed_out,
+            waited_s=round(waited_s, 3),
+            target_states=targets,
+            events=events,
+            last_status=_record_status(record) if record is not None else {},
+            note=_wait_note(record, matched=matched, timed_out=timed_out, terminal_only=terminal_only),
+        )
 
     def _outcome_from_ack(self, cmd_id: str, ack: RcpMessage) -> SubmitOutcome:
         return SubmitOutcome(
@@ -1067,6 +1297,177 @@ class SubmitService:
         return dict(ack.payload)
 
 
+def _resolve_wait_targets(target_states: Iterable[str] | None) -> tuple[frozenset[str], bool]:
+    """Expand and validate the requested wait target states.
+
+    Args:
+        target_states: The caller's names, or None for the terminal default.
+
+    Returns:
+        ``(targets, terminal_only)`` where ``targets`` is the expanded set and
+        ``terminal_only`` records that the caller asked only for the terminal
+        set (used to phrase the build/queue note).
+
+    Raises:
+        ValueError: If any name is unknown.
+
+    """
+    if target_states is None:
+        return TERMINAL_STATES, True
+    requested = list(target_states)
+    if not requested or requested == ["terminal"]:
+        return TERMINAL_STATES, True
+    targets: set[str] = set()
+    for name in requested:
+        if name == "terminal":
+            targets |= TERMINAL_STATES
+            continue
+        if name not in _KNOWN_WAIT_STATES:
+            msg = f"unknown wait target state {name!r}"
+            raise ValueError(msg)
+        targets.add(name)
+    return frozenset(targets), targets <= TERMINAL_STATES
+
+
+def _validate_timeout(timeout_s: float) -> float:
+    """Validate a requested wait timeout against the supported bounds.
+
+    A bounded wait is the whole point of the primitive, so an out-of-range
+    request is refused explicitly rather than silently clamped: the caller
+    learns the real limit instead of getting a shorter wait than it asked for.
+
+    Args:
+        timeout_s: The caller's requested bound.
+
+    Returns:
+        ``timeout_s`` as a float, unchanged.
+
+    Raises:
+        ValueError: If ``timeout_s`` is outside
+            ``[MIN_WAIT_TIMEOUT_S, MAX_WAIT_TIMEOUT_S]``.
+
+    """
+    value = float(timeout_s)
+    if not MIN_WAIT_TIMEOUT_S <= value <= MAX_WAIT_TIMEOUT_S:
+        msg = f"timeout_s must be between {MIN_WAIT_TIMEOUT_S:g} and {MAX_WAIT_TIMEOUT_S:g} seconds, got {value:g}"
+        raise ValueError(msg)
+    return value
+
+
+def _record_status(record: SimRecord) -> dict[str, Any]:
+    """Project one record into the wait's ``last_status`` block.
+
+    A non-terminal record with no scheduler ``job_id`` is reported with
+    ``phase: "building"`` (the build/prepare/queue window) so a caller is told
+    "still building", not "still running"; a record with a job id is
+    ``phase: "queued"``/``"running"`` from its state.  The data is the
+    registry's own projection, never invented.
+
+    Args:
+        record: The latest-run record for the simulation.
+
+    Returns:
+        A JSON-safe status dict.
+
+    """
+    status: dict[str, Any] = {
+        "state": record.state,
+        "job_id": record.job_id,
+        "slurm_state": record.slurm_state,
+        "step": record.step,
+        "percent": record.percent,
+        "eta_s": record.eta_s,
+        "error": record.error,
+        "error_code": record.error_code,
+        "active": record.active,
+    }
+    phase = _record_phase(record)
+    if phase is not None:
+        status["phase"] = phase
+    return status
+
+
+def _record_phase(record: SimRecord) -> str | None:
+    """Derive a build/queue/running phase hint from a record.
+
+    ``None`` for a terminal record (no phase is meaningful).  The hint is
+    purely a relabelling of the states the event stream already reported, so it
+    never asserts more than the registry knows.
+
+    Args:
+        record: The latest-run record.
+
+    Returns:
+        ``"building"``, ``"queued"``, ``"running"``, ``"finalizing"`` or None.
+
+    """
+    # If a canonical ``phase`` ever lands on the record (H4/workstream C), use
+    # it rather than deriving a second opinion: the registry stays the single
+    # source of truth for the phase label.
+    canonical = getattr(record, "phase", None)
+    if isinstance(canonical, str) and canonical:
+        return canonical
+    if record.state in TERMINAL_STATES:
+        return None
+    if record.job_id is None:
+        # accepted / workflow.finished with no scheduler id yet: the compile and
+        # prepare stages, before sbatch returned a job id.
+        return "building"
+    if record.state == SimulationState.JOB_RUNNING.value or record.slurm_state == "RUNNING":
+        return "running"
+    if record.state == SimulationState.JOB_FINISHED.value:
+        # The scheduler job is done; the simclient is linking/probing results.
+        return "finalizing"
+    return "queued"
+
+
+def _wait_note(
+    record: SimRecord | None,
+    *,
+    matched: bool,
+    timed_out: bool,
+    terminal_only: bool,
+) -> str | None:
+    """Phrase the human-readable note for a wait outcome.
+
+    A timeout during the build/queue window is deliberately called out: a
+    PIConGPU compile can take 15-20 min and the queue wait longer, so "no
+    terminal state yet" is not a hang and the caller should wait again.
+
+    Args:
+        record: The latest-run record, if known.
+        matched: Whether the wait resolved on a requested target.
+        timed_out: Whether the wait hit its deadline.
+        terminal_only: Whether the caller waited only for terminal states.
+
+    Returns:
+        The note, or None when the outcome needs no explanation.
+
+    """
+    if not timed_out:
+        # The only non-timeout return that needs a note: the run is already
+        # terminal but not a requested target, so it can never reach one.
+        if not matched and record is not None and record.state in TERMINAL_STATES:
+            return (
+                f"the run reached terminal state {record.state!r}, which is not one "
+                "of the requested targets; no further state transition is expected"
+            )
+        return None
+    if record is None:
+        return "unsupported: the simulation is not in the registry"
+    if record.job_id is None:
+        return (
+            "still in the build/queue phase (no scheduler job id yet; a PIConGPU "
+            "compile can take 15-20 min); call wait_for_simulation again to keep waiting"
+        )
+    if not terminal_only:
+        return "the requested state was not reached before the deadline; call again to keep waiting"
+    return (
+        f"last-known state {record.state!r}; the run is not terminal yet, "
+        "call wait_for_simulation again to keep waiting"
+    )
+
+
 def resolve_script(picmi_script: str, *, workdir: Path) -> Path:
     """Resolve the tool's ``picmi_script`` argument to a file path.
 
@@ -1120,7 +1521,12 @@ def _spec_provenance(runner_dump: dict[str, Any], fallback_revision: str) -> dic
 
 __all__ = [
     "DEFAULT_EVENT_LOG_MAX",
+    "DEFAULT_WAIT_POLL_S",
+    "DEFAULT_WAIT_TIMEOUT_S",
     "MAX_EVENT_PAGE",
+    "MAX_WAIT_TIMEOUT_S",
+    "MIN_WAIT_POLL_S",
+    "MIN_WAIT_TIMEOUT_S",
     "TERMINAL_STATES",
     "AckTimeoutError",
     "BuiltSpec",
@@ -1128,6 +1534,7 @@ __all__ = [
     "SimulationBuildError",
     "SubmitOutcome",
     "SubmitService",
+    "WaitOutcome",
     "condense_events",
     "resolve_script",
 ]
