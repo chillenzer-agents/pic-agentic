@@ -1667,14 +1667,17 @@ async def _analyze_tool(runtime: HelloRuntime, sim_id: str, *, query: str | None
             answer = analysis.synthesize_answer(query, rocrate, metadata, openpmd, plugins)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
             return _soft_error(runtime, sim_id, op.value, exc)
+    # ``answer`` first: it is the useful product, and the (already trimmed, L3)
+    # bookkeeping sections follow so a reader does not have to scan past bulky
+    # metadata to find the physics.
     result = {
         "ok": True,
         "sim_id": sim_id,
+        "answer": answer,
         "rocrate": rocrate,
         "metadata": metadata,
         "openpmd": openpmd,
         "plugins": plugins,
-        "answer": answer,
     }
     return _redact_dict(runtime, result)
 

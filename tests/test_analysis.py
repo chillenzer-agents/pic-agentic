@@ -195,6 +195,52 @@ def test_unavailable_reader_is_named_in_the_answer() -> None:
     assert "picongpu plugin readers are not installed" in answer
 
 
+def test_trim_metadata_drops_bulky_values() -> None:
+    """L3: the returned ``rc_params``/``rendering_context`` keep names, not values."""
+    metadata = {
+        "runner": {"run_dir": "/x/run"},
+        "rc_params": {"build_jobs": 4, "profile_template_content": "x" * 100_000},
+        "rendering_context": {"grid": "3d", "huge": ["y" * 1000]},
+    }
+    trimmed = analysis.trim_metadata(metadata)
+    assert trimmed["runner"] == {"run_dir": "/x/run"}
+    assert trimmed["rc_params"] == {
+        "_trimmed": True,
+        "n_fields": 2,
+        "fields": ["build_jobs", "profile_template_content"],
+    }
+    assert trimmed["rendering_context"]["_trimmed"] is True
+    # The trim is what keeps the ack small: no bulk value survives.
+    assert "x" * 100 not in json.dumps(trimmed)
+    assert "y" * 100 not in json.dumps(trimmed)
+
+
+def test_trim_metadata_leaves_a_pending_section_untouched() -> None:
+    assert analysis.trim_metadata({"rc_params": {}, "runner": {"a": 1}}) == {
+        "rc_params": {},
+        "runner": {"a": 1},
+    }
+
+
+def test_analyze_returns_trimmed_metadata_but_keeps_the_answer(tmp_path) -> None:
+    """L3: ``analyze`` trims the bulky sections yet the bookkeeping fact remains."""
+    setup = _setup(tmp_path)
+    # Plant a large rc_params blob; the answer's rc-parameters fact must still
+    # name its field and the returned section must not carry the blob.
+    bulk = "z" * 200_000
+    (setup / "metadata" / "rc_params.json").write_text(
+        json.dumps({"build_jobs": 4, "profile_template_content": bulk}),
+        encoding="utf-8",
+    )
+    sections = analysis.analyze(tmp_path / "run", setup, None)
+    assert sections["metadata"]["rc_params"]["_trimmed"] is True
+    assert sections["metadata"]["rc_params"]["fields"] == ["build_jobs", "profile_template_content"]
+    assert bulk not in json.dumps(sections)
+    answer = sections["answer"]
+    assert "rc parameters metadata carries 2 field(s)" in answer
+    assert "profile_template_content" in answer
+
+
 def test_read_plugin_summaries_reuses_the_results_engine(tmp_path, monkeypatch) -> None:
     from pic_agentic import results as results_mod
 

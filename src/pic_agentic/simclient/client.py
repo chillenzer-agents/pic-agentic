@@ -1727,6 +1727,9 @@ class SimClient:
             setup_dir=derive_setup_dir(run_dir),
             output_dir=run_dir / "simOutput",
         )
+        # ``analysis.analyze`` returns compact metadata sections (bulky
+        # ``rc_params``/``rendering_context`` values are summarised, L3); the
+        # server's query re-synthesis reads their retained field names.
         return {"result": sections}
 
     @staticmethod

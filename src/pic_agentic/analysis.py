@@ -246,6 +246,52 @@ def read_pypicongpu_metadata(setup_dir: Path | str) -> dict[str, dict[str, Any]]
     return sections
 
 
+#: Metadata sections whose *values* can be bulky enough to dominate the ack
+#: (``rc_params`` routinely carries e.g. ``profile_template_content``, a whole
+#: rendered template).  The analysis answer only needs their field *names*, so
+#: the returned sections keep the names and drop the values (L3).
+_BULKY_METADATA_SECTIONS = ("rc_params", "rendering_context")
+
+
+def _trim_metadata_section(section: Any) -> Any:
+    """Reduce one metadata section to its field names (L3).
+
+    Returns:
+        The section unchanged when empty/non-mapping, else a compact summary
+        ``{"_trimmed": True, "n_fields", "fields"}``.
+
+    """
+    if not isinstance(section, dict) or not section:
+        return section
+    return {
+        "_trimmed": True,
+        "n_fields": len(section),
+        "fields": sorted(str(field) for field in section)[:_MAX_FACT_FIELDS],
+    }
+
+
+def trim_metadata(metadata: Any) -> Any:
+    """Drop the bulky values from the returned analysis metadata sections (L3).
+
+    The raw ``rc_params``/``rendering_context`` blobs can be far larger than the
+    useful physics ``answer`` (which is synthesized from the full sections before
+    this trim), making the ``analyze_output`` ack huge and burying the answer.
+    The returned sections keep the field names and their count, so the answer and
+    its provenance stay readable while the ack stays small.  ``read_*`` helpers
+    still return the full (redacted) sections for a caller that needs them.
+
+    Returns:
+        The metadata with the bulky sections summarised.
+
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+    return {
+        key: _trim_metadata_section(value) if key in _BULKY_METADATA_SECTIONS else value
+        for key, value in metadata.items()
+    }
+
+
 def read_openpmd_summary(output_dir: Path | str) -> dict[str, Any]:
     """Summarize the linked openPMD output using the scandir-only walk.
 
@@ -315,7 +361,7 @@ def _sim_contexts(metadata: Any) -> list[dict[str, Any]]:
         return []
     contexts = []
     rendering = metadata.get("rendering_context")
-    if isinstance(rendering, dict) and rendering:
+    if isinstance(rendering, dict) and rendering and not rendering.get("_trimmed"):
         contexts.append(rendering)
     runner = metadata.get("runner")
     sim = runner.get("sim") if isinstance(runner, dict) else None
@@ -544,9 +590,19 @@ def _metadata_facts(metadata: Any) -> list[str]:
     facts: list[str] = []
     for key, label in labels.items():
         section = metadata.get(key)
-        if isinstance(section, dict) and section:
-            names = ", ".join(sorted(str(field) for field in section)[:_MAX_FACT_FIELDS])
-            facts.append(f"{label} metadata carries {len(section)} field(s): {names}")
+        if not isinstance(section, dict) or not section:
+            continue
+        if section.get("_trimmed"):
+            # ``trim_metadata`` summarised a bulky section; use the retained
+            # field names so the bookkeeping fact (and a server-side query
+            # re-synthesis over an already-trimmed ack) stays exact (L3).
+            fields = [str(field) for field in section.get("fields", [])]
+            count = int(section.get("n_fields", len(fields)))
+        else:
+            fields = sorted(str(field) for field in section)
+            count = len(section)
+        names = ", ".join(fields[:_MAX_FACT_FIELDS])
+        facts.append(f"{label} metadata carries {count} field(s): {names}")
     return facts
 
 
@@ -1003,7 +1059,16 @@ def analyze(
         answer = synthesize_answer(query, rocrate, metadata, openpmd, plugins)
     except Exception:  # ruff: ignore[blind-except] - analyze must never raise
         answer = "No analysis metadata is available for this simulation."
-    return {"rocrate": rocrate, "metadata": metadata, "openpmd": openpmd, "plugins": plugins, "answer": answer}
+    # The answer is synthesized from the *full* sections, so trimming the bulky
+    # metadata values afterwards cannot change it; it only keeps the ack small and
+    # the answer prominent (L3).
+    return {
+        "rocrate": rocrate,
+        "metadata": trim_metadata(metadata),
+        "openpmd": openpmd,
+        "plugins": plugins,
+        "answer": answer,
+    }
 
 
 __all__ = [
@@ -1013,4 +1078,5 @@ __all__ = [
     "read_pypicongpu_metadata",
     "read_rocrate",
     "synthesize_answer",
+    "trim_metadata",
 ]
