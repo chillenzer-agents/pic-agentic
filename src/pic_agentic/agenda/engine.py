@@ -60,13 +60,18 @@ ObserveFn = Callable[[], Mapping[str, str]]
 
 #: ``(key) -> ReuseRecord | None``: lookup a completed run to reuse.
 ReuseLookupFn = Callable[[str], "ReuseRecord | None"]
-#: ``(key, sim_id, state) -> None``: record a completed run.
-ReuseRecordFn = Callable[[str, str, str], None]
+#: ``(key, sim_id, state, run_id) -> None``: record a completed run.  The
+#: run-batch identity (the submission's stable command id) travels into the
+#: registry so a reused leaf can name the run it was linked to.
+ReuseRecordFn = Callable[[str, str, str, "str | None"], None]
 
-#: ``(spec) -> key``: the content key for reuse.  Defaults to the wire hash
-#: (``{"sim": ...}``); the server overrides it to fold in the provenance tuple,
-#: so a result produced under a different PIConGPU revision is not reused.
-ReuseKeyFn = Callable[[Mapping[str, Any]], str]
+#: ``(spec, point) -> key``: the content key for reuse.  ``point`` is the
+#: leaf's sweep point (or None); it is folded into the key so two identical
+#: specs at *different* points are different simulations and do not reuse each
+#: other.  Defaults to the wire hash; the server overrides it to fold in the
+#: provenance tuple and the point, so a result produced under a different
+#: PIConGPU revision or a different sweep point is not reused.
+ReuseKeyFn = Callable[[Mapping[str, Any], "dict | None"], str]
 
 #: ``() -> {sim_id: ActualUsage}`` actual-cost observation callable (gap 4).
 ActualsFn = Callable[[], Mapping[str, "ActualUsage"]]
@@ -303,11 +308,14 @@ class AgendaEngine:
                 a completed run whose key matches, so the leaf is linked to it
                 instead of being submitted again.  Without it (and without
                 ``reuse_record``) no reuse is attempted.
-            reuse_record: Optional ``(key, sim_id, state)`` called when a leaf
-                finishes successfully, so a later identical spec can reuse it.
-            reuse_key: Optional ``(spec) -> key`` content key.  Defaults to the
-                wire hash; the server folds in the provenance tuple so a result
-                from a different PIConGPU revision is not reused.
+            reuse_record: Optional ``(key, sim_id, state, run_id)`` called when
+                a leaf finishes successfully, so a later identical spec can reuse
+                it.  ``run_id`` is the submission's stable command id (the run
+                identity, distinct from the content-addressed ``sim_id``).
+            reuse_key: Optional ``(spec, point) -> key`` content key.  Defaults
+                to the wire hash; the server folds in the provenance tuple and
+                the leaf's sweep point so a result from a different PIConGPU
+                revision or a different sweep point is not reused.
 
         """
         self.store = store
@@ -529,8 +537,12 @@ class AgendaEngine:
                 # Already terminal before this tick (or itself reused): no new
                 # run to record.
                 continue
+            # The run-batch identity is the submission's stable command id, a
+            # pure function of the campaign/path/spec -- so a replayed tick
+            # derives the same value and the entry stays attributable.
+            run_id = _idempotency_key_for(campaign, path, sim.spec)
             try:
-                self.reuse_record(self.reuse_key(sim.spec), sim.sim_id or sim_id, "done")
+                self.reuse_record(self.reuse_key(sim.spec, sim.point), sim.sim_id or sim_id, "done", run_id)
             except Exception:  # ruff: ignore[blind-except] - recording is best-effort
                 log.warning("reuse record failed for sim %s", sim.sim_id)
 
@@ -720,10 +732,11 @@ class AgendaEngine:
         for path, sim in updated.simulations():
             if sim.status != "planned":
                 continue
-            record = self.reuse_lookup(self.reuse_key(sim.spec))
+            record = self.reuse_lookup(self.reuse_key(sim.spec, sim.point))
             if record is None:
                 continue
             sim.sim_id = record.sim_id
+            sim.run_id = record.run_id
             sim.status = "done"
             sim.reused = True
             reused.append(path)
@@ -813,6 +826,7 @@ class AgendaEngine:
         leaf = leaf_at(agenda, path)
         if leaf is not None:
             leaf.sim_id = sim_id
+            leaf.run_id = key
             leaf.status = "submitted"
             # Stamp what we reserved so a later reconciliation can correct it.
             leaf.estimated_core_hours = request.est_core_hours
@@ -856,6 +870,8 @@ class AgendaEngine:
                     "path": path,
                     "status": sim.status,
                     "sim_id": sim.sim_id,
+                    "run_id": sim.run_id,
+                    "reused": sim.reused,
                     "point": sim.point,
                     "sweep_parameter": sim.sweep_parameter,
                     "requires_approval": sim.requires_approval,
@@ -890,6 +906,8 @@ class AgendaEngine:
             {
                 "path": path,
                 "sim_id": sim.sim_id,
+                "run_id": sim.run_id,
+                "reused": sim.reused,
                 "status": sim.status,
                 "point": sim.point,
                 "sweep_parameter": sim.sweep_parameter,
@@ -1084,7 +1102,21 @@ def _idempotency_key(campaign: Campaign, path: str, step: PlanStep) -> str:
         A 32-character lowercase hex command id.
 
     """
-    seed = f"{campaign.name}\x00{path}\x00{_spec_hash(step.spec)}"
+    return _idempotency_key_for(campaign, path, step.spec)
+
+
+def _idempotency_key_for(campaign: Campaign, path: str, spec: Mapping[str, Any]) -> str:
+    """Return the stable command id for ``(campaign, path, spec)``.
+
+    The run-batch identity of a leaf: a pure function of the persisted campaign
+    data, so a fresh engine after a restart (or a replay) derives the same key
+    and can attribute a later ``results.ready`` event back to the run.
+
+    Returns:
+        A 32-character lowercase hex command id.
+
+    """
+    seed = f"{campaign.name}\x00{path}\x00{_spec_hash(spec)}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
@@ -1099,7 +1131,7 @@ def _spec_hash(spec: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _wire_hash(spec: Mapping[str, Any]) -> str:
+def _wire_hash(spec: Mapping[str, Any], point: Mapping[str, Any] | None = None) -> str:
     """Return the hash of the *wire payload* a leaf submission produces.
 
     Mirrors :func:`pic_agentic.protocol.simulation.
@@ -1108,12 +1140,22 @@ def _wire_hash(spec: Mapping[str, Any]) -> str:
     only) so this module stays extraction-ready, and used so duplicate detection
     matches exactly the bytes the ``sim_id`` uses.
 
+    When called as the engine's default ``reuse_key``, ``point`` is the leaf's
+    sweep point and is folded in as well, so the default key reproduces the
+    point-scoped reuse rule (``{"sim": ..., "point": ...}``) without the server
+    override.  Direct calls (duplicate detection) omit it; the wire payload they
+    compare (and the cluster's ``sim_id``) is point-independent by design -- the
+    sweep point is provenance, not part of the submitted simulation.
+
     Returns:
-        The sha256 hex digest of the canonical ``{"sim": ...}`` encoding.
+        The sha256 hex digest of the canonical ``{"sim": ...[, "point": ...]}``
+        encoding.
 
     """
     sim = spec.get("sim")
     payload = {"sim": sim} if sim is not None else dict(spec)
+    if point is not None:
+        payload["point"] = dict(point)
     return _spec_hash(payload)
 
 

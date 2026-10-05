@@ -349,6 +349,43 @@ results stay reachable). Treat those entries as the recorded history of runs
 that actually happened; use `list_simulations(active_only=true)` to hide
 terminal history when you only care about live work.
 
+### `sim_id` is a spec label, not a run id
+
+A simulation's `sim_id` is only the first 8 hex of its payload hash (32 bits):
+it is a **content label**, so two byte-identical specs — and two re-runs of the
+same spec — share it. It is deliberately *not* a unique run identity, and it is
+too short to be a reliable cache key. The run identity is the **`run_id`** (the
+submission's stable command id): returned by `submit_simulation`, exposed in
+`get_status`/`list_simulations`, and carried per campaign leaf in
+`agenda_status` and the RO-Crate. Two re-runs of one spec therefore report the
+same `sim_id` but different `run_id`s, which is how you tell a re-run from a
+distinct study point.
+
+### Content-addressed reuse
+
+Reuse keys on the **full** content key — the wire payload, the provenance tuple
+and the leaf's **sweep point** — not on `sim_id`, so a spec that already
+completed is *linked* to that run instead of being submitted again.
+`advance_agenda` reports such leaves under `reused`; `agenda_status` marks them
+with `reused: true` and their `run_id`; the RO-Crate flags them `reused`.
+**Reuse requires identical content, provenance and sweep point**: two
+byte-identical specs at *different* points (e.g. `point={"x": 1.0}` and
+`point={"x": 2.0}`) are **different simulations** and never reuse one another,
+so a leaf's provenance cannot attribute its result to a point that never ran.
+Finer-grained reuse (e.g. point-insensitive reuse of the same physics) is future
+work. A **bare `submit_simulation` counts too**, but it has *no* sweep point: it
+is recorded as pending the moment the cluster accepts it and promoted to
+reusable when its `results.ready` event arrives (only a run whose results exist
+is reused), so a completed ad-hoc run is reused by a later point-less,
+otherwise-identical campaign leaf rather than re-run — never by a point-carrying
+leaf. The provenance tuple is part of the key, and it names the **server's**
+effective provenance (its configured/local PIConGPU revision/schema; a
+spec-carried revision is only a fallback for a server without a local pin).
+Identical physics therefore does **not** reuse across a changed server pin or
+schema — the result would not be attributable to a run the server can vouch for.
+A revision carried inside a leaf's own spec does not change the key when the
+server has a configured revision, so it cannot be used to force a re-run.
+
 ## Security model (M1)
 
 - The LLM-supplied `message` is written to a server-generated absolute path
