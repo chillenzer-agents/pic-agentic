@@ -27,6 +27,7 @@ from pic_agentic.protocol.simulation import (
     build_submit_event,
     payload_wire_bytes,
     provenance_mismatches,
+    simulation_phase,
     simulation_spec_from_runner_dump,
 )
 from pic_agentic.rcp import Kind, SenderRole, canonical_bytes
@@ -74,6 +75,24 @@ def test_spec_drops_cluster_local_dirs() -> None:
 def test_spec_requires_sim() -> None:
     with pytest.raises(UnsupportedPayloadError):
         simulation_spec_from_runner_dump({"setup_dir": "/x"})
+
+
+def test_simulation_phase_maps_lifecycle_states() -> None:
+    """H4: the phase derivation covers build/queue/run/terminal transitions."""
+    assert simulation_phase(SimulationState.ACCEPTED.value) == "building"
+    assert simulation_phase(SimulationState.WORKFLOW_FINISHED.value) == "building"
+    assert simulation_phase(SimulationState.WORKFLOW_FINISHED.value, 7) == "queued"
+    assert simulation_phase(SimulationState.SUBMITTED.value, 7) == "queued"
+    assert simulation_phase(SimulationState.JOB_RUNNING.value, 7) == "running"
+    assert simulation_phase(SimulationState.STEP_FINISHED.value, 7) == "running"
+    # A checkpoint is non-terminal: the simulation is still running.
+    assert simulation_phase(SimulationState.CHECKPOINT.value, 7) == "running"
+    assert simulation_phase(SimulationState.CHECKPOINT.value) == "running"
+    assert simulation_phase(SimulationState.RESULTS_READY.value, 7) == "done"
+    assert simulation_phase(SimulationState.JOB_FAILED.value, 7) == "failed"
+    assert simulation_phase(SimulationState.CANCELLED.value, 7) == "cancelled"
+    # An empty/unknown state still falls back to the pre-submit window.
+    assert simulation_phase("") == "building"
 
 
 def test_payload_hash_and_sim_id_are_deterministic() -> None:

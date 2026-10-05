@@ -382,6 +382,82 @@ class SimulationStage(StrEnum):
     RUN = "run"
 
 
+class SimulationPhase(StrEnum):
+    """Coarse run phase, exposed so build time is distinguishable from queue time.
+
+    This is a *derived* observation over the existing lifecycle stream (the
+    server projects it from the record's state and job id), not a new wire
+    event.  The pinned simclient emits only one coarse ``accepted`` ack and has
+    no pre-``job_id`` stage event, so ``BUILDING`` and ``QUEUED`` are the two
+    best-effort buckets for the window between ``accepted`` and the SLURM job:
+
+    - ``BUILDING``: accepted, but the simclient has not yet reported a job id.
+      This covers the local CWL build/prepare/submit workflow *and* the SLURM
+      queue wait for the job id to be parsed, which the event stream cannot
+      separate (see ``docs`` and the ``get_events`` description).
+    - ``QUEUED``: a job id exists but no event has confirmed the job running
+      (the ``submitted``/``workflow.finished`` window; SLURM ``PENDING``).
+    - ``RUNNING``: a running/job-progress event has been seen.
+    - ``DONE``/``FAILED``/``CANCELLED``: terminal outcomes.
+
+    The phase is deliberately conservative for the stall heuristic: only
+    ``RUNNING`` means the record is expected to tick progress, so an idle build
+    or queue wait never reads as ``stalled``.
+    """
+
+    BUILDING = "building"
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+#: Direct lifecycle-state -> phase table for the states whose phase does not
+#: depend on whether a job id is known.
+_PHASE_BY_STATE: dict[str, SimulationPhase] = {
+    SimulationState.RESULTS_READY.value: SimulationPhase.DONE,
+    SimulationState.JOB_FINISHED.value: SimulationPhase.DONE,
+    SimulationState.FAILED.value: SimulationPhase.FAILED,
+    SimulationState.JOB_FAILED.value: SimulationPhase.FAILED,
+    SimulationState.CANCELLED.value: SimulationPhase.CANCELLED,
+    SimulationState.JOB_RUNNING.value: SimulationPhase.RUNNING,
+    SimulationState.STEP_FINISHED.value: SimulationPhase.RUNNING,
+    # A checkpoint request is a non-terminal mid-run outcome: the simulation
+    # keeps running, so it must count as RUNNING (and stay eligible for the
+    # ``stalled`` heuristic) rather than fall through to the queued bucket.
+    SimulationState.CHECKPOINT.value: SimulationPhase.RUNNING,
+}
+
+
+def simulation_phase(state: str, job_id: int | None = None) -> str:
+    """Derive the coarse run phase from the lifecycle state and job id.
+
+    The mapping is a pure projection of the event stream the server already
+    keeps (see :class:`SimulationPhase` for why ``BUILDING`` and ``QUEUED`` are
+    best-effort despite the simclient's coarse acks).
+
+    Args:
+        state: The lifecycle state value (``SimulationState`` or a raw string).
+        job_id: The SLURM job id, if one is known for the run.
+
+    Returns:
+        One of the :class:`SimulationPhase` values.
+
+    """
+    normalized = str(state or "")
+    direct = _PHASE_BY_STATE.get(normalized)
+    if direct is not None:
+        return direct.value
+    # The remaining states (``accepted``/``submitted``/``workflow.finished`` or
+    # an unknown/empty state) sit in the pre-submit window until a job id
+    # exists: with one, the SLURM job is queued; without one, the local build
+    # (or an unparsed id for a non-scheduler run) is still in progress.
+    if job_id is not None:
+        return SimulationPhase.QUEUED.value
+    return SimulationPhase.BUILDING.value
+
+
 #: Progress events at least this far apart (percent) are emitted; the terminal
 #: event is always emitted.  Matches the design's condensation (section 4.2).
 PROGRESS_EVENT_STEP_PERCENT = 25

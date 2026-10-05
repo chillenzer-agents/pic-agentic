@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from pic_agentic.protocol.simulation import SimulationPhase, simulation_phase
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
@@ -45,6 +47,9 @@ class FleetSummary(BaseModel):
     #: "successful-but-empty" health signal, distinct from a failure.
     suspect: int = 0
     by_state: dict[str, int] = Field(default_factory=dict)
+    #: How many records are in each coarse run phase (H4: ``building``/``queued``
+    #: make a long pre-``job_id`` wait visible instead of looking wedged).
+    by_phase: dict[str, int] = Field(default_factory=dict)
     #: Mean progress of the records that report a ``percent``, else None.
     aggregate_percent: float | None = None
 
@@ -65,6 +70,10 @@ _DONE_STATES = frozenset({"results.ready", "simulation.job_finished"})
 #: States that mean a run failed.
 _FAILED_STATES = frozenset({"simulation.failed", "simulation.job_failed"})
 
+#: The valid phase values; a duck-typed record's ``phase`` is trusted only when
+#: it is one of these, so a wrong string cannot leak into ``by_phase``.
+_KNOWN_PHASES = frozenset(member.value for member in SimulationPhase)
+
 
 def fleet_summary(records: Sequence[SimRecord] | Iterable[SimRecord]) -> FleetSummary:
     """Aggregate the fleet into counts and a mean progress percentage.
@@ -78,11 +87,14 @@ def fleet_summary(records: Sequence[SimRecord] | Iterable[SimRecord]) -> FleetSu
     """
     records = list(records)
     by_state: dict[str, int] = {}
+    by_phase: dict[str, int] = {}
     percents: list[int] = []
     summary = FleetSummary()
     for record in records:
         state = str(getattr(record, "state", "") or "")
         by_state[state] = by_state.get(state, 0) + 1
+        phase = _phase_of(record)
+        by_phase[phase] = by_phase.get(phase, 0) + 1
         active = bool(getattr(record, "active", False))
         summary.total += 1
         if active:
@@ -101,6 +113,7 @@ def fleet_summary(records: Sequence[SimRecord] | Iterable[SimRecord]) -> FleetSu
         if isinstance(percent, int):
             percents.append(percent)
     summary.by_state = dict(sorted(by_state.items()))
+    summary.by_phase = dict(sorted(by_phase.items()))
     summary.aggregate_percent = sum(percents) / len(percents) if percents else None
     return summary
 
@@ -116,8 +129,10 @@ def detect_alerts(
     Args:
         records: The registry records.
         now: The reference time (injected, so the function is pure).
-        stall_after_s: How long an active run may go without a lifecycle event
-            before it is reported as ``stalled``.
+        stall_after_s: How long a **running** record may go without a lifecycle
+            event before it is reported as ``stalled``.  Build/queue records
+            (no running event yet) are exempt: they legitimately go many
+            minutes without an event (H3).
 
     Returns:
         One alert per condition; a record can raise at most one (failure kinds
@@ -185,17 +200,44 @@ def fleet_view(
     }
 
 
+def _phase_of(record: SimRecord) -> str:
+    """Return a record's coarse run phase, deriving it if the object lacks one.
+
+    Records are duck-typed here, so a test double or an older projection may not
+    carry the computed :attr:`~pic_agentic.server.simulation.SimRecord.phase`;
+    in that case derive the phase from ``state``/``job_id`` with the same rule
+    the record uses.
+
+    Returns:
+        One of the :class:`~pic_agentic.protocol.simulation.SimulationPhase`
+        values.
+
+    """
+    phase = getattr(record, "phase", None)
+    if isinstance(phase, str) and phase in _KNOWN_PHASES:
+        return phase
+    return simulation_phase(
+        str(getattr(record, "state", "") or ""),
+        getattr(record, "job_id", None),
+    )
+
+
 def _is_stalled(record: SimRecord, *, now: datetime, stall_after_s: float) -> float | None:
     """Return the idle seconds of a stalled active record, else None.
 
-    An inactive (terminal) record is never stalled; a record without a parseable
-    ``last_event_ts`` cannot be judged and is not reported.
+    Only a record in the ``running`` phase can be stalled (H3): the window
+    between ``accepted`` and the SLURM job legitimately runs for many minutes
+    with no lifecycle event (the local CWL build, then the queue wait), so a
+    ``building``/``queued`` record is never reported as wedged.  A record
+    without a parseable ``last_event_ts`` cannot be judged and is not reported.
 
     Returns:
         The idle seconds when the record is stalled, else None.
 
     """
     if not bool(getattr(record, "active", False)):
+        return None
+    if _phase_of(record) != SimulationPhase.RUNNING.value:
         return None
     last_event_ts = getattr(record, "last_event_ts", None)
     if not last_event_ts:

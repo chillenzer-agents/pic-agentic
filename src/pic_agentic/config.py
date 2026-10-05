@@ -131,8 +131,10 @@ class Config(BaseModel):
     #: whose builds take longer than the 15-minute default (kept equal to
     #: ``pic_agentic.agenda.engine.DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S``).
     agenda_deferred_outcome_timeout_s: float = 900.0
-    #: How long an active simulation may go without a lifecycle event before the
-    #: fleet view reports it as stalled.
+    #: How long a **running** simulation may go without a lifecycle event before
+    #: the fleet view reports it as stalled.  Records still in the build/queue
+    #: phase (no running event yet) are exempt: the window between ``accepted``
+    #: and the SLURM job legitimately runs 15-20 min with no event (H3).
     fleet_stall_after_s: float = 900.0
     #: Matrix room id for human chat (``!status``, ``!fleet``, ``!png ...``).
     #: Empty disables the human-command handler.
