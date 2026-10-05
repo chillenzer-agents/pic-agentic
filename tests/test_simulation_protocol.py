@@ -85,6 +85,9 @@ def test_simulation_phase_maps_lifecycle_states() -> None:
     assert simulation_phase(SimulationState.SUBMITTED.value, 7) == "queued"
     assert simulation_phase(SimulationState.JOB_RUNNING.value, 7) == "running"
     assert simulation_phase(SimulationState.STEP_FINISHED.value, 7) == "running"
+    # A checkpoint is non-terminal: the simulation is still running.
+    assert simulation_phase(SimulationState.CHECKPOINT.value, 7) == "running"
+    assert simulation_phase(SimulationState.CHECKPOINT.value) == "running"
     assert simulation_phase(SimulationState.RESULTS_READY.value, 7) == "done"
     assert simulation_phase(SimulationState.JOB_FAILED.value, 7) == "failed"
     assert simulation_phase(SimulationState.CANCELLED.value, 7) == "cancelled"

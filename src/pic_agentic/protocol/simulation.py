@@ -423,16 +423,11 @@ _PHASE_BY_STATE: dict[str, SimulationPhase] = {
     SimulationState.CANCELLED.value: SimulationPhase.CANCELLED,
     SimulationState.JOB_RUNNING.value: SimulationPhase.RUNNING,
     SimulationState.STEP_FINISHED.value: SimulationPhase.RUNNING,
+    # A checkpoint request is a non-terminal mid-run outcome: the simulation
+    # keeps running, so it must count as RUNNING (and stay eligible for the
+    # ``stalled`` heuristic) rather than fall through to the queued bucket.
+    SimulationState.CHECKPOINT.value: SimulationPhase.RUNNING,
 }
-
-#: States that sit in the pre-submit window until a job id exists.
-_PHASE_PRE_SUBMIT_STATES = frozenset(
-    {
-        SimulationState.ACCEPTED.value,
-        SimulationState.SUBMITTED.value,
-        SimulationState.WORKFLOW_FINISHED.value,
-    },
-)
 
 
 def simulation_phase(state: str, job_id: int | None = None) -> str:
@@ -458,8 +453,6 @@ def simulation_phase(state: str, job_id: int | None = None) -> str:
     # an unknown/empty state) sit in the pre-submit window until a job id
     # exists: with one, the SLURM job is queued; without one, the local build
     # (or an unparsed id for a non-scheduler run) is still in progress.
-    if normalized in _PHASE_PRE_SUBMIT_STATES and job_id is None:
-        return SimulationPhase.BUILDING.value
     if job_id is not None:
         return SimulationPhase.QUEUED.value
     return SimulationPhase.BUILDING.value

@@ -129,6 +129,29 @@ def test_summary_counts_by_phase() -> None:
     assert summary.by_phase == {"building": 1, "done": 1, "queued": 1, "running": 1}
 
 
+def test_summary_counts_failed_and_cancelled_phases() -> None:
+    """The phase histogram also covers the terminal failure outcomes."""
+    records = [
+        _record("a", "simulation.job_failed", active=False),
+        _record("b", "simulation.cancelled", active=False),
+        _record("c", "simulation.checkpoint", active=True, job_id=9),
+    ]
+    summary = fleet_summary(records)
+    assert summary.by_phase == {"cancelled": 1, "failed": 1, "running": 1}
+
+
+def test_checkpoint_record_is_still_stalled() -> None:
+    """A stale checkpointed run is mid-run, so it must stay ``stalled``-eligible.
+
+    ``simulation.checkpoint`` is non-terminal (the simulation keeps running);
+    misclassifying it as ``queued`` would silently disarm the stall alert.
+    """
+    stale = (NOW - timedelta(seconds=9999)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    records = [_record("a", "simulation.checkpoint", active=True, job_id=99, last_event_ts=stale)]
+    alerts = detect_alerts(records, now=NOW, stall_after_s=60)
+    assert [a.kind for a in alerts] == ["stalled"]
+
+
 def test_active_without_timestamp_is_not_stalled() -> None:
     records = [_record("a", "simulation.submitted", active=True)]
     assert detect_alerts(records, now=NOW, stall_after_s=60) == []

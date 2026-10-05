@@ -364,8 +364,8 @@ field (`building`/`queued`/`running`/`done`/`failed`/`cancelled`):
   for the job id to be parsed; the event stream cannot separate the two, so the
   bucket is deliberately best-effort).
 - `queued` — a `job_id` exists but no running/job-progress event has arrived.
-- `running` — a `simulation.job_running` or `simulation.step_finished` event
-  has been seen.
+- `running` — a `simulation.job_running`, `simulation.step_finished` or the
+  non-terminal `simulation.checkpoint` event has been seen.
 - `done`/`failed`/`cancelled` — terminal outcomes.
 
 `get_status`, `list_simulations` and `get_events` report `phase`; the
