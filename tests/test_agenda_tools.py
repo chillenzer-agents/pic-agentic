@@ -962,6 +962,125 @@ async def test_create_campaign_rejects_duplicate_values(tmp_path) -> None:
     assert not (tmp_path / "campaign.json").exists()
 
 
+async def test_create_campaign_refuses_a_cell_cnt_only_grid_patch(tmp_path) -> None:
+    """The beta-6 trap: a lone ``cell_cnt`` patch is refused, not submitted (A1).
+
+    Patching only ``sim.grid.cell_cnt`` leaves the denormalised ``cell_size``,
+    ``cell_depth`` and ``delta_t_si`` at the base spec's values, so a "fixed-box
+    resolution sweep" actually varies the box size at constant resolution.  The
+    create-time gate must refuse it with the co-vary advice and persist nothing.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "warm_conv",
+            "base_spec": base,
+            "patch_path": "sim.grid.cell_cnt",
+            "values": [{"x": 48, "y": 48, "z": 48}, {"x": 64, "y": 64, "z": 64}],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    assert "cell_depth" in result["detail"]
+    assert "delta_t_si" in result["detail"]
+    assert "add_agenda_leaf" in result["detail"]
+    assert not (tmp_path / "campaign.json").exists()
+
+
+async def test_create_campaign_refuses_a_cell_size_only_grid_patch(tmp_path) -> None:
+    """A lone ``cell_size`` patch is refused too (A1).
+
+    It would leave ``cell_depth`` (the z cell length) stale against the new
+    ``cell_size.z`` and change the CFL-consistent ``delta_t_si`` requirement.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "res",
+            "base_spec": base,
+            "patch_path": "sim.grid.cell_size",
+            "values": [{"x": 6e-8, "y": 6e-8, "z": 6e-8}],
+        },
+    )
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    assert "sim.grid.cell_size" in result["detail"]
+
+
+async def test_create_campaign_accepts_a_whole_grid_patch(tmp_path) -> None:
+    """A whole ``sim.grid`` node patch is the supported single-path form (A1).
+
+    Replacing the entire grid object moves ``cell_size``, ``cell_cnt`` and
+    ``cell_depth`` together, so all derived invariants hold and the campaign is
+    accepted.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    coarse = dict(base["sim"]["grid"])
+    coarse["cell_cnt"] = {"x": 48, "y": 48, "z": 48}
+    coarse["cell_size"] = {"x": 1.25e-7, "y": 1.25e-7, "z": 1.25e-7}
+    coarse["cell_depth"] = 1.25e-7
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "fixedbox", "base_spec": base, "patch_path": "sim.grid", "values": [coarse]},
+    )
+    assert result == {"ok": True, "name": "fixedbox", "leaves": ["leaf000"]}
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].spec["sim"]["grid"]["cell_cnt"] == {"x": 48, "y": 48, "z": 48}
+
+
+async def test_create_campaign_accepts_a_consistent_multi_field_leaf(tmp_path) -> None:
+    """A whole-spec leaf with co-varied box/dt/steps passes ``add_agenda_leaf`` (A1).
+
+    This is the empirical-correct route from the beta-6 run: build the base
+    campaign, then add one leaf per resolution carrying every co-varied node.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec": base, "patch_path": "sim.time_steps", "values": [base["sim"]["time_steps"]]},
+    )
+    leaf = _valid_spec()
+    leaf["sim"]["grid"]["cell_cnt"] = {"x": 48, "y": 48, "z": 48}
+    leaf["sim"]["grid"]["cell_size"] = {"x": 1.25e-7, "y": 1.25e-7, "z": 1.25e-7}
+    leaf["sim"]["grid"]["cell_depth"] = 1.25e-7
+    # CFL: c*dt <= 1/sqrt(3)/dx for a cube; 1/sqrt(3)/1.25e-7 / c with ~0.95 margin.
+    leaf["sim"]["delta_t_si"] = 2.2869269268364335e-16
+    leaf["sim"]["time_steps"] = 110
+    result = await _call(config, "add_agenda_leaf", {"name": "leaf_n48", "spec": leaf})
+    assert result == {"ok": True, "path": "leaf_n48"}
+
+
+async def test_create_campaign_accepts_an_unrelated_patch(tmp_path) -> None:
+    """A normal non-grid patch is untouched by the guard (no regression) (A1).
+
+    The P1 focal-position sweep patches a laser component; the grid, dt and
+    solver are all untouched, so the consistency guard must not fire.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "focal",
+            "base_spec": base,
+            "patch_path": "sim.laser.0.focus_pos_si.1.component",
+            "values": [4.4e-5, 4.8e-5],
+        },
+    )
+    assert result["ok"] is True
+
+
 async def test_create_campaign_rejects_a_misplaced_computed_field(tmp_path) -> None:
     """A spec whose computed field is nested fails at creation, actionably (P2b).
 

@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import pytest
 
-from pic_agentic.simulation_build import check_spec_round_trip
+from pic_agentic.simulation_build import check_spec_consistency, check_spec_round_trip
 
 #: Whether the pinned PIConGPU is importable in this interpreter.  The fallback
 #: tests only describe the no-pin behaviour; the exact check is covered by the
@@ -102,3 +103,79 @@ def test_beta3_bad_spec_is_rejected_by_the_check() -> None:
     assert "sim.moving_window" in detail
     # The message is bounded even for a many-error spec.
     assert "more error(s)" in detail
+
+
+def test_consistency_ignores_a_patch_that_does_not_touch_the_grid() -> None:
+    """An unrelated patch never trips the derived-invariant check (A1, no false reject)."""
+    dump = _campaign_spec(2)
+    assert check_spec_consistency(dump, "sim.laser.0.focus_pos_si.1.component") is None
+    assert check_spec_consistency(dump, "sim.time_steps") is None
+
+
+def test_consistency_flags_a_stale_cell_depth() -> None:
+    """A ``cell_size`` patch that leaves ``cell_depth`` stale is reported (A1)."""
+    dump = _campaign_spec(2)
+    dump["sim"]["grid"]["cell_size"] = {"x": 6.25e-8, "y": 6.25e-8, "z": 6.25e-8}
+    detail = check_spec_consistency(dump, "sim.grid.cell_size")
+    assert detail is not None
+    assert "cell_depth" in detail
+    assert "sim.grid.cell_size.z" in detail
+
+
+def test_consistency_flags_a_cfl_violation_on_a_delta_t_patch() -> None:
+    """A ``delta_t_si`` patch beyond the Yee CFL limit is reported (A1)."""
+    dump = _campaign_spec(2)
+    dump["sim"]["delta_t_si"] = 5.0e-15
+    detail = check_spec_consistency(dump, "sim.delta_t_si")
+    assert detail is not None
+    assert "CFL" in detail
+    assert "sim.delta_t_si" in detail
+
+
+def test_consistency_skips_the_lehe_and_none_solvers() -> None:
+    """Solvers whose CFL limit is undetermined from the wire are skipped (A1)."""
+    for solver in ({"type_lehe": True, "name": "Lehe<>"}, {"type_none": True, "name": "None"}):
+        dump = _campaign_spec(2)
+        dump["sim"]["solver"] = solver
+        dump["sim"]["delta_t_si"] = 5.0e-15
+        assert check_spec_consistency(dump, "sim.delta_t_si") is None
+
+
+def test_consistency_matches_the_pin_cfl_limit_for_ao() -> None:
+    """The arbitrary-order FDTD limit follows the pin's CFLChecker arithmetic (A1)."""
+    dump = _campaign_spec(2)
+    dump["sim"]["solver"] = {"type_arbitraryorderfdtd": True, "name": "ArbitraryOrderFDTD<2>", "neighbors": 2}
+    # dt chosen to sit exactly at the (tighter) AO limit is accepted, above it is not.
+    cell = [1.772e-7, 4.43e-8, 1.772e-7]
+    yee = 1.0 / math.sqrt(sum(1.0 / d**2 for d in cell))
+    ao_limit = yee / (7.0 / 6.0)
+    dump["sim"]["delta_t_si"] = ao_limit / 299792458.0
+    assert check_spec_consistency(dump, "sim.delta_t_si") is None
+    dump["sim"]["delta_t_si"] = ao_limit * 1.01 / 299792458.0
+    assert check_spec_consistency(dump, "sim.delta_t_si") is not None
+
+
+def test_consistency_flags_a_grid_dist_that_no_longer_sums() -> None:
+    """A ``cell_cnt`` patch that leaves ``grid_dist`` stale is reported (A1)."""
+    dump = _campaign_spec(2)
+    dump["sim"]["grid"]["grid_dist"] = {"x": [96, 96], "y": [1024, 1024], "z": [96, 96]}
+    dump["sim"]["grid"]["cell_cnt"] = {"x": 200, "y": 2048, "z": 192}
+    detail = check_spec_consistency(dump, "sim.grid.cell_cnt")
+    assert detail is not None
+    assert "grid_dist" in detail
+    assert "sums to 192" in detail
+
+
+@pytest.mark.skipif(_HAS_PICONGPU, reason="documents the no-pin behaviour")
+def test_consistency_is_exact_without_the_pin() -> None:
+    """The consistency check is pure arithmetic, so it never degrades to a false reject (A1).
+
+    Unlike the round-trip gate (which is best-effort offline), the derived
+    invariants depend only on the wire spec, so the same stale ``cell_depth`` is
+    reported with or without PIConGPU importable.
+    """
+    dump = _campaign_spec(2)
+    dump["sim"]["grid"]["cell_size"] = {"x": 6.25e-8, "y": 6.25e-8, "z": 6.25e-8}
+    assert check_spec_consistency(dump, "sim.grid.cell_size") is not None
+    # A valid spec is still accepted offline.
+    assert check_spec_consistency(_campaign_spec(2), "sim.grid") is None

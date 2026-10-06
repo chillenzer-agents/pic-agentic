@@ -52,7 +52,7 @@ from pic_agentic.protocol.simulation import (
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
 from pic_agentic.simclient.simulation import SimulationErrorCode
-from pic_agentic.simulation_build import check_spec_round_trip
+from pic_agentic.simulation_build import check_spec_consistency, check_spec_round_trip
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -844,7 +844,11 @@ class AgendaService:
         :meth:`SubmitService.prepare_spec` and :func:`payload_wire_size` -- the
         *same* allow-list and escaped inline-size checks a submission runs -- so
         a campaign that could never be submitted is refused at creation time
-        rather than surfacing a bare error at ``advance_agenda``.  Duplicate
+        rather than surfacing a bare error at ``advance_agenda``.  The derived
+        invariants a single-node patch can break (stale ``cell_depth``, a CFL
+        violation, a ``grid_dist``/``cell_cnt`` mismatch) are checked too, and
+        the known denormalising grid patches are refused outright
+        (``invalid_campaign_spec``).  Duplicate
         patched specs (e.g. ``values=[4, 4]``) are rejected up front too: they
         map to one ``sim_id`` and the engine would later refuse the tick.
         Nothing is persisted unless every leaf validates.
@@ -914,7 +918,7 @@ class AgendaService:
             }
         patched: list[dict[str, Any]] = [_patch_spec(base_spec, patch_path, value) for value in values]
         for spec in patched:
-            invalid = self._validate_leaf_spec(spec)
+            invalid = self._validate_leaf_spec(spec, patch_path)
             if invalid is not None:
                 return invalid
         collision = _duplicate_leaf_error(patched)
@@ -1011,14 +1015,17 @@ class AgendaService:
                 removed.append(str(store.path))
         return removed
 
-    def _validate_leaf_spec(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+    def _validate_leaf_spec(self, spec: dict[str, Any], patch_path: str = "") -> dict[str, Any] | None:
         """Validate one patched leaf through the submission path.
 
         Runs the same allow-list check, the pinned-schema round-trip gate the
         simclient applies (via :func:`~pic_agentic.simulation_build.
-        check_spec_round_trip`) and the escaped inline-size cap a ``submit_spec``
+        check_spec_round_trip`), the derived-invariant check scoped to
+        ``patch_path`` (via :func:`~pic_agentic.simulation_build.
+        check_spec_consistency`) and the escaped inline-size cap a ``submit_spec``
         would, so a leaf that could never be submitted is rejected at creation
-        with an actionable reason.
+        with an actionable reason.  A whole-spec ``add_agenda_leaf`` passes no
+        ``patch_path`` and is not consistency-checked (it owns every node).
 
         This is synchronous and runs under the agenda lock.  With the pin
         importable the round-trip is ~7 ms per leaf, so a 200-leaf campaign
@@ -1034,9 +1041,15 @@ class AgendaService:
             payload = self.submit_service.prepare_spec(spec)
         except UnsupportedPayloadError as exc:
             return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(str(exc))}
+        denormalized = _denormalized_patch_error(patch_path)
+        if denormalized is not None:
+            return denormalized
         round_trip = check_spec_round_trip(spec)
         if round_trip is not None:
             return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(round_trip)}
+        inconsistent = check_spec_consistency(spec, patch_path)
+        if inconsistent is not None:
+            return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(inconsistent)}
         size = payload_wire_size(payload)
         if size > MAX_INLINE_PAYLOAD_BYTES:
             return {
@@ -1099,6 +1112,50 @@ class AgendaService:
         agenda = campaign.agenda.add(**{name: leaf})
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": name}
+
+
+#: Dotted patch-path prefixes whose single-node patch is refused because it
+#: would leave a denormalised sibling stale.  A ``cell_cnt`` or ``cell_size``
+#: patch changes the physical box while the derived ``cell_depth`` (3D) and the
+#: CFL-consistent ``delta_t_si``/``time_steps`` stay at the base values -- the
+#: beta-6 "fixed-box resolution sweep" that actually varied the box size.  The
+#: consistent way to move these is a whole-node patch (``sim.grid``) or one
+#: whole spec per leaf via ``add_agenda_leaf``; both are provided.
+_DENORMALIZED_GRID_PATCHES = ("sim.grid.cell_cnt", "sim.grid.cell_size")
+
+
+def _denormalized_patch_error(patch_path: str) -> dict[str, Any] | None:
+    """Refuse a single-node patch that would leave a denormalised sibling stale.
+
+    ``create_campaign`` patches exactly one node, so a grid-resolution patch
+    cannot update the siblings it feeds.  Patching ``sim.grid.cell_cnt`` alone
+    keeps ``cell_size``/``cell_depth`` (the physical box changes instead of the
+    resolution) and keeps the base ``delta_t_si``, whose CFL validity depends on
+    ``cell_size``; both passed every prior gate in the beta-6 run.  The
+    arithmetic form of this (stale ``cell_depth``, CFL violation) is caught by
+    :func:`~pic_agentic.simulation_build.check_spec_consistency`, but the
+    box-size/CFL pair can also be self-consistent yet physically wrong, so the
+    dangerous single-node patches are refused outright with the co-vary advice.
+
+    Returns:
+        The ``invalid_campaign_spec`` soft error for a known denormalising
+        patch, else ``None``.
+
+    """
+    if patch_path not in _DENORMALIZED_GRID_PATCHES:
+        return None
+    return {
+        "ok": False,
+        "error": "invalid_campaign_spec",
+        "detail": (
+            f"patch_path {patch_path!r} changes the grid while leaving its denormalised siblings "
+            "(cell_depth, delta_t_si, time_steps) stale -- e.g. a resolution sweep that actually "
+            "varies the box size. This cannot be a single-node sweep: co-vary `sim.grid.cell_size`, "
+            "`sim.grid.cell_cnt` and `sim.grid.cell_depth`, and set a CFL-consistent `sim.delta_t_si` "
+            "and matching `sim.time_steps`. Patch the whole `sim.grid` node (values = whole grid "
+            "objects) or use add_agenda_leaf with one whole spec per leaf."
+        ),
+    }
 
 
 def _parameter_for(patch_path: str) -> str:
