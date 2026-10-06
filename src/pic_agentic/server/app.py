@@ -53,6 +53,7 @@ from pic_agentic.server.simulation import (
     SimRecord,
     SubmitOutcome,
     SubmitService,
+    WaitExceedsClientTimeoutError,
     WaitOutcome,
     condense_events,
     resolve_script,
@@ -130,6 +131,7 @@ class HelloRuntime:
             picongpu_revision=config.picongpu_revision,
             ack_timeout_s=config.ack_timeout_s,
             results_root=config.results_root,
+            client_timeout_s=config.mcp_client_timeout_s(),
         )
         self.agenda_service = AgendaService(config, self.submit_service)
         # H7: a bare submit_simulation is invisible to the campaign engine, so
@@ -1198,6 +1200,18 @@ async def _wait_tool(
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
         )
+    except WaitExceedsClientTimeoutError as exc:
+        # A clear pre-block error, not a clamp and not the client's opaque
+        # -32001: the requested wait would outlast the MCP client budget.
+        return {
+            "sim_id": sim_id,
+            "ok": False,
+            "error": "wait_exceeds_client_timeout",
+            "detail": runtime.config.redact(str(exc)),
+            "requested_timeout_s": exc.requested_s,
+            "client_timeout_s": exc.client_timeout_s,
+            "max_timeout_s": exc.limit_s,
+        }
     except (KeyError, ValueError) as exc:
         return {"sim_id": sim_id, "ok": False, "error": runtime.config.redact(str(exc))}
     return _redact_dict(runtime, {"sim_id": sim_id, **outcome.model_dump(mode="json")})
