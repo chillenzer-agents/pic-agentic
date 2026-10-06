@@ -40,10 +40,11 @@ The seeded instructions also carry an inline
 `FieldEnergyMonitor(period=TimeStepSpec[::20, -1])` snippet (the beta-6 agent
 reverse-engineered that inclusive slice syntax from source), and three
 warnings a Runner-spec study needs: the spec is a *rendered snapshot* with
-denormalized fields, so a grid/resolution patch must co-vary `cell_cnt`,
-`cell_size`, `cell_depth`, `delta_t_si` and `time_steps` (the consistency gate
-added in this wave refuses a lone `cell_cnt` patch, which silently changes the
-physical box); finer `dx` needs a CFL-consistent `delta_t_si`/step count or the
+denormalized fields, so patching only `sim.grid.cell_cnt` (or only `cell_size`)
+is a box-size, not a resolution, change — and box-size sweeps are allowed; a
+fixed-box resolution sweep must instead co-vary `cell_size`, `cell_cnt` and
+`cell_depth` together with a CFL-consistent `delta_t_si` and matching
+`time_steps`; finer `dx` needs a CFL-consistent `delta_t_si`/step count or the
 compile fails on the Yee CFL `static_assert`; and a laser's Huygens surface must
 sit outside the 12-cell default PML absorber (the `GaussianLaser` 16-cell
 default is right; 8 cells segfaults at step 0). Because the pin's

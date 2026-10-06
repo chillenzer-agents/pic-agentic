@@ -335,9 +335,12 @@ denormalized fields, not a live model: the physical box is
 extent. Patching one node therefore changes the physics in a way the other
 nodes do not follow:
 
-- a grid/resolution patch must co-vary `cell_cnt`, `cell_size`, `cell_depth`,
-  `delta_t_si` and `time_steps`; the consistency gate added in this wave refuses
-  a lone `cell_cnt` patch because it silently changes the physical box;
+- patching only `sim.grid.cell_cnt` (or only `cell_size`) is a **box-size**, not
+  a resolution, change — and that is allowed, because a box-size sweep is a
+  legitimate study; a **fixed-box resolution** sweep must instead co-vary
+  `cell_size`, `cell_cnt` and `cell_depth` together with a CFL-consistent
+  `delta_t_si` and matching `time_steps` (a whole `sim.grid` patch, or one whole
+  spec per leaf via `add_agenda_leaf(spec_path=...)`);
 - finer `dx` also needs a CFL-consistent `delta_t_si` and step count — changing
   only the grid fails the compile with the Yee solver's CFL `static_assert`
   (`fields/MaxwellSolver/Yee/Yee.hpp`);

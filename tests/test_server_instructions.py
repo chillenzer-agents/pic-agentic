@@ -59,15 +59,24 @@ def test_instructions_point_at_the_picongpu_documentation_and_examples() -> None
 
 def test_instructions_warn_about_rendered_snapshot_and_denormalized_fields() -> None:
     # E1 (A1's trap): a Runner spec is a rendered snapshot with denormalized
-    # fields, so a grid patch must co-vary the whole grid/time_description set;
-    # a lone cell_cnt patch silently changes the physical box.
+    # fields, so a fixed-box resolution patch must co-vary the whole
+    # grid/time_description set. Patching only cell_cnt (or only cell_size) is a
+    # box-size change, not a resolution change -- and box-size sweeps are
+    # allowed, so the text must not claim a lone cell_cnt patch is refused.
     for field in ("cell_cnt", "cell_size", "cell_depth", "delta_t_si", "time_steps"):
         assert field in SERVER_INSTRUCTIONS
     assert "denormalized" in SERVER_INSTRUCTIONS
     assert "co-vary" in SERVER_INSTRUCTIONS
+    assert "box-size" in SERVER_INSTRUCTIONS
+    assert "box-size sweeps are allowed" in SERVER_INSTRUCTIONS
     assert "lone cell_cnt patch" in SERVER_INSTRUCTIONS
-    # The refusal is a gate added in this wave, not pre-existing behaviour.
-    assert "consistency gate" in SERVER_INSTRUCTIONS
+    # The old refusal claim is gone: no consistency gate rejects the patch.
+    assert "refused" not in SERVER_INSTRUCTIONS
+    assert "consistency gate" not in SERVER_INSTRUCTIONS
+    # The fixed-box route is spelled out: a whole sim.grid patch, or one whole
+    # spec per leaf via add_agenda_leaf(spec_path=...).
+    assert "sim.grid" in SERVER_INSTRUCTIONS
+    assert "add_agenda_leaf(spec_path=...)" in SERVER_INSTRUCTIONS
 
 
 def test_instructions_warn_about_the_cfl_condition() -> None:
