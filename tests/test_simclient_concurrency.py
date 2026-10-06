@@ -603,6 +603,51 @@ def test_child_stderr_fd_is_teed_and_captured(fake_picongpu_runner, tmp_path) ->
     assert "child: command not found" in real_path.read_text(encoding="utf-8"), "child output must stay visible"
 
 
+class _HoldingRunner:
+    """Writes to the child stderr fd and blocks until released."""
+
+    setup_dir = Path("/nonexistent/input")
+
+    def __init__(self, run_dir: Path, release: threading.Event) -> None:
+        self.run_dir = run_dir
+        self._release = release
+
+    @staticmethod
+    def generate(**_flags: object) -> None:
+        return
+
+    def run(self) -> None:
+        runtime_context = sys.modules["picongpu.pypicongpu.runner"].RuntimeContext
+        context = runtime_context(kwargs={})
+        os.write(context.default_stderr.fileno(), b"LIVE-BUILD-COMPILING\n")
+        self._release.wait(timeout=5)
+
+
+def test_run_workflow_populates_the_live_build_tail(fake_picongpu_runner, tmp_path) -> None:
+    """B2: while the workflow runs, the capture feeds the get_logs live tail."""
+    sim_mod._install_capture_context()
+    run_dir = tmp_path / "run"
+    release = threading.Event()
+    runner = _HoldingRunner(run_dir, release)
+    thread = threading.Thread(target=sim_mod._run_workflow, args=(runner,))
+    thread.start()
+    try:
+        deadline = time.time() + 3.0
+        lines: list[str] = []
+        while time.time() < deadline:
+            lines = sim_mod.live_build_log(run_dir)
+            if any("LIVE-BUILD-COMPILING" in line for line in lines):
+                break
+            time.sleep(0.01)
+        assert any("LIVE-BUILD-COMPILING" in line for line in lines)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    # Once the workflow ends, the live tail is dropped (the failure error / real
+    # log files take over).
+    assert sim_mod.live_build_log(run_dir) == []
+
+
 def test_thread_buffer_handler_routes_to_emitting_thread() -> None:
     """M2: the shared logger handler captures only the emitting run's buffer."""
     handler = sim_mod._ThreadBufferHandler()

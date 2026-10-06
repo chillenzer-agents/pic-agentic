@@ -424,8 +424,10 @@ terminal history when you only care about live work.
 A run can spend 15-20 minutes between `accepted` and the SLURM `job_id`: the
 simclient builds the setup locally and only then parses the job id out of
 `submission_information.txt`. During that window `job_id` is `null`, there are
-no step/percent values, `get_events` is empty and the logs read "not started
-yet" — which is normal, not wedged.
+no step/percent values and `get_events` is empty — which is normal, not wedged.
+`get_logs` serves the captured compiler output tail while the build is running
+(the same stderr that later appears in a failure `error`); before any output is
+captured it answers "still building", not the misleading "not started yet".
 
 To make that window legible, every status surface carries a derived `phase`
 field (`building`/`queued`/`running`/`done`/`failed`/`cancelled`):

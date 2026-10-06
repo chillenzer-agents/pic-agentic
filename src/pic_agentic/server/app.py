@@ -1165,7 +1165,12 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
 
     @server.tool(
         title="Get simulation logs",
-        description="Return up to `tail` lines of a simulation's stdout, stderr or workflow log stream.",
+        description=(
+            "Return up to `tail` lines of a simulation's stdout, stderr or workflow "
+            "log stream. While the local build is still running (no `job_id` yet) "
+            "the `stdout`/`workflow` streams serve the captured compiler output tail, "
+            "or a 'still building' note before any output is captured."
+        ),
         annotations=_READ_ONLY,
     )
     async def get_logs(sim_id: str, *, stream: str = "stdout", tail: int = 100) -> dict[str, Any]:
@@ -2102,6 +2107,7 @@ def _merge_status(projection: dict[str, Any], live: dict[str, Any]) -> None:
         "avg_per_step",
         "eta_s",
         "exit_code",
+        "exit_signal",
         "suspect",
     ):
         if live.get(field) is not None:

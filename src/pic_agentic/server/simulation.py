@@ -45,6 +45,7 @@ from pic_agentic.protocol.simulation import (
     build_submit_command,
     client_capability_mismatch,
     payload_wire_size,
+    signal_from_exit_code,
     simulation_phase,
 )
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
@@ -1485,6 +1486,7 @@ def _record_status(record: SimRecord) -> dict[str, Any]:
         "error": record.error,
         "error_code": record.error_code,
         "failure_summary": record.failure_summary,
+        "exit_signal": signal_from_exit_code(record.exit_code),
         "active": record.active,
     }
     phase = _record_phase(record)

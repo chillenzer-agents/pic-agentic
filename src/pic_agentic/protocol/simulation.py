@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import signal
 from enum import StrEnum
 from typing import Any
 
@@ -467,6 +468,42 @@ PROGRESS_EVENT_STEP_PERCENT = 25
 
 #: Log streams ``get_logs`` can request.
 LOG_STREAMS = ("stdout", "stderr", "workflow")
+
+#: A shell/SLURM encodes a signal death as ``128 + signal``; a raw wait status
+#: carries it in the high byte (``<< 8``).  ``_EXIT_STATUS_BYTE`` is the largest
+#: value that is a canonical (non-shifted) exit status.
+_SIGNAL_EXIT_BASE = 128
+_EXIT_STATUS_BYTE = 255
+
+
+def signal_from_exit_code(exit_code: int | None) -> str | None:
+    """Return the signal a shell-style exit status died from, if any.
+
+    A process killed by signal *N* is reported by a shell/SLURM in the canonical
+    ``128 + N`` form (e.g. 139 = SIGSEGV, 137 = SIGKILL, 143 = SIGTERM).  Some
+    sources (e.g. a raw wait status) instead carry the status in the high byte
+    (``(128 + N) << 8``, so 35584 = ``139 << 8`` = SIGSEGV); both encodings are
+    recognised.  A bounded human annotation makes a raw ``exit_code`` legible
+    without changing the numeric value on the wire.
+
+    Args:
+        exit_code: The raw exit status, or None.
+
+    Returns:
+        The signal name (e.g. ``"SIGSEGV"``), or None when the status is not a
+        signal death (or is unknown).
+
+    """
+    if exit_code is None or exit_code <= _SIGNAL_EXIT_BASE:
+        return None
+    status = exit_code >> 8 if exit_code > _EXIT_STATUS_BYTE else exit_code
+    if status <= _SIGNAL_EXIT_BASE:
+        return None
+    signum = status - _SIGNAL_EXIT_BASE
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
 
 
 class SubmitParams(BaseModel):
@@ -934,6 +971,11 @@ def build_submit_event(
             if value is not None
         },
     )
+    # A raw signal-death status (e.g. 139) gets a bounded human annotation
+    # alongside the unchanged numeric ``exit_code`` (B2).
+    exit_signal = signal_from_exit_code(exit_code)
+    if exit_signal is not None:
+        payload["exit_signal"] = exit_signal
     return RcpMessage(
         sim=sim,
         kind=Kind.EVENT,
@@ -1046,6 +1088,7 @@ def build_status_ack(
                 ("avg_per_step", avg_per_step),
                 ("eta_s", eta_s),
                 ("exit_code", exit_code),
+                ("exit_signal", signal_from_exit_code(exit_code)),
                 ("error", error),
                 ("error_code", error_code),
                 ("failure_summary", failure_summary),

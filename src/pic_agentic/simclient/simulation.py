@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -420,6 +421,111 @@ _CAPTURE_PROXY: _CapturingStderr | None = None
 #: reader).
 _CAPTURE_READ_CHUNK = 4096
 
+#: Number of trailing output lines retained while a build/run workflow runs, so
+#: ``get_logs`` can show the compiler tail during the multi-minute build window
+#: instead of a flat "not started yet".  Bounded so a long build cannot grow the
+#: simclient's memory.
+_BUILD_TAIL_LINES = 200
+
+#: Cap on the bytes retained for the live build tail (a backstop against a few
+#: very long lines), matching the failure-detail budget order of magnitude.
+_MAX_BUILD_TAIL_BYTES = 64 * 1024
+
+
+class _RingTail:
+    """A bounded, thread-safe ring of the last captured lines.
+
+    Bounded by both line count (:data:`_BUILD_TAIL_LINES`) and total bytes
+    (:data:`_MAX_BUILD_TAIL_BYTES`) so a build emitting a few very long lines
+    cannot grow the simclient's memory either.
+    """
+
+    def __init__(self, maxlen: int = _BUILD_TAIL_LINES) -> None:
+        """Create an empty tail."""
+        self._lines: deque[str] = deque(maxlen=maxlen)
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def add(self, text: str) -> None:
+        """Append the lines in ``text``, normalising CRLF and dropping blanks.
+
+        Args:
+            text: A chunk of captured output (may contain several lines).
+
+        """
+        with self._lock:
+            for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                if not line:
+                    continue
+                self._lines.append(line)
+                self._bytes += len(line)
+            while self._lines and self._bytes > _MAX_BUILD_TAIL_BYTES:
+                self._bytes -= len(self._lines.popleft())
+
+    def lines(self) -> list[str]:
+        """Return the retained lines, oldest first.
+
+        Returns:
+            A copy of the current tail.
+
+        """
+        with self._lock:
+            return list(self._lines)
+
+
+#: Per-run live build tails, keyed by ``run_dir`` (a string), so ``get_logs``
+#: can read the compiler output while :func:`_run_workflow` is still running.
+_live_build_tails: dict[str, _RingTail] = {}
+_live_build_tails_lock = threading.Lock()
+
+
+def _register_live_build_tail(run_dir: Path | str) -> _RingTail:
+    """Register (or reuse) the live build tail for ``run_dir``.
+
+    Args:
+        run_dir: The run directory (the tail key).
+
+    Returns:
+        The shared tail to feed and to expose via :func:`live_build_log`.
+
+    """
+    key = str(run_dir)
+    with _live_build_tails_lock:
+        tail = _live_build_tails.get(key)
+        if tail is None:
+            tail = _RingTail()
+            _live_build_tails[key] = tail
+        return tail
+
+
+def _unregister_live_build_tail(run_dir: Path | str) -> None:
+    """Drop the live build tail for ``run_dir`` (after the workflow ends).
+
+    The failure ``error`` already carries the compiler tail, so the live tail
+    only exists for the duration of the build.
+
+    Args:
+        run_dir: The run directory whose tail is no longer needed.
+
+    """
+    with _live_build_tails_lock:
+        _live_build_tails.pop(str(run_dir), None)
+
+
+def live_build_log(run_dir: Path | str) -> list[str]:
+    """Return the retained build tail for a run, if a build was captured.
+
+    Args:
+        run_dir: The run directory (a resolve of the derived setup's sibling).
+
+    Returns:
+        The retained lines, oldest first; empty when nothing was captured.
+
+    """
+    with _live_build_tails_lock:
+        tail = _live_build_tails.get(str(run_dir))
+    return tail.lines() if tail is not None else []
+
 
 class _CapturingStderr:
     """A per-run ``stderr`` proxy that tees into the invoking thread's buffer.
@@ -563,15 +669,20 @@ class _ThreadBufferHandler(logging.Handler):
         self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Append the formatted record to the current thread's buffer."""
+        """Append the formatted record to the current thread's buffer and tail."""
         buffer = getattr(_CAPTURE_STATE, "buffer", None)
         if buffer is None:
             return
         try:
+            text = self.format(record) + "\n"
             with _CAPTURE_STATE.lock:
-                buffer.write(self.format(record) + "\n")
+                buffer.write(text)
         except Exception:  # ruff: ignore[blind-except] - logging must never raise into cwltool
             self.handleError(record)
+            return
+        tail = getattr(_CAPTURE_STATE, "tail", None)
+        if tail is not None:
+            tail.add(text)
 
 
 def _install_capture_logger() -> None:
@@ -641,17 +752,29 @@ def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
     real = _CAPTURE_PROXY._real if _CAPTURE_PROXY is not None else sys.stderr  # ruff: ignore[private-member-access] - same class
     read_fd, write_fd = os.pipe()
 
+    # The live build tail (B2): the same captured output, bounded and exposed by
+    # ``get_logs`` while the workflow runs, so the multi-minute build window is
+    # observable instead of a flat "not started yet".  A test double without a
+    # ``run_dir`` gets no tail.
+    run_dir = getattr(runner, "run_dir", None)
+    live_tail = _register_live_build_tail(run_dir) if run_dir is not None else None
+
     lock = threading.Lock()
 
     def reader() -> None:
         # Tee each chunk to the real stderr (operator logs stay visible) and
-        # the run's buffer; a daemon thread so a stuck child cannot wedge exit.
-        with os.fdopen(read_fd, "rb", closefd=True) as stream:
+        # the run's buffer/tail; a daemon thread so a stuck child cannot wedge
+        # exit.  ``buffering=0`` is important: a *buffered* ``read(n)`` blocks
+        # until ``n`` bytes or EOF, which would hold the whole build's output
+        # until the step ended and defeat the live tail (B2).
+        with os.fdopen(read_fd, "rb", buffering=0) as stream:
             for chunk in iter(lambda: stream.read(_CAPTURE_READ_CHUNK), b""):
                 text = chunk.decode("utf-8", errors="replace")
                 real.write(text)
                 with lock:
                     buffer.write(text)
+                if live_tail is not None:
+                    live_tail.add(text)
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
@@ -659,11 +782,13 @@ def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
     _CAPTURE_STATE.buffer = buffer
     _CAPTURE_STATE.lock = lock
     _CAPTURE_STATE.write_fd = write_fd
+    _CAPTURE_STATE.tail = live_tail
     try:
         runner.run()
     finally:
         _CAPTURE_STATE.buffer = None
         _CAPTURE_STATE.write_fd = None
+        _CAPTURE_STATE.tail = None
         # Close our write end first so the reader sees EOF once every inheriting
         # child has also closed it; only then join.
         with contextlib.suppress(OSError):  # pragma: no cover - a child could not close our fd
@@ -678,6 +803,11 @@ def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
         lines = "\n".join(line.rstrip() for line in text.splitlines() if _ERROR_LINE_RE.search(line))
         if capture is not None:
             capture.append(lines)
+        if live_tail is not None:
+            # The workflow (and its compiler output) has ended; the failure
+            # ``error`` already folds the tail in, and the success path reads the
+            # real log files.  Drop the live tail so it cannot be served stale.
+            _unregister_live_build_tail(run_dir)
     return lines
 
 
