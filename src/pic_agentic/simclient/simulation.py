@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -65,6 +66,12 @@ class SimulationErrorCode(StrEnum):
     OUTCOME_UNKNOWN = "outcome_unknown"
     PICONGPU_UNAVAILABLE = "picongpu_unavailable"
     GENERATE_FAILED = "generate_failed"
+    #: The CWL workflow's *build* step (the PIConGPU ``pic-build`` compile)
+    #: failed: a compile error such as a CFL ``static_assert``.  Distinct from
+    #: :data:`RUN_FAILED` because the run never started -- the failure is in the
+    #: build that precedes submission, and its remediation (fix the setup /
+    #: params) differs from a runtime crash.
+    BUILD_FAILED = "build_failed"
     RUN_FAILED = "run_failed"
     #: M3 control/results error codes.
     NOT_SIGNALABLE = "not_signalable"
@@ -82,18 +89,27 @@ class SimulationErrorCode(StrEnum):
 class SimulationExecutionError(RuntimeError):
     """A stage failure carrying a machine-readable error code."""
 
-    def __init__(self, code: SimulationErrorCode, message: str, stage: SimulationStage | None = None) -> None:
+    def __init__(
+        self,
+        code: SimulationErrorCode,
+        message: str,
+        stage: SimulationStage | None = None,
+        summary: str | None = None,
+    ) -> None:
         """Create the error.
 
         Args:
             code: Stable error code reported in the ack/event.
             message: Human-readable detail.
             stage: Pipeline stage, when the failure happened after acceptance.
+            summary: Optional short, human-readable cause extracted from a long
+                raw error (e.g. the compiler line from a cwltool dump).
 
         """
         super().__init__(message)
         self.code = code
         self.stage = stage
+        self.summary = summary
 
 
 @dataclass
@@ -351,6 +367,42 @@ _ERROR_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Cap on the short failure summary sent alongside the full error text.
+_MAX_FAILURE_SUMMARY = 500
+
+#: A compiler/CMake error line worth promoting into the summary.  Anchored on
+#: the ``error:``/``error #``/``error N`` markers a C++ compiler (or nvcc) emits,
+#: plus the ``gmake``/``make`` error tail and CMake's own ``CMake Error``.
+_COMPILER_ERROR_RE = re.compile(
+    r"(?:^|\W)error(?:\s*[:#]|\s+\d+)|gmake(?:\[\d+\])?: \*\*\*|make(?:\[\d+\])?: \*\*\*|CMake Error",
+)
+
+#: The CWL workflow's build (compile) step, as it appears in a cwltool failure.
+#: A failure naming this step is a *build* failure.
+_BUILD_STEP_RE = re.compile(r"\[\s*(?:job|step)\s+build_step(?:_\d+)?\s*\]", re.IGNORECASE)
+
+#: Any named cwltool workflow step (the pinned workflow names every step
+#: ``<name>_step``).  A failure naming a step other than the build step is not a
+#: compile failure -- it is the submit machinery or, for a job that really ran and
+#: crashed, reported by the SLURM follower as ``job_failed`` instead.
+_ANY_STEP_RE = re.compile(r"\[\s*(?:job|step)\s+\w+_step(?:_\d+)?\s*\]", re.IGNORECASE)
+
+#: Build-step markers, as a fallback when no step-named line survived (e.g. a
+#: truncated capture holding only the C++ tail).  These require a genuine
+#: compiler/make/CMake *error* marker, not a bare build artifact path: a
+#: submit-machinery failure whose truncated tail merely echoes a
+#: ``.../build/main.x.cpp`` path or the word ``cmake`` must not be relabelled a
+#: compile failure.
+_BUILD_MARKER_RE = re.compile(
+    r"\bpic-build\b"
+    r"|gmake(?:\[\d+\])?: \*\*\*"
+    r"|make(?:\[\d+\])?: \*\*\*"
+    r"|CMake Error"
+    r"|\bnvcc\b[^\n]*\b(?:error|fatal)\b"
+    r"|\.(?:hpp|cpp|cu|cuh)(?:\(\d+\)|:\d+)?:\s*(?:fatal\s+)?error\b",
+    re.IGNORECASE,
+)
+
 
 #: Per-thread capture scratch for :class:`_CapturingStderr`; set for the
 #: duration of one workflow run so concurrent runs never share a buffer.  Holds
@@ -376,6 +428,118 @@ _CAPTURE_PROXY: _CapturingStderr | None = None
 #: Chunk size for the per-run pipe reader (matches the removed ``os.dup2``
 #: reader).
 _CAPTURE_READ_CHUNK = 4096
+
+#: Number of trailing output lines retained while a build/run workflow runs, so
+#: ``get_logs`` can show the compiler tail during the multi-minute build window
+#: instead of a flat "not started yet".  Bounded so a long build cannot grow the
+#: simclient's memory.
+_BUILD_TAIL_LINES = 200
+
+#: Cap on the bytes retained for the live build tail (a backstop against a few
+#: very long lines), matching the failure-detail budget order of magnitude.
+_MAX_BUILD_TAIL_BYTES = 64 * 1024
+
+
+class _RingTail:
+    """A bounded, thread-safe ring of the last captured lines.
+
+    Bounded by both line count (:data:`_BUILD_TAIL_LINES`) and total bytes
+    (:data:`_MAX_BUILD_TAIL_BYTES`) so a build emitting a few very long lines
+    cannot grow the simclient's memory either.
+    """
+
+    def __init__(self, maxlen: int = _BUILD_TAIL_LINES) -> None:
+        """Create an empty tail."""
+        self._lines: deque[str] = deque(maxlen=maxlen)
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def add(self, text: str) -> None:
+        """Append the lines in ``text``, normalising CRLF and dropping blanks.
+
+        The byte accounting must survive the deque's own ``maxlen`` eviction:
+        when the deque is full, ``append`` silently drops the oldest line, so
+        the running total has to subtract that line's length too.  Recomputing
+        ``sum`` after the insertion is the simplest way to stay exact and keeps
+        the explicit byte-budget eviction from popping lines the deque already
+        accounts for.
+
+        Args:
+            text: A chunk of captured output (may contain several lines).
+
+        """
+        with self._lock:
+            for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                if not line:
+                    continue
+                self._lines.append(line)
+            while self._lines and sum(len(line) for line in self._lines) > _MAX_BUILD_TAIL_BYTES:
+                self._lines.popleft()
+            self._bytes = sum(len(line) for line in self._lines)
+
+    def lines(self) -> list[str]:
+        """Return the retained lines, oldest first.
+
+        Returns:
+            A copy of the current tail.
+
+        """
+        with self._lock:
+            return list(self._lines)
+
+
+#: Per-run live build tails, keyed by ``run_dir`` (a string), so ``get_logs``
+#: can read the compiler output while :func:`_run_workflow` is still running.
+_live_build_tails: dict[str, _RingTail] = {}
+_live_build_tails_lock = threading.Lock()
+
+
+def _register_live_build_tail(run_dir: Path | str) -> _RingTail:
+    """Register (or reuse) the live build tail for ``run_dir``.
+
+    Args:
+        run_dir: The run directory (the tail key).
+
+    Returns:
+        The shared tail to feed and to expose via :func:`live_build_log`.
+
+    """
+    key = str(run_dir)
+    with _live_build_tails_lock:
+        tail = _live_build_tails.get(key)
+        if tail is None:
+            tail = _RingTail()
+            _live_build_tails[key] = tail
+        return tail
+
+
+def _unregister_live_build_tail(run_dir: Path | str) -> None:
+    """Drop the live build tail for ``run_dir`` (after the workflow ends).
+
+    The failure ``error`` already carries the compiler tail, so the live tail
+    only exists for the duration of the build.
+
+    Args:
+        run_dir: The run directory whose tail is no longer needed.
+
+    """
+    with _live_build_tails_lock:
+        _live_build_tails.pop(str(run_dir), None)
+
+
+def live_build_log(run_dir: Path | str) -> list[str]:
+    """Return the retained build tail for a run, if a build was captured.
+
+    Args:
+        run_dir: The run directory (a resolve of the derived setup's sibling).
+
+    Returns:
+        The retained lines, oldest first; empty when nothing was captured.
+
+    """
+    with _live_build_tails_lock:
+        tail = _live_build_tails.get(str(run_dir))
+    return tail.lines() if tail is not None else []
 
 
 class _CapturingStderr:
@@ -520,15 +684,20 @@ class _ThreadBufferHandler(logging.Handler):
         self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Append the formatted record to the current thread's buffer."""
+        """Append the formatted record to the current thread's buffer and tail."""
         buffer = getattr(_CAPTURE_STATE, "buffer", None)
         if buffer is None:
             return
         try:
+            text = self.format(record) + "\n"
             with _CAPTURE_STATE.lock:
-                buffer.write(self.format(record) + "\n")
+                buffer.write(text)
         except Exception:  # ruff: ignore[blind-except] - logging must never raise into cwltool
             self.handleError(record)
+            return
+        tail = getattr(_CAPTURE_STATE, "tail", None)
+        if tail is not None:
+            tail.add(text)
 
 
 def _install_capture_logger() -> None:
@@ -598,17 +767,29 @@ def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
     real = _CAPTURE_PROXY._real if _CAPTURE_PROXY is not None else sys.stderr  # ruff: ignore[private-member-access] - same class
     read_fd, write_fd = os.pipe()
 
+    # The live build tail (B2): the same captured output, bounded and exposed by
+    # ``get_logs`` while the workflow runs, so the multi-minute build window is
+    # observable instead of a flat "not started yet".  A test double without a
+    # ``run_dir`` gets no tail.
+    run_dir = getattr(runner, "run_dir", None)
+    live_tail = _register_live_build_tail(run_dir) if run_dir is not None else None
+
     lock = threading.Lock()
 
     def reader() -> None:
         # Tee each chunk to the real stderr (operator logs stay visible) and
-        # the run's buffer; a daemon thread so a stuck child cannot wedge exit.
-        with os.fdopen(read_fd, "rb", closefd=True) as stream:
+        # the run's buffer/tail; a daemon thread so a stuck child cannot wedge
+        # exit.  ``buffering=0`` is important: a *buffered* ``read(n)`` blocks
+        # until ``n`` bytes or EOF, which would hold the whole build's output
+        # until the step ended and defeat the live tail (B2).
+        with os.fdopen(read_fd, "rb", buffering=0) as stream:
             for chunk in iter(lambda: stream.read(_CAPTURE_READ_CHUNK), b""):
                 text = chunk.decode("utf-8", errors="replace")
                 real.write(text)
                 with lock:
                     buffer.write(text)
+                if live_tail is not None:
+                    live_tail.add(text)
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
@@ -616,11 +797,13 @@ def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
     _CAPTURE_STATE.buffer = buffer
     _CAPTURE_STATE.lock = lock
     _CAPTURE_STATE.write_fd = write_fd
+    _CAPTURE_STATE.tail = live_tail
     try:
         runner.run()
     finally:
         _CAPTURE_STATE.buffer = None
         _CAPTURE_STATE.write_fd = None
+        _CAPTURE_STATE.tail = None
         # Close our write end first so the reader sees EOF once every inheriting
         # child has also closed it; only then join.
         with contextlib.suppress(OSError):  # pragma: no cover - a child could not close our fd
@@ -635,6 +818,11 @@ def _run_workflow(runner: Any, capture: list[str] | None = None) -> str:
         lines = "\n".join(line.rstrip() for line in text.splitlines() if _ERROR_LINE_RE.search(line))
         if capture is not None:
             capture.append(lines)
+        if live_tail is not None:
+            # The workflow (and its compiler output) has ended; the failure
+            # ``error`` already folds the tail in, and the success path reads the
+            # real log files.  Drop the live tail so it cannot be served stale.
+            _unregister_live_build_tail(run_dir)
     return lines
 
 
@@ -675,6 +863,71 @@ def _workflow_failure_detail(run_dir: Path, captured: str = "") -> str:
     if not detail:
         detail = _scan_retained_step_logs(run_dir)
     return detail[-_MAX_ERROR_DETAIL:]
+
+
+def _classify_workflow_failure(detail: str) -> tuple[SimulationErrorCode, SimulationStage]:
+    """Classify a cwltool workflow failure as a build or a run-stage failure.
+
+    The captured cwltool detail names the failing step.  A failure of the
+    ``build_step`` is the PIConGPU compile (``pic-build``): a cwltool job that
+    exits with a compiler ``error:`` and/or did not produce the ``bin``
+    directory.  A failure of any other workflow step (the
+    ``prepare_submission``/``submit``/``organize_output`` machinery) is a
+    run-stage failure; a genuine numerical/runtime failure surfaces through a
+    SLURM ``job_failed`` (not a workflow exception) and keeps its own distinct
+    reporting.
+
+    Args:
+        detail: The captured workflow failure text.
+
+    Returns:
+        The ``(error_code, stage)`` pair for a ``simulation.failed`` event.
+
+    """
+    if _BUILD_STEP_RE.search(detail):
+        return SimulationErrorCode.BUILD_FAILED, SimulationStage.BUILD
+    if _ANY_STEP_RE.search(detail):
+        # A different workflow step failed (prepare/submit/organize machinery);
+        # the compiler never ran, so it is not a build-stage compile failure.
+        return SimulationErrorCode.RUN_FAILED, SimulationStage.RUN
+    if _BUILD_MARKER_RE.search(detail):
+        # No step line survived, but the detail carries compiler/CMake output.
+        return SimulationErrorCode.BUILD_FAILED, SimulationStage.BUILD
+    return SimulationErrorCode.RUN_FAILED, SimulationStage.RUN
+
+
+def _failure_summary(detail: str) -> str | None:
+    """Extract a bounded one-of-the-first compiler/CMake error lines.
+
+    The raw ``error`` is a cwltool ``permanentFail`` dump followed by a
+    truncated C++ compiler tail; the actual cause (e.g. a CFL ``static_assert``)
+    is a single line buried in it.  Promote the first compiler/CMake error line
+    (plus the ``make`` tail when present) into a short summary so the cause is
+    readable without scrolling the dump; the full text stays in ``error``.
+
+    Args:
+        detail: The captured workflow failure text.
+
+    Returns:
+        A short summary string, or None when no recognizable error line exists.
+
+    """
+    summary: list[str] = []
+    for line in detail.splitlines():
+        stripped = line.strip()
+        if not stripped or not _COMPILER_ERROR_RE.search(stripped):
+            continue
+        # Skip cwltool's own wrapper diagnostics (``... cwltool: [job
+        # build_step] Job error:``): they name the failing step but not the
+        # cause.  The compiler/CMake/make lines below them carry the cause.
+        if "cwltool:" in stripped:
+            continue
+        summary.append(stripped)
+        if len("\n".join(summary)) >= _MAX_FAILURE_SUMMARY:
+            break
+    if not summary:
+        return None
+    return "\n".join(summary)[:_MAX_FAILURE_SUMMARY]
 
 
 def _scan_retained_step_logs(run_dir: Path) -> str:
@@ -840,7 +1093,9 @@ async def execute_submit(
         msg = f"workflow failed: {exc}"
         if detail:
             msg = f"{msg}\n{detail}"
-        raise SimulationExecutionError(SimulationErrorCode.RUN_FAILED, msg, SimulationStage.RUN) from exc
+        code, stage = _classify_workflow_failure(detail)
+        summary = _failure_summary(detail)
+        raise SimulationExecutionError(code, msg, stage, summary=summary) from exc
 
     job_id = job_id_reader(runner.run_dir, prepared.payload)
     if job_id is not None:

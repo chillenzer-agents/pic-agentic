@@ -378,6 +378,160 @@ async def test_execute_submit_reports_this_runs_stderr(fake_picongpu_runner, tmp
     assert "MARKER-solo" in str(excinfo.value)
 
 
+#: A realistic build-step (compile) failure, wrapping cwltool noise around the
+#: actual C++ compiler line (the beta-6 CFL ``static_assert`` shape).
+_BUILD_FAILURE = (
+    "workflow failed: Completed permanentFail\n"
+    "WARNING cwltool: [job build_step_14] exited with status: 5\n"
+    "ERROR cwltool: [job build_step_14] Job error:\n"
+    "Error collecting output for parameter 'bin_directory': build.cwl:73:7: "
+    "Did not find output file with glob pattern: ['bin'].\n"
+    ".../picongpu/fields/MaxwellSolver/Yee/Yee.hpp(56): error: no instance of "
+    'function template "mpl_::assertion_failed" matches the argument list\n'
+    "gmake[2]: *** [CMakeFiles/picongpu.dir/build.make:185: main.x.cpp.o] Error 1\n"
+    "gmake: *** [Makefile:136: all] Error 2"
+)
+
+#: A submit-machinery failure (not the compile step) stays a run-stage failure.
+_SUBMIT_FAILURE = (
+    "workflow failed: Completed permanentFail\n"
+    "WARNING cwltool: [job submit_step_3] exited with status: 1\n"
+    "ERROR cwltool: [job submit_step_3] Job error: sbatch not found"
+)
+
+
+def test_classify_workflow_failure_build_vs_run() -> None:
+    """B1: a build_step failure is build_failed/build; another step is run."""
+    assert sim_mod._classify_workflow_failure(_BUILD_FAILURE) == (
+        SimulationErrorCode.BUILD_FAILED,
+        SimulationStage.BUILD,
+    )
+    assert sim_mod._classify_workflow_failure(_SUBMIT_FAILURE) == (
+        SimulationErrorCode.RUN_FAILED,
+        SimulationStage.RUN,
+    )
+    # A truncated capture holding only the compiler/make tail is still a build.
+    tail_only = "gmake[2]: *** [CMakeFiles/picongpu.dir/build.make:185: main.x.cpp.o] Error 1"
+    assert sim_mod._classify_workflow_failure(tail_only) == (SimulationErrorCode.BUILD_FAILED, SimulationStage.BUILD)
+
+
+def test_classify_fallback_ignores_bare_build_artifact_paths() -> None:
+    """B1: a submit failure whose tail merely names a build path is not a build.
+
+    The step banner is gone in a truncated capture, so the fallback marker must
+    require a genuine compiler/make error, not a bare ``.cpp``/``cmake`` path an
+    ``sbatch``/organize failure could echo.
+    """
+    submit_tail = (
+        "workflow failed: Completed permanentFail\n"
+        "ERROR cwltool: submit_step_3 Job error: sbatch not found while staging "
+        ".../build/main.x.cpp and cmake helpers"
+    )
+    assert sim_mod._classify_workflow_failure(submit_tail) == (
+        SimulationErrorCode.RUN_FAILED,
+        SimulationStage.RUN,
+    )
+    # A bare ``.cpp``/``cmake`` mention without a compiler error is not a build.
+    assert sim_mod._classify_workflow_failure("staging /work/build/main.x.cpp with cmake") == (
+        SimulationErrorCode.RUN_FAILED,
+        SimulationStage.RUN,
+    )
+    # A real compiler marker without the step banner is still a build failure.
+    compiler_tail = ".../Yee.hpp(56): error: no instance of overloaded function matches"
+    assert sim_mod._classify_workflow_failure(compiler_tail) == (
+        SimulationErrorCode.BUILD_FAILED,
+        SimulationStage.BUILD,
+    )
+    nvcc_tail = "nvcc fatal   : Unsupported gpu architecture 'compute_999'"
+    assert sim_mod._classify_workflow_failure(nvcc_tail) == (
+        SimulationErrorCode.BUILD_FAILED,
+        SimulationStage.BUILD,
+    )
+
+
+def test_failure_summary_extracts_the_compiler_cause() -> None:
+    """B1: the summary names the compiler line, not cwltool's wrapper noise."""
+    summary = sim_mod._failure_summary(_BUILD_FAILURE)
+    assert summary is not None
+    assert "Yee.hpp" in summary
+    assert "error:" in summary
+    assert "cwltool:" not in summary
+    assert len(summary) <= sim_mod._MAX_FAILURE_SUMMARY
+    # No recognisable compiler line -> no summary (the raw error still stands).
+    assert sim_mod._failure_summary("workflow failed: Completed permanentFail") is None
+
+
+class _RaisingRunner:
+    """A runner whose workflow raises with a preset captured detail."""
+
+    def __init__(self, run_dir: Path, detail: str) -> None:
+        self.run_dir = run_dir
+        self.setup_dir = run_dir.parent / "input"
+        self._detail = detail
+
+    @staticmethod
+    def generate(**_flags: object) -> None:
+        return
+
+
+async def test_execute_submit_build_failure_carries_code_stage_and_summary(tmp_path, monkeypatch) -> None:
+    """B1: a compile failure raises build_failed/build with a short summary."""
+
+    def fake_workflow(runner: object, capture: list[str] | None = None) -> str:
+        if capture is not None:
+            capture.append(_BUILD_FAILURE)
+        msg = "Completed permanentFail"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(sim_mod, "_run_workflow", fake_workflow)
+    runner = _RaisingRunner(tmp_path / "run", _BUILD_FAILURE)
+    prepared = PreparedSubmit(
+        payload=SimpleNamespace(sim_id="buildc1"),
+        params=SubmitParams(),
+        runner=runner,
+        config=SubmitConfig(setup_root=tmp_path),
+    )
+
+    async def emit(*_args: object, **_kwargs: object) -> None:
+        return
+
+    with pytest.raises(SimulationExecutionError) as excinfo:
+        await execute_submit(prepared=prepared, emit=emit, job_id_reader=lambda _run, _payload: None)
+    assert excinfo.value.code is SimulationErrorCode.BUILD_FAILED
+    assert excinfo.value.stage is SimulationStage.BUILD
+    assert excinfo.value.summary is not None
+    assert "Yee.hpp" in excinfo.value.summary
+    # The full raw detail stays in the message.
+    assert "permanentFail" in str(excinfo.value)
+
+
+async def test_execute_submit_runtime_failure_stays_run(tmp_path, monkeypatch) -> None:
+    """B1: a non-build workflow failure is still run_failed/run."""
+
+    def fake_workflow(runner: object, capture: list[str] | None = None) -> str:
+        if capture is not None:
+            capture.append(_SUBMIT_FAILURE)
+        msg = "Completed permanentFail"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(sim_mod, "_run_workflow", fake_workflow)
+    runner = _RaisingRunner(tmp_path / "run", _SUBMIT_FAILURE)
+    prepared = PreparedSubmit(
+        payload=SimpleNamespace(sim_id="runfail1"),
+        params=SubmitParams(),
+        runner=runner,
+        config=SubmitConfig(setup_root=tmp_path),
+    )
+
+    async def emit(*_args: object, **_kwargs: object) -> None:
+        return
+
+    with pytest.raises(SimulationExecutionError) as excinfo:
+        await execute_submit(prepared=prepared, emit=emit, job_id_reader=lambda _run, _payload: None)
+    assert excinfo.value.code is SimulationErrorCode.RUN_FAILED
+    assert excinfo.value.stage is SimulationStage.RUN
+
+
 class _RealStub:
     """A minimal real-stream stub for the proxy tee test."""
 
@@ -481,6 +635,51 @@ def test_child_stderr_fd_is_teed_and_captured(fake_picongpu_runner, tmp_path) ->
             sim_mod._CAPTURE_PROXY._real = saved_target
     assert "child: command not found" in (capture[0] if capture else ""), "child fd output must be captured per run"
     assert "child: command not found" in real_path.read_text(encoding="utf-8"), "child output must stay visible"
+
+
+class _HoldingRunner:
+    """Writes to the child stderr fd and blocks until released."""
+
+    setup_dir = Path("/nonexistent/input")
+
+    def __init__(self, run_dir: Path, release: threading.Event) -> None:
+        self.run_dir = run_dir
+        self._release = release
+
+    @staticmethod
+    def generate(**_flags: object) -> None:
+        return
+
+    def run(self) -> None:
+        runtime_context = sys.modules["picongpu.pypicongpu.runner"].RuntimeContext
+        context = runtime_context(kwargs={})
+        os.write(context.default_stderr.fileno(), b"LIVE-BUILD-COMPILING\n")
+        self._release.wait(timeout=5)
+
+
+def test_run_workflow_populates_the_live_build_tail(fake_picongpu_runner, tmp_path) -> None:
+    """B2: while the workflow runs, the capture feeds the get_logs live tail."""
+    sim_mod._install_capture_context()
+    run_dir = tmp_path / "run"
+    release = threading.Event()
+    runner = _HoldingRunner(run_dir, release)
+    thread = threading.Thread(target=sim_mod._run_workflow, args=(runner,))
+    thread.start()
+    try:
+        deadline = time.time() + 3.0
+        lines: list[str] = []
+        while time.time() < deadline:
+            lines = sim_mod.live_build_log(run_dir)
+            if any("LIVE-BUILD-COMPILING" in line for line in lines):
+                break
+            time.sleep(0.01)
+        assert any("LIVE-BUILD-COMPILING" in line for line in lines)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    # Once the workflow ends, the live tail is dropped (the failure error / real
+    # log files take over).
+    assert sim_mod.live_build_log(run_dir) == []
 
 
 def test_thread_buffer_handler_routes_to_emitting_thread() -> None:

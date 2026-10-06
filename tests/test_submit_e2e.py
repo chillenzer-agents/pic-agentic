@@ -554,6 +554,54 @@ async def test_replay_of_failed_submission_reports_failure(shared_dir, tmp_path,
     assert second.payload["state"] == SimulationState.FAILED.value
 
 
+async def test_failed_submission_event_carries_build_classification(
+    shared_dir, tmp_path, fake_runner, monkeypatch
+) -> None:
+    """B1 end-to-end: a compile failure reaches the room's failed event.
+
+    The event must carry ``error_code=build_failed``, ``stage=build`` and a
+    bounded ``failure_summary`` naming the compiler cause, so the agent does not
+    have to read the raw cwltool dump.
+    """
+    mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+
+    build_detail = (
+        "WARNING cwltool: [job build_step_2] exited with status: 5\n"
+        ".../Yee.hpp(56): error: no instance of function template matches\n"
+        "gmake: *** [Makefile:136: all] Error 2"
+    )
+
+    def failing_workflow(runner: object, capture: list[str] | None = None) -> str:
+        if capture is not None:
+            capture.append(build_detail)
+        msg = "Completed permanentFail"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(sim_mod, "_run_workflow", failing_workflow)
+    _cmd_id, _payload, command = await service.build_payload(script)
+    ack = await client.handle(command)
+    assert ack is not None
+    # The direct ``handle`` path emits lifecycle events to the sim-side
+    # transport without a server pump; drain them (the client sends on
+    # ``sim_t``, so they surface on ``mcp_t``) and inspect the payloads.
+    sent: list[dict] = []
+    while True:
+        try:
+            message = await asyncio.wait_for(anext(mcp_t.receive()), timeout=0.2)
+        except (TimeoutError, StopAsyncIteration):
+            break
+        sent.append(message.payload)
+    failed_events = [payload for payload in sent if payload.get("state") == SimulationState.FAILED.value]
+    assert failed_events
+    failed = failed_events[-1]
+    assert failed["error_code"] == "build_failed"
+    assert failed["stage"] == "build"
+    assert "Yee.hpp" in failed["failure_summary"]
+    assert "permanentFail" in failed["error"]
+
+
 async def test_submit_rejects_unsupported_simulation_key(shared_dir, tmp_path, fake_runner) -> None:
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
