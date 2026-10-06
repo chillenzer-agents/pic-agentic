@@ -114,11 +114,12 @@ _WINDOW_COVERAGE_WARNING = 0.9
 #: down further if it still exceeds :data:`MAX_RESULT_BYTES`.
 _PLUGIN_MAX_POINTS = 256
 
-#: Reader -> the summary arrays that carry *measured values* (as opposed to the
-#: coordinate axes such as ``bins_kev``/``y_slices_m``/``omega_per_s``, which are
-#: nonzero by construction).  An all-zero value array is a likely vacuous result.
-#: The openPMD and image readers have no such scalar (a phase-space plane or a
-#: PNG legitimately has zero-valued cells), so they are not annotated.
+#: Reader -> the summary arrays/scalars that carry *measured values* (as opposed
+#: to the coordinate axes such as ``bins_kev``/``y_slices_m``/``omega_per_s``,
+#: which are nonzero by construction).  An all-zero value is a likely vacuous
+#: result.  The openPMD and image readers have no such scalar (a phase-space
+#: plane or a PNG legitimately has zero-valued cells), so they are not
+#: annotated.
 _VACUOUS_VALUE_KEYS: dict[str, tuple[str, ...]] = {
     "energy_histogram": ("counts",),
     "emittance": ("slice_emit_mrad",),
@@ -126,7 +127,23 @@ _VACUOUS_VALUE_KEYS: dict[str, tuple[str, ...]] = {
     # keying vacuity on it could warn -- or stay silent -- on the subsample
     # while the measured total is nonzero.  The honest scalar is the total.
     "transition_radiation": ("total_intensity",),
+    # A field-energy study's only numeric artifact is ``fields_energy.dat``; an
+    # all-zero trajectory is the physically-empty case.  The total is the sum of
+    # the components, so its min/max cover it: both zero iff every component and
+    # every step is zero (``_has_nonzero_leaf`` keys on ``fabs``, so an
+    # unphysical negative component still clears it).
+    "energy_fields": ("total_J_min", "total_J_max"),
 }
+
+#: Reserved summary key marking a reader summary that :func:`_annotate_vacuous`
+#: found entirely zero.  The vacuity *probe* keys on this explicit marker rather
+#: than the presence of any ``warning``: ``energy_histogram`` already warns about
+#: a mis-window, and a truncated ``energy_fields`` history warns too, and neither
+#: of those is the all-zero health signal (a populated but clipped/windowed
+#: diagnostic must not be misread as a "successful-but-empty" run).  It is an
+#: internal control flag, not public protocol data, so :func:`_plugin` strips it
+#: from the response before it reaches the wire.
+_VACUOUS_MARKER_KEY = "vacuous"
 
 #: Array-rank constants for the openPMD reader summaries.  The shipped readers
 #: return 2D phase-space planes and 2D radiation spectra, and a calorimeter cube
@@ -1924,13 +1941,22 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     if not keys:
         return summary
     values = [summary[key] for key in keys if key in summary]
-    if not values or any(_has_nonzero_leaf(value) for value in values):
+    # ``None`` means the reader could not measure the value (e.g. a capped
+    # field-energy window with no whole row), which is *unknown*, not zero: a
+    # vacuity claim would be false, so bail rather than warn.
+    if not values or any(value is None for value in values) or any(_has_nonzero_leaf(value) for value in values):
         return summary
+    message = f"{reader} is all zeros; the run may have no particles in range or the diagnostic may be misconfigured"
+    existing = summary.get("warning")
     return {
         **summary,
-        "warning": (
-            f"{reader} is all zeros; the run may have no particles in range or the diagnostic may be misconfigured"
-        ),
+        # Keep any warning the reader already set (e.g. a truncated history)
+        # rather than silently dropping it.
+        "warning": f"{existing}; {message}" if existing else message,
+        # An explicit marker so the vacuity probe can tell *this* signal from an
+        # unrelated warning a reader may also carry (e.g. a mis-window
+        # ``energy_histogram`` or a truncated ``energy_fields`` history).
+        _VACUOUS_MARKER_KEY: True,
     }
 
 
@@ -2056,7 +2082,10 @@ def probe_vacuity(sim_id: str, *, run_dir: Path | str) -> str | None:
     probed.  A run whose energy histogram is all-zero while its (non-numeric)
     phase space or radiation output is populated is still flagged, because the
     vacuity signal only ever looked at scalar value arrays; treat the flag as
-    "no particles in the numeric diagnostics", not "no particles at all".
+    "no particles in the numeric diagnostics", not "no particles at all".  The
+    verdict keys on the explicit all-zero marker, so a populated-but-mis-window
+    histogram or a truncated field-energy history (both of which also carry a
+    ``warning``) does not masquerade as the empty-run signal.
 
     Args:
         sim_id: The simulation id.
@@ -2091,9 +2120,12 @@ def probe_vacuity(sim_id: str, *, run_dir: Path | str) -> str | None:
                 # cannot be judged, so it neither clears nor flags the run.
                 continue
             saw_artifact = True
-            if "warning" not in result:
+            if not result.get(_VACUOUS_MARKER_KEY):
+                # A populated artifact clears the run.  Key on the explicit
+                # all-zero marker, not on any ``warning``: a mis-window
+                # histogram or a truncated history warns too but is not empty.
                 return None
-            warning = str(result["warning"])
+            warning = str(result.get("warning", ""))
     return warning if saw_artifact else None
 
 
@@ -2319,7 +2351,8 @@ def _parse_fields_energy(text: str) -> tuple[list[_FieldEnergyRow], list[str], b
 
     Returns:
         ``(rows, component_names, truncated)``.  ``truncated`` is True when a
-        row was dropped as malformed, so the summary can say so.
+        row was dropped as malformed.  A byte-cap cut is signalled by
+        :func:`_read_fields_energy`, which trims the text to whole lines first.
 
     """
     rows: list[_FieldEnergyRow] = []
@@ -2380,21 +2413,26 @@ def _build_energy_fields(
 
     """
     _ = instance, groups, window
-    rows, components, truncated = _read_fields_energy(target)
-    return _summarize_energy_fields(rows, components, iteration, target, truncated=truncated)
+    rows, components, truncated, capped = _read_fields_energy(target)
+    return _summarize_energy_fields(rows, components, iteration, target, truncated=truncated, capped=capped)
 
 
-def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str], bool]:
+def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str], bool, bool]:
     """Read a native text plugin file under a byte cap and parse it once.
 
-    The read is bounded by :data:`_NATIVE_TEXT_MAX_BYTES`, so a pathologically
-    large ``fields_energy.dat`` cannot be pulled wholly into memory despite the
-    cap the comment documents (m1); a chunky read stops just past the cap and
-    the parser then sees only the prefix (excess rows are dropped as malformed,
-    and ``truncated`` says so).
+    The read is bounded by :data:`_NATIVE_TEXT_MAX_BYTES`.  Reading one byte past
+    the cap is what detects a file larger than the window: rows beyond the cap
+    are never read, so a clean prefix would otherwise parse with
+    ``truncated=False`` and the trajectory (and the reported peak) would be
+    silently partial.  When the cap was hit the trailing partial line is dropped
+    (a row cut mid-number could parse to a wrong value) and ``truncated`` is set.
 
     Returns:
-        ``(rows, component_names, truncated)`` from :func:`_parse_fields_energy`.
+        ``(rows, component_names, truncated, capped)``.  ``truncated`` is True
+        when the byte cap was hit or a row was dropped as malformed.  ``capped``
+        is the raw byte-cap signal on its own, so a caller can tell "no complete
+        line fit inside the cap" (``capped`` with no rows) from a genuinely
+        empty/absent file.
 
     Raises:
         ResultsReaderError: If the file cannot be read.
@@ -2406,8 +2444,16 @@ def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str],
     except OSError as exc:  # pragma: no cover - target existence is checked earlier
         msg = f"cannot read {target.name}: {exc}"
         raise ResultsReaderError(msg) from exc
+    capped = len(raw) > _NATIVE_TEXT_MAX_BYTES
+    if capped:
+        raw = raw[:_NATIVE_TEXT_MAX_BYTES]
+        # Drop the final (incomplete) line: a row severed by the cap could still
+        # parse to a wrong value, so only whole lines of the prefix are trusted.
+        last_newline = raw.rfind(b"\n")
+        raw = raw[: last_newline + 1] if last_newline >= 0 else b""
     text = raw.decode("utf-8", errors="replace")
-    return _parse_fields_energy(text)
+    rows, components, truncated = _parse_fields_energy(text)
+    return rows, components, truncated or capped, capped
 
 
 def _summarize_energy_fields(
@@ -2417,6 +2463,7 @@ def _summarize_energy_fields(
     target: Path,
     *,
     truncated: bool,
+    capped: bool = False,
 ) -> dict[str, Any]:
     """Shape already-parsed ``EnergyFields`` rows into the bounded summary.
 
@@ -2424,23 +2471,32 @@ def _summarize_energy_fields(
     the file once and reuse the rows for both the step resolution and the
     summary (m3).
 
+    ``capped`` is the raw byte-cap signal from :func:`_read_fields_energy`.
+    A capped file with no complete line inside the cap (e.g. one very long line
+    or nonewline content) still gets an honest truncated summary here rather
+    than a ``no_results`` error: the file demonstrably *has* data, the reader
+    just could not fit a whole row inside the window.
+
     Returns:
         The bounded summary dict.
 
     Raises:
-        ResultsReaderError: If there are no parsable rows.
+        ResultsReaderError: If there are no parsable rows and the file was not
+            clipped by the cap.
 
     """
     if not rows:
-        msg = f"{target.name} has no parsable field-energy rows"
-        raise ResultsReaderError(msg)
+        if not capped:
+            msg = f"{target.name} has no parsable field-energy rows"
+            raise ResultsReaderError(msg)
+        return _empty_capped_energy_fields(components, target)
     steps = [row.step for row in rows]
     totals = [row.total for row in rows]
     index = steps.index(iteration) if iteration in steps else len(rows) - 1
     component_values = [[row.components[position] for row in rows] for position in range(len(components))]
     strided_steps, downsampled = _stride([float(step) for step in steps])
     strided_totals, _ = _stride(totals)
-    return {
+    summary: dict[str, Any] = {
         "step": [int(step) for step in strided_steps],
         "total_J": strided_totals,
         "component_names": list(components),
@@ -2462,6 +2518,63 @@ def _summarize_energy_fields(
         **_plugin_source(target, steps[index]),
         "truncated": truncated,
         "downsampled": downsampled,
+    }
+    if truncated:
+        # ``total_J_max`` is the peak *over the rows read*.  When the history was
+        # clipped by the byte cap (or a malformed row), that peak is not the
+        # file's real historical maximum; say so rather than presenting a partial
+        # trajectory as complete.
+        # A *range*, so use the true min/max rather than assuming the file is in
+        # ascending step order (the writer is monotonic, but a re-ordered or
+        # malformed history must not be described with a backwards interval).
+        summary["warning"] = (
+            f"{target.name} was truncated; the summary covers steps {min(steps)}-{max(steps)} "
+            f"({len(rows)} rows) and total_J_max is the peak over those rows only"
+        )
+    return summary
+
+
+def _empty_capped_energy_fields(components: list[str], target: Path) -> dict[str, Any]:
+    """Summary for a capped ``fields_energy.dat`` window holding no whole row.
+
+    A file larger than :data:`_NATIVE_TEXT_MAX_BYTES` whose first cap-sized
+    window contains no newline (e.g. one very long line, or a writer that never
+    emits a newline) leaves no parsable prefix.  The file demonstrably *has*
+    data, so reporting the historical ``no_results`` error would be misleading;
+    an honest truncated summary with an explicit warning is returned instead.
+    The min/max/last totals are ``None`` (unknown), not ``0`` - the reader must
+    not imply the fields are empty - which also keeps :func:`_annotate_vacuous`
+    from misreading the unknown as an all-zero signal.
+
+    Returns:
+        The truncated, data-free bounded summary dict.
+
+    """
+    return {
+        "step": [],
+        "total_J": [],
+        "component_names": list(components),
+        "component_last_J": {},
+        "component_min_J": {},
+        "component_max_J": {},
+        "selected_step": None,
+        "step_first": None,
+        "step_last": None,
+        "n_steps": 0,
+        "total_J_min": None,
+        "total_J_max": None,
+        "total_J_last": None,
+        "total_J_selected": None,
+        "units_J": "Joule",
+        "source_path": target.name,
+        "source_size_bytes": _entry_size(target),
+        "iteration": None,
+        "truncated": True,
+        "downsampled": False,
+        "warning": (
+            f"{target.name} was truncated; no complete field-energy row fit inside the "
+            f"{_NATIVE_TEXT_MAX_BYTES}-byte read cap, so no trajectory is reported"
+        ),
     }
 
 
@@ -2487,13 +2600,17 @@ def _native_plugin_result(
 
     """
     _ = output
-    rows, components, truncated = _read_fields_energy(target)
+    rows, components, truncated, capped = _read_fields_energy(target)
     available = [row.step for row in rows]
     if not available:
+        if capped:
+            # A file larger than the cap with no whole row in the window: report
+            # an honest truncated summary rather than the historical error.
+            return _annotate_vacuous(reader, _empty_capped_energy_fields(components, target))
         msg = f"{target.name} has no parsable field-energy rows"
         raise ResultsReaderError(msg)
     selected = _resolve_plugin_iteration(available, params.iteration)
-    summary = _summarize_energy_fields(rows, components, selected, target, truncated=truncated)
+    summary = _summarize_energy_fields(rows, components, selected, target, truncated=truncated, capped=capped)
     return _annotate_vacuous(reader, summary)
 
 
@@ -2609,7 +2726,16 @@ def _plugin(
     target = _plugin_target(output, params, spec)
     if target is None:
         return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
-    return _read_plugin_target(reader, spec, output, params, target)
+    payload = _read_plugin_target(reader, spec, output, params, target)
+    # The reader shares its summary with :func:`probe_vacuity`, which keys on the
+    # explicit all-zero marker; that marker is an internal control flag, not part
+    # of the public summary, so strip it from the response before it reaches the
+    # wire rather than documenting a reserved key every caller must ignore.  The
+    # probe does not go through here, so it still sees the marker.
+    result = payload.get("result")
+    if isinstance(result, dict):
+        result.pop(_VACUOUS_MARKER_KEY, None)
+    return payload
 
 
 def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:

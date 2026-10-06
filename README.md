@@ -617,7 +617,14 @@ before this reader existed `describe_results` mislabelled it `binary` and
 min/max/last totals, the selected row's own `total_J_selected`, and the step
 range; `iteration` selects one reported step
 (`last` by default). No optional reader is needed. `read_result` serves the file
-directly as a bounded text tail as well.
+directly as a bounded text tail as well. The history is read under an 8 MiB cap;
+a file larger than that is clipped to whole leading rows and the summary reports
+`truncated: true` with a `warning` naming the covered step range, so a partial
+trajectory (and the peak over it) is never presented as the complete history.
+A capped file whose window holds no complete row (e.g. one very long line)
+still returns a `truncated: true` summary with unknown (`null`) totals and an
+explicit warning rather than an empty-looking error, so a genuinely absent
+artifact stays distinguishable from an unreadable window.
 
 The `energy_histogram` reader reports `count_in_window` for a [keV] window that
 is **requestable** with `min_kev`/`max_kev` (both or neither, non-negative,
@@ -684,11 +691,15 @@ was empty" (the beta-4 empty-campaign case) without a reviewer reading a
 histogram by hand.
 
 The probe is deliberately narrow: only the numeric *text* readers
-(`energy_histogram`, `emittance`, `transition_radiation`) are examined, and
-*every* matching artifact of each is read, so a populated species clears a run
-with another empty one. A run whose energy histogram is all-zero while a
-phase-space or radiation diagnostic is populated is still flagged; treat the
-signal as "no particles in the numeric diagnostics", not "no particles at all".
+(`energy_histogram`, `energy_fields`, `emittance`, `transition_radiation`) are
+examined, and *every* matching artifact of each is read, so a populated species
+clears a run with another empty one. A run whose energy histogram is all-zero
+while a phase-space or radiation diagnostic is populated is still flagged; treat
+the signal as "no particles in the numeric diagnostics", not "no particles at
+all". A populated-but-clipped diagnostic does not trip the probe: it keys on an
+explicit all-zero marker rather than on the mere presence of a `warning` (a
+mis-window histogram and a truncated field-energy history both warn without
+being empty).
 
 ## Tests and tooling
 

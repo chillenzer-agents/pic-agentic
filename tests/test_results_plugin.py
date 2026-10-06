@@ -162,6 +162,114 @@ def test_field_energy_physics_fact_names_the_selected_step(tmp_path: Path) -> No
     assert "at iteration 50 is 3e-05" not in joined
 
 
+def test_field_energy_under_the_byte_cap_is_not_truncated(tmp_path: Path) -> None:
+    """A small history is complete, so there is no truncation warning (C2)."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 1.5e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is False
+    assert "warning" not in summary
+
+
+def test_field_energy_history_over_the_byte_cap_is_marked_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2: a file larger than the read cap reports ``truncated`` and says so.
+
+    Rows beyond :data:`results._NATIVE_TEXT_MAX_BYTES` are never read, so a clean
+    prefix must not be presented as a complete history.  The peak is placed
+    *after* the cap: a silent prefix would report the low prefix peak as
+    ``total_J_max``, which is exactly the C2 harm.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    monkeypatch.setattr(results, "_NATIVE_TEXT_MAX_BYTES", 512)
+    steps = tuple(range(2000))
+    totals = tuple(1.0 if step < 1000 else 99.0 for step in steps)
+    fields_energy_dat(run, steps=steps, totals=totals)
+    assert (run / "simOutput" / "fields_energy.dat").stat().st_size > 512
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is True
+    assert "truncated" in summary["warning"]
+    # The peak is over the rows *read*: every complete row of the prefix has the
+    # 1.0 J total, so the summary must report exactly 1.0 and never the 99 J peak
+    # that lies beyond the cap.
+    assert summary["total_J_max"] == pytest.approx(1.0)
+    # Only whole rows of the prefix are kept, so the selected step is a real one.
+    assert summary["step_last"] in steps
+
+
+def test_field_energy_over_the_cap_without_a_whole_row_is_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An over-cap window with no newline yields a truncated summary, not an error.
+
+    A file larger than the cap whose first window holds no complete line (one
+    very long line, or a writer that never emits a newline) used to fall through
+    to ``no_results`` ("has no parsable field-energy rows"), which wrongly implies
+    the file is empty.  It demonstrably has data, so the reader reports
+    ``truncated`` with unknown totals rather than a misleading error.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    monkeypatch.setattr(results, "_NATIVE_TEXT_MAX_BYTES", 512)
+    path = run / "simOutput" / "fields_energy.dat"
+    path.write_bytes(b"0 " + b"9.9e0 " * 500)
+    assert path.stat().st_size > 512
+    assert b"\n" not in path.read_bytes()
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is True
+    assert "truncated" in summary["warning"]
+    assert summary["n_steps"] == 0
+    # Unknown, not zero: the reader must not claim the fields are empty.
+    assert summary["total_J_max"] is None
+    assert "warning" in summary
+    assert "all zeros" not in summary["warning"]
+
+
+def test_field_energy_truncation_warning_reports_a_true_step_range(tmp_path: Path) -> None:
+    """The truncation warning names the min-max step even for an out-of-order file.
+
+    The writer is monotonic, but the warning must describe a real *range*: a
+    re-ordered history must not be reported with a backwards interval.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    target = run / "simOutput" / "fields_energy.dat"
+    target.write_text("0 1.0\n", encoding="utf-8")
+    rows = [
+        results._FieldEnergyRow(step=100, total=3.0, components=[3.0 / 6] * 6),
+        results._FieldEnergyRow(step=0, total=1.0, components=[1.0 / 6] * 6),
+        results._FieldEnergyRow(step=50, total=2.0, components=[2.0 / 6] * 6),
+    ]
+    summary = results._summarize_energy_fields(
+        rows,
+        ["Bx", "By", "Bz", "Ex", "Ey", "Ez"],
+        50,
+        target,
+        truncated=True,
+    )
+    assert "steps 0-100" in summary["warning"]
+
+
+def test_field_energy_malformed_row_marks_truncated(tmp_path: Path) -> None:
+    """A malformed row is dropped and reported, independent of the byte cap."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    path = fields_energy_dat(run, steps=(0, 50), totals=(1.0e-5, 2.0e-5))
+    path.write_text(path.read_text(encoding="utf-8") + "not a row\n", encoding="utf-8")
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is True
+    assert "truncated" in summary["warning"]
+
+
 def test_field_energy_file_reads_as_a_bounded_text_tail(tmp_path: Path) -> None:
     """H2: ``read_result`` no longer rejects ``fields_energy.dat`` as binary."""
     run = tmp_path / "run"
@@ -403,12 +511,100 @@ def test_annotate_vacuous_covers_the_numeric_readers() -> None:
         "energy_histogram": {"counts": [0.0, 0.0], "bins_kev": [1.0, 2.0]},
         "emittance": {"slice_emit_mrad": [0.0, 0.0], "y_slices_m": [0.0, 1.0]},
         "transition_radiation": {"total_intensity": 0.0, "intensity": [0.0]},
+        "energy_fields": {
+            "total_J_min": 0.0,
+            "total_J_max": 0.0,
+            "total_J_last": 0.0,
+            "total_J": [0.0, 0.0],
+            "step": [0, 50],
+        },
     }
     for reader, summary in cases.items():
         annotated = results._annotate_vacuous(reader, summary)
         assert "all zeros" in annotated["warning"]
+        assert annotated[results._VACUOUS_MARKER_KEY] is True
     nonzero = results._annotate_vacuous("energy_histogram", {"counts": [0.0, 3.0], "bins_kev": [1.0, 2.0]})
     assert "warning" not in nonzero
+    assert results._VACUOUS_MARKER_KEY not in nonzero
+
+
+def test_annotate_vacuous_keeps_a_reader_warning_and_marks_the_empty_signal() -> None:
+    """The all-zero marker is distinct from a reader's own warning.
+
+    An all-zero ``fields_energy.dat`` is also (usually) truncated; the summary
+    must keep both the truncation warning and add the all-zero signal, and the
+    vacuity marker must be present so the probe still flags the run (C1).
+    """
+    dead = {"total_J_min": 0.0, "total_J_max": 0.0, "warning": "fields_energy.dat was truncated"}
+    annotated = results._annotate_vacuous("energy_fields", dead)
+    assert annotated[results._VACUOUS_MARKER_KEY] is True
+    assert "truncated" in annotated["warning"]
+    assert "all zeros" in annotated["warning"]
+
+
+def test_probe_vacuity_ignores_a_non_vacuous_reader_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A populated-but-warning summary must not be read as an empty run (C1).
+
+    The ``energy_histogram`` mis-window warning was the latent trap: once a
+    reader that also warns (``energy_fields`` truncation, histogram mis-window)
+    entered the probe, keying on ``"warning" in result`` would have flagged a
+    populated run.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run)
+    monkeypatch.setattr(
+        results,
+        "_read_plugin_target",
+        lambda *_a, **_k: {
+            "result": {"counts": [0.0, 3.0], "count_in_window": {"count": 0.0}, "warning": "window misses the data"},
+        },
+    )
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None
+
+
+def test_probe_vacuity_flags_an_all_zero_energy_fields_run(tmp_path: Path) -> None:
+    """C1: an all-zero ``fields_energy.dat`` is a suspect run with no PIConGPU.
+
+    The field-energy monitor is a study's only numeric artifact; the native
+    reader needs no PIConGPU install, so the real path is exercised directly.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(0.0, 0.0, 0.0))
+    warning = results.probe_vacuity(SIM_ID, run_dir=run)
+    assert warning is not None
+    assert "all zeros" in warning
+
+
+def test_probe_vacuity_clears_a_populated_energy_fields_run(tmp_path: Path) -> None:
+    """C1: a populated ``fields_energy.dat`` is not suspect."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run)
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None
+
+
+def test_read_plugin_result_does_not_leak_the_vacuity_marker(tmp_path: Path) -> None:
+    """The internal all-zero marker must not reach the public ack.
+
+    The marker is a control flag for :func:`probe_vacuity`, not documented
+    protocol data; a caller of ``read_plugin_result`` must see the ``warning``
+    but not an undocumented ``vacuous`` key.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(0.0, 0.0, 0.0))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert results._VACUOUS_MARKER_KEY not in summary
+    assert "all zeros" in summary["warning"]
+    # The probe still sees it: it reads the summary through the reader path,
+    # not through ``_plugin``, so the strip cannot starve the health signal.
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is not None
 
 
 def test_transition_radiation_vacuity_uses_the_total_not_the_stride() -> None:
