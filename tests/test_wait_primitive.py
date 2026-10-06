@@ -308,6 +308,15 @@ async def test_wait_unknown_simulation_raises_keyerror() -> None:
         await service.wait_for_state("nope", timeout_s=1.0)
 
 
+async def test_wait_unknown_simulation_is_reported_before_the_budget() -> None:
+    """An unknown id must not leak the client budget as the primary error."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05, client_timeout_s=300.0)
+    # The default timeout (1800 s) exceeds the 300 s budget, so the pre-fix
+    # order reported wait_exceeds_client_timeout for the unknown id.
+    with pytest.raises(KeyError, match="unknown simulation"):
+        await service.wait_for_state("nope")
+
+
 @pytest.mark.parametrize("timeout_s", [0.0, -1.0, MIN_WAIT_TIMEOUT_S / 2, MAX_WAIT_TIMEOUT_S + 1])
 async def test_wait_validates_timeout_bounds(timeout_s: float) -> None:
     service = _service()

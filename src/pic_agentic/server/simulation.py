@@ -892,10 +892,12 @@ class SubmitService:
         """
         targets, terminal_only = _resolve_wait_targets(target_states)
         timeout = _validate_timeout(timeout_s)
-        _check_client_budget(timeout, self.client_timeout_s)
+        # Resolve the simulation first: an unknown id is the caller's primary
+        # mistake, and reporting a budget detail for it would be misleading.
         if self.get(sim_id) is None:
             msg = f"unknown simulation {sim_id!r}"
             raise KeyError(msg)
+        _check_client_budget(timeout, self.client_timeout_s)
         interval = max(poll_interval_s, MIN_WAIT_POLL_S)
         wakeup = asyncio.Event()
         self._waiters.setdefault(sim_id, set()).add(wakeup)
