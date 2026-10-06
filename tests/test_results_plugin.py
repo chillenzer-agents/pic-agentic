@@ -403,12 +403,81 @@ def test_annotate_vacuous_covers_the_numeric_readers() -> None:
         "energy_histogram": {"counts": [0.0, 0.0], "bins_kev": [1.0, 2.0]},
         "emittance": {"slice_emit_mrad": [0.0, 0.0], "y_slices_m": [0.0, 1.0]},
         "transition_radiation": {"total_intensity": 0.0, "intensity": [0.0]},
+        "energy_fields": {
+            "total_J_min": 0.0,
+            "total_J_max": 0.0,
+            "total_J_last": 0.0,
+            "total_J": [0.0, 0.0],
+            "step": [0, 50],
+        },
     }
     for reader, summary in cases.items():
         annotated = results._annotate_vacuous(reader, summary)
         assert "all zeros" in annotated["warning"]
+        assert annotated[results._VACUOUS_MARKER_KEY] is True
     nonzero = results._annotate_vacuous("energy_histogram", {"counts": [0.0, 3.0], "bins_kev": [1.0, 2.0]})
     assert "warning" not in nonzero
+    assert results._VACUOUS_MARKER_KEY not in nonzero
+
+
+def test_annotate_vacuous_keeps_a_reader_warning_and_marks_the_empty_signal() -> None:
+    """The all-zero marker is distinct from a reader's own warning.
+
+    An all-zero ``fields_energy.dat`` is also (usually) truncated; the summary
+    must keep both the truncation warning and add the all-zero signal, and the
+    vacuity marker must be present so the probe still flags the run (C1).
+    """
+    dead = {"total_J_min": 0.0, "total_J_max": 0.0, "warning": "fields_energy.dat was truncated"}
+    annotated = results._annotate_vacuous("energy_fields", dead)
+    assert annotated[results._VACUOUS_MARKER_KEY] is True
+    assert "truncated" in annotated["warning"]
+    assert "all zeros" in annotated["warning"]
+
+
+def test_probe_vacuity_ignores_a_non_vacuous_reader_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A populated-but-warning summary must not be read as an empty run (C1).
+
+    The ``energy_histogram`` mis-window warning was the latent trap: once a
+    reader that also warns (``energy_fields`` truncation, histogram mis-window)
+    entered the probe, keying on ``"warning" in result`` would have flagged a
+    populated run.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    energy_histogram_dat(run)
+    monkeypatch.setattr(
+        results,
+        "_read_plugin_target",
+        lambda *_a, **_k: {
+            "result": {"counts": [0.0, 3.0], "count_in_window": {"count": 0.0}, "warning": "window misses the data"},
+        },
+    )
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None
+
+
+def test_probe_vacuity_flags_an_all_zero_energy_fields_run(tmp_path: Path) -> None:
+    """C1: an all-zero ``fields_energy.dat`` is a suspect run with no PIConGPU.
+
+    The field-energy monitor is a study's only numeric artifact; the native
+    reader needs no PIConGPU install, so the real path is exercised directly.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(0.0, 0.0, 0.0))
+    warning = results.probe_vacuity(SIM_ID, run_dir=run)
+    assert warning is not None
+    assert "all zeros" in warning
+
+
+def test_probe_vacuity_clears_a_populated_energy_fields_run(tmp_path: Path) -> None:
+    """C1: a populated ``fields_energy.dat`` is not suspect."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run)
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is None
 
 
 def test_transition_radiation_vacuity_uses_the_total_not_the_stride() -> None:

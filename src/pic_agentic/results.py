@@ -114,11 +114,12 @@ _WINDOW_COVERAGE_WARNING = 0.9
 #: down further if it still exceeds :data:`MAX_RESULT_BYTES`.
 _PLUGIN_MAX_POINTS = 256
 
-#: Reader -> the summary arrays that carry *measured values* (as opposed to the
-#: coordinate axes such as ``bins_kev``/``y_slices_m``/``omega_per_s``, which are
-#: nonzero by construction).  An all-zero value array is a likely vacuous result.
-#: The openPMD and image readers have no such scalar (a phase-space plane or a
-#: PNG legitimately has zero-valued cells), so they are not annotated.
+#: Reader -> the summary arrays/scalars that carry *measured values* (as opposed
+#: to the coordinate axes such as ``bins_kev``/``y_slices_m``/``omega_per_s``,
+#: which are nonzero by construction).  An all-zero value is a likely vacuous
+#: result.  The openPMD and image readers have no such scalar (a phase-space
+#: plane or a PNG legitimately has zero-valued cells), so they are not
+#: annotated.
 _VACUOUS_VALUE_KEYS: dict[str, tuple[str, ...]] = {
     "energy_histogram": ("counts",),
     "emittance": ("slice_emit_mrad",),
@@ -126,7 +127,21 @@ _VACUOUS_VALUE_KEYS: dict[str, tuple[str, ...]] = {
     # keying vacuity on it could warn -- or stay silent -- on the subsample
     # while the measured total is nonzero.  The honest scalar is the total.
     "transition_radiation": ("total_intensity",),
+    # A field-energy study's only numeric artifact is ``fields_energy.dat``; an
+    # all-zero trajectory is the physically-empty case.  The total is the sum of
+    # the components, so its min/max cover it: both zero iff every component and
+    # every step is zero (``_has_nonzero_leaf`` keys on ``fabs``, so an
+    # unphysical negative component still clears it).
+    "energy_fields": ("total_J_min", "total_J_max"),
 }
+
+#: Reserved summary key marking a reader summary that :func:`_annotate_vacuous`
+#: found entirely zero.  The vacuity *probe* keys on this explicit marker rather
+#: than the presence of any ``warning``: ``energy_histogram`` already warns about
+#: a mis-window, and a truncated ``energy_fields`` history warns too, and neither
+#: of those is the all-zero health signal (a populated but clipped/windowed
+#: diagnostic must not be misread as a "successful-but-empty" run).
+_VACUOUS_MARKER_KEY = "vacuous"
 
 #: Array-rank constants for the openPMD reader summaries.  The shipped readers
 #: return 2D phase-space planes and 2D radiation spectra, and a calorimeter cube
@@ -1926,11 +1941,17 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     values = [summary[key] for key in keys if key in summary]
     if not values or any(_has_nonzero_leaf(value) for value in values):
         return summary
+    message = f"{reader} is all zeros; the run may have no particles in range or the diagnostic may be misconfigured"
+    existing = summary.get("warning")
     return {
         **summary,
-        "warning": (
-            f"{reader} is all zeros; the run may have no particles in range or the diagnostic may be misconfigured"
-        ),
+        # Keep any warning the reader already set (e.g. a truncated history)
+        # rather than silently dropping it.
+        "warning": f"{existing}; {message}" if existing else message,
+        # An explicit marker so the vacuity probe can tell *this* signal from an
+        # unrelated warning a reader may also carry (e.g. a mis-window
+        # ``energy_histogram`` or a truncated ``energy_fields`` history).
+        _VACUOUS_MARKER_KEY: True,
     }
 
 
@@ -2056,7 +2077,10 @@ def probe_vacuity(sim_id: str, *, run_dir: Path | str) -> str | None:
     probed.  A run whose energy histogram is all-zero while its (non-numeric)
     phase space or radiation output is populated is still flagged, because the
     vacuity signal only ever looked at scalar value arrays; treat the flag as
-    "no particles in the numeric diagnostics", not "no particles at all".
+    "no particles in the numeric diagnostics", not "no particles at all".  The
+    verdict keys on the explicit all-zero marker, so a populated-but-mis-window
+    histogram or a truncated field-energy history (both of which also carry a
+    ``warning``) does not masquerade as the empty-run signal.
 
     Args:
         sim_id: The simulation id.
@@ -2091,9 +2115,12 @@ def probe_vacuity(sim_id: str, *, run_dir: Path | str) -> str | None:
                 # cannot be judged, so it neither clears nor flags the run.
                 continue
             saw_artifact = True
-            if "warning" not in result:
+            if not result.get(_VACUOUS_MARKER_KEY):
+                # A populated artifact clears the run.  Key on the explicit
+                # all-zero marker, not on any ``warning``: a mis-window
+                # histogram or a truncated history warns too but is not empty.
                 return None
-            warning = str(result["warning"])
+            warning = str(result.get("warning", ""))
     return warning if saw_artifact else None
 
 

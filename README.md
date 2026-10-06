@@ -684,11 +684,15 @@ was empty" (the beta-4 empty-campaign case) without a reviewer reading a
 histogram by hand.
 
 The probe is deliberately narrow: only the numeric *text* readers
-(`energy_histogram`, `emittance`, `transition_radiation`) are examined, and
-*every* matching artifact of each is read, so a populated species clears a run
-with another empty one. A run whose energy histogram is all-zero while a
-phase-space or radiation diagnostic is populated is still flagged; treat the
-signal as "no particles in the numeric diagnostics", not "no particles at all".
+(`energy_histogram`, `energy_fields`, `emittance`, `transition_radiation`) are
+examined, and *every* matching artifact of each is read, so a populated species
+clears a run with another empty one. A run whose energy histogram is all-zero
+while a phase-space or radiation diagnostic is populated is still flagged; treat
+the signal as "no particles in the numeric diagnostics", not "no particles at
+all". A populated-but-clipped diagnostic does not trip the probe: it keys on an
+explicit all-zero marker rather than on the mere presence of a `warning` (a
+mis-window histogram and a truncated field-energy history both warn without
+being empty).
 
 ## Tests and tooling
 
