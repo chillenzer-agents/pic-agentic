@@ -564,6 +564,15 @@ async def test_failed_submission_event_carries_build_classification(
     have to read the raw cwltool dump.
     """
     mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    # The shared ``fake_runner`` reports ``0.9.0-dev`` while a real pinned
+    # PIConGPU reports e.g. ``0.9.0-"dev"``, so ``prepare_submit`` would reject
+    # the command with ``version_mismatch`` before ``_run_workflow`` is reached.
+    # This test targets the *workflow-failure* path, not provenance, so null the
+    # client's local tuple (blank local entries skip the provenance comparison).
+    monkeypatch.setattr(
+        "pic_agentic.simclient.client._local_provenance",
+        lambda: {"picongpu_version": "", "picongpu_revision": "", "schema_hash": ""},
+    )
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
 
