@@ -52,6 +52,7 @@ from pic_agentic.simclient.simulation import (
     SubmitConfig,
     execute_submit,
     find_stdout_path,
+    live_build_log,
     parse_payload,
     prepare_submit,
 )
@@ -314,6 +315,11 @@ class SimClient:
         self.capabilities = ClientCapabilities.current(client_version=_package_version)
         #: Per-sim follow-state and detached watcher tasks, keyed by ``sim_id``.
         self._tracked: dict[str, TrackedSim] = {}
+        #: Run directories of builds currently in flight, keyed by ``sim_id``.
+        #: A build has no ``TrackedSim`` yet, but ``get_logs`` uses this to find
+        #: and serve the live compiler tail during the multi-minute build window
+        #: (B2) instead of a flat "not started yet".
+        self._active_builds: dict[str, str] = {}
         #: Current watcher per ``sim_id`` (the latest run).
         self._follow_tasks: dict[str, asyncio.Task[None]] = {}
         #: Every live watcher task, including a superseded one still winding
@@ -983,6 +989,9 @@ class SimClient:
             await self.transport.send(event)
 
         try:
+            build_run_dir = getattr(prepared.runner, "run_dir", None)
+            if build_run_dir is not None:
+                self._active_builds[sim_id] = str(build_run_dir)
             result = await execute_submit(
                 prepared=prepared,
                 emit=emit,
@@ -994,6 +1003,7 @@ class SimClient:
                 stage=exc.stage or SimulationStage.BUILD,
                 error=str(exc),
                 error_code=exc.code,
+                failure_summary=exc.summary,
             )
             if cmd_id:
                 self._persist_processed(
@@ -1008,6 +1018,10 @@ class SimClient:
                     )
                 )
             return
+        finally:
+            # The build window is over: the live compiler tail is no longer
+            # served (the follower/real log files take over).
+            self._active_builds.pop(sim_id, None)
         if cmd_id:
             self._persist_processed(
                 ProcessedCommand(
@@ -1636,6 +1650,26 @@ class SimClient:
         await self.transport.send(ack)
         return ack
 
+    def _active_build_lines(self, sim_id: str) -> list[str]:
+        """Return the live compiler tail of an in-flight build, if any (B2).
+
+        A build in flight has persisted its ``sim_id`` but has no ``TrackedSim``,
+        so :meth:`_handle_logs` would otherwise answer "not started yet" for the
+        whole 15-20 minute compile.  The ``execute_submit`` build registers its
+        captured output per ``run_dir`` (see
+        :func:`~pic_agentic.simclient.simulation.live_build_log`); look it up via
+        the tracked build directory.
+
+        Returns:
+            The retained build lines (oldest first), or an empty list when no
+            build is in flight for the sim or nothing has been captured.
+
+        """
+        run_dir = self._active_builds.get(sim_id)
+        if run_dir is None:
+            return []
+        return live_build_log(run_dir)
+
     @staticmethod
     def _log_path(tracked: TrackedSim, stream: str) -> Path | None:
         """Resolve the on-disk file backing a log stream.
@@ -1742,16 +1776,35 @@ class SimClient:
                         error_code=latest.error_code or SimulationState.FAILED.value,
                     )
                 else:
-                    ack = self._build_logs_ack(
-                        message,
-                        cmd_id=cmd_id,
-                        sim_id=sim_id,
-                        stream=stream,
-                        lines=[],
-                        total_lines=0,
-                        error="the simulation has not started yet; logs appear after submission",
-                        error_code="logs_not_available",
-                    )
+                    # The build may still be emitting compiler output (B2): serve
+                    # the live tail when the simclient has captured it, so the
+                    # multi-minute build window is observable.  Only fall back to
+                    # the (now accurate) "still building" note when there is
+                    # genuinely nothing captured yet.
+                    build_lines = self._active_build_lines(sim_id)
+                    if build_lines:
+                        ack = self._build_logs_ack(
+                            message,
+                            cmd_id=cmd_id,
+                            sim_id=sim_id,
+                            stream=stream,
+                            lines=build_lines[-tail:] if tail else [],
+                            total_lines=len(build_lines),
+                        )
+                    else:
+                        ack = self._build_logs_ack(
+                            message,
+                            cmd_id=cmd_id,
+                            sim_id=sim_id,
+                            stream=stream,
+                            lines=[],
+                            total_lines=0,
+                            error=(
+                                "the simulation is still building; no log output captured yet "
+                                "(the build can take 15-20 minutes before the job is submitted)"
+                            ),
+                            error_code="logs_not_available",
+                        )
             else:
                 ack = self._build_logs_ack(
                     message,
@@ -1990,6 +2043,7 @@ class SimClient:
         stage: SimulationStage | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        failure_summary: str | None = None,
         submit_system: str | None = None,
         results_linked: bool | None = None,
         step: int | None = None,
@@ -2014,6 +2068,7 @@ class SimClient:
             stage=stage,
             error=error,
             error_code=error_code,
+            failure_summary=failure_summary,
             submit_system=submit_system,
             results_linked=results_linked,
             step=step,

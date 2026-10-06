@@ -42,6 +42,7 @@ from pic_agentic.protocol.simulation import (
     SimulationOp,
     SubmitParams,
     UnsupportedPayloadError,
+    signal_from_exit_code,
     simulation_phase,
 )
 from pic_agentic.server.agenda import AgendaService, no_campaign_error
@@ -1054,6 +1055,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "(building/queued/running/done/failed/cancelled): while `job_id` is "
             "null the run is `building`, which can take 15-20 minutes before the "
             "SLURM job id appears, so a null `job_id` is not a fault. "
+            "A failed run also carries `error`, `error_code`, "
+            "`failure_summary`, `stage`, `exit_code` and `exit_signal` (e.g. "
+            "`error_code: build_failed`, `stage: build` for a compile failure), "
+            "so the reason and stage are visible here, not only on the event log. "
             "For a completed run, `suspect` carries the all-zero health warning "
             "when its numeric diagnostics are all empty. A status is available "
             "for any simulation the signed room records, including runs whose "
@@ -1176,7 +1181,12 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
 
     @server.tool(
         title="Get simulation logs",
-        description="Return up to `tail` lines of a simulation's stdout, stderr or workflow log stream.",
+        description=(
+            "Return up to `tail` lines of a simulation's stdout, stderr or workflow "
+            "log stream. While the local build is still running (no `job_id` yet) "
+            "the `stdout`/`workflow` streams serve the captured compiler output tail, "
+            "or a 'still building' note before any output is captured."
+        ),
         annotations=_READ_ONLY,
     )
     async def get_logs(sim_id: str, *, stream: str = "stdout", tail: int = 100) -> dict[str, Any]:
@@ -2106,6 +2116,12 @@ def _status_dict(record: SimRecord) -> dict[str, Any]:
         "percent": record.percent,
         "walltime": record.walltime,
         "eta_s": record.eta_s,
+        "exit_code": record.exit_code,
+        "exit_signal": signal_from_exit_code(record.exit_code),
+        "error": record.error,
+        "error_code": record.error_code,
+        "failure_summary": record.failure_summary,
+        "stage": record.stage,
         "suspect": record.suspect,
         "since_last_event_s": _since_last_event_s(record.last_event_ts),
     }
@@ -2132,6 +2148,7 @@ def _merge_status(projection: dict[str, Any], live: dict[str, Any]) -> None:
         "avg_per_step",
         "eta_s",
         "exit_code",
+        "exit_signal",
         "suspect",
     ):
         if live.get(field) is not None:
