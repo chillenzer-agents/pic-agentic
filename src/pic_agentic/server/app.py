@@ -603,6 +603,7 @@ class HelloRuntime:
         *,
         base_spec_path: str | None = None,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         """Create and persist a campaign with one leaf per sweep value.
 
@@ -621,7 +622,9 @@ class HelloRuntime:
         )
         if error is not None:
             return error
-        return await self.agenda_service.create_campaign(name, resolved, patch_path, values, parameter=parameter)
+        return await self.agenda_service.create_campaign(
+            name, resolved, patch_path, values, parameter=parameter, point_key=point_key
+        )
 
     def _resolve_spec(
         self,
@@ -829,6 +832,14 @@ SERVER_INSTRUCTIONS = (
     "dict, so a nested list element is reachable too "
     "(e.g. sim.laser.0.focus_pos_si.1.component for the laser's focal-position "
     "component), not only a top-level field such as sim.time_steps. "
+    "A lone sim.grid.cell_cnt patch is an allowed box-size sweep (it holds "
+    "cell_size/resolution fixed and changes the physical box); a lone "
+    "sim.grid.cell_size patch changes the resolution at a fixed cell count. "
+    "Because a Runner spec is a rendered snapshot with denormalised fields, "
+    "create_campaign adds a non-blocking warning naming that effect. For a "
+    "fixed-box resolution study one patch_path cannot hold the box fixed: "
+    "co-vary the grid, delta_t_si and time_steps via add_agenda_leaf with one "
+    "whole spec per leaf. "
     "create_campaign refuses to overwrite an existing campaign; to start a fresh "
     "one, remove the old state first with delete_campaign (reset), optionally "
     "after stop_agenda to cancel in-flight jobs. "
@@ -1610,6 +1621,23 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "point={last path segment: value} plus a human-readable "
             "sweep_parameter (the path with list indices dropped, e.g. "
             "'sim.laser.focus_pos_si.component'; override it with `parameter`). "
+            "This is a SINGLE-node sweep. A lone grid patch is allowed and is a "
+            "box-size sweep: patching `sim.grid.cell_cnt` alone holds "
+            "`cell_size` (the resolution) fixed and changes the physical box "
+            "size, while patching `sim.grid.cell_size` alone changes the "
+            "resolution at a fixed cell count. Both are legitimate; because a "
+            "Runner spec is a rendered snapshot with denormalised fields, "
+            "`create_campaign` returns an advisory `warnings` entry naming the "
+            "effect (it never refuses). If you instead want a FIXED-BOX "
+            "resolution study, one patch_path cannot express it -- co-vary "
+            "`sim.grid.cell_size`, `sim.grid.cell_cnt` (and 3D `cell_depth`) "
+            "plus a CFL-consistent `sim.delta_t_si`/`sim.time_steps`, e.g. with "
+            "`add_agenda_leaf` and one whole spec per leaf. (A `cell_size` patch "
+            "that leaves `cell_depth` stale against `cell_size.z`, an explicit "
+            "`grid_dist` that no longer sums to `cell_cnt`, or a "
+            "CFL-violating `delta_t_si` is still refused as arithmetically "
+            "inconsistent.) Override the recorded point key with `point_key` when a "
+            "seed-only patch would mislabel the study. "
             "A numeric path segment is interpreted by the node it addresses: a "
             "list index on a list, or a dict key on a dict, so a nested list "
             "element is reachable (e.g. "
@@ -1639,6 +1667,7 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         base_spec: dict[str, Any] | None = None,
         base_spec_path: str | None = None,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         result = await runtime.create_campaign(
             name,
@@ -1647,6 +1676,7 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             values,
             base_spec_path=base_spec_path,
             parameter=parameter,
+            point_key=point_key,
         )
         return _redact_dict(runtime, result)
 

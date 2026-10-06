@@ -328,9 +328,23 @@ the pin's source.
 ### Multi-node studies need explicit leaves (H5)
 
 `create_campaign` expresses a **single-path** sweep: one `patch_path`, one list
-of values. A resolution convergence study must co-vary more than one spec node
-(e.g. the grid cell count **and** `time_steps`, holding the physical box size
-fixed) and so cannot be one `patch_path`. `add_agenda_leaf` is the escape hatch:
+of values. **Box-size sweeps are allowed**: a lone `sim.grid.cell_cnt` patch
+holds `cell_size` (the resolution) fixed and varies the physical box, and a lone
+`sim.grid.cell_size` patch changes the resolution at a fixed cell count — both
+are legitimate and accepted (the per-axis forms such as `sim.grid.cell_cnt.x`
+too). A *fixed-box resolution convergence* study, by contrast, must co-vary more
+than one spec node (e.g. the grid cell count **and** `time_steps`, holding the
+physical box size fixed) and so cannot be one `patch_path`. Because a Runner spec
+is a rendered snapshot with denormalised fields, a lone `cell_cnt`/`cell_size`
+patch silently changes either the box or the resolution; to keep that from
+misleading an agent that intended the other study, `create_campaign` records a
+non-blocking `warnings` entry on its result naming the effect (it never refuses).
+The genuinely arithmetic invariants a patch can break (stale `cell_depth`, an
+explicit `grid_dist` that no longer sums to `cell_cnt`, and the solver's CFL
+`c·dt ≤ dx` stability limit) *are* checked on every `create_campaign`-patched
+leaf and refused with an actionable message. A whole-spec `add_agenda_leaf` leaf,
+which owns every node, is not checked against these derived invariants.
+`add_agenda_leaf` is the escape hatch:
 create the base campaign, then add one leaf per study point carrying its own
 whole spec, so any number of nodes can differ between leaves. A leaf spec may be
 inline (`spec=`) or, for a large spec, staged by reference

@@ -52,7 +52,7 @@ from pic_agentic.protocol.simulation import (
 from pic_agentic.server.hello import AckTimeoutError
 from pic_agentic.server.simulation import _spec_provenance
 from pic_agentic.simclient.simulation import SimulationErrorCode
-from pic_agentic.simulation_build import check_spec_round_trip
+from pic_agentic.simulation_build import check_spec_consistency, check_spec_round_trip
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -821,6 +821,7 @@ class AgendaService:
         values: list[Any],
         *,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         """Create and persist a campaign with one leaf per sweep value.
 
@@ -832,7 +833,8 @@ class AgendaService:
         the driver do, preserving the sweep assignment for provenance, and a
         human-readable ``sweep_parameter`` (the dotted path with list indices
         dropped, e.g. ``sim.laser.focus_pos_si.component``) so the point key is
-        not opaque; an explicit ``parameter`` overrides the derived name.  The
+        not opaque; an explicit ``parameter`` overrides the derived name and an
+        explicit ``point_key`` overrides the point key itself.  The
         campaign is written through the same
         :class:`~pic_agentic.agenda.store.AgendaStore` the other agenda tools
         read, so ``advance_agenda`` picks it up on the next tick.
@@ -844,7 +846,15 @@ class AgendaService:
         :meth:`SubmitService.prepare_spec` and :func:`payload_wire_size` -- the
         *same* allow-list and escaped inline-size checks a submission runs -- so
         a campaign that could never be submitted is refused at creation time
-        rather than surfacing a bare error at ``advance_agenda``.  Duplicate
+        rather than surfacing a bare error at ``advance_agenda``.  The derived
+        invariants a single-node patch can leave *arithmetically* inconsistent
+        (a stale ``cell_depth``, a CFL violation, a ``grid_dist``/``cell_cnt``
+        mismatch) are checked too and refused with an actionable reason.  A lone
+        ``sim.grid.cell_cnt`` (or ``cell_size``) patch is **not** refused: a
+        box-size sweep is legitimate.  It is instead recorded as a non-blocking
+        ``warnings`` entry on the result, because a fixed-box resolution sweep
+        must co-vary cell_size/cell_cnt(/cell_depth) and delta_t_si/time_steps.
+        Duplicate
         patched specs (e.g. ``values=[4, 4]``) are rejected up front too: they
         map to one ``sim_id`` and the engine would later refuse the tick.
         Nothing is persisted unless every leaf validates.
@@ -858,17 +868,25 @@ class AgendaService:
             parameter: Optional human-readable name for the swept quantity,
                 stored on each leaf as ``sweep_parameter``.  When omitted it is
                 derived from ``patch_path``.
+            point_key: Optional override for the ``point`` key, which otherwise
+                defaults to the last ``patch_path`` segment.  Use it when the
+                campaign is seeded with an unrelated patch (e.g. a single
+                ``sim.time_steps`` value) and the recorded point should name the
+                quantity actually being studied.
 
         Returns:
-            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
-            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
-            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
-            ``duplicate_campaign_spec``).
+            ``{"ok": True, "name": name, "leaves": [<paths>]}`` -- with an
+            advisory ``warnings`` list for a lone ``cell_cnt``/``cell_size``
+            box-size sweep -- or a soft error (``campaign_exists``,
+            ``no_values``, ``invalid_campaign``, ``invalid_campaign_spec``,
+            ``spec_exceeds_inline_limit``, ``duplicate_campaign_spec``).
 
         """
         async with self._lock:
             try:
-                return self._create_campaign(name, base_spec, patch_path, values, parameter=parameter)
+                return self._create_campaign(
+                    name, base_spec, patch_path, values, parameter=parameter, point_key=point_key
+                )
             except (TypeError, ValueError, IndexError) as exc:
                 # A bad patch path (including an out-of-range list index) or an
                 # invalid leaf name/value is a model-level error: report it as
@@ -886,21 +904,27 @@ class AgendaService:
         values: list[Any],
         *,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         """Build the campaign and save it (may raise).
 
         Returns:
-            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
-            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
-            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
-            ``duplicate_campaign_spec``).  No file is written on any error.
+            ``{"ok": True, "name": name, "leaves": [<paths>]}`` (plus a
+            non-blocking ``warnings`` list for a lone ``cell_cnt``/``cell_size``
+            box-size sweep), or a soft error (``campaign_exists``,
+            ``no_values``, ``invalid_campaign``, ``invalid_campaign_spec``,
+            ``spec_exceeds_inline_limit``, ``duplicate_campaign_spec``).  No file
+            is written on any error.
 
         """
         if self.store.exists():
             return {"ok": False, "error": "campaign_exists"}
         if not values:
             return {"ok": False, "error": "no_values"}
-        point_key = _parameter_for(patch_path)
+        # An explicit ``point_key`` (sanitised) overrides the last-patch-segment
+        # derivation, so a seed-only campaign is not mislabelled by an unrelated
+        # patch field (A2); the readable ``sweep_parameter`` stays separate.
+        point_key = (readable_label(point_key) if point_key else None) or _parameter_for(patch_path)
         derived = sweep_parameter_for(patch_path, base_spec)
         sweep_parameter = readable_label(parameter) if parameter else readable_label(derived)
         if not _leaf_target_exists(base_spec, patch_path):
@@ -914,7 +938,7 @@ class AgendaService:
             }
         patched: list[dict[str, Any]] = [_patch_spec(base_spec, patch_path, value) for value in values]
         for spec in patched:
-            invalid = self._validate_leaf_spec(spec)
+            invalid = self._validate_leaf_spec(spec, patch_path)
             if invalid is not None:
                 return invalid
         collision = _duplicate_leaf_error(patched)
@@ -934,7 +958,14 @@ class AgendaService:
             agenda = agenda.add(**{leaf_name: leaf})
             leaves.append(leaf_name)
         self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
-        return {"ok": True, "name": name, "leaves": leaves}
+        result: dict[str, Any] = {"ok": True, "name": name, "leaves": leaves}
+        # Advisory only (never a refusal): flag a lone cell_cnt/cell_size patch
+        # as a box-size/resolution sweep so an agent that meant to hold the box
+        # fixed is not misled by the beta-6 trap of silent box variation.
+        advisory = _box_size_sweep_warning(patch_path)
+        if advisory is not None:
+            result["warnings"] = [advisory]
+        return result
 
     async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
         """Remove the persisted campaign and its sibling reuse registry.
@@ -1011,14 +1042,17 @@ class AgendaService:
                 removed.append(str(store.path))
         return removed
 
-    def _validate_leaf_spec(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+    def _validate_leaf_spec(self, spec: dict[str, Any], patch_path: str = "") -> dict[str, Any] | None:
         """Validate one patched leaf through the submission path.
 
         Runs the same allow-list check, the pinned-schema round-trip gate the
         simclient applies (via :func:`~pic_agentic.simulation_build.
-        check_spec_round_trip`) and the escaped inline-size cap a ``submit_spec``
+        check_spec_round_trip`), the derived-invariant check scoped to
+        ``patch_path`` (via :func:`~pic_agentic.simulation_build.
+        check_spec_consistency`) and the escaped inline-size cap a ``submit_spec``
         would, so a leaf that could never be submitted is rejected at creation
-        with an actionable reason.
+        with an actionable reason.  A whole-spec ``add_agenda_leaf`` passes no
+        ``patch_path`` and is not consistency-checked (it owns every node).
 
         This is synchronous and runs under the agenda lock.  With the pin
         importable the round-trip is ~7 ms per leaf, so a 200-leaf campaign
@@ -1037,6 +1071,9 @@ class AgendaService:
         round_trip = check_spec_round_trip(spec)
         if round_trip is not None:
             return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(round_trip)}
+        inconsistent = check_spec_consistency(spec, patch_path)
+        if inconsistent is not None:
+            return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(inconsistent)}
         size = payload_wire_size(payload)
         if size > MAX_INLINE_PAYLOAD_BYTES:
             return {
@@ -1099,6 +1136,48 @@ class AgendaService:
         agenda = campaign.agenda.add(**{name: leaf})
         self.store.save(campaign.model_copy(update={"agenda": agenda}))
         return {"ok": True, "path": name}
+
+
+#: Dotted patch-path prefixes whose single-node patch changes one half of the
+#: box-size/resolution pair while holding the other fixed.  A ``cell_cnt``-only
+#: patch keeps the base ``cell_size`` (and the CFL-consistent ``delta_t_si``) and
+#: so varies the physical box at constant resolution; a ``cell_size``-only patch
+#: holds the cell count and so varies the resolution at constant box.  Both are
+#: **allowed** -- a box-size sweep is a legitimate study -- but the beta-6 harm
+#: was *silent* box variation when a fixed-box resolution sweep was intended, so
+#: these are flagged with an advisory (never a refusal).
+_BOX_OR_RESOLUTION_PATCH_PREFIXES = ("sim.grid.cell_cnt", "sim.grid.cell_size")
+
+
+def _box_size_sweep_warning(patch_path: str) -> str | None:
+    """Return an advisory when a lone grid patch changes the box/resolution pair.
+
+    ``create_campaign`` patches exactly one node, so a ``cell_cnt``-only patch
+    cannot also move ``cell_size`` (and its derived ``cell_depth``): the physical
+    box changes while the cell size -- the resolution -- stays fixed.  This is a
+    legitimate **box-size sweep** and is accepted; the same is true of a
+    ``cell_size``-only patch, which changes the resolution at a constant cell
+    count.  The advisory exists only because the beta-6 trap was that an agent
+    intending a *fixed-box resolution sweep* got the box varied silently; it is
+    never a refusal and never blocks submission.
+
+    Returns:
+        The advisory text for a box-size/resolution single-node patch, else
+        ``None``.
+
+    """
+    if not patch_path.startswith(_BOX_OR_RESOLUTION_PATCH_PREFIXES):
+        return None
+    if patch_path.startswith("sim.grid.cell_cnt"):
+        effect = "changes the physical box size at constant cell_size (resolution)"
+    else:
+        effect = "changes the cell_size (resolution) at constant cell count"
+    return (
+        f"patch_path {patch_path!r} {effect} -- a legitimate box-size sweep; accepted. "
+        "If you intended a fixed-box resolution sweep, this does not hold the box fixed: co-vary "
+        "`sim.grid.cell_size`, `sim.grid.cell_cnt` (and 3D `sim.grid.cell_depth`) plus a "
+        "CFL-consistent `sim.delta_t_si`/`sim.time_steps` (e.g. via add_agenda_leaf with whole specs)."
+    )
 
 
 def _parameter_for(patch_path: str) -> str:

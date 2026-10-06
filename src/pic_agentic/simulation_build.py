@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import secrets
 import shutil
@@ -321,6 +322,348 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
     if dumped == sim_dump:
         return None
     return _round_trip_diff_message(sim_dump, dumped)
+
+
+#: Speed of light in vacuum [m/s].  Matches ``scipy.constants.c``, which the
+#: pin uses for its own CFL arithmetic, so the limit here matches the
+#: ``maxwellSolver::CFLChecker`` compile-time assert up to :data:`_CFL_REL_TOL`.
+_SPEED_OF_LIGHT = 299792458.0
+
+#: Relative slack on the CFL comparison.  The C++ ``CFLChecker`` asserts an exact
+#: ``c*dt <= c*dt_max`` on the rendered (rounded) values; this check accepts up
+#: to ``c*dt <= c*dt_max * (1 + 1e-6)`` so a spec sitting exactly on the limit
+#: is not a false rejection.  The effective limit is therefore ~1e-6 *looser*
+#: than the pin's assert, not identical to it.
+_CFL_REL_TOL = 1e-6
+
+#: Solver kinds whose CFL limit is not fully determined by the wire spec, so the
+#: consistency check skips them rather than guessing: ``Lehe`` (its
+#: Cherenkov-free direction is not recorded) and ``None`` (no CFL limit at all).
+_CFL_UNDETERMINED_SOLVERS = frozenset({"lehe", "none"})
+
+#: Spatial dimensions of a 2D/3D grid, as reported by the pin's computed
+#: ``sim_dim`` field.
+_SIM_DIM_2D = 2
+_SIM_DIM_3D = 3
+
+
+def check_spec_consistency(runner_dump: dict[str, object], patch_path: str) -> str | None:
+    """Check the derived invariants a single-node patch can leave stale.
+
+    ``create_campaign`` patches exactly one dotted Runner-spec path per leaf and
+    does **not** recompute the denormalised fields that path feeds, so a
+    valid-looking patch can leave the leaf arithmetically inconsistent.  This
+    check is scoped to the patched path: only the invariants that patch can
+    affect are tested, so an untouched (and perhaps deliberately synthetic)
+    field never triggers a false rejection.  Three invariants are covered:
+
+    - ``sim.grid.cell_depth`` is the z cell length (the pin's ``Grid3D``
+      ``@computed_field`` returns ``cell_size[2]``) and must equal
+      ``sim.grid.cell_size.z`` for a 3D grid; a ``cell_size``/``cell_depth`` (or
+      whole ``sim.grid``) patch can break it.
+    - an explicit ``sim.grid.grid_dist`` must sum to ``sim.grid.cell_cnt`` per
+      axis (the pin's ``Grid3D.check`` raises otherwise); a ``cell_cnt``/
+      ``grid_dist`` (or whole ``sim.grid``) patch can break it.
+    - the CFL stability limit of the chosen field solver:
+      ``c * delta_t_si <= c * dt_max(cell_size)`` (the ``CFLChecker`` assert the
+      beta-6 ``warm_conv3`` run hit at compile time); a ``delta_t_si``,
+      ``cell_size``/``sim.grid`` or solver patch can cross it.
+
+    These are arithmetic facts about the wire spec, so the check needs no
+    PIConGPU import: it is exact with or without the pin and never degrades to a
+    false rejection.  Solver kinds whose CFL limit is not fully determined by the
+    wire spec (``Lehe``, whose Cherenkov-free direction is not recorded, and the
+    limit-free ``None`` solver) are deliberately skipped rather than guessed at.
+
+    Args:
+        runner_dump: A wire spec carrying ``sim``.
+        patch_path: The dotted path ``create_campaign`` patched.  A whole-spec
+            ``add_agenda_leaf`` has no such path and is not checked here.
+
+    Returns:
+        An actionable message when a patched invariant is violated, else
+        ``None``.
+
+    """
+    sim = runner_dump.get("sim")
+    if not isinstance(sim, dict):
+        return None
+    grid = sim.get("grid")
+    if not isinstance(grid, dict):
+        return None
+    touches_grid = patch_path == "sim.grid" or patch_path.startswith("sim.grid.")
+    if touches_grid or patch_path in {"sim.grid.cell_size", "sim.grid.cell_depth"}:
+        message = _cell_depth_message(grid)
+        if message is not None:
+            return message
+    if touches_grid or patch_path in {"sim.grid.cell_cnt", "sim.grid.grid_dist"}:
+        message = _grid_dist_message(grid)
+        if message is not None:
+            return message
+    if touches_grid or patch_path in {"sim.delta_t_si", "sim.grid.cell_size", "sim.solver"}:
+        message = _cfl_message(sim, grid)
+        if message is not None:
+            return message
+    return None
+
+
+def _grid_dist_message(grid: dict[str, object]) -> str | None:
+    """Return the message when an explicit ``grid_dist`` does not sum to cell counts.
+
+    ``grid_dist`` is the denormalised per-GPU cell split: each axis's entries
+    must sum to ``cell_cnt`` (the pin's ``Grid3D.check`` raises otherwise), so a
+    lone ``grid_dist``/``cell_cnt`` patch can leave it stale.  ``None`` means
+    even distribution and carries no invariant.
+
+    Returns:
+        The actionable message, or ``None`` when consistent (or no explicit
+        distribution).
+
+    """
+    grid_dist = grid.get("grid_dist")
+    cell_cnt = grid.get("cell_cnt")
+    if grid_dist is None or not isinstance(grid_dist, dict) or not isinstance(cell_cnt, dict):
+        return None
+    axes: tuple[str, ...] = ("x", "y", "z") if _grid_is_3d(grid) else ("x", "y")
+    for axis in axes:
+        chunks = grid_dist.get(axis)
+        count = cell_cnt.get(axis)
+        if not isinstance(chunks, list) or not _is_number(count):
+            continue
+        cells = _grid_dist_chunks(chunks)
+        if cells is None:
+            continue
+        if sum(cells) != int(count):
+            return (
+                f"sim.grid.grid_dist.{axis} sums to {sum(cells)}, which is inconsistent with "
+                f"sim.grid.cell_cnt.{axis} ({int(count)}): an explicit distribution must sum to the "
+                "cell count. Co-vary cell_cnt and grid_dist (or patch the whole `sim.grid` node)."
+            )
+    return None
+
+
+def _grid_dist_chunks(chunks: list[object]) -> list[int] | None:
+    """Return the per-GPU cell counts encoded in one axis's ``grid_dist``.
+
+    The pin serialises ``grid_dist`` as ``[{"device_cells": N}, ...]``
+    (``pypicongpu/grid.py`` ``serialise_grid_dist3``), while a hand-authored
+    spec may use a flat ``[N, ...]``.  Both forms are accepted; an entry that
+    is neither a number nor a ``{"device_cells": N}`` mapping makes the axis
+    undeterminable.
+
+    Returns:
+        The chunk cell counts, or ``None`` when an entry is not a valid chunk.
+
+    """
+    cells: list[int] = []
+    for chunk in chunks:
+        value: object = chunk.get("device_cells") if isinstance(chunk, dict) else chunk
+        if not _is_number(value):
+            return None
+        cells.append(int(value))
+    return cells
+
+
+def _cell_depth_message(grid: dict[str, object]) -> str | None:
+    """Return the message when ``cell_depth`` mirrors a stale z cell size.
+
+    For a 3D grid the pin computes ``cell_depth`` from ``cell_size[2]``; a 2D
+    grid's ``cell_depth`` is an independent slab thickness, so there is no
+    invariant to break.
+
+    Returns:
+        The actionable message, or ``None`` when consistent (or not 3D).
+
+    """
+    cell_size = grid.get("cell_size")
+    cell_depth = grid.get("cell_depth")
+    if not isinstance(cell_size, dict) or not _is_number(cell_depth):
+        return None
+    if not _grid_is_3d(grid):
+        return None
+    z = cell_size.get("z")
+    if not _is_number(z):
+        return None
+    if math.isclose(float(cell_depth), float(z), rel_tol=1e-9, abs_tol=0.0):
+        return None
+    return (
+        f"sim.grid.cell_depth ({float(cell_depth):g}) is inconsistent with "
+        f"sim.grid.cell_size.z ({float(z):g}): cell_depth is the z cell length, a denormalised copy "
+        "the pin recomputes from cell_size. Patch the whole `sim.grid` node so the fields move "
+        "together, or use add_agenda_leaf with a whole spec per leaf."
+    )
+
+
+def _cfl_message(sim: dict[str, object], grid: dict[str, object]) -> str | None:
+    """Return the message when ``c * delta_t_si`` exceeds the solver CFL limit.
+
+    Returns:
+        The actionable message, or ``None`` when within the limit, when the
+        limit cannot be determined from the wire spec, or when a required value
+        is missing.
+
+    """
+    delta_t = sim.get("delta_t_si")
+    if not _is_number(delta_t) or float(delta_t) <= 0.0:
+        return None
+    cell_sizes = _spatial_cell_sizes(grid)
+    if cell_sizes is None:
+        return None
+    limit = _cfl_max_cell_step(sim.get("solver"), cell_sizes)
+    if limit is None:
+        return None
+    c_delta_t = _SPEED_OF_LIGHT * float(delta_t)
+    if c_delta_t <= limit * (1.0 + _CFL_REL_TOL):
+        return None
+    return (
+        f"sim.delta_t_si ({float(delta_t):g} s) violates the field solver's CFL stability limit: "
+        f"c*delta_t_si = {c_delta_t:.6g} m exceeds the maximum {limit:.6g} m for cell sizes "
+        f"{cell_sizes} m. Reduce delta_t_si, or co-vary the grid (cell_size/cell_cnt/cell_depth), "
+        "delta_t_si and time_steps together (e.g. via add_agenda_leaf with whole specs)."
+    )
+
+
+def _cfl_max_cell_step(solver: object, cell_sizes: list[float]) -> float | None:
+    """Return the solver's maximum ``c * dt`` for the given spatial cell sizes.
+
+    Mirrors the C++ ``maxwellSolver::CFLChecker`` specializations (and the pin's
+    ``_cfl_max_cdt``): ``Yee`` is ``1 / sqrt(sum 1/dx_i^2)``; ``CKC`` is the
+    minimum cell size; ``ArbitraryOrderFDTD`` divides the Yee term by its
+    alternating weight sum.  ``Lehe`` (free direction not in the wire) and
+    ``None`` (no limit) return ``None`` so the caller skips rather than guesses.
+
+    Returns:
+        The limit on ``c * dt`` in metres, or ``None`` when not determinable.
+
+    """
+    kind = _solver_kind(solver)
+    if kind is None or kind in _CFL_UNDETERMINED_SOLVERS:
+        return None
+    inv_squared = sum(1.0 / size**2 for size in cell_sizes)
+    if kind == "yee":
+        return 1.0 / math.sqrt(inv_squared)
+    if kind == "ckc":
+        return min(cell_sizes)
+    # "ao": the Yee term divided by the alternating finite-difference weight sum.
+    neighbors = solver.get("neighbors") if isinstance(solver, dict) else None
+    if not _is_number(neighbors) or float(neighbors) < 1.0 or not float(neighbors).is_integer():
+        return None
+    weight_sum = _ao_weight_sum(int(neighbors))
+    if weight_sum <= 0.0:
+        return None
+    return 1.0 / (weight_sum * math.sqrt(inv_squared))
+
+
+def _ao_weight_sum(neighbors: int) -> float:
+    """Return the arbitrary-order FDTD alternating weight sum.
+
+    Mirrors ``aoFDTD::AOFDTDWeights`` (and the pin's ``_ao_fDTD_weight_sum``),
+    used by the C++ ``CFLChecker<ArbitraryOrderFDTD>`` to tighten the Yee term.
+
+    Returns:
+        The alternating sum of the finite-difference weights.
+
+    """
+    weights = [0.0] * neighbors
+    weights[0] = (
+        4.0 * neighbors * (math.factorial(2 * neighbors) / (2 ** (2 * neighbors) * math.factorial(neighbors) ** 2)) ** 2
+    )
+    for k in range(1, neighbors):
+        weights[k] = -((k - 0.5) ** 2 * (neighbors - k) / (neighbors + k) / (k + 0.5) ** 2) * weights[k - 1]
+    return sum(weight if index % 2 == 0 else -weight for index, weight in enumerate(weights))
+
+
+def _solver_kind(solver: object) -> str | None:
+    """Identify the field solver from its wire form.
+
+    Returns:
+        One of ``"yee"``, ``"lehe"``, ``"ckc"``, ``"ao"``, ``"none"``, else
+        ``None`` when the form is unrecognised.
+
+    """
+    if not isinstance(solver, dict):
+        return None
+    flag_kinds = {
+        "type_none": "none",
+        "type_yee": "yee",
+        "type_lehe": "lehe",
+        "type_ckc": "ckc",
+        "type_arbitraryorderfdtd": "ao",
+    }
+    kind = next((kind for flag, kind in flag_kinds.items() if solver.get(flag) is True), None)
+    if kind is not None:
+        return kind
+    return _solver_kind_by_name(solver.get("name"))
+
+
+def _solver_kind_by_name(name: object) -> str | None:
+    """Map a solver's rendered ``name`` back to its wire kind.
+
+    The ``name`` is the pin's ``@computed_field`` string (``"Yee"``,
+    ``"Lehe<>"``, ``"CKC"``, ``"ArbitraryOrderFDTD<2>"``, ``"None"``), used as
+    the fallback when the discriminator flag is absent.
+
+    Returns:
+        The kind, or ``None`` when the name is unrecognised.
+
+    """
+    if not isinstance(name, str):
+        return None
+    prefixes = {"Yee": "yee", "Lehe": "lehe", "CKC": "ckc", "ArbitraryOrderFDTD": "ao"}
+    kind = next((kind for prefix, kind in prefixes.items() if name.startswith(prefix)), None)
+    if kind is not None:
+        return kind
+    return "none" if name == "None" else None
+
+
+def _spatial_cell_sizes(grid: dict[str, object]) -> list[float] | None:
+    """Return the per-axis cell sizes the solver resolves, x-major.
+
+    A 3D grid resolves x/y/z; a 2D grid resolves x/y (the pin shrinks the cell
+    size to ``simDim`` before computing the CFL term).
+
+    Returns:
+        The positive cell sizes, or ``None`` when any is missing or invalid.
+
+    """
+    cell_size = grid.get("cell_size")
+    if not isinstance(cell_size, dict):
+        return None
+    axes = ("x", "y", "z") if _grid_is_3d(grid) else ("x", "y")
+    sizes: list[float] = []
+    for axis in axes:
+        value = cell_size.get(axis)
+        if not _is_number(value) or float(value) <= 0.0:
+            return None
+        sizes.append(float(value))
+    return sizes
+
+
+def _grid_is_3d(grid: dict[str, object]) -> bool:
+    """Whether a wire grid resolves three spatial dimensions.
+
+    Returns:
+        True for a 3D grid, False for a 2D grid (the fallback when the
+        discriminator/computed flags are absent infers from ``cell_size``).
+
+    """
+    sim_dim = grid.get("sim_dim")
+    if grid.get("has_z") is False or sim_dim == _SIM_DIM_2D or grid.get("type_grid2d") is True:
+        return False
+    if grid.get("has_z") is True or sim_dim == _SIM_DIM_3D or grid.get("type_grid3d") is True:
+        return True
+    cell_size = grid.get("cell_size")
+    return isinstance(cell_size, dict) and "z" in cell_size
+
+
+def _is_number(value: object) -> bool:
+    """Whether ``value`` is a real number (and not a bool).
+
+    Returns:
+        True for an int/float that is not a bool.
+
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _round_trip_diff_message(before: object, after: object) -> str:
