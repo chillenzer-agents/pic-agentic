@@ -233,6 +233,31 @@ def test_field_energy_over_the_cap_without_a_whole_row_is_truncated(
     assert "all zeros" not in summary["warning"]
 
 
+def test_field_energy_truncation_warning_reports_a_true_step_range(tmp_path: Path) -> None:
+    """The truncation warning names the min-max step even for an out-of-order file.
+
+    The writer is monotonic, but the warning must describe a real *range*: a
+    re-ordered history must not be reported with a backwards interval.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    target = run / "simOutput" / "fields_energy.dat"
+    target.write_text("0 1.0\n", encoding="utf-8")
+    rows = [
+        results._FieldEnergyRow(step=100, total=3.0, components=[3.0 / 6] * 6),
+        results._FieldEnergyRow(step=0, total=1.0, components=[1.0 / 6] * 6),
+        results._FieldEnergyRow(step=50, total=2.0, components=[2.0 / 6] * 6),
+    ]
+    summary = results._summarize_energy_fields(
+        rows,
+        ["Bx", "By", "Bz", "Ex", "Ey", "Ez"],
+        50,
+        target,
+        truncated=True,
+    )
+    assert "steps 0-100" in summary["warning"]
+
+
 def test_field_energy_malformed_row_marks_truncated(tmp_path: Path) -> None:
     """A malformed row is dropped and reported, independent of the byte cap."""
     run = tmp_path / "run"

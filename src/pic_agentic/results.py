@@ -2524,8 +2524,11 @@ def _summarize_energy_fields(
         # clipped by the byte cap (or a malformed row), that peak is not the
         # file's real historical maximum; say so rather than presenting a partial
         # trajectory as complete.
+        # A *range*, so use the true min/max rather than assuming the file is in
+        # ascending step order (the writer is monotonic, but a re-ordered or
+        # malformed history must not be described with a backwards interval).
         summary["warning"] = (
-            f"{target.name} was truncated; the summary covers steps {steps[0]}-{steps[-1]} "
+            f"{target.name} was truncated; the summary covers steps {min(steps)}-{max(steps)} "
             f"({len(rows)} rows) and total_J_max is the peak over those rows only"
         )
     return summary
