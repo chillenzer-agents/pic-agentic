@@ -61,11 +61,12 @@ PY="${PYTHON:-python3}"
 EXPECTED_TOOLS="${PIC_AGENTIC_EXPECTED_TOOLS:-36}"
 # Seconds to wait for the room backfill in the preflight.
 ROOM_PREFLIGHT_TIMEOUT_S="${PIC_AGENTIC_ROOM_PREFLIGHT_TIMEOUT_S:-60}"
-# mcp server request timeout (ms).  Conservatively high: the simclient's async
-# result path can wait on a cluster round trip, and the maintainer is reworking
-# that async behaviour, after which this will be tuned down.  Do NOT raise this
-# to the old 9e6.
-MCP_TIMEOUT_MS="${PIC_AGENTIC_MCP_TIMEOUT_MS:-120000}"
+# MCP client request budget (ms).  Single source of truth for BOTH the opencode
+# server entry `timeout` and the `PIC_AGENTIC_MCP_TIMEOUT_MS` env var the server
+# reads to bound wait_for_simulation: it must be the same number, or the server
+# cannot tell a wait that outlasts the client (D1).  The default is kept equal
+# to beta-container-setup.sh's; bump both together.
+MCP_TIMEOUT_MS="${PIC_AGENTIC_MCP_TIMEOUT_MS:-300000}"
 
 MODE="install"
 case "${1:-install}" in
@@ -344,6 +345,11 @@ if env.get("PIC_AGENTIC_CONFIG") != config:
 timeout = entry.get("timeout")
 if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
     problems.append("timeout missing/invalid")
+# The server bounds wait_for_simulation against PIC_AGENTIC_MCP_TIMEOUT_MS, so
+# it must carry the SAME budget as the opencode entry timeout (D1).
+env_budget = env.get("PIC_AGENTIC_MCP_TIMEOUT_MS")
+if env_budget != str(entry.get("timeout")):
+    problems.append("PIC_AGENTIC_MCP_TIMEOUT_MS != timeout")
 if problems:
     sys.exit("; ".join(problems))
 print(f"OK - registered (timeout {entry['timeout']} ms)")
@@ -502,9 +508,10 @@ chmod 600 "$CONFIG"
 
 # 4. Register the MCP server with opencode (idempotent JSON edit, valid JSON
 #    out, other entries preserved).  NOTE: opencode's key is `environment`, not
-#    `env`.  JSON cannot carry comments, so the timeout rationale lives here:
-#    `timeout` is conservatively 120000 ms because the maintainer is reworking
-#    the simclient async result path and will tune it down once that lands.
+#    `env`.  JSON cannot carry comments, so the rationale lives here: `timeout`
+#    is the request budget (default 300000 ms) and the SAME value is stamped
+#    into `PIC_AGENTIC_MCP_TIMEOUT_MS` so the server can bound
+#    wait_for_simulation against it (D1).
 log "registering the pic-agentic MCP server in $OPENCODE_JSON"
 "$VENV/bin/python" - "$OPENCODE_JSON" "$VENV" "$CONFIG" "$MCP_TIMEOUT_MS" <<'PYJSON'
 import json
@@ -518,7 +525,11 @@ cfg.setdefault("mcp", {})["pic-agentic"] = {
     "type": "local",
     "command": [f"{venv}/bin/pic-agentic-mcp"],
     "enabled": True,
-    "environment": {"PIC_AGENTIC_SIM": "cluster", "PIC_AGENTIC_CONFIG": config},
+    "environment": {
+        "PIC_AGENTIC_SIM": "cluster",
+        "PIC_AGENTIC_CONFIG": config,
+        "PIC_AGENTIC_MCP_TIMEOUT_MS": str(timeout_ms),
+    },
     "timeout": int(timeout_ms),
 }
 p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")

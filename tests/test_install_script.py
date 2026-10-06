@@ -19,6 +19,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "install-mcp.sh"
+BETA_SCRIPT = REPO / "scripts" / "beta-container-setup.sh"
 
 #: The pre-fix base head the installer must never pin again.
 STALE_PIN = "96d86a4611d239159e160092125ffe9cce33e6ac"
@@ -94,6 +95,29 @@ def test_room_preflight_accepts_either_role_and_warns_on_empty_room() -> None:
     assert 'm.sender_role == "mcpserver"' not in text
     assert "no RCP messages in the room yet" in text, "fresh-room warn path missing"
     assert "m.verify(c.rcp_secret)" in text, "verification over all roles missing"
+
+
+def test_scripts_agree_on_the_mcp_client_budget() -> None:
+    """D1: both setup scripts must default MCP_TIMEOUT_MS to the same value."""
+    install = _script_text()
+    beta = BETA_SCRIPT.read_text(encoding="utf-8")
+    pattern = r'MCP_TIMEOUT_MS="\$\{PIC_AGENTIC_MCP_TIMEOUT_MS:-(\d+)\}"'
+    install_match = re.search(pattern, install)
+    beta_match = re.search(pattern, beta)
+    assert install_match, "install-mcp.sh does not define the overridable budget default"
+    assert beta_match, "beta-container-setup.sh does not define the overridable budget default"
+    assert install_match.group(1) == beta_match.group(1), (
+        f"budget mismatch: install-mcp.sh={install_match.group(1)} beta-container-setup.sh={beta_match.group(1)}"
+    )
+
+
+def test_scripts_stamp_the_budget_into_the_env_var() -> None:
+    """D1: the same budget the entry timeout uses feeds the server env var."""
+    for script in (_script_text(), BETA_SCRIPT.read_text(encoding="utf-8")):
+        assert '"PIC_AGENTIC_MCP_TIMEOUT_MS": str(timeout_ms)' in script, (
+            "the registration does not pass the budget to the server env"
+        )
+        assert '"timeout": int(timeout_ms)' in script, "the entry timeout does not use the shared budget"
 
 
 def test_help_does_not_print_the_set_euo_pipefail_line() -> None:
