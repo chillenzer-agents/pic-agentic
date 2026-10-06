@@ -991,6 +991,31 @@ async def test_create_campaign_refuses_a_cell_cnt_only_grid_patch(tmp_path) -> N
     assert not (tmp_path / "campaign.json").exists()
 
 
+async def test_create_campaign_refuses_a_sub_axis_grid_patch(tmp_path) -> None:
+    """A sub-axis ``cell_cnt.x``/``cell_size.x`` patch is refused like its parent (A1).
+
+    The sub-axis forms have the same denormalising effect as the whole
+    ``cell_cnt``/``cell_size`` nodes and must not slip past the outright guard;
+    the ``cell_depth`` check alone scopes to z and would false-reject an
+    x-sweep, so the guard must catch them first.
+    """
+    for patch_path, value in (
+        ("sim.grid.cell_cnt.x", 48),
+        ("sim.grid.cell_cnt.z", 48),
+        ("sim.grid.cell_size.x", 2.5e-7),
+    ):
+        config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / f"{patch_path.replace('.', '_')}.json"))
+        base = _valid_spec()
+        result = await _call(
+            config,
+            "create_campaign",
+            {"name": "subaxis", "base_spec": base, "patch_path": patch_path, "values": [value]},
+        )
+        assert result["ok"] is False, patch_path
+        assert result["error"] == "invalid_campaign_spec", patch_path
+        assert "add_agenda_leaf" in result["detail"]
+
+
 async def test_create_campaign_refuses_a_cell_size_only_grid_patch(tmp_path) -> None:
     """A lone ``cell_size`` patch is refused too (A1).
 

@@ -1132,9 +1132,12 @@ class AgendaService:
 #: patch changes the physical box while the derived ``cell_depth`` (3D) and the
 #: CFL-consistent ``delta_t_si``/``time_steps`` stay at the base values -- the
 #: beta-6 "fixed-box resolution sweep" that actually varied the box size.  The
-#: consistent way to move these is a whole-node patch (``sim.grid``) or one
-#: whole spec per leaf via ``add_agenda_leaf``; both are provided.
-_DENORMALIZED_GRID_PATCHES = ("sim.grid.cell_cnt", "sim.grid.cell_size")
+#: prefixes match the sub-axis forms too (``sim.grid.cell_cnt.x``), which have
+#: the same effect and would otherwise also be false-rejected by the z
+#: ``cell_depth`` check.  The consistent way to move these is a whole-node patch
+#: (``sim.grid``) or one whole spec per leaf via ``add_agenda_leaf``; both are
+#: provided.
+_DENORMALIZED_GRID_PATCH_PREFIXES = ("sim.grid.cell_cnt", "sim.grid.cell_size")
 
 
 def _denormalized_patch_error(patch_path: str) -> dict[str, Any] | None:
@@ -1155,7 +1158,7 @@ def _denormalized_patch_error(patch_path: str) -> dict[str, Any] | None:
         patch, else ``None``.
 
     """
-    if patch_path not in _DENORMALIZED_GRID_PATCHES:
+    if not patch_path.startswith(_DENORMALIZED_GRID_PATCH_PREFIXES):
         return None
     return {
         "ok": False,
