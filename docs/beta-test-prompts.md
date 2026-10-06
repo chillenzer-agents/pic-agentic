@@ -36,6 +36,21 @@ snippet built from the pinned classes. The beta-5 agent copied
 and then had to reverse-engineer `site-packages`; the pin uses
 `picmi.diagnostics.NativeFieldDump`/`DerivedFieldDump`/`PhaseSpace`/
 `EnergyHistogram`/`FieldEnergyMonitor`. The installed package is authoritative.
+The seeded instructions also carry an inline
+`FieldEnergyMonitor(period=TimeStepSpec[::20, -1])` snippet (the beta-6 agent
+reverse-engineered that inclusive slice syntax from source), and three
+warnings a Runner-spec study needs: the spec is a *rendered snapshot* with
+denormalized fields, so patching only `sim.grid.cell_cnt` (or only `cell_size`)
+is a box-size, not a resolution, change — and box-size sweeps are allowed; a
+fixed-box resolution sweep must instead co-vary `cell_size`, `cell_cnt` and
+`cell_depth` together with a CFL-consistent `delta_t_si` and matching
+`time_steps`; finer `dx` needs a CFL-consistent `delta_t_si`/step count or the
+compile fails on the Yee CFL `static_assert`; and a laser's Huygens surface must
+sit outside the 12-cell default PML absorber (the `GaussianLaser` 16-cell
+default is right; 8 cells segfaults at step 0). Because the pin's
+`TimeStepSpec` is a plain class, not a pydantic model, `model_json_schema()` is
+unavailable for `TimeStepSpec`-backed diagnostics; the instructions point at the
+pinned classes under `lib/python/picongpu/picmi/diagnostics/` instead.
 
 Independently of *why* a run is empty, a completed run whose only numeric plugin
 artifact reads all-zero is now a first-class **health signal**, not silence:
