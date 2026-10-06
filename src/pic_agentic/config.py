@@ -54,6 +54,7 @@ ENV_MAP = {
     "fleet_stall_after_s": "PIC_AGENTIC_FLEET_STALL_AFTER_S",
     "human_room_id": "PIC_AGENTIC_HUMAN_ROOM_ID",
     "notify": "PIC_AGENTIC_NOTIFY",
+    "mcp_timeout_ms": "PIC_AGENTIC_MCP_TIMEOUT_MS",
 }
 
 REDACTED = "[REDACTED]"
@@ -141,6 +142,26 @@ class Config(BaseModel):
     human_room_id: str = ""
     #: Whether to push a one-line notification to the human room after a tick.
     notify: bool = False
+    #: The MCP client's per-request budget, in milliseconds, as registered with
+    #: opencode (``"timeout"`` in the ``pic-agentic`` server entry).  The MCP
+    #: framework does not pass this to the server, so the setup scripts stamp it
+    #: into the same env var (``PIC_AGENTIC_MCP_TIMEOUT_MS``) they use to size
+    #: the client entry; the server then knows the budget against which it must
+    #: bound a blocking tool call.  ``None`` means "unknown" (no env var): the
+    #: wait tool then validates only, exactly as before.
+    mcp_timeout_ms: int | None = None
+
+    def mcp_client_timeout_s(self) -> float | None:
+        """Return the known MCP client request budget in seconds.
+
+        Returns:
+            ``mcp_timeout_ms / 1000`` when the budget is known and positive,
+            else ``None`` (the server must then validate without a budget).
+
+        """
+        if self.mcp_timeout_ms is None or self.mcp_timeout_ms <= 0:
+            return None
+        return self.mcp_timeout_ms / 1000.0
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:
