@@ -839,6 +839,7 @@ def build_submit_ack(
     job_id: int | None = None,
     error: str | None = None,
     error_code: str | None = None,
+    failure_summary: str | None = None,
 ) -> RcpMessage:
     """Build the simclient's acknowledgement of a submit command.
 
@@ -851,6 +852,8 @@ def build_submit_ack(
         payload["error"] = error
     if error_code:
         payload["error_code"] = error_code
+    if failure_summary:
+        payload["failure_summary"] = failure_summary
     return RcpMessage(
         sim=sim,
         kind=Kind.ACK,
@@ -873,6 +876,7 @@ def build_submit_event(
     stage: SimulationStage | None = None,
     error: str | None = None,
     error_code: str | None = None,
+    failure_summary: str | None = None,
     submit_system: str | None = None,
     results_linked: bool | None = None,
     step: int | None = None,
@@ -905,6 +909,8 @@ def build_submit_event(
         payload["error"] = error
     if error_code:
         payload["error_code"] = error_code
+    if failure_summary:
+        payload["failure_summary"] = failure_summary
     if results_linked is not None:
         payload["results_linked"] = results_linked
     if manifest is not None:
@@ -1014,6 +1020,7 @@ def build_status_ack(
     exit_code: int | None = None,
     error: str | None = None,
     error_code: str | None = None,
+    failure_summary: str | None = None,
     suspect: str | None = None,
 ) -> RcpMessage:
     """Build the simclient's live-status response (M2b).
@@ -1041,6 +1048,7 @@ def build_status_ack(
                 ("exit_code", exit_code),
                 ("error", error),
                 ("error_code", error_code),
+                ("failure_summary", failure_summary),
                 ("suspect", suspect),
             )
             if value is not None

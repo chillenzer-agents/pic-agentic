@@ -994,6 +994,7 @@ class SimClient:
                 stage=exc.stage or SimulationStage.BUILD,
                 error=str(exc),
                 error_code=exc.code,
+                failure_summary=exc.summary,
             )
             if cmd_id:
                 self._persist_processed(
@@ -1990,6 +1991,7 @@ class SimClient:
         stage: SimulationStage | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        failure_summary: str | None = None,
         submit_system: str | None = None,
         results_linked: bool | None = None,
         step: int | None = None,
@@ -2014,6 +2016,7 @@ class SimClient:
             stage=stage,
             error=error,
             error_code=error_code,
+            failure_summary=failure_summary,
             submit_system=submit_system,
             results_linked=results_linked,
             step=step,

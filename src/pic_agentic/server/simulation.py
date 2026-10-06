@@ -126,13 +126,14 @@ _RECORD_FIELDS = (
     "run_dir",
     "error",
     "error_code",
+    "failure_summary",
     "stage",
     "suspect",
 )
 
 #: The failure-reason subset of :data:`_RECORD_FIELDS`, projected from a submit
 #: ack as well (a rejection reports its reason on the ack, not as an event).
-_FAILURE_FIELDS = ("error", "error_code", "stage")
+_FAILURE_FIELDS = ("error", "error_code", "failure_summary", "stage")
 
 
 class SimRecord(BaseModel):
@@ -164,6 +165,9 @@ class SimRecord(BaseModel):
     error: str | None = None
     #: Stable machine-readable failure code (e.g. ``unsupported``).
     error_code: str | None = None
+    #: A short, human-readable cause extracted from a long raw ``error`` (e.g.
+    #: the compiler line from a cwltool ``permanentFail`` dump).
+    failure_summary: str | None = None
     #: Pipeline stage the failure occurred in, when the simclient reported one.
     stage: str | None = None
     #: The "successful-but-empty" health flag: the all-zero warning text when the
@@ -1480,6 +1484,7 @@ def _record_status(record: SimRecord) -> dict[str, Any]:
         "eta_s": record.eta_s,
         "error": record.error,
         "error_code": record.error_code,
+        "failure_summary": record.failure_summary,
         "active": record.active,
     }
     phase = _record_phase(record)

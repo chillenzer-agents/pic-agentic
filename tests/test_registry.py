@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pic_agentic.protocol.simulation import (
     SimulationPayload,
+    SimulationStage,
     SimulationState,
     SubmitParams,
     build_submit_ack,
@@ -229,6 +230,27 @@ def test_job_failed_and_simulation_failed_are_terminal() -> None:
         assert record is not None
         assert record.active is False
         assert record.exit_code == 3
+
+
+def test_build_failure_projects_code_stage_and_summary() -> None:
+    """B1: a build failure event's failure_summary/stage is kept on the record."""
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(
+        _event(
+            SimulationState.FAILED,
+            seq=2,
+            error="workflow failed: Completed permanentFail\n... Yee.hpp error",
+            error_code="build_failed",
+            stage=SimulationStage.BUILD,
+            failure_summary="Yee.hpp(56): error: CFL static_assert",
+        )
+    )
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.error_code == "build_failed"
+    assert record.stage == "build"
+    assert record.failure_summary == "Yee.hpp(56): error: CFL static_assert"
 
 
 def test_an_event_omitting_a_field_does_not_erase_it() -> None:

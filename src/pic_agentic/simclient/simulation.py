@@ -65,6 +65,12 @@ class SimulationErrorCode(StrEnum):
     OUTCOME_UNKNOWN = "outcome_unknown"
     PICONGPU_UNAVAILABLE = "picongpu_unavailable"
     GENERATE_FAILED = "generate_failed"
+    #: The CWL workflow's *build* step (the PIConGPU ``pic-build`` compile)
+    #: failed: a compile error such as a CFL ``static_assert``.  Distinct from
+    #: :data:`RUN_FAILED` because the run never started -- the failure is in the
+    #: build that precedes submission, and its remediation (fix the setup /
+    #: params) differs from a runtime crash.
+    BUILD_FAILED = "build_failed"
     RUN_FAILED = "run_failed"
     #: M3 control/results error codes.
     NOT_SIGNALABLE = "not_signalable"
@@ -82,18 +88,27 @@ class SimulationErrorCode(StrEnum):
 class SimulationExecutionError(RuntimeError):
     """A stage failure carrying a machine-readable error code."""
 
-    def __init__(self, code: SimulationErrorCode, message: str, stage: SimulationStage | None = None) -> None:
+    def __init__(
+        self,
+        code: SimulationErrorCode,
+        message: str,
+        stage: SimulationStage | None = None,
+        summary: str | None = None,
+    ) -> None:
         """Create the error.
 
         Args:
             code: Stable error code reported in the ack/event.
             message: Human-readable detail.
             stage: Pipeline stage, when the failure happened after acceptance.
+            summary: Optional short, human-readable cause extracted from a long
+                raw error (e.g. the compiler line from a cwltool dump).
 
         """
         super().__init__(message)
         self.code = code
         self.stage = stage
+        self.summary = summary
 
 
 @dataclass
@@ -348,6 +363,34 @@ _MAX_SCAN_HITS = 50
 #: Lines worth keeping from the captured stderr for the failure event.
 _ERROR_LINE_RE = re.compile(
     r"error|fatal|not found|No such file|command not found|exited with status|permanentFail|missing expected",
+    re.IGNORECASE,
+)
+
+#: Cap on the short failure summary sent alongside the full error text.
+_MAX_FAILURE_SUMMARY = 500
+
+#: A compiler/CMake error line worth promoting into the summary.  Anchored on
+#: the ``error:``/``error #``/``error N`` markers a C++ compiler (or nvcc) emits,
+#: plus the ``gmake``/``make`` error tail and CMake's own ``CMake Error``.
+_COMPILER_ERROR_RE = re.compile(
+    r"(?:^|\W)error(?:\s*[:#]|\s+\d+)|gmake(?:\[\d+\])?: \*\*\*|make(?:\[\d+\])?: \*\*\*|CMake Error",
+)
+
+#: The CWL workflow's build (compile) step, as it appears in a cwltool failure.
+#: A failure naming this step is a *build* failure.
+_BUILD_STEP_RE = re.compile(r"\[\s*(?:job|step)\s+build_step(?:_\d+)?\s*\]", re.IGNORECASE)
+
+#: Any named cwltool workflow step (the pinned workflow names every step
+#: ``<name>_step``).  A failure naming a step other than the build step is not a
+#: compile failure -- it is the submit machinery or, for a job that really ran and
+#: crashed, reported by the SLURM follower as ``job_failed`` instead.
+_ANY_STEP_RE = re.compile(r"\[\s*(?:job|step)\s+\w+_step(?:_\d+)?\s*\]", re.IGNORECASE)
+
+#: Build-step markers, as a fallback when no step-named line survived (e.g. a
+#: truncated capture holding only the C++ tail): pic-build / CMake output is
+#: build output.
+_BUILD_MARKER_RE = re.compile(
+    r"\bpic-build\b|\bgmake\b|\bcmake\b|\bmake install\b|\bnvcc\b|\.(?:hpp|cpp|cu|cuh)\b",
     re.IGNORECASE,
 )
 
@@ -677,6 +720,71 @@ def _workflow_failure_detail(run_dir: Path, captured: str = "") -> str:
     return detail[-_MAX_ERROR_DETAIL:]
 
 
+def _classify_workflow_failure(detail: str) -> tuple[SimulationErrorCode, SimulationStage]:
+    """Classify a cwltool workflow failure as a build or a run-stage failure.
+
+    The captured cwltool detail names the failing step.  A failure of the
+    ``build_step`` is the PIConGPU compile (``pic-build``): a cwltool job that
+    exits with a compiler ``error:`` and/or did not produce the ``bin``
+    directory.  A failure of any other workflow step (the
+    ``prepare_submission``/``submit``/``organize_output`` machinery) is a
+    run-stage failure; a genuine numerical/runtime failure surfaces through a
+    SLURM ``job_failed`` (not a workflow exception) and keeps its own distinct
+    reporting.
+
+    Args:
+        detail: The captured workflow failure text.
+
+    Returns:
+        The ``(error_code, stage)`` pair for a ``simulation.failed`` event.
+
+    """
+    if _BUILD_STEP_RE.search(detail):
+        return SimulationErrorCode.BUILD_FAILED, SimulationStage.BUILD
+    if _ANY_STEP_RE.search(detail):
+        # A different workflow step failed (prepare/submit/organize machinery);
+        # the compiler never ran, so it is not a build-stage compile failure.
+        return SimulationErrorCode.RUN_FAILED, SimulationStage.RUN
+    if _BUILD_MARKER_RE.search(detail):
+        # No step line survived, but the detail carries compiler/CMake output.
+        return SimulationErrorCode.BUILD_FAILED, SimulationStage.BUILD
+    return SimulationErrorCode.RUN_FAILED, SimulationStage.RUN
+
+
+def _failure_summary(detail: str) -> str | None:
+    """Extract a bounded one-of-the-first compiler/CMake error lines.
+
+    The raw ``error`` is a cwltool ``permanentFail`` dump followed by a
+    truncated C++ compiler tail; the actual cause (e.g. a CFL ``static_assert``)
+    is a single line buried in it.  Promote the first compiler/CMake error line
+    (plus the ``make`` tail when present) into a short summary so the cause is
+    readable without scrolling the dump; the full text stays in ``error``.
+
+    Args:
+        detail: The captured workflow failure text.
+
+    Returns:
+        A short summary string, or None when no recognizable error line exists.
+
+    """
+    summary: list[str] = []
+    for line in detail.splitlines():
+        stripped = line.strip()
+        if not stripped or not _COMPILER_ERROR_RE.search(stripped):
+            continue
+        # Skip cwltool's own wrapper diagnostics (``... cwltool: [job
+        # build_step] Job error:``): they name the failing step but not the
+        # cause.  The compiler/CMake/make lines below them carry the cause.
+        if "cwltool:" in stripped:
+            continue
+        summary.append(stripped)
+        if len("\n".join(summary)) >= _MAX_FAILURE_SUMMARY:
+            break
+    if not summary:
+        return None
+    return "\n".join(summary)[:_MAX_FAILURE_SUMMARY]
+
+
 def _scan_retained_step_logs(run_dir: Path) -> str:
     """Best-effort scan of the retained cwltool cache for an error line.
 
@@ -840,7 +948,9 @@ async def execute_submit(
         msg = f"workflow failed: {exc}"
         if detail:
             msg = f"{msg}\n{detail}"
-        raise SimulationExecutionError(SimulationErrorCode.RUN_FAILED, msg, SimulationStage.RUN) from exc
+        code, stage = _classify_workflow_failure(detail)
+        summary = _failure_summary(detail)
+        raise SimulationExecutionError(code, msg, stage, summary=summary) from exc
 
     job_id = job_id_reader(runner.run_dir, prepared.payload)
     if job_id is not None:
