@@ -41,15 +41,15 @@ The seeded instructions also carry an inline
 reverse-engineered that inclusive slice syntax from source), and three
 warnings a Runner-spec study needs: the spec is a *rendered snapshot* with
 denormalized fields, so a grid/resolution patch must co-vary `cell_cnt`,
-`cell_size`, `cell_depth`, `delta_t_si` and `time_steps` (a lone `cell_cnt`
-patch silently changes the physical box); finer `dx` needs a CFL-consistent
-`delta_t_si`/step count or the compile fails on the Yee CFL `static_assert`;
-and a laser's Huygens surface must sit outside the 12-cell PML absorber (the
-`GaussianLaser` 16-cell default is right; 8 cells segfaults at step 0). Because
-the PICMI `TimeStepSpec` is not a pydantic model, `model_json_schema()` is
-unavailable for `TimeStepSpec`-backed diagnostics (an upstream PICMI
-limitation); the instructions point at the pinned classes under
-`lib/python/picongpu/picmi/diagnostics/` instead.
+`cell_size`, `cell_depth`, `delta_t_si` and `time_steps` (the consistency gate
+added in this wave refuses a lone `cell_cnt` patch, which silently changes the
+physical box); finer `dx` needs a CFL-consistent `delta_t_si`/step count or the
+compile fails on the Yee CFL `static_assert`; and a laser's Huygens surface must
+sit outside the 12-cell default PML absorber (the `GaussianLaser` 16-cell
+default is right; 8 cells segfaults at step 0). Because the pin's
+`TimeStepSpec` is a plain class, not a pydantic model, `model_json_schema()` is
+unavailable for `TimeStepSpec`-backed diagnostics; the instructions point at the
+pinned classes under `lib/python/picongpu/picmi/diagnostics/` instead.
 
 Independently of *why* a run is empty, a completed run whose only numeric plugin
 artifact reads all-zero is now a first-class **health signal**, not silence:

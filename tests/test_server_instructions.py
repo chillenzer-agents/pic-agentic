@@ -66,6 +66,8 @@ def test_instructions_warn_about_rendered_snapshot_and_denormalized_fields() -> 
     assert "denormalized" in SERVER_INSTRUCTIONS
     assert "co-vary" in SERVER_INSTRUCTIONS
     assert "lone cell_cnt patch" in SERVER_INSTRUCTIONS
+    # The refusal is a gate added in this wave, not pre-existing behaviour.
+    assert "consistency gate" in SERVER_INSTRUCTIONS
 
 
 def test_instructions_warn_about_the_cfl_condition() -> None:
@@ -82,6 +84,8 @@ def test_instructions_warn_that_the_huygens_surface_must_clear_the_pml() -> None
     assert "Huygens" in SERVER_INSTRUCTIONS
     assert "PML" in SERVER_INSTRUCTIONS
     assert "12-cell" in SERVER_INSTRUCTIONS
+    # 12 cells is the default PML; the exponential absorber uses 32.
+    assert "default PML" in SERVER_INSTRUCTIONS
     assert "16 cells" in SERVER_INSTRUCTIONS
     assert "exit 139" in SERVER_INSTRUCTIONS
 
@@ -97,10 +101,13 @@ def test_instructions_carry_a_field_energy_monitor_snippet() -> None:
 
 def test_instructions_report_time_step_spec_schema_introspection_gap() -> None:
     # E2: model_json_schema() fails for TimeStepSpec-backed diagnostics because
-    # the PICMI TimeStepSpec is not a pydantic model (upstream cause); point the
-    # agent at the pinned class list instead.
+    # the pin's TimeStepSpec is a plain class, not a pydantic model; point the
+    # agent at the pinned class list instead. Attribute it to the pin, not to
+    # the PICMI standard, which does not ship the class.
     assert "model_json_schema" in SERVER_INSTRUCTIONS
     assert "not a pydantic model" in SERVER_INSTRUCTIONS
+    assert "pin's TimeStepSpec" in SERVER_INSTRUCTIONS
+    assert "upstream PICMI" not in SERVER_INSTRUCTIONS
     assert "picmi/diagnostics/" in SERVER_INSTRUCTIONS
 
 

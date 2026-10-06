@@ -336,21 +336,22 @@ extent. Patching one node therefore changes the physics in a way the other
 nodes do not follow:
 
 - a grid/resolution patch must co-vary `cell_cnt`, `cell_size`, `cell_depth`,
-  `delta_t_si` and `time_steps`; a lone `cell_cnt` patch is refused because it
-  silently changes the physical box;
+  `delta_t_si` and `time_steps`; the consistency gate added in this wave refuses
+  a lone `cell_cnt` patch because it silently changes the physical box;
 - finer `dx` also needs a CFL-consistent `delta_t_si` and step count — changing
   only the grid fails the compile with the Yee solver's CFL `static_assert`
   (`fields/MaxwellSolver/Yee/Yee.hpp`);
-- a laser's Huygens surface must sit **outside** the 12-cell PML absorber
+- a laser's Huygens surface must sit **outside** the 12-cell default PML absorber
   (`include/picongpu/param/fieldAbsorber.param`, `THICKNESS = 12`). The
   `GaussianLaser` default (16 cells) is right; an 8-cell placement segfaults at
   step 0 (exit 139).
 
 `model_json_schema()` is unavailable for diagnostics whose `period` is a
-`TimeStepSpec`: the PICMI `TimeStepSpec` is not a pydantic model, so pydantic
-cannot build a JSON schema for it. This is an **upstream PICMI limitation**;
-the instructions point the agent at the pinned classes under
-`lib/python/picongpu/picmi/diagnostics/` instead.
+`TimeStepSpec`: the pin's `TimeStepSpec` (defined in
+`picongpu/picmi/diagnostics/timestepspec.py`, a plain class rather than a
+pydantic model) does not come from the PICMI standard package, so pydantic
+cannot build a JSON schema for it. The instructions point the agent at the
+pinned classes under `lib/python/picongpu/picmi/diagnostics/` instead.
 
 ### Multi-node studies need explicit leaves (H5)
 
