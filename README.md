@@ -335,10 +335,13 @@ snapshot with denormalised fields, patching `sim.grid.cell_cnt` (or
 `sim.grid.cell_size`) **alone** silently leaves `cell_depth`, `delta_t_si` and
 the physical box inconsistent — a "fixed-box resolution sweep" that actually
 varies the box size at constant resolution. `create_campaign` therefore refuses
-those two single-node patches with `invalid_campaign_spec`; the derived
-invariants a patch can break (stale `cell_depth`, an explicit `grid_dist` that
-no longer sums to `cell_cnt`, and the solver's CFL `c·dt ≤ dx` stability limit)
-are checked on every patched leaf and refused with an actionable message.
+those two single-node patches (and their per-axis forms, `sim.grid.cell_cnt.x`
+etc.) with `invalid_campaign_spec`; the derived invariants a patch can break
+(stale `cell_depth`, an explicit `grid_dist` that no longer sums to `cell_cnt`,
+and the solver's CFL `c·dt ≤ dx` stability limit) are checked on every
+`create_campaign`-patched leaf and refused with an actionable message. A
+whole-spec `add_agenda_leaf` leaf, which owns every node, is not checked against
+these derived invariants.
 `add_agenda_leaf` is the escape hatch:
 create the base campaign, then add one leaf per study point carrying its own
 whole spec, so any number of nodes can differ between leaves. A leaf spec may be
