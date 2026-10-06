@@ -388,10 +388,18 @@ _BUILD_STEP_RE = re.compile(r"\[\s*(?:job|step)\s+build_step(?:_\d+)?\s*\]", re.
 _ANY_STEP_RE = re.compile(r"\[\s*(?:job|step)\s+\w+_step(?:_\d+)?\s*\]", re.IGNORECASE)
 
 #: Build-step markers, as a fallback when no step-named line survived (e.g. a
-#: truncated capture holding only the C++ tail): pic-build / CMake output is
-#: build output.
+#: truncated capture holding only the C++ tail).  These require a genuine
+#: compiler/make/CMake *error* marker, not a bare build artifact path: a
+#: submit-machinery failure whose truncated tail merely echoes a
+#: ``.../build/main.x.cpp`` path or the word ``cmake`` must not be relabelled a
+#: compile failure.
 _BUILD_MARKER_RE = re.compile(
-    r"\bpic-build\b|\bgmake\b|\bcmake\b|\bmake install\b|\bnvcc\b|\.(?:hpp|cpp|cu|cuh)\b",
+    r"\bpic-build\b"
+    r"|gmake(?:\[\d+\])?: \*\*\*"
+    r"|make(?:\[\d+\])?: \*\*\*"
+    r"|CMake Error"
+    r"|\bnvcc\b[^\n]*\b(?:error|fatal)\b"
+    r"|\.(?:hpp|cpp|cu|cuh)(?:\(\d+\)|:\d+)?:\s*(?:fatal\s+)?error\b",
     re.IGNORECASE,
 )
 

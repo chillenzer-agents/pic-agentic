@@ -415,6 +415,40 @@ def test_classify_workflow_failure_build_vs_run() -> None:
     assert sim_mod._classify_workflow_failure(tail_only) == (SimulationErrorCode.BUILD_FAILED, SimulationStage.BUILD)
 
 
+def test_classify_fallback_ignores_bare_build_artifact_paths() -> None:
+    """B1: a submit failure whose tail merely names a build path is not a build.
+
+    The step banner is gone in a truncated capture, so the fallback marker must
+    require a genuine compiler/make error, not a bare ``.cpp``/``cmake`` path an
+    ``sbatch``/organize failure could echo.
+    """
+    submit_tail = (
+        "workflow failed: Completed permanentFail\n"
+        "ERROR cwltool: submit_step_3 Job error: sbatch not found while staging "
+        ".../build/main.x.cpp and cmake helpers"
+    )
+    assert sim_mod._classify_workflow_failure(submit_tail) == (
+        SimulationErrorCode.RUN_FAILED,
+        SimulationStage.RUN,
+    )
+    # A bare ``.cpp``/``cmake`` mention without a compiler error is not a build.
+    assert sim_mod._classify_workflow_failure("staging /work/build/main.x.cpp with cmake") == (
+        SimulationErrorCode.RUN_FAILED,
+        SimulationStage.RUN,
+    )
+    # A real compiler marker without the step banner is still a build failure.
+    compiler_tail = ".../Yee.hpp(56): error: no instance of overloaded function matches"
+    assert sim_mod._classify_workflow_failure(compiler_tail) == (
+        SimulationErrorCode.BUILD_FAILED,
+        SimulationStage.BUILD,
+    )
+    nvcc_tail = "nvcc fatal   : Unsupported gpu architecture 'compute_999'"
+    assert sim_mod._classify_workflow_failure(nvcc_tail) == (
+        SimulationErrorCode.BUILD_FAILED,
+        SimulationStage.BUILD,
+    )
+
+
 def test_failure_summary_extracts_the_compiler_cause() -> None:
     """B1: the summary names the compiler line, not cwltool's wrapper noise."""
     summary = sim_mod._failure_summary(_BUILD_FAILURE)
