@@ -529,6 +529,36 @@ def test_live_build_tail_is_bounded_and_unregistered(tmp_path) -> None:
     assert sim_mod.live_build_log(run_dir) == []
 
 
+def test_live_build_tail_byte_accounting_survives_auto_eviction() -> None:
+    """B2: ``_bytes`` tracks the deque's own ``maxlen`` eviction.
+
+    A burst of many short lines fills the deque past ``maxlen``, so the oldest
+    lines are dropped by the deque itself; the byte total must reflect only the
+    retained lines, otherwise it over-counts and the explicit byte-budget
+    eviction then pops still-needed lines (briefly emptying the tail).
+    """
+    tail = sim_mod._RingTail()
+    for index in range(60000):
+        tail.add(f"compiling main.x.cpp.o {index}\n")
+    lines = tail.lines()
+    assert len(lines) == sim_mod._BUILD_TAIL_LINES
+    assert tail._bytes == sum(len(line) for line in lines)
+    assert tail._bytes <= sim_mod._MAX_BUILD_TAIL_BYTES
+
+
+def test_live_build_tail_byte_budget_evicts_before_emptying() -> None:
+    """B2: the byte backstop drops whole lines but never the live tail entirely."""
+    tail = sim_mod._RingTail()
+    for _ in range(20000):
+        tail.add("short\n")
+    for _ in range(50):
+        tail.add("x" * 2048 + "\n")
+    lines = tail.lines()
+    assert lines, "the tail must not be emptied by the byte backstop"
+    assert tail._bytes == sum(len(line) for line in lines)
+    assert tail._bytes <= sim_mod._MAX_BUILD_TAIL_BYTES
+
+
 async def test_pull_rejected_when_submit_disabled(shared_dir, tmp_path) -> None:
     shared, _state_dir = shared_dir
     _mcp_t, sim_t = MemoryTransport.create_pair()

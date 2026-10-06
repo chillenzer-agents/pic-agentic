@@ -449,6 +449,13 @@ class _RingTail:
     def add(self, text: str) -> None:
         """Append the lines in ``text``, normalising CRLF and dropping blanks.
 
+        The byte accounting must survive the deque's own ``maxlen`` eviction:
+        when the deque is full, ``append`` silently drops the oldest line, so
+        the running total has to subtract that line's length too.  Recomputing
+        ``sum`` after the insertion is the simplest way to stay exact and keeps
+        the explicit byte-budget eviction from popping lines the deque already
+        accounts for.
+
         Args:
             text: A chunk of captured output (may contain several lines).
 
@@ -458,9 +465,9 @@ class _RingTail:
                 if not line:
                     continue
                 self._lines.append(line)
-                self._bytes += len(line)
-            while self._lines and self._bytes > _MAX_BUILD_TAIL_BYTES:
-                self._bytes -= len(self._lines.popleft())
+            while self._lines and sum(len(line) for line in self._lines) > _MAX_BUILD_TAIL_BYTES:
+                self._lines.popleft()
+            self._bytes = sum(len(line) for line in self._lines)
 
     def lines(self) -> list[str]:
         """Return the retained lines, oldest first.
