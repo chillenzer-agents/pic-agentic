@@ -405,6 +405,29 @@ async def test_wait_for_simulation_tool_over_budget_is_a_clear_soft_error() -> N
     assert "timed_out" not in payload
 
 
+async def test_wait_for_simulation_tool_default_call_is_not_refused_at_shipped_budget() -> None:
+    """D1: the no-``timeout_s`` default call must succeed under the shipped budget.
+
+    The shipped install stamps a client budget above the server's
+    ``MAX_WAIT_TIMEOUT_S``, so the documented default (1800 s) is inside it and
+    the plain "wait for my sim" call is not pre-empted with
+    ``wait_exceeds_client_timeout``.  The simulation is already terminal, so the
+    default call returns at once if it is accepted at all.
+    """
+    config = Config(rcp_secret=SECRET, mcp_timeout_ms=3_900_000)
+    server, runtime = build_server(config, SIM)
+    runtime.submit_service.on_message(
+        _event(SimulationState.FAILED, seq=1, job_id=None, error="boom", error_code="failed"),
+    )
+
+    payload = (await server.call_tool("wait_for_simulation", {"sim_id": SIM_ID})).structured_content
+
+    assert payload["ok"] is True, payload
+    assert payload["matched"] is True
+    assert "error" not in payload
+    assert config.mcp_client_timeout_s() - WAIT_CLIENT_TIMEOUT_SKEW_S >= DEFAULT_WAIT_TIMEOUT_S
+
+
 async def test_wait_for_simulation_tool_in_budget_still_returns_terminal() -> None:
     """A long wait within a generous budget remains event-driven data."""
     config = Config(rcp_secret=SECRET, mcp_timeout_ms=1_800_000)

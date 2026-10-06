@@ -64,9 +64,12 @@ ROOM_PREFLIGHT_TIMEOUT_S="${PIC_AGENTIC_ROOM_PREFLIGHT_TIMEOUT_S:-60}"
 # MCP client request budget (ms).  Single source of truth for BOTH the opencode
 # server entry `timeout` and the `PIC_AGENTIC_MCP_TIMEOUT_MS` env var the server
 # reads to bound wait_for_simulation: it must be the same number, or the server
-# cannot tell a wait that outlasts the client (D1).  The default is kept equal
-# to beta-container-setup.sh's; bump both together.
-MCP_TIMEOUT_MS="${PIC_AGENTIC_MCP_TIMEOUT_MS:-300000}"
+# cannot tell a wait that outlasts the client (D1).  Kept above the server's
+# MAX_WAIT_TIMEOUT_S (3600 s) plus WAIT_CLIENT_TIMEOUT_SKEW_S (5 s) so even the
+# longest accepted wait fits the budget and the default wait (1800 s) is never
+# refused.  The default is kept equal to beta-container-setup.sh's; bump both
+# together.
+MCP_TIMEOUT_MS="${PIC_AGENTIC_MCP_TIMEOUT_MS:-3900000}"
 
 MODE="install"
 case "${1:-install}" in
@@ -509,7 +512,7 @@ chmod 600 "$CONFIG"
 # 4. Register the MCP server with opencode (idempotent JSON edit, valid JSON
 #    out, other entries preserved).  NOTE: opencode's key is `environment`, not
 #    `env`.  JSON cannot carry comments, so the rationale lives here: `timeout`
-#    is the request budget (default 300000 ms) and the SAME value is stamped
+#    is the request budget (default 3900000 ms) and the SAME value is stamped
 #    into `PIC_AGENTIC_MCP_TIMEOUT_MS` so the server can bound
 #    wait_for_simulation against it (D1).
 log "registering the pic-agentic MCP server in $OPENCODE_JSON"

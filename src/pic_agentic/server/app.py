@@ -1148,8 +1148,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "simulation.step_finished, results.ready, simulation.failed, "
             "simulation.cancelled, or the alias `terminal`) to return earlier, "
             "e.g. on `simulation.job_running`. A long wait needs the MCP client "
-            "timeout to exceed `timeout_s`; the shipped install uses 300 s by "
-            "default and tells the server that budget, so an over-budget wait "
+            "timeout to exceed `timeout_s`; the shipped install uses 3900 s by "
+            "default and tells the server that budget, so the default wait and "
+            "any wait within the [0.1, 3600] s ceiling fit, while a larger "
+            "over-budget wait "
             "is refused with `wait_exceeds_client_timeout` instead of failing "
             "opaque. Raise `PIC_AGENTIC_MCP_TIMEOUT_MS` for longer waits."
         ),

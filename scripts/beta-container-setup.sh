@@ -57,9 +57,11 @@ AGENDA_FILE="${AGENDA_FILE:-$HOME/.config/pic-agentic/campaign.json}"
 # MCP client request budget (ms).  Single source of truth for BOTH the opencode
 # server entry `timeout` and the `PIC_AGENTIC_MCP_TIMEOUT_MS` env var the server
 # reads to bound wait_for_simulation: it must be the same number, or the server
-# cannot tell a wait that outlasts the client (D1).  Kept equal to
-# install-mcp.sh's default; bump both together.
-MCP_TIMEOUT_MS="${PIC_AGENTIC_MCP_TIMEOUT_MS:-300000}"
+# cannot tell a wait that outlasts the client (D1).  Kept above the server's
+# MAX_WAIT_TIMEOUT_S (3600 s) plus WAIT_CLIENT_TIMEOUT_SKEW_S (5 s) so even the
+# longest accepted wait fits the budget and the default wait (1800 s) is never
+# refused.  Kept equal to install-mcp.sh's default; bump both together.
+MCP_TIMEOUT_MS="${PIC_AGENTIC_MCP_TIMEOUT_MS:-3900000}"
 
 log() { printf '==> %s\n' "$*"; }
 die() {

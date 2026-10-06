@@ -120,6 +120,30 @@ def test_scripts_stamp_the_budget_into_the_env_var() -> None:
         assert '"timeout": int(timeout_ms)' in script, "the entry timeout does not use the shared budget"
 
 
+def test_shipped_budget_exceeds_the_server_wait_ceiling() -> None:
+    """The shipped budget must fit every accepted wait, so no default is refused.
+
+    The server refuses a wait whose ``timeout_s`` plus the safety skew exceeds
+    the budget (``WAIT_CLIENT_TIMEOUT_SKEW_S``); the same server caps
+    ``timeout_s`` at ``MAX_WAIT_TIMEOUT_S``.  A shipped budget at or below that
+    ceiling plus the skew would make the documented default (1800 s) -- or even
+    an explicit in-ceiling wait -- fail 100% of the time under the shipped
+    install (D1 follow-up).
+    """
+    from pic_agentic.server.simulation import MAX_WAIT_TIMEOUT_S, WAIT_CLIENT_TIMEOUT_SKEW_S
+
+    pattern = r'MCP_TIMEOUT_MS="\$\{PIC_AGENTIC_MCP_TIMEOUT_MS:-(\d+)\}"'
+    for text in (_script_text(), BETA_SCRIPT.read_text(encoding="utf-8")):
+        match = re.search(pattern, text)
+        assert match, "a setup script does not define the overridable budget default"
+        budget_s = int(match.group(1)) / 1000.0
+        assert budget_s > MAX_WAIT_TIMEOUT_S + WAIT_CLIENT_TIMEOUT_SKEW_S, (
+            f"shipped budget {budget_s:g} s does not fit the server's "
+            f"MAX_WAIT_TIMEOUT_S {MAX_WAIT_TIMEOUT_S:g} s + skew "
+            f"{WAIT_CLIENT_TIMEOUT_SKEW_S:g} s"
+        )
+
+
 def test_help_does_not_print_the_set_euo_pipefail_line() -> None:
     bash = shutil.which("bash")
     if bash is None:

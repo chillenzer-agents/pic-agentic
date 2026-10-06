@@ -529,11 +529,13 @@ transport need not be started -- a wait only reads the registry.
 
 A single MCP tool call cannot hold the connection indefinitely, so the wait is
 bounded by `timeout_s` **and** by the MCP client's request timeout. The shipped
-setup scripts register the server with a 300 s request budget and pass the same
-value to the server as `PIC_AGENTIC_MCP_TIMEOUT_MS`, so an over-budget wait is
-refused with a clear `wait_exceeds_client_timeout` error rather than the client's
-opaque `-32001` (the same budget the async result path already relies on). For a
-longer wait, raise `PIC_AGENTIC_MCP_TIMEOUT_MS` (both scripts honour it).
+setup scripts register the server with a 3900 s request budget (comfortably above
+the 3600 s `timeout_s` ceiling plus the 5 s safety skew) and pass the same value
+to the server as `PIC_AGENTIC_MCP_TIMEOUT_MS`, so a default wait is never refused
+and an over-budget wait is refused with a clear `wait_exceeds_client_timeout`
+error rather than the client's opaque `-32001` (the same budget the async result
+path already relies on). For a longer wait, raise `PIC_AGENTIC_MCP_TIMEOUT_MS`
+(both scripts honour it).
 
 ## Security model (M1)
 
