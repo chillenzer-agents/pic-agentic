@@ -1941,7 +1941,10 @@ def _annotate_vacuous(reader: str, summary: dict[str, Any]) -> dict[str, Any]:
     if not keys:
         return summary
     values = [summary[key] for key in keys if key in summary]
-    if not values or any(_has_nonzero_leaf(value) for value in values):
+    # ``None`` means the reader could not measure the value (e.g. a capped
+    # field-energy window with no whole row), which is *unknown*, not zero: a
+    # vacuity claim would be false, so bail rather than warn.
+    if not values or any(value is None for value in values) or any(_has_nonzero_leaf(value) for value in values):
         return summary
     message = f"{reader} is all zeros; the run may have no particles in range or the diagnostic may be misconfigured"
     existing = summary.get("warning")
@@ -2410,11 +2413,11 @@ def _build_energy_fields(
 
     """
     _ = instance, groups, window
-    rows, components, truncated = _read_fields_energy(target)
-    return _summarize_energy_fields(rows, components, iteration, target, truncated=truncated)
+    rows, components, truncated, capped = _read_fields_energy(target)
+    return _summarize_energy_fields(rows, components, iteration, target, truncated=truncated, capped=capped)
 
 
-def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str], bool]:
+def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str], bool, bool]:
     """Read a native text plugin file under a byte cap and parse it once.
 
     The read is bounded by :data:`_NATIVE_TEXT_MAX_BYTES`.  Reading one byte past
@@ -2425,8 +2428,11 @@ def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str],
     (a row cut mid-number could parse to a wrong value) and ``truncated`` is set.
 
     Returns:
-        ``(rows, component_names, truncated)``.  ``truncated`` is True when the
-        byte cap was hit or a row was dropped as malformed.
+        ``(rows, component_names, truncated, capped)``.  ``truncated`` is True
+        when the byte cap was hit or a row was dropped as malformed.  ``capped``
+        is the raw byte-cap signal on its own, so a caller can tell "no complete
+        line fit inside the cap" (``capped`` with no rows) from a genuinely
+        empty/absent file.
 
     Raises:
         ResultsReaderError: If the file cannot be read.
@@ -2447,7 +2453,7 @@ def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str],
         raw = raw[: last_newline + 1] if last_newline >= 0 else b""
     text = raw.decode("utf-8", errors="replace")
     rows, components, truncated = _parse_fields_energy(text)
-    return rows, components, truncated or capped
+    return rows, components, truncated or capped, capped
 
 
 def _summarize_energy_fields(
@@ -2457,6 +2463,7 @@ def _summarize_energy_fields(
     target: Path,
     *,
     truncated: bool,
+    capped: bool = False,
 ) -> dict[str, Any]:
     """Shape already-parsed ``EnergyFields`` rows into the bounded summary.
 
@@ -2464,16 +2471,25 @@ def _summarize_energy_fields(
     the file once and reuse the rows for both the step resolution and the
     summary (m3).
 
+    ``capped`` is the raw byte-cap signal from :func:`_read_fields_energy`.
+    A capped file with no complete line inside the cap (e.g. one very long line
+    or nonewline content) still gets an honest truncated summary here rather
+    than a ``no_results`` error: the file demonstrably *has* data, the reader
+    just could not fit a whole row inside the window.
+
     Returns:
         The bounded summary dict.
 
     Raises:
-        ResultsReaderError: If there are no parsable rows.
+        ResultsReaderError: If there are no parsable rows and the file was not
+            clipped by the cap.
 
     """
     if not rows:
-        msg = f"{target.name} has no parsable field-energy rows"
-        raise ResultsReaderError(msg)
+        if not capped:
+            msg = f"{target.name} has no parsable field-energy rows"
+            raise ResultsReaderError(msg)
+        return _empty_capped_energy_fields(components, target)
     steps = [row.step for row in rows]
     totals = [row.total for row in rows]
     index = steps.index(iteration) if iteration in steps else len(rows) - 1
@@ -2515,6 +2531,50 @@ def _summarize_energy_fields(
     return summary
 
 
+def _empty_capped_energy_fields(components: list[str], target: Path) -> dict[str, Any]:
+    """Summary for a capped ``fields_energy.dat`` window holding no whole row.
+
+    A file larger than :data:`_NATIVE_TEXT_MAX_BYTES` whose first cap-sized
+    window contains no newline (e.g. one very long line, or a writer that never
+    emits a newline) leaves no parsable prefix.  The file demonstrably *has*
+    data, so reporting the historical ``no_results`` error would be misleading;
+    an honest truncated summary with an explicit warning is returned instead.
+    The min/max/last totals are ``None`` (unknown), not ``0`` - the reader must
+    not imply the fields are empty - which also keeps :func:`_annotate_vacuous`
+    from misreading the unknown as an all-zero signal.
+
+    Returns:
+        The truncated, data-free bounded summary dict.
+
+    """
+    return {
+        "step": [],
+        "total_J": [],
+        "component_names": list(components),
+        "component_last_J": {},
+        "component_min_J": {},
+        "component_max_J": {},
+        "selected_step": None,
+        "step_first": None,
+        "step_last": None,
+        "n_steps": 0,
+        "total_J_min": None,
+        "total_J_max": None,
+        "total_J_last": None,
+        "total_J_selected": None,
+        "units_J": "Joule",
+        "source_path": target.name,
+        "source_size_bytes": _entry_size(target),
+        "iteration": None,
+        "truncated": True,
+        "downsampled": False,
+        "warning": (
+            f"{target.name} was truncated; no complete field-energy row fit inside the "
+            f"{_NATIVE_TEXT_MAX_BYTES}-byte read cap, so no trajectory is reported"
+        ),
+    }
+
+
 def _native_plugin_result(
     reader: str,
     output: Path,
@@ -2537,13 +2597,17 @@ def _native_plugin_result(
 
     """
     _ = output
-    rows, components, truncated = _read_fields_energy(target)
+    rows, components, truncated, capped = _read_fields_energy(target)
     available = [row.step for row in rows]
     if not available:
+        if capped:
+            # A file larger than the cap with no whole row in the window: report
+            # an honest truncated summary rather than the historical error.
+            return _annotate_vacuous(reader, _empty_capped_energy_fields(components, target))
         msg = f"{target.name} has no parsable field-energy rows"
         raise ResultsReaderError(msg)
     selected = _resolve_plugin_iteration(available, params.iteration)
-    summary = _summarize_energy_fields(rows, components, selected, target, truncated=truncated)
+    summary = _summarize_energy_fields(rows, components, selected, target, truncated=truncated, capped=capped)
     return _annotate_vacuous(reader, summary)
 
 

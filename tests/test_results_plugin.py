@@ -195,10 +195,42 @@ def test_field_energy_history_over_the_byte_cap_is_marked_truncated(
     summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
     assert summary["truncated"] is True
     assert "truncated" in summary["warning"]
-    # The real file peak (99 J) lies beyond the cap, so it must NOT be reported.
-    assert summary["total_J_max"] < 99.0
+    # The peak is over the rows *read*: every complete row of the prefix has the
+    # 1.0 J total, so the summary must report exactly 1.0 and never the 99 J peak
+    # that lies beyond the cap.
+    assert summary["total_J_max"] == pytest.approx(1.0)
     # Only whole rows of the prefix are kept, so the selected step is a real one.
     assert summary["step_last"] in steps
+
+
+def test_field_energy_over_the_cap_without_a_whole_row_is_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An over-cap window with no newline yields a truncated summary, not an error.
+
+    A file larger than the cap whose first window holds no complete line (one
+    very long line, or a writer that never emits a newline) used to fall through
+    to ``no_results`` ("has no parsable field-energy rows"), which wrongly implies
+    the file is empty.  It demonstrably has data, so the reader reports
+    ``truncated`` with unknown totals rather than a misleading error.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    monkeypatch.setattr(results, "_NATIVE_TEXT_MAX_BYTES", 512)
+    path = run / "simOutput" / "fields_energy.dat"
+    path.write_bytes(b"0 " + b"9.9e0 " * 500)
+    assert path.stat().st_size > 512
+    assert b"\n" not in path.read_bytes()
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is True
+    assert "truncated" in summary["warning"]
+    assert summary["n_steps"] == 0
+    # Unknown, not zero: the reader must not claim the fields are empty.
+    assert summary["total_J_max"] is None
+    assert "warning" in summary
+    assert "all zeros" not in summary["warning"]
 
 
 def test_field_energy_malformed_row_marks_truncated(tmp_path: Path) -> None:
