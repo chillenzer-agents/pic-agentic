@@ -1136,7 +1136,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "compile can take 15-20 min, so the default `timeout_s` (1800 s) "
             "covers the build plus the start of the queue wait; `timeout_s` is "
             "validated to lie within [0.1, 3600] s, so longer builds need repeat "
-            "calls. `last_status.phase` is `building` while the simclient has "
+            "calls. A wait that would outlast the MCP client request budget is "
+            "refused up front with `error: wait_exceeds_client_timeout` (not "
+            "clamped): pass a smaller `timeout_s` and poll+repeat, or raise "
+            "`PIC_AGENTIC_MCP_TIMEOUT_MS`. `last_status.phase` is `building` while the simclient has "
             "not yet reported a scheduler job id (compile/prepare), else "
             "`queued`/`running`/`finalizing` (job done, linking results); no "
             "state is ever invented. Pass "
@@ -1145,8 +1148,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "simulation.step_finished, results.ready, simulation.failed, "
             "simulation.cancelled, or the alias `terminal`) to return earlier, "
             "e.g. on `simulation.job_running`. A long wait needs the MCP client "
-            "timeout to exceed `timeout_s` (the shipped install uses 120 s by "
-            "default; raise `PIC_AGENTIC_MCP_TIMEOUT_MS` for long waits)."
+            "timeout to exceed `timeout_s`; the shipped install uses 300 s by "
+            "default and tells the server that budget, so an over-budget wait "
+            "is refused with `wait_exceeds_client_timeout` instead of failing "
+            "opaque. Raise `PIC_AGENTIC_MCP_TIMEOUT_MS` for longer waits."
         ),
         annotations=_READ_ONLY,
     )
@@ -1187,7 +1192,11 @@ async def _wait_tool(
     A timeout is returned as data (``ok: true`` with ``timed_out: true`` and
     ``matched: false``): the wait is a convenience, and "not yet" must not be
     reported as a failure.  An unknown simulation or target state is a soft
-    ``ok: false`` with an ``error``.
+    ``ok: false`` with an ``error``.  A ``timeout_s`` that would outlast the
+    known MCP client request budget is a distinct soft ``error``
+    ``wait_exceeds_client_timeout`` (never a clamp, never the client's opaque
+    ``-32001``), so the caller learns the real budget up front (D1); with no
+    budget configured the request is only validated, as before.
 
     Returns:
         The redacted :class:`WaitOutcome` dict, or a soft ``error`` dict.
