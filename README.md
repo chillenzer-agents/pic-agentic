@@ -472,6 +472,11 @@ in `error`. A signal-death `exit_code` (139 = SIGSEGV, 137 = SIGKILL, 143 =
 SIGTERM, and the raw wait-status `<< 8` form) is annotated as `exit_signal`
 alongside the unchanged numeric value.
 
+The `error`, `error_code`, `failure_summary`, `stage`, `exit_code` and
+`exit_signal` fields are all carried by the `get_status` projection as well as
+the failure event and `wait_for_simulation.last_status`, so a build failure is
+legible from whichever status surface the caller polls.
+
 ### `sim_id` is a spec label, not a run id
 
 A simulation's `sim_id` is only the first 8 hex of its payload hash (32 bits):

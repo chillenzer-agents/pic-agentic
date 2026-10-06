@@ -321,6 +321,33 @@ async def test_get_status_surfaces_the_suspect_flag() -> None:
     assert rows[0]["suspect"] == "energy_histogram is all zeros"
 
 
+def test_status_dict_surfaces_failure_fields() -> None:
+    """B1: a terminal build failure is legible from the get_status projection.
+
+    The event payload and ``last_status`` carry these fields, but the primary
+    ``get_status`` projection omitted them, so ``stage=build`` was invisible on
+    the surface an operator actually polls.
+    """
+    from pic_agentic.server.app import _status_dict
+    from pic_agentic.server.simulation import SimRecord
+
+    record = SimRecord(
+        sim_id=SIM_ID,
+        cmd_id="c1",
+        state=SimulationState.FAILED.value,
+        error_code="build_failed",
+        stage="build",
+        failure_summary="Yee.hpp(56): error: CFL static_assert",
+        exit_code=139,
+    )
+    status = _status_dict(record)
+    assert status["error_code"] == "build_failed"
+    assert status["stage"] == "build"
+    assert status["failure_summary"] == "Yee.hpp(56): error: CFL static_assert"
+    assert status["exit_code"] == 139
+    assert status["exit_signal"] == "SIGSEGV"
+
+
 def test_merge_status_keeps_projection_progress_the_ack_omits() -> None:
     """A live ack that omits a progress field must not erase the projection."""
     from pic_agentic.server.app import _merge_status
