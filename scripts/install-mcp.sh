@@ -521,7 +521,7 @@ import json
 import sys
 from pathlib import Path
 
-path, venv, config, timeout_ms = sys.argv[1:5]
+path, venv, config, timeout_ms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 p = Path(path)
 cfg = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"$schema": "https://opencode.ai/config.json"}
 cfg.setdefault("mcp", {})["pic-agentic"] = {
