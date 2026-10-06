@@ -2346,7 +2346,8 @@ def _parse_fields_energy(text: str) -> tuple[list[_FieldEnergyRow], list[str], b
 
     Returns:
         ``(rows, component_names, truncated)``.  ``truncated`` is True when a
-        row was dropped as malformed, so the summary can say so.
+        row was dropped as malformed.  A byte-cap cut is signalled by
+        :func:`_read_fields_energy`, which trims the text to whole lines first.
 
     """
     rows: list[_FieldEnergyRow] = []
@@ -2414,14 +2415,16 @@ def _build_energy_fields(
 def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str], bool]:
     """Read a native text plugin file under a byte cap and parse it once.
 
-    The read is bounded by :data:`_NATIVE_TEXT_MAX_BYTES`, so a pathologically
-    large ``fields_energy.dat`` cannot be pulled wholly into memory despite the
-    cap the comment documents (m1); a chunky read stops just past the cap and
-    the parser then sees only the prefix (excess rows are dropped as malformed,
-    and ``truncated`` says so).
+    The read is bounded by :data:`_NATIVE_TEXT_MAX_BYTES`.  Reading one byte past
+    the cap is what detects a file larger than the window: rows beyond the cap
+    are never read, so a clean prefix would otherwise parse with
+    ``truncated=False`` and the trajectory (and the reported peak) would be
+    silently partial.  When the cap was hit the trailing partial line is dropped
+    (a row cut mid-number could parse to a wrong value) and ``truncated`` is set.
 
     Returns:
-        ``(rows, component_names, truncated)`` from :func:`_parse_fields_energy`.
+        ``(rows, component_names, truncated)``.  ``truncated`` is True when the
+        byte cap was hit or a row was dropped as malformed.
 
     Raises:
         ResultsReaderError: If the file cannot be read.
@@ -2433,8 +2436,16 @@ def _read_fields_energy(target: Path) -> tuple[list[_FieldEnergyRow], list[str],
     except OSError as exc:  # pragma: no cover - target existence is checked earlier
         msg = f"cannot read {target.name}: {exc}"
         raise ResultsReaderError(msg) from exc
+    capped = len(raw) > _NATIVE_TEXT_MAX_BYTES
+    if capped:
+        raw = raw[:_NATIVE_TEXT_MAX_BYTES]
+        # Drop the final (incomplete) line: a row severed by the cap could still
+        # parse to a wrong value, so only whole lines of the prefix are trusted.
+        last_newline = raw.rfind(b"\n")
+        raw = raw[: last_newline + 1] if last_newline >= 0 else b""
     text = raw.decode("utf-8", errors="replace")
-    return _parse_fields_energy(text)
+    rows, components, truncated = _parse_fields_energy(text)
+    return rows, components, truncated or capped
 
 
 def _summarize_energy_fields(
@@ -2467,7 +2478,7 @@ def _summarize_energy_fields(
     component_values = [[row.components[position] for row in rows] for position in range(len(components))]
     strided_steps, downsampled = _stride([float(step) for step in steps])
     strided_totals, _ = _stride(totals)
-    return {
+    summary: dict[str, Any] = {
         "step": [int(step) for step in strided_steps],
         "total_J": strided_totals,
         "component_names": list(components),
@@ -2490,6 +2501,16 @@ def _summarize_energy_fields(
         "truncated": truncated,
         "downsampled": downsampled,
     }
+    if truncated:
+        # ``total_J_max`` is the peak *over the rows read*.  When the history was
+        # clipped by the byte cap (or a malformed row), that peak is not the
+        # file's real historical maximum; say so rather than presenting a partial
+        # trajectory as complete.
+        summary["warning"] = (
+            f"{target.name} was truncated; the summary covers steps {steps[0]}-{steps[-1]} "
+            f"({len(rows)} rows) and total_J_max is the peak over those rows only"
+        )
+    return summary
 
 
 def _native_plugin_result(

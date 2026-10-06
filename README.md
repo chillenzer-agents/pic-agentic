@@ -617,7 +617,10 @@ before this reader existed `describe_results` mislabelled it `binary` and
 min/max/last totals, the selected row's own `total_J_selected`, and the step
 range; `iteration` selects one reported step
 (`last` by default). No optional reader is needed. `read_result` serves the file
-directly as a bounded text tail as well.
+directly as a bounded text tail as well. The history is read under an 8 MiB cap;
+a file larger than that is clipped to whole leading rows and the summary reports
+`truncated: true` with a `warning` naming the covered step range, so a partial
+trajectory (and the peak over it) is never presented as the complete history.
 
 The `energy_histogram` reader reports `count_in_window` for a [keV] window that
 is **requestable** with `min_kev`/`max_kev` (both or neither, non-negative,

@@ -162,6 +162,57 @@ def test_field_energy_physics_fact_names_the_selected_step(tmp_path: Path) -> No
     assert "at iteration 50 is 3e-05" not in joined
 
 
+def test_field_energy_under_the_byte_cap_is_not_truncated(tmp_path: Path) -> None:
+    """A small history is complete, so there is no truncation warning (C2)."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(1.0e-5, 2.0e-5, 1.5e-5))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is False
+    assert "warning" not in summary
+
+
+def test_field_energy_history_over_the_byte_cap_is_marked_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2: a file larger than the read cap reports ``truncated`` and says so.
+
+    Rows beyond :data:`results._NATIVE_TEXT_MAX_BYTES` are never read, so a clean
+    prefix must not be presented as a complete history.  The peak is placed
+    *after* the cap: a silent prefix would report the low prefix peak as
+    ``total_J_max``, which is exactly the C2 harm.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    monkeypatch.setattr(results, "_NATIVE_TEXT_MAX_BYTES", 512)
+    steps = tuple(range(2000))
+    totals = tuple(1.0 if step < 1000 else 99.0 for step in steps)
+    fields_energy_dat(run, steps=steps, totals=totals)
+    assert (run / "simOutput" / "fields_energy.dat").stat().st_size > 512
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is True
+    assert "truncated" in summary["warning"]
+    # The real file peak (99 J) lies beyond the cap, so it must NOT be reported.
+    assert summary["total_J_max"] < 99.0
+    # Only whole rows of the prefix are kept, so the selected step is a real one.
+    assert summary["step_last"] in steps
+
+
+def test_field_energy_malformed_row_marks_truncated(tmp_path: Path) -> None:
+    """A malformed row is dropped and reported, independent of the byte cap."""
+    run = tmp_path / "run"
+    write_output_unit(run)
+    path = fields_energy_dat(run, steps=(0, 50), totals=(1.0e-5, 2.0e-5))
+    path.write_text(path.read_text(encoding="utf-8") + "not a row\n", encoding="utf-8")
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert summary["truncated"] is True
+    assert "truncated" in summary["warning"]
+
+
 def test_field_energy_file_reads_as_a_bounded_text_tail(tmp_path: Path) -> None:
     """H2: ``read_result`` no longer rejects ``fields_energy.dat`` as binary."""
     run = tmp_path / "run"
