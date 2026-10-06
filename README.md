@@ -323,7 +323,28 @@ The seeded `instructions` carry a minimal, verified snippet using
 `picmi.Cartesian3DGrid`, `picmi.ElectromagneticSolver`, `picmi.Species`,
 `picmi.UniformDistribution`, `picmi.PseudoRandomLayout` and
 `picmi.Simulation`, so an agent has a compiling starting point without reading
-the pin's source.
+the pin's source. A second inline snippet shows a version-matched
+`picmi.diagnostics.FieldEnergyMonitor(period=picmi.diagnostics.TimeStepSpec[::20,
+-1])`, the diagnostic the beta-6 agent had to reverse-engineer from source.
+
+### Runner specs are rendered snapshots (E1)
+
+A Runner spec obtained from `build_spec` is a **rendered snapshot** with
+denormalized fields, not a live model: the physical box is
+`cell_size * cell_cnt` per axis, and `delta_t_si`/`time_steps` carry the time
+extent. Patching one node therefore changes the physics in a way the other
+nodes do not follow:
+
+- a grid/resolution patch must co-vary `cell_cnt`, `cell_size`, `cell_depth`,
+  `delta_t_si` and `time_steps`; a lone `cell_cnt` patch is refused because it
+  silently changes the physical box;
+- finer `dx` also needs a CFL-consistent `delta_t_si` and step count — changing
+  only the grid fails the compile with the Yee solver's CFL `static_assert`
+  (`fields/MaxwellSolver/Yee/Yee.hpp`);
+- a laser's Huygens surface must sit **outside** the 12-cell PML absorber
+  (`include/picongpu/param/fieldAbsorber.param`, `THICKNESS = 12`). The
+  `GaussianLaser` default (16 cells) is right; an 8-cell placement segfaults at
+  step 0 (exit 139).
 
 ### Multi-node studies need explicit leaves (H5)
 

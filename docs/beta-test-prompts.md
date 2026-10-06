@@ -36,6 +36,16 @@ snippet built from the pinned classes. The beta-5 agent copied
 and then had to reverse-engineer `site-packages`; the pin uses
 `picmi.diagnostics.NativeFieldDump`/`DerivedFieldDump`/`PhaseSpace`/
 `EnergyHistogram`/`FieldEnergyMonitor`. The installed package is authoritative.
+The seeded instructions also carry an inline
+`FieldEnergyMonitor(period=TimeStepSpec[::20, -1])` snippet (the beta-6 agent
+reverse-engineered that inclusive slice syntax from source), and three
+warnings a Runner-spec study needs: the spec is a *rendered snapshot* with
+denormalized fields, so a grid/resolution patch must co-vary `cell_cnt`,
+`cell_size`, `cell_depth`, `delta_t_si` and `time_steps` (a lone `cell_cnt`
+patch silently changes the physical box); finer `dx` needs a CFL-consistent
+`delta_t_si`/step count or the compile fails on the Yee CFL `static_assert`;
+and a laser's Huygens surface must sit outside the 12-cell PML absorber (the
+`GaussianLaser` 16-cell default is right; 8 cells segfaults at step 0).
 
 Independently of *why* a run is empty, a completed run whose only numeric plugin
 artifact reads all-zero is now a first-class **health signal**, not silence:
