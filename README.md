@@ -453,6 +453,25 @@ phase is computed with `simulation_phase` in
 `src/pic_agentic/protocol/simulation.py`; it is a pure projection of the
 existing event stream and adds no wire message.
 
+### Build vs. run failure classification
+
+A failure inside the CWL workflow is classified by the step that failed. The
+workflow's `build_step` is the PIConGPU compile (`pic-build`), so a compile
+error — e.g. a CFL `static_assert` in the Yee solver — is reported as
+`error_code: build_failed`, `stage: "build"`, not the misleading
+`run_failed`/`stage: "run"`. A failure in any other workflow step (prepare,
+submit, organize) is reported as `run_failed`/`stage: "run"`. A simulation that
+actually runs and crashes is a SLURM job failure, reported separately as
+`simulation.job_failed` with the raw `exit_code`.
+
+Because the raw `error` is a cwltool `permanentFail` dump followed by a
+truncated C++ tail, the failure event also carries a bounded
+`failure_summary` naming the first compiler/CMake error line (and the `make`
+tail), so the cause is readable without scrolling the dump; the full text stays
+in `error`. A signal-death `exit_code` (139 = SIGSEGV, 137 = SIGKILL, 143 =
+SIGTERM, and the raw wait-status `<< 8` form) is annotated as `exit_signal`
+alongside the unchanged numeric value.
+
 ### `sim_id` is a spec label, not a run id
 
 A simulation's `sim_id` is only the first 8 hex of its payload hash (32 bits):
