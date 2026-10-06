@@ -847,10 +847,14 @@ class AgendaService:
         *same* allow-list and escaped inline-size checks a submission runs -- so
         a campaign that could never be submitted is refused at creation time
         rather than surfacing a bare error at ``advance_agenda``.  The derived
-        invariants a single-node patch can break (stale ``cell_depth``, a CFL
-        violation, a ``grid_dist``/``cell_cnt`` mismatch) are checked too, and
-        the known denormalising grid patches are refused outright
-        (``invalid_campaign_spec``).  Duplicate
+        invariants a single-node patch can leave *arithmetically* inconsistent
+        (a stale ``cell_depth``, a CFL violation, a ``grid_dist``/``cell_cnt``
+        mismatch) are checked too and refused with an actionable reason.  A lone
+        ``sim.grid.cell_cnt`` (or ``cell_size``) patch is **not** refused: a
+        box-size sweep is legitimate.  It is instead recorded as a non-blocking
+        ``warnings`` entry on the result, because a fixed-box resolution sweep
+        must co-vary cell_size/cell_cnt(/cell_depth) and delta_t_si/time_steps.
+        Duplicate
         patched specs (e.g. ``values=[4, 4]``) are rejected up front too: they
         map to one ``sim_id`` and the engine would later refuse the tick.
         Nothing is persisted unless every leaf validates.
@@ -871,10 +875,11 @@ class AgendaService:
                 quantity actually being studied.
 
         Returns:
-            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
-            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
-            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
-            ``duplicate_campaign_spec``).
+            ``{"ok": True, "name": name, "leaves": [<paths>]}`` -- with an
+            advisory ``warnings`` list for a lone ``cell_cnt``/``cell_size``
+            box-size sweep -- or a soft error (``campaign_exists``,
+            ``no_values``, ``invalid_campaign``, ``invalid_campaign_spec``,
+            ``spec_exceeds_inline_limit``, ``duplicate_campaign_spec``).
 
         """
         async with self._lock:
@@ -904,10 +909,12 @@ class AgendaService:
         """Build the campaign and save it (may raise).
 
         Returns:
-            ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
-            error (``campaign_exists``, ``no_values``, ``invalid_campaign``,
-            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
-            ``duplicate_campaign_spec``).  No file is written on any error.
+            ``{"ok": True, "name": name, "leaves": [<paths>]}`` (plus a
+            non-blocking ``warnings`` list for a lone ``cell_cnt``/``cell_size``
+            box-size sweep), or a soft error (``campaign_exists``,
+            ``no_values``, ``invalid_campaign``, ``invalid_campaign_spec``,
+            ``spec_exceeds_inline_limit``, ``duplicate_campaign_spec``).  No file
+            is written on any error.
 
         """
         if self.store.exists():
@@ -951,7 +958,14 @@ class AgendaService:
             agenda = agenda.add(**{leaf_name: leaf})
             leaves.append(leaf_name)
         self.store.save(Campaign(name=name, agenda=agenda).with_created_ts())
-        return {"ok": True, "name": name, "leaves": leaves}
+        result: dict[str, Any] = {"ok": True, "name": name, "leaves": leaves}
+        # Advisory only (never a refusal): flag a lone cell_cnt/cell_size patch
+        # as a box-size/resolution sweep so an agent that meant to hold the box
+        # fixed is not misled by the beta-6 trap of silent box variation.
+        advisory = _box_size_sweep_warning(patch_path)
+        if advisory is not None:
+            result["warnings"] = [advisory]
+        return result
 
     async def delete_campaign(self, *, force: bool = False) -> dict[str, Any]:
         """Remove the persisted campaign and its sibling reuse registry.
@@ -1054,9 +1068,6 @@ class AgendaService:
             payload = self.submit_service.prepare_spec(spec)
         except UnsupportedPayloadError as exc:
             return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(str(exc))}
-        denormalized = _denormalized_patch_error(patch_path)
-        if denormalized is not None:
-            return denormalized
         round_trip = check_spec_round_trip(spec)
         if round_trip is not None:
             return {"ok": False, "error": "invalid_campaign_spec", "detail": self.config.redact(round_trip)}
@@ -1127,51 +1138,46 @@ class AgendaService:
         return {"ok": True, "path": name}
 
 
-#: Dotted patch-path prefixes whose single-node patch is refused because it
-#: would leave a denormalised sibling stale.  A ``cell_cnt`` or ``cell_size``
-#: patch changes the physical box while the derived ``cell_depth`` (3D) and the
-#: CFL-consistent ``delta_t_si``/``time_steps`` stay at the base values -- the
-#: beta-6 "fixed-box resolution sweep" that actually varied the box size.  The
-#: prefixes match the sub-axis forms too (``sim.grid.cell_cnt.x``), which have
-#: the same effect and would otherwise also be false-rejected by the z
-#: ``cell_depth`` check.  The consistent way to move these is a whole-node patch
-#: (``sim.grid``) or one whole spec per leaf via ``add_agenda_leaf``; both are
-#: provided.
-_DENORMALIZED_GRID_PATCH_PREFIXES = ("sim.grid.cell_cnt", "sim.grid.cell_size")
+#: Dotted patch-path prefixes whose single-node patch changes one half of the
+#: box-size/resolution pair while holding the other fixed.  A ``cell_cnt``-only
+#: patch keeps the base ``cell_size`` (and the CFL-consistent ``delta_t_si``) and
+#: so varies the physical box at constant resolution; a ``cell_size``-only patch
+#: holds the cell count and so varies the resolution at constant box.  Both are
+#: **allowed** -- a box-size sweep is a legitimate study -- but the beta-6 harm
+#: was *silent* box variation when a fixed-box resolution sweep was intended, so
+#: these are flagged with an advisory (never a refusal).
+_BOX_OR_RESOLUTION_PATCH_PREFIXES = ("sim.grid.cell_cnt", "sim.grid.cell_size")
 
 
-def _denormalized_patch_error(patch_path: str) -> dict[str, Any] | None:
-    """Refuse a single-node patch that would leave a denormalised sibling stale.
+def _box_size_sweep_warning(patch_path: str) -> str | None:
+    """Return an advisory when a lone grid patch changes the box/resolution pair.
 
-    ``create_campaign`` patches exactly one node, so a grid-resolution patch
-    cannot update the siblings it feeds.  Patching ``sim.grid.cell_cnt`` alone
-    keeps ``cell_size``/``cell_depth`` (the physical box changes instead of the
-    resolution) and keeps the base ``delta_t_si``, whose CFL validity depends on
-    ``cell_size``; both passed every prior gate in the beta-6 run.  The
-    arithmetic form of this (stale ``cell_depth``, CFL violation) is caught by
-    :func:`~pic_agentic.simulation_build.check_spec_consistency`, but the
-    box-size/CFL pair can also be self-consistent yet physically wrong, so the
-    dangerous single-node patches are refused outright with the co-vary advice.
+    ``create_campaign`` patches exactly one node, so a ``cell_cnt``-only patch
+    cannot also move ``cell_size`` (and its derived ``cell_depth``): the physical
+    box changes while the cell size -- the resolution -- stays fixed.  This is a
+    legitimate **box-size sweep** and is accepted; the same is true of a
+    ``cell_size``-only patch, which changes the resolution at a constant cell
+    count.  The advisory exists only because the beta-6 trap was that an agent
+    intending a *fixed-box resolution sweep* got the box varied silently; it is
+    never a refusal and never blocks submission.
 
     Returns:
-        The ``invalid_campaign_spec`` soft error for a known denormalising
-        patch, else ``None``.
+        The advisory text for a box-size/resolution single-node patch, else
+        ``None``.
 
     """
-    if not patch_path.startswith(_DENORMALIZED_GRID_PATCH_PREFIXES):
+    if not patch_path.startswith(_BOX_OR_RESOLUTION_PATCH_PREFIXES):
         return None
-    return {
-        "ok": False,
-        "error": "invalid_campaign_spec",
-        "detail": (
-            f"patch_path {patch_path!r} changes the grid while leaving its denormalised siblings "
-            "(cell_depth, delta_t_si, time_steps) stale -- e.g. a resolution sweep that actually "
-            "varies the box size. This cannot be a single-node sweep: co-vary `sim.grid.cell_size`, "
-            "`sim.grid.cell_cnt` and `sim.grid.cell_depth`, and set a CFL-consistent `sim.delta_t_si` "
-            "and matching `sim.time_steps`. Patch the whole `sim.grid` node (values = whole grid "
-            "objects) or use add_agenda_leaf with one whole spec per leaf."
-        ),
-    }
+    if patch_path.startswith("sim.grid.cell_cnt"):
+        effect = "changes the physical box size at constant cell_size (resolution)"
+    else:
+        effect = "changes the cell_size (resolution) at constant cell count"
+    return (
+        f"patch_path {patch_path!r} {effect} -- a legitimate box-size sweep; accepted. "
+        "If you intended a fixed-box resolution sweep, this does not hold the box fixed: co-vary "
+        "`sim.grid.cell_size`, `sim.grid.cell_cnt` (and 3D `sim.grid.cell_depth`) plus a "
+        "CFL-consistent `sim.delta_t_si`/`sim.time_steps` (e.g. via add_agenda_leaf with whole specs)."
+    )
 
 
 def _parameter_for(patch_path: str) -> str:
