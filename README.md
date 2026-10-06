@@ -323,7 +323,38 @@ The seeded `instructions` carry a minimal, verified snippet using
 `picmi.Cartesian3DGrid`, `picmi.ElectromagneticSolver`, `picmi.Species`,
 `picmi.UniformDistribution`, `picmi.PseudoRandomLayout` and
 `picmi.Simulation`, so an agent has a compiling starting point without reading
-the pin's source.
+the pin's source. A second inline snippet shows a version-matched
+`picmi.diagnostics.FieldEnergyMonitor(period=picmi.diagnostics.TimeStepSpec[::20,
+-1])`, the diagnostic the beta-6 agent had to reverse-engineer from source.
+
+### Runner specs are rendered snapshots (E1)
+
+A Runner spec obtained from `build_spec` is a **rendered snapshot** with
+denormalized fields, not a live model: the physical box is
+`cell_size * cell_cnt` per axis, and `delta_t_si`/`time_steps` carry the time
+extent. Patching one node therefore changes the physics in a way the other
+nodes do not follow:
+
+- patching only `sim.grid.cell_cnt` (or only `cell_size`) is a **box-size**, not
+  a resolution, change — and that is allowed, because a box-size sweep is a
+  legitimate study; a **fixed-box resolution** sweep must instead co-vary
+  `cell_size`, `cell_cnt` and `cell_depth` together with a CFL-consistent
+  `delta_t_si` and matching `time_steps` (a whole `sim.grid` patch, or one whole
+  spec per leaf via `add_agenda_leaf(spec_path=...)`);
+- finer `dx` also needs a CFL-consistent `delta_t_si` and step count — changing
+  only the grid fails the compile with the Yee solver's CFL `static_assert`
+  (`fields/MaxwellSolver/Yee/Yee.hpp`);
+- a laser's Huygens surface must sit **outside** the 12-cell default PML absorber
+  (`include/picongpu/param/fieldAbsorber.param`, `THICKNESS = 12`). The
+  `GaussianLaser` default (16 cells) is right; an 8-cell placement segfaults at
+  step 0 (exit 139).
+
+`model_json_schema()` is unavailable for diagnostics whose `period` is a
+`TimeStepSpec`: the pin's `TimeStepSpec` (defined in
+`picongpu/picmi/diagnostics/timestepspec.py`, a plain class rather than a
+pydantic model) does not come from the PICMI standard package, so pydantic
+cannot build a JSON schema for it. The instructions point the agent at the
+pinned classes under `lib/python/picongpu/picmi/diagnostics/` instead.
 
 ### Multi-node studies need explicit leaves (H5)
 
