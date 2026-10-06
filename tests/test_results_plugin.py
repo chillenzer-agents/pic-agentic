@@ -531,6 +531,25 @@ def test_probe_vacuity_clears_a_populated_energy_fields_run(tmp_path: Path) -> N
     assert results.probe_vacuity(SIM_ID, run_dir=run) is None
 
 
+def test_read_plugin_result_does_not_leak_the_vacuity_marker(tmp_path: Path) -> None:
+    """The internal all-zero marker must not reach the public ack.
+
+    The marker is a control flag for :func:`probe_vacuity`, not documented
+    protocol data; a caller of ``read_plugin_result`` must see the ``warning``
+    but not an undocumented ``vacuous`` key.
+    """
+    run = tmp_path / "run"
+    write_output_unit(run)
+    fields_energy_dat(run, steps=(0, 50, 100), totals=(0.0, 0.0, 0.0))
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.PLUGIN, reader="energy_fields", iteration="last")
+    summary = results.resolve_result(params, run_dir=run, sim_id=SIM_ID)["result"]
+    assert results._VACUOUS_MARKER_KEY not in summary
+    assert "all zeros" in summary["warning"]
+    # The probe still sees it: it reads the summary through the reader path,
+    # not through ``_plugin``, so the strip cannot starve the health signal.
+    assert results.probe_vacuity(SIM_ID, run_dir=run) is not None
+
+
 def test_transition_radiation_vacuity_uses_the_total_not_the_stride() -> None:
     """The all-zero warning keys on ``total_intensity``, not the strided view.
 

@@ -140,7 +140,9 @@ _VACUOUS_VALUE_KEYS: dict[str, tuple[str, ...]] = {
 #: than the presence of any ``warning``: ``energy_histogram`` already warns about
 #: a mis-window, and a truncated ``energy_fields`` history warns too, and neither
 #: of those is the all-zero health signal (a populated but clipped/windowed
-#: diagnostic must not be misread as a "successful-but-empty" run).
+#: diagnostic must not be misread as a "successful-but-empty" run).  It is an
+#: internal control flag, not public protocol data, so :func:`_plugin` strips it
+#: from the response before it reaches the wire.
 _VACUOUS_MARKER_KEY = "vacuous"
 
 #: Array-rank constants for the openPMD reader summaries.  The shipped readers
@@ -2657,7 +2659,16 @@ def _plugin(
     target = _plugin_target(output, params, spec)
     if target is None:
         return _error(SimulationErrorCode.NO_RESULTS, "no such plugin result file")
-    return _read_plugin_target(reader, spec, output, params, target)
+    payload = _read_plugin_target(reader, spec, output, params, target)
+    # The reader shares its summary with :func:`probe_vacuity`, which keys on the
+    # explicit all-zero marker; that marker is an internal control flag, not part
+    # of the public summary, so strip it from the response before it reaches the
+    # wire rather than documenting a reserved key every caller must ignore.  The
+    # probe does not go through here, so it still sees the marker.
+    result = payload.get("result")
+    if isinstance(result, dict):
+        result.pop(_VACUOUS_MARKER_KEY, None)
+    return payload
 
 
 def _dispatch_reader(params: ResultParams, target: Path) -> dict[str, Any]:
