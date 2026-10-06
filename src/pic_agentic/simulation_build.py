@@ -325,13 +325,15 @@ def check_spec_round_trip(runner_dump: dict[str, object]) -> str | None:
 
 
 #: Speed of light in vacuum [m/s].  Matches ``scipy.constants.c``, which the
-#: pin uses for its own CFL arithmetic, so the limit here agrees with the
-#: ``maxwellSolver::CFLChecker`` compile-time assert.
+#: pin uses for its own CFL arithmetic, so the limit here matches the
+#: ``maxwellSolver::CFLChecker`` compile-time assert up to :data:`_CFL_REL_TOL`.
 _SPEED_OF_LIGHT = 299792458.0
 
 #: Relative slack on the CFL comparison.  The C++ ``CFLChecker`` asserts an exact
-#: ``c*dt <= c*dt_max`` on the rendered (rounded) values; a little slack keeps a
-#: spec sitting exactly on the limit from being a false rejection.
+#: ``c*dt <= c*dt_max`` on the rendered (rounded) values; this check accepts up
+#: to ``c*dt <= c*dt_max * (1 + 1e-6)`` so a spec sitting exactly on the limit
+#: is not a false rejection.  The effective limit is therefore ~1e-6 *looser*
+#: than the pin's assert, not identical to it.
 _CFL_REL_TOL = 1e-6
 
 #: Solver kinds whose CFL limit is not fully determined by the wire spec, so the
@@ -420,27 +422,46 @@ def _grid_dist_message(grid: dict[str, object]) -> str | None:
     """
     grid_dist = grid.get("grid_dist")
     cell_cnt = grid.get("cell_cnt")
-    if grid_dist is None or not isinstance(cell_cnt, dict):
+    if grid_dist is None or not isinstance(grid_dist, dict) or not isinstance(cell_cnt, dict):
         return None
-    if not _grid_is_3d(grid):
-        axes: tuple[str, ...] = ("x", "y")
-    else:
-        axes = ("x", "y", "z")
+    axes: tuple[str, ...] = ("x", "y", "z") if _grid_is_3d(grid) else ("x", "y")
     for axis in axes:
-        chunks = grid_dist.get(axis) if isinstance(grid_dist, dict) else None
+        chunks = grid_dist.get(axis)
         count = cell_cnt.get(axis)
         if not isinstance(chunks, list) or not _is_number(count):
             continue
-        if any(not _is_number(chunk) for chunk in chunks):
+        cells = _grid_dist_chunks(chunks)
+        if cells is None:
             continue
-        if sum(int(chunk) for chunk in chunks) != int(count):
-            total = sum(int(chunk) for chunk in chunks)
+        if sum(cells) != int(count):
             return (
-                f"sim.grid.grid_dist.{axis} sums to {total}, which is inconsistent with "
+                f"sim.grid.grid_dist.{axis} sums to {sum(cells)}, which is inconsistent with "
                 f"sim.grid.cell_cnt.{axis} ({int(count)}): an explicit distribution must sum to the "
                 "cell count. Co-vary cell_cnt and grid_dist (or patch the whole `sim.grid` node)."
             )
     return None
+
+
+def _grid_dist_chunks(chunks: list[object]) -> list[int] | None:
+    """Return the per-GPU cell counts encoded in one axis's ``grid_dist``.
+
+    The pin serialises ``grid_dist`` as ``[{"device_cells": N}, ...]``
+    (``pypicongpu/grid.py`` ``serialise_grid_dist3``), while a hand-authored
+    spec may use a flat ``[N, ...]``.  Both forms are accepted; an entry that
+    is neither a number nor a ``{"device_cells": N}`` mapping makes the axis
+    undeterminable.
+
+    Returns:
+        The chunk cell counts, or ``None`` when an entry is not a valid chunk.
+
+    """
+    cells: list[int] = []
+    for chunk in chunks:
+        value: object = chunk.get("device_cells") if isinstance(chunk, dict) else chunk
+        if not _is_number(value):
+            return None
+        cells.append(int(value))
+    return cells
 
 
 def _cell_depth_message(grid: dict[str, object]) -> str | None:

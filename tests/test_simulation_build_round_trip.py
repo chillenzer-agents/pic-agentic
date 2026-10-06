@@ -155,15 +155,57 @@ def test_consistency_matches_the_pin_cfl_limit_for_ao() -> None:
     assert check_spec_consistency(dump, "sim.delta_t_si") is not None
 
 
-def test_consistency_flags_a_grid_dist_that_no_longer_sums() -> None:
-    """A ``cell_cnt`` patch that leaves ``grid_dist`` stale is reported (A1)."""
+def test_consistency_cfl_slack_is_only_a_tiny_relative_tolerance() -> None:
+    """The CFL check is the pin limit up to ``1e-6`` relative slack, no more (A1).
+
+    The slack keeps a spec sitting exactly on the pin's assert from being a
+    false rejection; it must not accept a materially over-limit ``delta_t_si``.
+    """
     dump = _campaign_spec(2)
-    dump["sim"]["grid"]["grid_dist"] = {"x": [96, 96], "y": [1024, 1024], "z": [96, 96]}
+    cell = list(dump["sim"]["grid"]["cell_size"].values())
+    limit = 1.0 / math.sqrt(sum(1.0 / d**2 for d in cell))
+    # Exactly on the limit and within the 1e-6 slack: accepted.
+    dump["sim"]["delta_t_si"] = limit * (1.0 + 1e-7) / 299792458.0
+    assert check_spec_consistency(dump, "sim.delta_t_si") is None
+    # Just beyond the slack: rejected.
+    dump["sim"]["delta_t_si"] = limit * (1.0 + 1e-3) / 299792458.0
+    assert check_spec_consistency(dump, "sim.delta_t_si") is not None
+
+
+def test_consistency_flags_a_grid_dist_that_no_longer_sums() -> None:
+    """A ``cell_cnt`` patch that leaves ``grid_dist`` stale is reported (A1).
+
+    The explicit distribution uses the *real* pin wire shape,
+    ``{"device_cells": N}`` per GPU (``pypicongpu/grid.py``
+    ``serialise_grid_dist3``); the flat form is rejected by the pin's own
+    round-trip, so only this shape can reach the consistency check.
+    """
+    dump = _campaign_spec(2)
+    dump["sim"]["grid"]["grid_dist"] = {
+        "x": [{"device_cells": 96}, {"device_cells": 96}],
+        "y": [{"device_cells": 1024}, {"device_cells": 1024}],
+        "z": [{"device_cells": 96}, {"device_cells": 96}],
+    }
     dump["sim"]["grid"]["cell_cnt"] = {"x": 200, "y": 2048, "z": 192}
     detail = check_spec_consistency(dump, "sim.grid.cell_cnt")
     assert detail is not None
     assert "grid_dist" in detail
     assert "sums to 192" in detail
+
+
+def test_consistency_accepts_a_consistent_real_grid_dist() -> None:
+    """A real-shape ``grid_dist`` that does sum to ``cell_cnt`` is accepted (A1).
+
+    Guards against over-rejecting once the ``{"device_cells": N}`` shape is
+    understood: the base counts and the distribution agree here.
+    """
+    dump = _campaign_spec(2)
+    dump["sim"]["grid"]["grid_dist"] = {
+        "x": [{"device_cells": 192}],
+        "y": [{"device_cells": 2048}],
+        "z": [{"device_cells": 192}],
+    }
+    assert check_spec_consistency(dump, "sim.grid.cell_cnt") is None
 
 
 @pytest.mark.skipif(_HAS_PICONGPU, reason="documents the no-pin behaviour")
