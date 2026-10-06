@@ -514,8 +514,10 @@ transport need not be started -- a wait only reads the registry.
   clamped. The default (1800 s) accommodates the 15-20 min PIConGPU compile plus
   the start of the queue wait; longer waits repeat the call.
 - The server also knows the MCP client's request budget (`PIC_AGENTIC_MCP_TIMEOUT_MS`,
-  a single knob the setup scripts use for **both** the opencode entry `timeout`
-  and the server env var, so the two can never disagree). A `timeout_s` that
+  a single knob the setup scripts stamp into **both** the opencode entry `timeout`
+  and the server env var at install time, so a fresh install starts them equal;
+  editing the entry `timeout` afterwards can make the two diverge, which
+  `install-mcp.sh --check` detects). A `timeout_s` that
   would outlast that budget (minus a small skew) is refused **up front** with a
   soft `{"ok": false, "error": "wait_exceeds_client_timeout", ...}` carrying the
   budget — not clamped, not the client's opaque `-32001`. Pass a smaller
