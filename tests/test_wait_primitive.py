@@ -27,7 +27,9 @@ from pic_agentic.server.simulation import (
     DEFAULT_WAIT_TIMEOUT_S,
     MAX_WAIT_TIMEOUT_S,
     MIN_WAIT_TIMEOUT_S,
+    WAIT_CLIENT_TIMEOUT_SKEW_S,
     SubmitService,
+    WaitExceedsClientTimeoutError,
 )
 
 SECRET = new_secret_hex()
@@ -246,10 +248,73 @@ async def test_wait_reports_the_build_phase_without_inventing_a_state() -> None:
     assert "build/queue phase" in outcome.note
 
 
+async def test_wait_in_budget_blocks_and_returns_on_terminal() -> None:
+    """A wait that fits the known client budget still blocks event-driven."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05, client_timeout_s=300.0)
+    _seed_running(service)
+
+    async def projector() -> None:
+        await asyncio.sleep(0.02)
+        service.on_message(_event(SimulationState.RESULTS_READY, seq=3, job_id=JOB_ID, results_linked=True))
+
+    task = asyncio.create_task(projector())
+    outcome = await service.wait_for_state(SIM_ID, timeout_s=200.0, poll_interval_s=100.0)
+    await task
+
+    assert outcome.matched is True
+    assert outcome.waited_s < 1.0
+
+
+async def test_wait_over_budget_is_refused_before_blocking() -> None:
+    """D1: timeout_s beyond the client budget+skew raises a clear error, no block."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05, client_timeout_s=120.0)
+    _seed_running(service)
+
+    with pytest.raises(WaitExceedsClientTimeoutError) as excinfo:
+        await asyncio.wait_for(service.wait_for_state(SIM_ID, timeout_s=600.0), timeout=1.0)
+
+    err = excinfo.value
+    assert err.requested_s == pytest.approx(600.0)
+    assert err.client_timeout_s == pytest.approx(120.0)
+    assert err.limit_s == pytest.approx(120.0 - WAIT_CLIENT_TIMEOUT_SKEW_S)
+    assert "wait_exceeds_client_timeout" in str(err)
+    assert "PIC_AGENTIC_MCP_TIMEOUT_MS" in str(err)
+
+
+async def test_wait_unknown_budget_validates_only() -> None:
+    """No budget -> H10 behaviour: bounded only by [MIN, MAX], never refused."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05)  # client_timeout_s=None
+    # Terminal already, so the 600 s request is accepted and returns at once;
+    # with a known 120 s budget the same request would be refused up front.
+    service.on_message(_event(SimulationState.FAILED, seq=1, job_id=None, error="boom", error_code="failed"))
+
+    outcome = await service.wait_for_state(SIM_ID, timeout_s=600.0)
+    assert outcome.matched is True
+    assert outcome.ok is True
+
+
+async def test_wait_exactly_at_budget_minus_skew_is_allowed() -> None:
+    """The skew is a strict margin: budget - skew is still accepted."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05, client_timeout_s=120.0)
+    service.on_message(_event(SimulationState.FAILED, seq=1, job_id=None, error="boom", error_code="failed"))
+
+    outcome = await service.wait_for_state(SIM_ID, target_states=["terminal"], timeout_s=115.0)
+    assert outcome.matched is True
+
+
 async def test_wait_unknown_simulation_raises_keyerror() -> None:
     service = _service()
     with pytest.raises(KeyError, match="unknown simulation"):
         await service.wait_for_state("nope", timeout_s=1.0)
+
+
+async def test_wait_unknown_simulation_is_reported_before_the_budget() -> None:
+    """An unknown id must not leak the client budget as the primary error."""
+    service = SubmitService(sim=SIM, secret=SECRET, ack_timeout_s=0.05, client_timeout_s=300.0)
+    # The default timeout (1800 s) exceeds the 300 s budget, so the pre-fix
+    # order reported wait_exceeds_client_timeout for the unknown id.
+    with pytest.raises(KeyError, match="unknown simulation"):
+        await service.wait_for_state("nope")
 
 
 @pytest.mark.parametrize("timeout_s", [0.0, -1.0, MIN_WAIT_TIMEOUT_S / 2, MAX_WAIT_TIMEOUT_S + 1])
@@ -329,3 +394,87 @@ async def test_wait_for_simulation_tool_bad_arguments_are_soft_errors() -> None:
     ).structured_content
     assert bad_target["ok"] is False
     assert "unknown wait target state" in bad_target["error"]
+
+
+async def test_wait_for_simulation_tool_over_budget_is_a_clear_soft_error() -> None:
+    """D1: the tool returns wait_exceeds_client_timeout, not a -32001/clamp."""
+    config = Config(rcp_secret=SECRET, mcp_timeout_ms=120_000)
+    server, runtime = build_server(config, SIM)
+    runtime.submit_service.on_message(_event(SimulationState.JOB_RUNNING, seq=1, job_id=JOB_ID, slurm_state="RUNNING"))
+
+    payload = (await server.call_tool("wait_for_simulation", {"sim_id": SIM_ID, "timeout_s": 600.0})).structured_content
+
+    assert payload["ok"] is False
+    assert payload["error"] == "wait_exceeds_client_timeout"
+    assert payload["client_timeout_s"] == pytest.approx(120.0)
+    assert payload["requested_timeout_s"] == pytest.approx(600.0)
+    assert payload["max_timeout_s"] == pytest.approx(115.0)
+    assert "PIC_AGENTIC_MCP_TIMEOUT_MS" in payload["detail"]
+    # The wait did not block and did not clamp: it returned the error up front.
+    assert "timed_out" not in payload
+
+
+async def test_wait_for_simulation_tool_default_call_is_not_refused_at_shipped_budget() -> None:
+    """D1: the no-``timeout_s`` default call must succeed under the shipped budget.
+
+    The shipped install stamps a client budget above the server's
+    ``MAX_WAIT_TIMEOUT_S``, so the documented default (1800 s) is inside it and
+    the plain "wait for my sim" call is not pre-empted with
+    ``wait_exceeds_client_timeout``.  The simulation is already terminal, so the
+    default call returns at once if it is accepted at all.
+    """
+    config = Config(rcp_secret=SECRET, mcp_timeout_ms=3_900_000)
+    server, runtime = build_server(config, SIM)
+    runtime.submit_service.on_message(
+        _event(SimulationState.FAILED, seq=1, job_id=None, error="boom", error_code="failed"),
+    )
+
+    payload = (await server.call_tool("wait_for_simulation", {"sim_id": SIM_ID})).structured_content
+
+    assert payload["ok"] is True, payload
+    assert payload["matched"] is True
+    assert "error" not in payload
+    assert config.mcp_client_timeout_s() - WAIT_CLIENT_TIMEOUT_SKEW_S >= DEFAULT_WAIT_TIMEOUT_S
+
+
+async def test_wait_for_simulation_tool_in_budget_still_returns_terminal() -> None:
+    """A long wait within a generous budget remains event-driven data."""
+    config = Config(rcp_secret=SECRET, mcp_timeout_ms=1_800_000)
+    server, runtime = build_server(config, SIM)
+    service = runtime.submit_service
+    _seed_running(service)
+
+    async def projector() -> None:
+        await asyncio.sleep(0.02)
+        service.on_message(_event(SimulationState.RESULTS_READY, seq=3, job_id=JOB_ID, results_linked=True))
+
+    task = asyncio.create_task(projector())
+    payload = (await server.call_tool("wait_for_simulation", {"sim_id": SIM_ID, "timeout_s": 600.0})).structured_content
+    await task
+
+    assert payload["matched"] is True
+    assert payload["timed_out"] is False
+
+
+async def test_wait_for_simulation_tool_unknown_budget_preserves_old_behaviour() -> None:
+    """No configured budget -> the 10000 s bound still validates as before."""
+    config = Config(rcp_secret=SECRET)  # mcp_timeout_ms unset
+    server, runtime = build_server(config, SIM)
+    # Already terminal: the 600 s request is accepted and returns at once,
+    # proving it was not refused for exceeding a (nonexistent) budget.
+    runtime.submit_service.on_message(
+        _event(SimulationState.FAILED, seq=1, job_id=None, error="boom", error_code="failed"),
+    )
+
+    payload_no_budget = (
+        await server.call_tool("wait_for_simulation", {"sim_id": SIM_ID, "timeout_s": 600.0})
+    ).structured_content
+    assert payload_no_budget["ok"] is True
+    assert payload_no_budget["matched"] is True
+
+    # The [0.1, 3600] bound still applies with no budget.
+    payload_over_max = (
+        await server.call_tool("wait_for_simulation", {"sim_id": SIM_ID, "timeout_s": 10_000.0})
+    ).structured_content
+    assert payload_over_max["ok"] is False
+    assert "timeout_s must be between" in payload_over_max["error"]

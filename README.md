@@ -513,6 +513,16 @@ transport need not be started -- a wait only reads the registry.
 - `timeout_s` is bounded to `[0.1, 3600]` s and validated, not silently
   clamped. The default (1800 s) accommodates the 15-20 min PIConGPU compile plus
   the start of the queue wait; longer waits repeat the call.
+- The server also knows the MCP client's request budget (`PIC_AGENTIC_MCP_TIMEOUT_MS`,
+  a single knob the setup scripts stamp into **both** the opencode entry `timeout`
+  and the server env var at install time, so a fresh install starts them equal;
+  editing the entry `timeout` afterwards can make the two diverge, which
+  `install-mcp.sh --check` detects). A `timeout_s` that
+  would outlast that budget (minus a small skew) is refused **up front** with a
+  soft `{"ok": false, "error": "wait_exceeds_client_timeout", ...}` carrying the
+  budget — not clamped, not the client's opaque `-32001`. Pass a smaller
+  `timeout_s` and poll+repeat, or raise `PIC_AGENTIC_MCP_TIMEOUT_MS`. If the
+  budget is unknown (no env var), the tool validates only, exactly as before.
 - `last_status.phase` is a derived label over what the event stream already
   reported: `building` while the simclient has not yet emitted a scheduler
   `job_id` (the compile/prepare window), else `queued`/`running`/`finalizing`.
@@ -521,9 +531,13 @@ transport need not be started -- a wait only reads the registry.
 
 A single MCP tool call cannot hold the connection indefinitely, so the wait is
 bounded by `timeout_s` **and** by the MCP client's request timeout. The shipped
-installer registers the server with a 120 s request budget; for a long wait,
-raise `PIC_AGENTIC_MCP_TIMEOUT_MS` so the client timeout exceeds `timeout_s`
-(the same budget the async result path already relies on).
+setup scripts register the server with a 3900 s request budget (comfortably above
+the 3600 s `timeout_s` ceiling plus the 5 s safety skew) and pass the same value
+to the server as `PIC_AGENTIC_MCP_TIMEOUT_MS`, so a default wait is never refused
+and an over-budget wait is refused with a clear `wait_exceeds_client_timeout`
+error rather than the client's opaque `-32001` (the same budget the async result
+path already relies on). For a longer wait, raise `PIC_AGENTIC_MCP_TIMEOUT_MS`
+(both scripts honour it).
 
 ## Security model (M1)
 

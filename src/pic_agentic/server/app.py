@@ -53,6 +53,7 @@ from pic_agentic.server.simulation import (
     SimRecord,
     SubmitOutcome,
     SubmitService,
+    WaitExceedsClientTimeoutError,
     WaitOutcome,
     condense_events,
     resolve_script,
@@ -130,6 +131,7 @@ class HelloRuntime:
             picongpu_revision=config.picongpu_revision,
             ack_timeout_s=config.ack_timeout_s,
             results_root=config.results_root,
+            client_timeout_s=config.mcp_client_timeout_s(),
         )
         self.agenda_service = AgendaService(config, self.submit_service)
         # H7: a bare submit_simulation is invisible to the campaign engine, so
@@ -1134,7 +1136,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "compile can take 15-20 min, so the default `timeout_s` (1800 s) "
             "covers the build plus the start of the queue wait; `timeout_s` is "
             "validated to lie within [0.1, 3600] s, so longer builds need repeat "
-            "calls. `last_status.phase` is `building` while the simclient has "
+            "calls. A wait that would outlast the MCP client request budget is "
+            "refused up front with `error: wait_exceeds_client_timeout` (not "
+            "clamped): pass a smaller `timeout_s` and poll+repeat, or raise "
+            "`PIC_AGENTIC_MCP_TIMEOUT_MS`. `last_status.phase` is `building` while the simclient has "
             "not yet reported a scheduler job id (compile/prepare), else "
             "`queued`/`running`/`finalizing` (job done, linking results); no "
             "state is ever invented. Pass "
@@ -1143,8 +1148,12 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "simulation.step_finished, results.ready, simulation.failed, "
             "simulation.cancelled, or the alias `terminal`) to return earlier, "
             "e.g. on `simulation.job_running`. A long wait needs the MCP client "
-            "timeout to exceed `timeout_s` (the shipped install uses 120 s by "
-            "default; raise `PIC_AGENTIC_MCP_TIMEOUT_MS` for long waits)."
+            "timeout to exceed `timeout_s`; the shipped install uses 3900 s by "
+            "default and tells the server that budget, so the default wait and "
+            "any wait within the [0.1, 3600] s ceiling fit, while a larger "
+            "over-budget wait "
+            "is refused with `wait_exceeds_client_timeout` instead of failing "
+            "opaque. Raise `PIC_AGENTIC_MCP_TIMEOUT_MS` for longer waits."
         ),
         annotations=_READ_ONLY,
     )
@@ -1185,7 +1194,11 @@ async def _wait_tool(
     A timeout is returned as data (``ok: true`` with ``timed_out: true`` and
     ``matched: false``): the wait is a convenience, and "not yet" must not be
     reported as a failure.  An unknown simulation or target state is a soft
-    ``ok: false`` with an ``error``.
+    ``ok: false`` with an ``error``.  A ``timeout_s`` that would outlast the
+    known MCP client request budget is a distinct soft ``error``
+    ``wait_exceeds_client_timeout`` (never a clamp, never the client's opaque
+    ``-32001``), so the caller learns the real budget up front (D1); with no
+    budget configured the request is only validated, as before.
 
     Returns:
         The redacted :class:`WaitOutcome` dict, or a soft ``error`` dict.
@@ -1198,6 +1211,18 @@ async def _wait_tool(
             timeout_s=timeout_s,
             poll_interval_s=poll_interval_s,
         )
+    except WaitExceedsClientTimeoutError as exc:
+        # A clear pre-block error, not a clamp and not the client's opaque
+        # -32001: the requested wait would outlast the MCP client budget.
+        return {
+            "sim_id": sim_id,
+            "ok": False,
+            "error": "wait_exceeds_client_timeout",
+            "detail": runtime.config.redact(str(exc)),
+            "requested_timeout_s": exc.requested_s,
+            "client_timeout_s": exc.client_timeout_s,
+            "max_timeout_s": exc.limit_s,
+        }
     except (KeyError, ValueError) as exc:
         return {"sim_id": sim_id, "ok": False, "error": runtime.config.redact(str(exc))}
     return _redact_dict(runtime, {"sim_id": sim_id, **outcome.model_dump(mode="json")})
