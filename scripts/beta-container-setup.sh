@@ -54,6 +54,14 @@ CONFIG="${CONFIG:-$HOME/.config/pic-agentic/config.toml}"
 OPENCODE_JSON="${OPENCODE_JSON:-$HOME/.config/opencode/opencode.json}"
 # Where the agent's campaign state lives (server-writable, container-local).
 AGENDA_FILE="${AGENDA_FILE:-$HOME/.config/pic-agentic/campaign.json}"
+# MCP client request budget (ms).  Single source of truth for BOTH the opencode
+# server entry `timeout` and the `PIC_AGENTIC_MCP_TIMEOUT_MS` env var the server
+# reads to bound wait_for_simulation: it must be the same number, or the server
+# cannot tell a wait that outlasts the client (D1).  Kept above the server's
+# MAX_WAIT_TIMEOUT_S (3600 s) plus WAIT_CLIENT_TIMEOUT_SKEW_S (5 s) so even the
+# longest accepted wait fits the budget and the default wait (1800 s) is never
+# refused.  Kept equal to install-mcp.sh's default; bump both together.
+MCP_TIMEOUT_MS="${PIC_AGENTIC_MCP_TIMEOUT_MS:-3900000}"
 
 log() { printf '==> %s\n' "$*"; }
 die() {
@@ -253,20 +261,26 @@ fi
 # 5. Register the MCP server with opencode (idempotent JSON edit).
 log "registering the pic-agentic MCP server in $OPENCODE_JSON"
 mkdir -p "$(dirname "$OPENCODE_JSON")"
-"$PY" - "$OPENCODE_JSON" "$VENV" "$CONFIG" <<'PYJSON'
+"$PY" - "$OPENCODE_JSON" "$VENV" "$CONFIG" "$MCP_TIMEOUT_MS" <<'PYJSON'
 import json, sys
 from pathlib import Path
-path, venv, config = sys.argv[1], sys.argv[2], sys.argv[3]
+path, venv, config, timeout_ms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 p = Path(path)
 cfg = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"$schema": "https://opencode.ai/config.json"}
 cfg.setdefault("mcp", {})["pic-agentic"] = {
     "type": "local",
     "command": [f"{venv}/bin/pic-agentic-mcp"],
     "enabled": True,
-    "environment": {"PIC_AGENTIC_SIM": "cluster", "PIC_AGENTIC_CONFIG": config},
+    "environment": {
+        "PIC_AGENTIC_SIM": "cluster",
+        "PIC_AGENTIC_CONFIG": config,
+        # Same budget the entry `timeout` uses, so the server can refuse a
+        # wait_for_simulation that would outlast the client (D1).
+        "PIC_AGENTIC_MCP_TIMEOUT_MS": str(timeout_ms),
+    },
     # opencode defaults MCP requests to 5000 ms; result reads cross to the
     # cluster over Matrix and can take longer, so raise the client budget.
-    "timeout": 300000,
+    "timeout": int(timeout_ms),
 }
 p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 PYJSON

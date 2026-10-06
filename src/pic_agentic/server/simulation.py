@@ -86,6 +86,13 @@ MIN_WAIT_TIMEOUT_S = 0.1
 #: connection indefinitely.  Callers wait in bounded slices.
 MAX_WAIT_TIMEOUT_S = 3600.0
 
+#: Safety margin, in seconds, between a requested wait ``timeout_s`` and the
+#: known MCP client budget.  The client must stay on the wire a moment longer
+#: than the server blocks (transport/serialisation overhead), so a wait is only
+#: accepted when ``timeout_s + skew <= client budget``.  Without the margin a
+#: request that "fits" the budget exactly still races the client's own timer.
+WAIT_CLIENT_TIMEOUT_SKEW_S = 5.0
+
 #: Default wakeup cadence.  The wait is event-driven (it wakes as soon as a
 #: lifecycle event is projected); the poll is only the ceiling for a wakeup so a
 #: lost event cannot wedge the call until the deadline.
@@ -399,6 +406,7 @@ class SubmitService:
         runner_dump_builder: RunnerDumpBuilder = build_runner_dump,
         event_log_max: int = DEFAULT_EVENT_LOG_MAX,
         results_root: str = "",
+        client_timeout_s: float | None = None,
     ) -> None:
         """Create a service for one simulation.
 
@@ -412,6 +420,11 @@ class SubmitService:
             event_log_max: Maximum retained lifecycle events.
             results_root: Optional local mirror of a run's ``simOutput`` used
                 for the contract-4 ``readable`` check; never moved from.
+            client_timeout_s: The known MCP client request budget, in seconds,
+                or None when unknown.  When set, a ``wait_for_state`` request
+                whose ``timeout_s`` would outlast the budget is refused up
+                front (a clear error) instead of blocking until the client
+                kills the request with an opaque timeout (D1).
 
         """
         self.sim = sim
@@ -422,6 +435,7 @@ class SubmitService:
         self.runner_dump_builder = runner_dump_builder
         self.event_log_max = event_log_max
         self.results_root = results_root
+        self.client_timeout_s = client_timeout_s
         self.sequences = SequenceState()
         self._pending: dict[str, asyncio.Future[RcpMessage]] = {}
         #: Pending status/logs pulls, keyed by cmd_id, and the ack type each
@@ -875,12 +889,20 @@ class SubmitService:
         Raises:
             KeyError: If ``sim_id`` is unknown to the registry.
 
+        A ``timeout_s`` that would outlast the known MCP client request budget
+        (when one is configured) is refused via :func:`_check_client_budget` as
+        a ``WaitExceedsClientTimeoutError`` -- a ``ValueError`` the wait tool
+        degrades to a soft error, never a clamp.
+
         """
         targets, terminal_only = _resolve_wait_targets(target_states)
         timeout = _validate_timeout(timeout_s)
+        # Resolve the simulation first: an unknown id is the caller's primary
+        # mistake, and reporting a budget detail for it would be misleading.
         if self.get(sim_id) is None:
             msg = f"unknown simulation {sim_id!r}"
             raise KeyError(msg)
+        _check_client_budget(timeout, self.client_timeout_s)
         interval = max(poll_interval_s, MIN_WAIT_POLL_S)
         wakeup = asyncio.Event()
         self._waiters.setdefault(sim_id, set()).add(wakeup)
@@ -1435,6 +1457,71 @@ def _resolve_wait_targets(target_states: Iterable[str] | None) -> tuple[frozense
     return frozenset(targets), targets <= TERMINAL_STATES
 
 
+class WaitExceedsClientTimeoutError(ValueError):
+    """A requested wait would outlast the known MCP client request budget.
+
+    Raised *before* the wait blocks so the caller gets a clear, actionable
+    message instead of the MCP client killing the request with an opaque
+    ``-32001`` timeout.  Subclasses :class:`ValueError` so the existing
+    soft-error handling in the wait tool catches it unchanged.  Deliberately
+    *not* a clamp: H10 chose validated-not-clamped, and the point of this error
+    is to tell the caller the real budget and how to proceed.
+
+    Attributes:
+        requested_s: The ``timeout_s`` the caller asked for.
+        client_timeout_s: The known client budget, in seconds.
+        limit_s: The largest ``timeout_s`` that fits the budget (budget minus
+            the safety skew).
+
+    """
+
+    def __init__(self, requested_s: float, client_timeout_s: float, limit_s: float) -> None:
+        """Build the error with the numbers the message reports.
+
+        Args:
+            requested_s: The requested ``timeout_s``.
+            client_timeout_s: The known client budget, in seconds.
+            limit_s: The largest acceptable ``timeout_s``.
+
+        """
+        self.requested_s = requested_s
+        self.client_timeout_s = client_timeout_s
+        self.limit_s = limit_s
+        msg = (
+            f"wait_exceeds_client_timeout: timeout_s={requested_s:g} would outlast the MCP client "
+            f"request budget of {client_timeout_s:g} s (limit {limit_s:g} s); pass a smaller timeout_s "
+            "(poll+repeat) or raise PIC_AGENTIC_MCP_TIMEOUT_MS"
+        )
+        super().__init__(msg)
+
+
+def _check_client_budget(timeout_s: float, client_timeout_s: float | None) -> None:
+    """Refuse a wait that would outlast the known MCP client request budget.
+
+    The MCP framework never tells the server the client's per-request timeout,
+    so the setup scripts stamp the effective budget into
+    ``PIC_AGENTIC_MCP_TIMEOUT_MS`` (surfaced as ``client_timeout_s``).  Without
+    it the server can only validate ``timeout_s`` (the H10 contract); with it, a
+    request the client would abort with an opaque ``-32001`` becomes a clear
+    pre-block error.  A small skew keeps the client on the wire longer than the
+    server blocks, so a wait that "fits" exactly does not race the client timer.
+
+    Args:
+        timeout_s: The already-validated requested wait.
+        client_timeout_s: The known client budget in seconds, or None.
+
+    Raises:
+        WaitExceedsClientTimeoutError: If ``timeout_s`` plus the skew exceeds
+            the budget.
+
+    """
+    if client_timeout_s is None:
+        return
+    limit_s = client_timeout_s - WAIT_CLIENT_TIMEOUT_SKEW_S
+    if timeout_s > limit_s:
+        raise WaitExceedsClientTimeoutError(timeout_s, client_timeout_s, limit_s)
+
+
 def _validate_timeout(timeout_s: float) -> float:
     """Validate a requested wait timeout against the supported bounds.
 
@@ -1636,12 +1723,14 @@ __all__ = [
     "MIN_WAIT_POLL_S",
     "MIN_WAIT_TIMEOUT_S",
     "TERMINAL_STATES",
+    "WAIT_CLIENT_TIMEOUT_SKEW_S",
     "AckTimeoutError",
     "BuiltSpec",
     "SimRecord",
     "SimulationBuildError",
     "SubmitOutcome",
     "SubmitService",
+    "WaitExceedsClientTimeoutError",
     "WaitOutcome",
     "condense_events",
     "resolve_script",
