@@ -15,7 +15,7 @@ import os
 import tomllib
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 DEFAULT_CONFIG_PATH = Path("~/.config/pic-agentic/config.toml").expanduser()
 
@@ -150,6 +150,30 @@ class Config(BaseModel):
     #: bound a blocking tool call.  ``None`` means "unknown" (no env var): the
     #: wait tool then validates only, exactly as before.
     mcp_timeout_ms: int | None = None
+
+    @field_validator("mcp_timeout_ms", mode="before")
+    @classmethod
+    def _unparseable_timeout_is_unknown(cls, value: object) -> object:
+        """Treat a malformed ``PIC_AGENTIC_MCP_TIMEOUT_MS`` as "unknown".
+
+        The field's contract is that ``None`` means "the client budget is not
+        known", so a typo (``""``/``"abc"``) must degrade to that state rather
+        than abort ``Config.load`` (and the server) at startup.  A valid value
+        is passed through unchanged.
+
+        Returns:
+            The value unchanged when it is already ``None`` or parses as an
+            integer, else ``None``.
+
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return value
 
     def mcp_client_timeout_s(self) -> float | None:
         """Return the known MCP client request budget in seconds.

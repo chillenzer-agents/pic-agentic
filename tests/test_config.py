@@ -140,3 +140,12 @@ def test_mcp_timeout_non_positive_is_unknown(raw: str, tmp_path, monkeypatch) ->
     monkeypatch.setenv("PIC_AGENTIC_MCP_TIMEOUT_MS", raw)
     cfg = Config.load(tmp_path / "missing.toml")
     assert cfg.mcp_client_timeout_s() is None
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "12.5", "  "])
+def test_mcp_timeout_malformed_is_unknown(raw: str, tmp_path, monkeypatch) -> None:
+    """A malformed budget degrades to unknown instead of aborting startup."""
+    monkeypatch.setenv("PIC_AGENTIC_MCP_TIMEOUT_MS", raw)
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.mcp_timeout_ms is None
+    assert cfg.mcp_client_timeout_s() is None
