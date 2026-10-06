@@ -45,7 +45,11 @@ denormalized fields, so a grid/resolution patch must co-vary `cell_cnt`,
 patch silently changes the physical box); finer `dx` needs a CFL-consistent
 `delta_t_si`/step count or the compile fails on the Yee CFL `static_assert`;
 and a laser's Huygens surface must sit outside the 12-cell PML absorber (the
-`GaussianLaser` 16-cell default is right; 8 cells segfaults at step 0).
+`GaussianLaser` 16-cell default is right; 8 cells segfaults at step 0). Because
+the PICMI `TimeStepSpec` is not a pydantic model, `model_json_schema()` is
+unavailable for `TimeStepSpec`-backed diagnostics (an upstream PICMI
+limitation); the instructions point at the pinned classes under
+`lib/python/picongpu/picmi/diagnostics/` instead.
 
 Independently of *why* a run is empty, a completed run whose only numeric plugin
 artifact reads all-zero is now a first-class **health signal**, not silence:

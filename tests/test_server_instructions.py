@@ -95,6 +95,15 @@ def test_instructions_carry_a_field_energy_monitor_snippet() -> None:
     assert "diagnostics=[...]" in SERVER_INSTRUCTIONS
 
 
+def test_instructions_report_time_step_spec_schema_introspection_gap() -> None:
+    # E2: model_json_schema() fails for TimeStepSpec-backed diagnostics because
+    # the PICMI TimeStepSpec is not a pydantic model (upstream cause); point the
+    # agent at the pinned class list instead.
+    assert "model_json_schema" in SERVER_INSTRUCTIONS
+    assert "not a pydantic model" in SERVER_INSTRUCTIONS
+    assert "picmi/diagnostics/" in SERVER_INSTRUCTIONS
+
+
 def test_field_energy_monitor_snippet_is_valid_against_the_pin() -> None:
     # Exercise the snippet exactly as seeded: the same classes and slice syntax
     # must construct and attach to a pinned picmi.Simulation. Skipped where the

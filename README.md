@@ -346,6 +346,12 @@ nodes do not follow:
   `GaussianLaser` default (16 cells) is right; an 8-cell placement segfaults at
   step 0 (exit 139).
 
+`model_json_schema()` is unavailable for diagnostics whose `period` is a
+`TimeStepSpec`: the PICMI `TimeStepSpec` is not a pydantic model, so pydantic
+cannot build a JSON schema for it. This is an **upstream PICMI limitation**;
+the instructions point the agent at the pinned classes under
+`lib/python/picongpu/picmi/diagnostics/` instead.
+
 ### Multi-node studies need explicit leaves (H5)
 
 `create_campaign` expresses a **single-path** sweep: one `patch_path`, one list
