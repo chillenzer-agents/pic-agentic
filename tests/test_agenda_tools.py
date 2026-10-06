@@ -159,6 +159,7 @@ async def test_tool_registration_and_annotations() -> None:
         "patch_path",
         "values",
         "parameter",
+        "point_key",
     }
     assert set(tools["create_campaign"].input_schema["required"]) == {"name", "patch_path", "values"}
 
@@ -1079,6 +1080,49 @@ async def test_create_campaign_accepts_an_unrelated_patch(tmp_path) -> None:
         },
     )
     assert result["ok"] is True
+
+
+async def test_create_campaign_explicit_point_key_overrides_the_derived_point(tmp_path) -> None:
+    """A seed-only campaign can name its point instead of the patch field (A2).
+
+    ``create_campaign(patch_path="sim.time_steps", values=[...])`` used only to
+    seed a campaign otherwise records ``point={"time_steps": ...}`` even though
+    the leaf represents a different quantity (N, resolution, ...); ``point_key``
+    overrides that mislabel.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    result = await _call(
+        config,
+        "create_campaign",
+        {
+            "name": "seed",
+            "base_spec": base,
+            "patch_path": "sim.time_steps",
+            "values": [146],
+            "point_key": "N",
+            "parameter": "grid resolution N",
+        },
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    leaf = campaign.agenda.entries["leaf000"]
+    assert leaf.point == {"N": 146}
+    assert leaf.sweep_parameter == "grid resolution N"
+
+
+async def test_create_campaign_without_point_key_keeps_the_derived_point(tmp_path) -> None:
+    """``point_key`` is opt-in: the historic last-segment point is unchanged (A2)."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    base = _valid_spec()
+    result = await _call(
+        config,
+        "create_campaign",
+        {"name": "scan", "base_spec": base, "patch_path": "sim.time_steps", "values": [146]},
+    )
+    assert result["ok"] is True
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert campaign.agenda.entries["leaf000"].point == {"time_steps": 146}
 
 
 async def test_create_campaign_rejects_a_misplaced_computed_field(tmp_path) -> None:

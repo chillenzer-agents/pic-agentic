@@ -603,6 +603,7 @@ class HelloRuntime:
         *,
         base_spec_path: str | None = None,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         """Create and persist a campaign with one leaf per sweep value.
 
@@ -621,7 +622,9 @@ class HelloRuntime:
         )
         if error is not None:
             return error
-        return await self.agenda_service.create_campaign(name, resolved, patch_path, values, parameter=parameter)
+        return await self.agenda_service.create_campaign(
+            name, resolved, patch_path, values, parameter=parameter, point_key=point_key
+        )
 
     def _resolve_spec(
         self,
@@ -1622,7 +1625,8 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "patching `sim.grid.cell_cnt` or `sim.grid.cell_size` alone is refused "
             "(`invalid_campaign_spec`) because it silently leaves those siblings "
             "stale. Use `add_agenda_leaf` with one whole spec per leaf for such "
-            "studies. "
+            "studies. Override the recorded point key with `point_key` when a "
+            "seed-only patch would mislabel the study. "
             "A numeric path segment is interpreted by the node it addresses: a "
             "list index on a list, or a dict key on a dict, so a nested list "
             "element is reachable (e.g. "
@@ -1652,6 +1656,7 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
         base_spec: dict[str, Any] | None = None,
         base_spec_path: str | None = None,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         result = await runtime.create_campaign(
             name,
@@ -1660,6 +1665,7 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             values,
             base_spec_path=base_spec_path,
             parameter=parameter,
+            point_key=point_key,
         )
         return _redact_dict(runtime, result)
 

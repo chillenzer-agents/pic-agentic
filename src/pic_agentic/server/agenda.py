@@ -821,6 +821,7 @@ class AgendaService:
         values: list[Any],
         *,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         """Create and persist a campaign with one leaf per sweep value.
 
@@ -832,7 +833,8 @@ class AgendaService:
         the driver do, preserving the sweep assignment for provenance, and a
         human-readable ``sweep_parameter`` (the dotted path with list indices
         dropped, e.g. ``sim.laser.focus_pos_si.component``) so the point key is
-        not opaque; an explicit ``parameter`` overrides the derived name.  The
+        not opaque; an explicit ``parameter`` overrides the derived name and an
+        explicit ``point_key`` overrides the point key itself.  The
         campaign is written through the same
         :class:`~pic_agentic.agenda.store.AgendaStore` the other agenda tools
         read, so ``advance_agenda`` picks it up on the next tick.
@@ -862,6 +864,11 @@ class AgendaService:
             parameter: Optional human-readable name for the swept quantity,
                 stored on each leaf as ``sweep_parameter``.  When omitted it is
                 derived from ``patch_path``.
+            point_key: Optional override for the ``point`` key, which otherwise
+                defaults to the last ``patch_path`` segment.  Use it when the
+                campaign is seeded with an unrelated patch (e.g. a single
+                ``sim.time_steps`` value) and the recorded point should name the
+                quantity actually being studied.
 
         Returns:
             ``{"ok": True, "name": name, "leaves": [<paths>]}``, or a soft
@@ -872,7 +879,9 @@ class AgendaService:
         """
         async with self._lock:
             try:
-                return self._create_campaign(name, base_spec, patch_path, values, parameter=parameter)
+                return self._create_campaign(
+                    name, base_spec, patch_path, values, parameter=parameter, point_key=point_key
+                )
             except (TypeError, ValueError, IndexError) as exc:
                 # A bad patch path (including an out-of-range list index) or an
                 # invalid leaf name/value is a model-level error: report it as
@@ -890,6 +899,7 @@ class AgendaService:
         values: list[Any],
         *,
         parameter: str | None = None,
+        point_key: str | None = None,
     ) -> dict[str, Any]:
         """Build the campaign and save it (may raise).
 
@@ -904,7 +914,10 @@ class AgendaService:
             return {"ok": False, "error": "campaign_exists"}
         if not values:
             return {"ok": False, "error": "no_values"}
-        point_key = _parameter_for(patch_path)
+        # An explicit ``point_key`` (sanitised) overrides the last-patch-segment
+        # derivation, so a seed-only campaign is not mislabelled by an unrelated
+        # patch field (A2); the readable ``sweep_parameter`` stays separate.
+        point_key = (readable_label(point_key) if point_key else None) or _parameter_for(patch_path)
         derived = sweep_parameter_for(patch_path, base_spec)
         sweep_parameter = readable_label(parameter) if parameter else readable_label(derived)
         if not _leaf_target_exists(base_spec, patch_path):
