@@ -87,6 +87,18 @@ def test_instructions_warn_about_the_cfl_condition() -> None:
     assert "delta_t_si" in SERVER_INSTRUCTIONS
 
 
+def test_instructions_warn_about_the_super_cell_stencil_constraint() -> None:
+    # F8 / beta-7: a super cell smaller than the default is not a mere
+    # performance knob -- the default particle shape's stencil needs the
+    # default (8, 8, 4) [3D] / (16, 16) [2D] super cell, and (2, 2, 2) fails
+    # the build with the Esirkepov static_assert. Assert the invariant, not the
+    # exact prose.
+    assert "picongpu_super_cell_size" in SERVER_INSTRUCTIONS
+    assert "(8, 8, 4)" in SERVER_INSTRUCTIONS
+    assert "Esirkepov" in SERVER_INSTRUCTIONS
+    assert "too small for stencil" in SERVER_INSTRUCTIONS
+
+
 def test_instructions_warn_that_the_huygens_surface_must_clear_the_pml() -> None:
     # E1 (3): an 8-cell Huygens placement sits inside the 12-cell PML absorber
     # and segfaults at step 0; the GaussianLaser 16-cell default is right.

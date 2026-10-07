@@ -344,6 +344,13 @@ nodes do not follow:
 - finer `dx` also needs a CFL-consistent `delta_t_si` and step count — changing
   only the grid fails the compile with the Yee solver's CFL `static_assert`
   (`fields/MaxwellSolver/Yee/Yee.hpp`);
+- a super cell smaller than the pin's default `picongpu_super_cell_size`
+  (`(8, 8, 4)` in 3D, `(16, 16)` in 2D, `picmi/grid.py`) is not a free
+  performance knob: the default particle shape's stencil needs that much guard
+  margin, and a smaller choice such as `(2, 2, 2)` fails the build with the
+  Esirkepov `supercell or number of guard supercells is too small for stencil`
+  `static_assert`
+  (`fields/currentDeposition/Esirkepov/Esirkepov.hpp`);
 - a laser's Huygens surface must sit **outside** the 12-cell default PML absorber
   (`include/picongpu/param/fieldAbsorber.param`, `THICKNESS = 12`). The
   `GaussianLaser` default (16 cells) is right; an 8-cell placement segfaults at

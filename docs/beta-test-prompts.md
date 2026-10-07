@@ -45,10 +45,13 @@ is a box-size, not a resolution, change — and box-size sweeps are allowed; a
 fixed-box resolution sweep must instead co-vary `cell_size`, `cell_cnt` and
 `cell_depth` together with a CFL-consistent `delta_t_si` and matching
 `time_steps`; finer `dx` needs a CFL-consistent `delta_t_si`/step count or the
-compile fails on the Yee CFL `static_assert`; and a laser's Huygens surface must
-sit outside the 12-cell default PML absorber (the `GaussianLaser` 16-cell
-default is right; 8 cells segfaults at step 0). Because the pin's
-`TimeStepSpec` is a plain class, not a pydantic model, `model_json_schema()` is
+compile fails on the Yee CFL `static_assert`; a super cell smaller than the pin's
+default `picongpu_super_cell_size` (`(8, 8, 4)` in 3D, `(16, 16)` in 2D) fails
+the build with the Esirkepov "supercell or number of guard supercells is too
+small for stencil" `static_assert`, so it is not a free performance knob; and a
+laser's Huygens surface must sit outside the 12-cell default PML absorber (the
+`GaussianLaser` 16-cell default is right; 8 cells segfaults at step 0). Because
+the pin's `TimeStepSpec` is a plain class, not a pydantic model, `model_json_schema()` is
 unavailable for `TimeStepSpec`-backed diagnostics; the instructions point at the
 pinned classes under `lib/python/picongpu/picmi/diagnostics/` instead.
 
