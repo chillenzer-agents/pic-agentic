@@ -149,6 +149,72 @@ async def test_running_is_emitted_only_once(tmp_path) -> None:
     assert [state for state, _ in events].count(SimulationState.JOB_RUNNING) == 1
 
 
+async def _until(predicate, *, within_s: float = 1.0) -> None:
+    """Poll ``predicate`` until true or ``within_s`` elapses."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within_s
+    while not predicate():
+        if loop.time() >= deadline:
+            msg = "condition not met before timeout"
+            raise TimeoutError(msg)
+        await asyncio.sleep(0.005)
+
+
+async def test_pending_reason_events_are_deduplicated(tmp_path) -> None:
+    """F3: two identical pending reasons yield one event, a change yields a new one."""
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    reasons = ["PartitionNodeLimit", "PartitionNodeLimit", "Resources"]
+
+    async def job_info(_job_id: int) -> JobInfo:
+        return JobInfo(job_id=4711, state=SlurmJobState.PENDING, reason=reasons.pop(0) if reasons else "Resources")
+
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=job_info,
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events, emit = _collector()
+    follower.emit = emit
+    task = asyncio.create_task(follower.run())
+    await _until(lambda: follower.tracked.last_slurm_reason == "Resources")
+    follower.stop()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    emitted = [fields["slurm_reason"] for state, fields in events if state is SimulationState.SUBMITTED]
+    assert emitted == ["PartitionNodeLimit", "Resources"]
+
+
+async def test_pending_reason_none_emits_nothing(tmp_path) -> None:
+    """An ordinary ``Reason=None`` queue wait must not generate pending events."""
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    calls = {"n": 0}
+
+    async def job_info(_job_id: int) -> JobInfo:
+        calls["n"] += 1
+        return JobInfo(job_id=4711, state=SlurmJobState.RUNNING, reason=None)
+
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=job_info,
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events, emit = _collector()
+    follower.emit = emit
+    task = asyncio.create_task(follower.run())
+    await _until(lambda: calls["n"] >= 2)
+    follower.stop()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert [fields.get("slurm_reason") for state, fields in events if state is SimulationState.SUBMITTED] == []
+
+
 async def test_failed_job_reports_exit_code(tmp_path) -> None:
     stdout = tmp_path / "stdout"
     stdout.write_text("")

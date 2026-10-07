@@ -41,6 +41,49 @@ async def test_wait_for_job_reaches_completed(fake_env) -> None:
     assert info.state.terminal
 
 
+async def test_job_info_surfaces_the_pending_reason(fake_env) -> None:
+    """F3: the scheduler reason rides on :class:`JobInfo`, not just the state.
+
+    A job stuck at ``PENDING (PartitionNodeLimit)`` is indistinguishable from
+    one merely waiting its turn if only the state is reported; the fake
+    ``scontrol`` walks the ``Reason=`` field the way the real one does.
+    """
+    state_dir = fake_env / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "4701.state").write_text("PENDING 0 PartitionNodeLimit\n", encoding="utf-8")
+    client = SlurmClient(bin_dir=str(FAKE_BIN))
+    info = await client.job_info(4701)
+    assert info.state.value == "PENDING"
+    assert info.reason == "PartitionNodeLimit"
+    assert info.permanent is True
+
+
+async def test_job_info_reason_none_is_not_a_reason(fake_env) -> None:
+    """Slurm's ``Reason=None`` sentinel maps to ``None``, not the string."""
+    state_dir = fake_env / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "4702.state").write_text("RUNNING\n", encoding="utf-8")
+    client = SlurmClient(bin_dir=str(FAKE_BIN))
+    info = await client.job_info(4702)
+    assert info.reason is None
+    assert info.permanent is False
+
+
+@pytest.mark.parametrize("reason", ["Resources", "Priority", "QOSMaxJobsPerUserLimit", None, "None"])
+def test_transient_reasons_are_not_permanent(reason: str | None) -> None:
+    """Only the curated permanent set is flagged; a wait reason must not be."""
+    from pic_agentic.slurm.client import is_permanent_reason
+
+    assert is_permanent_reason(reason) is False
+
+
+@pytest.mark.parametrize("reason", ["PartitionNodeLimit", "PartitionTimeLimit", "MaxNodes", "PartitionConfig"])
+def test_partition_limit_reasons_are_permanent(reason: str) -> None:
+    from pic_agentic.slurm.client import is_permanent_reason
+
+    assert is_permanent_reason(reason) is True
+
+
 async def test_parse_human_output_fallback() -> None:
     assert SlurmClient.parse_job_id("Submitted batch job 12345") == 12345
     assert SlurmClient.parse_job_id("12345\n") == 12345

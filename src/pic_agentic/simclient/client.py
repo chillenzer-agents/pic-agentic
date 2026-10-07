@@ -1612,6 +1612,7 @@ class SimClient:
             return ack
         state = SimulationState.WORKFLOW_FINISHED.value
         slurm_state: str | None = None
+        slurm_reason: str | None = None
         exit_code: int | None = None
         error: str | None = None
         error_code: str | None = None
@@ -1620,6 +1621,7 @@ class SimClient:
                 info = await self.slurm.job_info(tracked.job_id)
                 state = self._state_for_info(info, tracked.run_dir)
                 slurm_state = info.state.value
+                slurm_reason = info.reason
                 exit_code = info.exit_code
             except Exception as exc:  # ruff: ignore[blind-except] - a transient scontrol failure is ack data
                 log.warning("status query failed for sim %s: %s", sim_id, exc)
@@ -1636,6 +1638,7 @@ class SimClient:
             sim_id=sim_id,
             state=state,
             slurm_state=slurm_state,
+            slurm_reason=slurm_reason,
             job_id=tracked.job_id,
             step=tracked.last_step,
             percent=tracked.last_percent if tracked.last_percent >= 0 else None,
@@ -1907,6 +1910,7 @@ class SimClient:
         sim_id: str,
         state: str,
         slurm_state: str | None = None,
+        slurm_reason: str | None = None,
         job_id: int | None = None,
         step: int | None = None,
         percent: int | None = None,
@@ -1926,6 +1930,7 @@ class SimClient:
             in_reply_to=message.transport_event_id,
             state=state,
             slurm_state=slurm_state,
+            slurm_reason=slurm_reason,
             job_id=job_id,
             step=step,
             percent=percent,
@@ -2052,6 +2057,7 @@ class SimClient:
         avg_per_step: str | None = None,
         eta_s: int | None = None,
         slurm_state: str | None = None,
+        slurm_reason: str | None = None,
         exit_code: int | None = None,
         core_hours: float | None = None,
         gpu_hours: float | None = None,
@@ -2077,6 +2083,7 @@ class SimClient:
             avg_per_step=avg_per_step,
             eta_s=eta_s,
             slurm_state=slurm_state,
+            slurm_reason=slurm_reason,
             exit_code=exit_code,
             core_hours=core_hours,
             gpu_hours=gpu_hours,

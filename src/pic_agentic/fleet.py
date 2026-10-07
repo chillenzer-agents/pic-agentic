@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from pic_agentic.protocol.simulation import SimulationPhase, simulation_phase
+from pic_agentic.slurm.client import is_permanent_reason
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
     from pic_agentic.server.simulation import SimRecord
 
 #: Alert kinds the fleet view can raise.
-AlertKind = Literal["stalled", "failed", "cancelled", "nonzero_exit", "suspect"]
+AlertKind = Literal["stalled", "failed", "cancelled", "nonzero_exit", "suspect", "blocked"]
 
 
 class FleetSummary(BaseModel):
@@ -168,6 +169,20 @@ def detect_alerts(
         if state in _DONE_STATES and suspect:
             alerts.append(FleetAlert(sim_id=sim_id, kind="suspect", detail=str(suspect), last_event_ts=last_event_ts))
             continue
+        # A pending job whose scheduler reason is a permanent limit can never
+        # start as requested (F3): report it as ``blocked`` rather than leaving
+        # it to look like an ordinary queue wait.
+        if bool(getattr(record, "active", False)) and _is_blocked(record):
+            reason = str(getattr(record, "slurm_reason", "") or "")
+            alerts.append(
+                FleetAlert(
+                    sim_id=sim_id,
+                    kind="blocked",
+                    detail=f"cannot schedule: {reason}",
+                    last_event_ts=last_event_ts,
+                ),
+            )
+            continue
         stalled = _is_stalled(record, now=now, stall_after_s=stall_after_s)
         if stalled is not None:
             alerts.append(
@@ -220,6 +235,25 @@ def _phase_of(record: SimRecord) -> str:
         str(getattr(record, "state", "") or ""),
         getattr(record, "job_id", None),
     )
+
+
+def _is_blocked(record: SimRecord) -> bool:
+    """Return whether a record's scheduler reason is a permanent block (F3).
+
+    Duck-typed like the rest of the module: a record may expose the derived
+    ``slurm_blocked`` (the :class:`SimRecord` path), or only the raw
+    ``slurm_reason`` (an older projection), in which case the curated permanent
+    set is consulted directly.
+
+    Returns:
+        True when the record is a pending job that can never schedule.
+
+    """
+    blocked = getattr(record, "slurm_blocked", None)
+    if isinstance(blocked, bool):
+        return blocked
+    reason = getattr(record, "slurm_reason", None)
+    return is_permanent_reason(reason)
 
 
 def _is_stalled(record: SimRecord, *, now: datetime, stall_after_s: float) -> float | None:

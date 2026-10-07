@@ -23,13 +23,53 @@ from pydantic import BaseModel
 SAFE_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
 SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 STATE_RE = re.compile(r"JobState=(\w+)")
+#: ``Reason=<token>`` in ``scontrol show job``; the scheduler's human-readable
+#: pending/terminal explanation (e.g. ``PartitionNodeLimit``).  ``None`` is
+#: Slurm's sentinel for "no reason", not a reason string.
+REASON_RE = re.compile(r"\bReason=(\S+)")
+
+#: Reasons that mean the job can never be scheduled as requested, so a caller
+#: must change the request instead of waiting.  Kept deliberately small and
+#: literal: a transient reason (``Resources``, ``Priority``, ``QOSMax...``) must
+#: never be advertised as permanent.  ``PartitionNodeLimit`` -- the beta-7 case
+#: (a 40/32-node s=8 job exceeding the partition's node cap) -- is definitive.
+PERMANENT_REASONS = frozenset(
+    {
+        "PartitionNodeLimit",
+        "PartitionTimeLimit",
+        "PartitionConfig",
+        "MaxNodes",
+    },
+)
+
+
+def is_permanent_reason(reason: str | None) -> bool:
+    """Return whether a SLURM reason means the request can never schedule.
+
+    Args:
+        reason: The scheduler reason string, or None/``"None"``.
+
+    Returns:
+        True for a reason in :data:`PERMANENT_REASONS`.
+
+    """
+    return reason in PERMANENT_REASONS
+
 
 #: ``sacct --parsable2`` accounting columns (fixed ``--format`` order):
-#: ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot``.
+#: ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES``.
 _MIN_ACCOUNTING_FIELDS = 3
 _COL_ELAPSED_RAW = 1
 _COL_ALLOC_CPUS = 2
-_COL_TRES = 3
+_COL_TRES_USAGE = 3
+_COL_TRES_ALLOC = 4
+
+#: TRES columns consulted for the GPU count, most authoritative first.  On this
+#: site ``TRESUsageInTot`` is empty for completed jobs, so the *allocation*
+#: (``AllocTRES``) is the fallback that keeps ``gpu_hours`` from reading 0 for
+#: every GPU job (F5).  ``AllocTRES`` describes the reserved GPUs, which for a
+#: GPU job equals the count whose wall-clock accrues GPU-hours.
+_GPU_TRES_COLUMNS = (_COL_TRES_USAGE, _COL_TRES_ALLOC)
 
 #: Signals the client will deliver.  A fixed set, so a wire string can never be
 #: interpolated into ``scontrol``/``scancel``.  ``TERM``/``ALRM`` are the M3
@@ -65,11 +105,23 @@ class SlurmJobState(StrEnum):
 
 
 class JobInfo(BaseModel):
-    """A snapshot of one SLURM job."""
+    """A snapshot of one SLURM job.
+
+    ``reason`` carries the scheduler's explanation (``scontrol``'s
+    ``Reason=...``): for a pending job this is *why* it is not running yet
+    (e.g. ``PartitionNodeLimit``), which the bare state cannot convey.  It is
+    ``None`` when Slurm reports no reason.
+    """
 
     job_id: int
     state: SlurmJobState
     exit_code: int | None = None
+    reason: str | None = None
+
+    @property
+    def permanent(self) -> bool:
+        """Whether :attr:`reason` means the job can never schedule as requested."""
+        return is_permanent_reason(self.reason)
 
 
 class JobAccounting(BaseModel):
@@ -84,12 +136,14 @@ class JobAccounting(BaseModel):
 def parse_accounting(output: str) -> dict[int, JobAccounting]:
     """Parse ``sacct --parsable2`` output into per-job actual usage.
 
-    The expected columns are ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot`` (or a
-    ``--format`` subset in the same order); ``ElapsedRaw`` is seconds and
-    ``AllocCPUS`` is the allocated CPU count, so
-    ``core_hours = ElapsedRaw * AllocCPUS / 3600``.  A ``gres/gpu=N`` in the TRES
-    usage contributes ``gpu_hours = elapsed_hours * N``.  A malformed row is
-    skipped, never raised.
+    The expected columns are ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|
+    AllocTRES`` (or a ``--format`` subset in the same order); ``ElapsedRaw`` is
+    seconds and ``AllocCPUS`` is the allocated CPU count, so
+    ``core_hours = ElapsedRaw * AllocCPUS / 3600``.  The GPU count is read from
+    the first TRES column that carries a ``gres/gpu=N`` -- ``TRESUsageInTot``
+    first, then ``AllocTRES`` -- and contributes
+    ``gpu_hours = elapsed_hours * N``.  A malformed row is skipped, never raised;
+    a genuinely GPU-less job keeps ``gpu_hours == 0.0``.
 
     Args:
         output: The raw ``sacct --parsable2`` stdout.
@@ -103,7 +157,7 @@ def parse_accounting(output: str) -> dict[int, JobAccounting]:
     if not lines:
         return accounting
     # Column positions in the fixed ``--format=JobID,ElapsedRaw,AllocCPUS,
-    # TRESUsageInTot`` order; ``|`` is the ``--parsable2`` delimiter.
+    # TRESUsageInTot,AllocTRES`` order; ``|`` is the ``--parsable2`` delimiter.
     for line in lines[1:]:  # the first line is the header
         fields = [field.strip() for field in line.split("|")]
         if len(fields) < _MIN_ACCOUNTING_FIELDS:
@@ -115,8 +169,14 @@ def parse_accounting(output: str) -> dict[int, JobAccounting]:
         elapsed_raw = _int_or_none(fields[_COL_ELAPSED_RAW])
         alloc_cpus = _int_or_none(fields[_COL_ALLOC_CPUS])
         elapsed_hours = (elapsed_raw or 0) / 3600.0
-        tres = fields[_COL_TRES] if len(fields) > _COL_TRES else ""
-        gpu_count = _gpu_count(tres)
+        # TRESUsageInTot is empty on this site, so fall back to AllocTRES; both
+        # carry the same ``gres/gpu=N`` shape.
+        gpu_count = 0
+        for column in _GPU_TRES_COLUMNS:
+            if len(fields) > column:
+                gpu_count = _gpu_count(fields[column])
+                if gpu_count:
+                    break
         accounting[job_id] = JobAccounting(
             job_id=job_id,
             core_hours=elapsed_hours * (alloc_cpus or 0),
@@ -137,6 +197,31 @@ def _int_or_none(text: str) -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+def _parse_reason(output: str) -> str | None:
+    """Extract the ``Reason=`` field from ``scontrol show job`` output.
+
+    Slurm prints ``Reason=None`` when there is no reason (the common case for a
+    running/completed job); that sentinel maps to ``None`` so callers only ever
+    see a genuine reason string.  ``Reason=`` is always the first token of its
+    space-separated value; Slurm pads/truncates it to a fixed width, so the
+    token itself is the reason.
+
+    Args:
+        output: The raw ``scontrol show job`` stdout.
+
+    Returns:
+        The reason string, or None when absent or ``None``.
+
+    """
+    match = REASON_RE.search(output)
+    if not match:
+        return None
+    reason = match.group(1).strip()
+    if not reason or reason == "None":
+        return None
+    return reason
 
 
 def _gpu_count(tres: str) -> int:
@@ -290,7 +375,7 @@ class SlurmClient:
         exit_match = re.search(r"ExitCode=(\d+):(\d+)", stdout)
         if exit_match:
             exit_code = int(exit_match.group(1))
-        return JobInfo(job_id=job_id, state=state, exit_code=exit_code)
+        return JobInfo(job_id=job_id, state=state, exit_code=exit_code, reason=_parse_reason(stdout))
 
     async def job_accounting(self, job_id: int) -> JobAccounting | None:
         """Query ``sacct`` for one finished job's actual resource usage.
@@ -314,7 +399,7 @@ class SlurmClient:
             str(job_id),
             "--parsable2",
             "--noheader",
-            "--format=JobID,ElapsedRaw,AllocCPUS,TRESUsageInTot",
+            "--format=JobID,ElapsedRaw,AllocCPUS,TRESUsageInTot,AllocTRES",
         ]
         try:
             rc, stdout, _stderr = await self._run(argv)
@@ -323,7 +408,7 @@ class SlurmClient:
         if rc != 0:
             return None
         # --noheader is requested, but accept a header line too (older sacct).
-        rows = parse_accounting("JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot\n" + stdout)
+        rows = parse_accounting("JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES\n" + stdout)
         return rows.get(job_id)
 
     async def wait_for_job(self, job_id: int, *, timeout_s: float, interval_s: float = 5.0) -> JobInfo:

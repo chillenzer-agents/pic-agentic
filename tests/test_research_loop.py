@@ -70,6 +70,37 @@ def test_parse_accounting_skips_malformed_rows() -> None:
     assert rows[4711].is_gpu is False
 
 
+def test_parse_accounting_falls_back_to_alloctres_for_gpu_count() -> None:
+    """F5: an empty ``TRESUsageInTot`` must not zero out ``gpu_hours``.
+
+    On the beta-7 cluster ``TRESUsageInTot`` was empty for completed GPU jobs,
+    so ``gpu_hours`` read 0.0 for every run while ``core_hours`` accrued; the
+    GPU count has to fall back to the ``AllocTRES`` reservation.  The column
+    shape mirrors ``sacct --parsable2
+    --format=JobID,ElapsedRaw,AllocCPUS,TRESUsageInTot,AllocTRES``.
+    """
+    output = "JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES\n606037|2118|8||gres/gpu=4\n"
+    rows = parse_accounting(output)
+    assert rows[606037].core_hours == pytest.approx(2118 * 8 / 3600)
+    assert rows[606037].gpu_hours == pytest.approx(2118 * 4 / 3600)
+    assert rows[606037].is_gpu is True
+
+
+def test_parse_accounting_prefers_tres_usage_over_alloc() -> None:
+    """``TRESUsageInTot`` wins when present; the fallback is only a fallback."""
+    output = "JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES\n4711|3600|8|gres/gpu=2|gres/gpu=4\n"
+    rows = parse_accounting(output)
+    assert rows[4711].gpu_hours == pytest.approx(2.0)
+
+
+def test_parse_accounting_gpu_less_job_stays_zero() -> None:
+    """A genuinely CPU-only job keeps ``gpu_hours == 0.0`` (no false positive)."""
+    output = "JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES\n4700|3600|8||cpu=8,mem=32G\n"
+    rows = parse_accounting(output)
+    assert rows[4700].gpu_hours == pytest.approx(0.0)
+    assert rows[4700].is_gpu is False
+
+
 def test_reconcile_replaces_the_estimate_with_the_actual() -> None:
     # Reserved 10 core-h; actually used 3 -> usage drops by 7.
     usage = BudgetUsage(core_hours=10.0, jobs_submitted=1)

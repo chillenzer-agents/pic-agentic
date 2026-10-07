@@ -80,6 +80,43 @@ def test_detect_stalled_boundary() -> None:
     assert alerts[0].kind == "stalled"
 
 
+def test_blocked_pending_job_alerts() -> None:
+    """F3: a permanently blocked pending job raises a ``blocked`` alert.
+
+    A 40-node job at ``PENDING (PartitionNodeLimit)`` can never start on the
+    gpu-v100 partition; the fleet view names the reason instead of letting it
+    look idle.
+    """
+    records = [
+        _record(
+            "blocked",
+            "simulation.submitted",
+            active=True,
+            job_id=606628,
+            slurm_state="PENDING",
+            slurm_reason="PartitionNodeLimit",
+        ),
+    ]
+    alerts = detect_alerts(records, now=NOW, stall_after_s=60)
+    assert [a.kind for a in alerts] == ["blocked"]
+    assert "PartitionNodeLimit" in alerts[0].detail
+
+
+def test_transient_pending_reason_is_not_blocked() -> None:
+    """A ``Resources`` wait is not surfaced as a permanent block."""
+    records = [
+        _record(
+            "waiting",
+            "simulation.submitted",
+            active=True,
+            job_id=99,
+            slurm_state="PENDING",
+            slurm_reason="Resources",
+        ),
+    ]
+    assert detect_alerts(records, now=NOW, stall_after_s=60) == []
+
+
 def test_stale_but_terminal_is_not_stalled() -> None:
     stale = (NOW - timedelta(seconds=9999)).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = [_record("a", "results.ready", active=False, last_event_ts=stale)]

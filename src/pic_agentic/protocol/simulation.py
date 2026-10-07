@@ -922,6 +922,7 @@ def build_submit_event(
     avg_per_step: str | None = None,
     eta_s: int | None = None,
     slurm_state: str | None = None,
+    slurm_reason: str | None = None,
     exit_code: int | None = None,
     core_hours: float | None = None,
     gpu_hours: float | None = None,
@@ -964,6 +965,7 @@ def build_submit_event(
                 ("avg_per_step", avg_per_step),
                 ("eta_s", eta_s),
                 ("slurm_state", slurm_state),
+                ("slurm_reason", slurm_reason),
                 ("exit_code", exit_code),
                 ("core_hours", core_hours),
                 ("gpu_hours", gpu_hours),
@@ -1053,6 +1055,7 @@ def build_status_ack(
     in_reply_to: str | None,
     state: str,
     slurm_state: str | None = None,
+    slurm_reason: str | None = None,
     job_id: int | None = None,
     step: int | None = None,
     percent: int | None = None,
@@ -1081,6 +1084,7 @@ def build_status_ack(
             key: value
             for key, value in (
                 ("slurm_state", slurm_state),
+                ("slurm_reason", slurm_reason),
                 ("job_id", job_id),
                 ("step", step),
                 ("percent", percent),

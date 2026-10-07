@@ -392,6 +392,46 @@ def test_ack_and_event_shape() -> None:
     assert event.payload["job_id"] == 7
 
 
+def test_slurm_reason_rides_the_event_and_status_ack() -> None:
+    """F3: the scheduler reason is carried on both the pending event and the ack."""
+    from pic_agentic.protocol.simulation import build_status_ack
+
+    event = build_submit_event(
+        sim="s",
+        seq=6,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.SUBMITTED,
+        job_id=7,
+        slurm_state="PENDING",
+        slurm_reason="PartitionNodeLimit",
+    )
+    assert event.payload["slurm_reason"] == "PartitionNodeLimit"
+    # An event without a reason omits the field rather than carrying null.
+    running = build_submit_event(
+        sim="s",
+        seq=7,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_RUNNING,
+        job_id=7,
+    )
+    assert "slurm_reason" not in running.payload
+
+    ack = build_status_ack(
+        sim="s",
+        seq=8,
+        cmd_id="c",
+        sim_id="abcd1234",
+        in_reply_to=None,
+        state=SimulationState.SUBMITTED.value,
+        slurm_state="PENDING",
+        slurm_reason="PartitionNodeLimit",
+        job_id=7,
+    )
+    assert ack.payload["slurm_reason"] == "PartitionNodeLimit"
+
+
 def test_signal_from_exit_code() -> None:
     """B2: a signal-death exit status maps to a bounded signal annotation."""
     from pic_agentic.protocol.simulation import signal_from_exit_code
