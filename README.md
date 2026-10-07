@@ -376,9 +376,14 @@ explicit `grid_dist` that no longer sums to `cell_cnt`, and the solver's CFL
 leaf and refused with an actionable message. A whole-spec `add_agenda_leaf` leaf,
 which owns every node, is not checked against these derived invariants.
 `add_agenda_leaf` is the escape hatch:
-create the base campaign, then add one leaf per study point carrying its own
-whole spec, so any number of nodes can differ between leaves. A leaf spec may be
-inline (`spec=`) or, for a large spec, staged by reference
+create the campaign empty — `create_campaign(name=...)` with no `patch_path`
+and no `values` persists a leafless campaign that reports `empty: true` and
+`complete: false` — then add one leaf per study point carrying its own whole
+spec, so any number of nodes can differ between leaves. Creating the campaign
+bare avoids inventing a meaningless identity patch: seeded leaves would carry a
+`point`/label derived from that unrelated field, while an added whole-spec leaf
+records exactly the `point`/`parameter` you pass (or stays point-less). A leaf
+spec may be inline (`spec=`) or, for a large spec, staged by reference
 (`add_agenda_leaf(name, spec_path=...)`) exactly like
 `create_campaign(base_spec_path=...)` — the same safe staging root and the same
 4 MiB *input file* cap. Staging lifts only the input-side (re-typing) limit: the

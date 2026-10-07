@@ -161,7 +161,9 @@ async def test_tool_registration_and_annotations() -> None:
         "parameter",
         "point_key",
     }
-    assert set(tools["create_campaign"].input_schema["required"]) == {"name", "patch_path", "values"}
+    # ``patch_path``/``values`` are optional: omitting both creates an empty
+    # campaign to be populated with whole-spec leaves.
+    assert set(tools["create_campaign"].input_schema["required"]) == {"name"}
 
     advance = tools["advance_agenda"].annotations
     assert advance is not None
@@ -709,6 +711,88 @@ async def test_create_campaign_without_values_is_a_soft_error(tmp_path) -> None:
         {"name": "scan", "base_spec": {"sim": {"time_steps": 4}}, "patch_path": "sim.time_steps", "values": []},
     )
     assert result == {"ok": False, "error": "no_values"}
+
+
+async def test_create_empty_campaign_is_not_complete_and_takes_whole_spec_leaves(tmp_path) -> None:
+    """A whole-spec-only study: create empty, then add whole-spec leaves (F7).
+
+    This is the clean path the beta-7 agent had to fake with an identity patch.
+    The empty campaign persists with no leaves and reports ``empty: true`` /
+    ``complete: false`` (so "no work yet" is not mistaken for "finished"), then
+    ``add_agenda_leaf`` populates it with independent whole specs, and the next
+    tick submits them.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    created = await _call(config, "create_campaign", {"name": "whole-specs"})
+    assert created == {"ok": True, "name": "whole-specs", "leaves": [], "empty": True}
+
+    # Before any leaf exists, neither status nor a tick claims the work is done.
+    status = await _call(config, "agenda_status", {})
+    assert status["empty"] is True
+    assert status["complete"] is False
+    assert status["counts"] == {"planned": 0, "submitted": 0, "running": 0, "done": 0, "failed": 0}
+    tick = await _call(config, "advance_agenda", {})
+    assert tick["empty"] is True
+    assert tick["complete"] is False
+    # ``state`` must not contradict the forced ``complete: false``.
+    assert tick["state"] == "running"
+    assert tick["submitted"] == []
+
+    # Populate with whole-spec leaves that vary as many nodes as they like.
+    for name, spec in (("s1", _valid_spec()), ("s2", _add_spec())):
+        added = await _call(config, "add_agenda_leaf", {"name": name, "spec": spec})
+        assert added == {"ok": True, "path": name}
+
+    after = await _call(config, "agenda_status", {})
+    assert after["complete"] is False
+    assert "empty" not in after
+    assert {leaf["path"] for leaf in after["leaves"]} == {"s1", "s2"}
+
+    submitted = await _call(config, "advance_agenda", {})
+    assert submitted["submitted"] == ["s1", "s2"]
+    assert submitted["complete"] is False
+
+
+async def test_added_whole_spec_leaf_carries_no_derived_point(tmp_path) -> None:
+    """A whole-spec leaf records exactly the point given, never a derived one.
+
+    A misleading point derived from an unrelated patch must not appear (F7/A2).
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    await _call(config, "create_campaign", {"name": "whole-specs"})
+    # No point: the leaf must stay point-less and label-less.
+    await _call(config, "add_agenda_leaf", {"name": "bare", "spec": _valid_spec()})
+    # Explicit point/parameter: recorded verbatim.
+    await _call(
+        config,
+        "add_agenda_leaf",
+        {"name": "labelled", "spec": _add_spec(), "point": {"resolution_scale": 2}, "parameter": "resolution scale"},
+    )
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    bare = campaign.agenda.entries["bare"]
+    assert bare.point is None
+    assert bare.sweep_parameter is None
+    labelled = campaign.agenda.entries["labelled"]
+    assert labelled.point == {"resolution_scale": 2}
+    assert labelled.sweep_parameter == "resolution scale"
+
+
+async def test_create_empty_campaign_rejects_stray_values_or_base(tmp_path) -> None:
+    """An empty campaign is created bare: values or a base spec are refused."""
+    config = Config(rcp_secret=SECRET, agenda_file=str(tmp_path / "campaign.json"))
+    stray_values = await _call(config, "create_campaign", {"name": "x", "values": [1]})
+    assert stray_values["ok"] is False
+    assert stray_values["error"] == "invalid_campaign"
+    assert not (tmp_path / "campaign.json").exists()
+
+    with_patch_no_values = await _call(config, "create_campaign", {"name": "x", "patch_path": "sim.time_steps"})
+    assert with_patch_no_values["ok"] is False
+    assert with_patch_no_values["error"] == "base_spec_required"
+
+    with_base = await _call(config, "create_campaign", {"name": "x", "base_spec": _valid_spec()})
+    assert with_base["ok"] is False
+    assert with_base["error"] == "invalid_campaign"
+    assert not (tmp_path / "campaign.json").exists()
 
 
 async def test_create_campaign_refuses_to_clobber_an_existing_campaign(tmp_path) -> None:

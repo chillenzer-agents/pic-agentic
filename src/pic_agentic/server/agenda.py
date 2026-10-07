@@ -348,7 +348,7 @@ class AgendaService:
             except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
                 log.warning("agenda tick failed: %s", exc)
                 return {"ok": False, "error": self.config.redact(str(exc))}
-        return result.model_dump()
+        return self._flag_empty_campaign(result.model_dump(), empty=self._campaign_has_no_leaves())
 
     def _build_engine(self, send: SendFn) -> AgendaEngine:
         """Assemble the engine with its live observation/submission callables.
@@ -455,10 +455,59 @@ class AgendaService:
             suspects=self._registry_suspects,
         )
         try:
-            return engine.status()
+            return self._flag_empty_campaign(engine.status(), empty=self._campaign_has_no_leaves())
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
             log.warning("agenda status failed: %s", exc)
             return {"ok": False, "error": self.config.redact(str(exc))}
+
+    @staticmethod
+    def _flag_empty_campaign(result: dict[str, Any], *, empty: bool) -> dict[str, Any]:
+        """Mark a campaign with no leaves ``empty`` and not ``complete``.
+
+        An empty campaign (created by ``create_campaign`` without a
+        ``patch_path`` and not yet populated) has no leaves, so the engine's
+        structural "all leaves terminal" check trivially holds and would report
+        ``complete: true`` before any work exists.  That would let an agent
+        conclude a study it has not started.  This overlay reports ``empty:
+        true`` and forces ``complete: false`` while there are no leaves, so
+        "no work yet" is never confused with "work finished".  Once a leaf is
+        added the overlay is a no-op and the engine's own ``complete`` stands.
+
+        Args:
+            result: An ``advance_agenda``/``agenda_status`` result dict.
+            empty: Whether the persisted campaign has no leaves.
+
+        Returns:
+            ``result`` with ``empty``/``complete`` corrected for an empty
+            campaign (otherwise unchanged).
+
+        """
+        if empty:
+            result["empty"] = True
+            result["complete"] = False
+            # A tick result sets ``state: "complete"`` for the structurally
+            # complete (leafless) campaign; keep it consistent with the forced
+            # ``complete: false`` by restoring the stored lifecycle state.
+            # ``agenda_status`` already reports the stored lifecycle state, so
+            # only the tick result carries the ``lifecycle`` key.
+            if "lifecycle" in result:
+                result["state"] = result["lifecycle"]
+        return result
+
+    def _campaign_has_no_leaves(self) -> bool:
+        """Whether the persisted campaign exists and has no leaves.
+
+        Best-effort: an unreadable campaign is reported as non-empty so the
+        overlay never masks a parse error the caller should see.
+
+        Returns:
+            True only when the campaign loads and its agenda is leafless.
+
+        """
+        try:
+            return not self.store.load(Campaign).agenda.simulations()
+        except Exception:  # ruff: ignore[blind-except] - emptiness probe must never raise
+            return False
 
     async def approve(self, path: str) -> dict[str, Any]:
         """Mark one campaign leaf as approved so the next tick may submit it.
@@ -825,14 +874,14 @@ class AgendaService:
     async def create_campaign(
         self,
         name: str,
-        base_spec: dict[str, Any],
-        patch_path: str,
-        values: list[Any],
+        base_spec: dict[str, Any] | None,
+        patch_path: str | None,
+        values: list[Any] | None,
         *,
         parameter: str | None = None,
         point_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create and persist a campaign with one leaf per sweep value.
+        """Create and persist a campaign, seeded or empty.
 
         The server-side equivalent of the driver's ``--agenda-init``: a fresh
         campaign is created with one leaf per entry in ``values``, each holding
@@ -847,6 +896,17 @@ class AgendaService:
         campaign is written through the same
         :class:`~pic_agentic.agenda.store.AgendaStore` the other agenda tools
         read, so ``advance_agenda`` picks it up on the next tick.
+
+        Omitting ``patch_path`` creates an **empty campaign** with no leaves:
+        the caller then populates it with whole-spec, multi-node leaves via
+        :meth:`add_leaf` (``add_agenda_leaf``).  This is the clean path for a
+        study whose leaves are all whole specs (e.g. a fixed-box resolution
+        convergence study that must co-vary grid cells, ``delta_t_si`` and
+        ``time_steps``): no identity patch is needed, so no seeded leaf carries
+        a ``point``/label derived from an unrelated field.  An empty campaign
+        reports ``empty: true`` and is *not* ``complete`` from
+        :meth:`advance`/:meth:`status` until it has leaves, so an agent is not
+        told its work is finished before it has begun.
 
         Creating over an existing campaign would clobber its state, so it is
         refused rather than overwritten.
@@ -886,9 +946,11 @@ class AgendaService:
         Returns:
             ``{"ok": True, "name": name, "leaves": [<paths>]}`` -- with an
             advisory ``warnings`` list for a lone ``cell_cnt``/``cell_size``
-            box-size sweep -- or a soft error (``campaign_exists``,
-            ``no_values``, ``invalid_campaign``, ``invalid_campaign_spec``,
-            ``spec_exceeds_inline_limit``, ``duplicate_campaign_spec``).
+            box-size sweep; an empty campaign returns ``{"ok": True, "name":
+            name, "leaves": [], "empty": True}`` -- or a soft error
+            (``campaign_exists``, ``no_values``, ``invalid_campaign``,
+            ``invalid_campaign_spec``, ``spec_exceeds_inline_limit``,
+            ``duplicate_campaign_spec``).
 
         """
         async with self._lock:
@@ -908,9 +970,9 @@ class AgendaService:
     def _create_campaign(
         self,
         name: str,
-        base_spec: dict[str, Any],
-        patch_path: str,
-        values: list[Any],
+        base_spec: dict[str, Any] | None,
+        patch_path: str | None,
+        values: list[Any] | None,
         *,
         parameter: str | None = None,
         point_key: str | None = None,
@@ -920,16 +982,69 @@ class AgendaService:
         Returns:
             ``{"ok": True, "name": name, "leaves": [<paths>]}`` (plus a
             non-blocking ``warnings`` list for a lone ``cell_cnt``/``cell_size``
-            box-size sweep), or a soft error (``campaign_exists``,
-            ``no_values``, ``invalid_campaign``, ``invalid_campaign_spec``,
+            box-size sweep; an empty campaign adds ``empty: True`` with no
+            leaves), or a soft error (``campaign_exists``, ``no_values``,
+            ``invalid_campaign``, ``invalid_campaign_spec``,
             ``spec_exceeds_inline_limit``, ``duplicate_campaign_spec``).  No file
             is written on any error.
 
         """
         if self.store.exists():
             return {"ok": False, "error": "campaign_exists"}
+        if patch_path is None:
+            return self._create_empty_campaign(name, values)
+        if base_spec is None:
+            return {
+                "ok": False,
+                "error": "invalid_campaign",
+                "detail": "a base spec is required when patch_path is given",
+            }
         if not values:
             return {"ok": False, "error": "no_values"}
+        return self._seed_campaign(name, base_spec, patch_path, values, parameter=parameter, point_key=point_key)
+
+    def _create_empty_campaign(self, name: str, values: list[Any] | None) -> dict[str, Any]:
+        """Persist a leafless campaign to be populated with whole-spec leaves.
+
+        The clean path for a study whose leaves are all whole specs: no identity
+        patch is needed, so no seeded leaf carries a misleading point/label.  A
+        caller that passed ``values`` without a ``patch_path`` is refused: the
+        leaves to add are whole specs, not sweep values.
+
+        Returns:
+            ``{"ok": True, "name": name, "leaves": [], "empty": True}``, or the
+            ``invalid_campaign`` soft error when ``values`` are given.
+
+        """
+        if values:
+            return {
+                "ok": False,
+                "error": "invalid_campaign",
+                "detail": (
+                    "patch_path is required when values are given; omit both patch_path and "
+                    "values to create an empty campaign and add whole-spec leaves afterwards"
+                ),
+            }
+        self.store.save(Campaign(name=name, agenda=AgendaGroup(name="campaign")).with_created_ts())
+        return {"ok": True, "name": name, "leaves": [], "empty": True}
+
+    def _seed_campaign(
+        self,
+        name: str,
+        base_spec: dict[str, Any],
+        patch_path: str,
+        values: list[Any],
+        *,
+        parameter: str | None,
+        point_key: str | None,
+    ) -> dict[str, Any]:
+        """Persist a campaign with one patched leaf per sweep value.
+
+        Returns:
+            ``{"ok": True, ...}`` with an advisory ``warnings`` list for a lone
+            ``cell_cnt``/``cell_size`` sweep, or a create-time soft error.
+
+        """
         # An explicit ``point_key`` (sanitised) overrides the last-patch-segment
         # derivation, so a seed-only campaign is not mislabelled by an unrelated
         # patch field (A2); the readable ``sweep_parameter`` stays separate.

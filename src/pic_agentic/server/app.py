@@ -601,8 +601,8 @@ class HelloRuntime:
         self,
         name: str,
         base_spec: dict[str, Any] | None,
-        patch_path: str,
-        values: list[Any],
+        patch_path: str | None,
+        values: list[Any] | None,
         *,
         base_spec_path: str | None = None,
         parameter: str | None = None,
@@ -611,12 +611,26 @@ class HelloRuntime:
         """Create and persist a campaign with one leaf per sweep value.
 
         The base spec comes either inline (``base_spec``) or from a staged JSON
-        file (``base_spec_path``); exactly one must be given.
+        file (``base_spec_path``); exactly one must be given.  Omitting
+        ``patch_path`` (and ``values``) creates an empty campaign to be
+        populated with whole-spec leaves via ``add_agenda_leaf``; no base spec
+        is needed then.
 
         Returns:
             ``{"ok": True, "name": name, "leaves": [...]}``, or a soft error.
 
         """
+        if patch_path is None:
+            if base_spec is not None or base_spec_path is not None:
+                return {
+                    "ok": False,
+                    "error": "invalid_campaign",
+                    "detail": (
+                        "a base spec is not used for an empty campaign; omit base_spec/"
+                        "base_spec_path too, then add whole-spec leaves with add_agenda_leaf"
+                    ),
+                }
+            return await self.agenda_service.create_campaign(name, None, None, values)
         resolved, error = self._resolve_spec(
             base_spec,
             base_spec_path,
@@ -817,8 +831,8 @@ SERVER_INSTRUCTIONS = (
     "Which tool: submit_simulation runs a single simulation; to scan one spec "
     "field across values, use build_spec then create_campaign (one leaf per "
     "value, same patch_path); to vary more than one spec node, or to give each "
-    "leaf its own whole spec, create the base campaign and add one "
-    "add_agenda_leaf per leaf with an explicit spec. "
+    "leaf its own whole spec, create the campaign empty (create_campaign with "
+    "no patch_path) and add one add_agenda_leaf per leaf with an explicit spec. "
     "A simulation is defined either as a PICMI Python script (submit_simulation) "
     "or, for parameter studies, as a pypicongpu Runner spec "
     "(build_spec to obtain one from a PICMI script, then create_campaign to scan "
@@ -841,8 +855,9 @@ SERVER_INSTRUCTIONS = (
     "Because a Runner spec is a rendered snapshot with denormalised fields, "
     "create_campaign adds a non-blocking warning naming that effect. For a "
     "fixed-box resolution study one patch_path cannot hold the box fixed: "
-    "co-vary the grid, delta_t_si and time_steps via add_agenda_leaf with one "
-    "whole spec per leaf. "
+    "co-vary the grid, delta_t_si and time_steps by creating the campaign empty "
+    "(create_campaign with no patch_path) and adding one add_agenda_leaf with "
+    "one whole spec per leaf. "
     "create_campaign refuses to overwrite an existing campaign; to start a fresh "
     "one, remove the old state first with delete_campaign (reset), optionally "
     "after stop_agenda to cancel in-flight jobs. "
@@ -1689,8 +1704,14 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "effect (it never refuses). If you instead want a FIXED-BOX "
             "resolution study, one patch_path cannot express it -- co-vary "
             "`sim.grid.cell_size`, `sim.grid.cell_cnt` (and 3D `cell_depth`) "
-            "plus a CFL-consistent `sim.delta_t_si`/`sim.time_steps`, e.g. with "
-            "`add_agenda_leaf` and one whole spec per leaf. (A `cell_size` patch "
+            "plus a CFL-consistent `sim.delta_t_si`/`sim.time_steps`. For that, "
+            "and for any study whose leaves are all whole specs, omit "
+            "`patch_path` (and `values`, `base_spec`): this creates an EMPTY "
+            "campaign (`empty: true`, no leaves) that you then populate with "
+            "one whole spec per leaf via `add_agenda_leaf(spec_path=...)`. An "
+            "empty campaign reports `complete: false` until a leaf is added, "
+            "and none of its leaves carry a point/label derived from an "
+            "unrelated patch. (A `cell_size` patch "
             "that leaves `cell_depth` stale against `cell_size.z`, an explicit "
             "`grid_dist` that no longer sums to `cell_cnt`, or a "
             "CFL-violating `delta_t_si` is still refused as arithmetically "
@@ -1719,9 +1740,9 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
     )
     async def create_campaign(
         name: str,
-        patch_path: str,
-        values: list[Any],
         *,
+        patch_path: str | None = None,
+        values: list[Any] | None = None,
         base_spec: dict[str, Any] | None = None,
         base_spec_path: str | None = None,
         parameter: str | None = None,
@@ -1770,10 +1791,14 @@ def _register_agenda_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "the next advance_agenda tick can submit it. Used by the agent to "
             "refine a sweep (e.g. add points around an optimum), and as the "
             "escape hatch for studies create_campaign cannot express with a "
-            "single patch_path: build the base campaign, then add one leaf per "
-            "point with its own whole spec, varying as many spec nodes as the "
-            "study needs (e.g. grid cells and time_steps together for a "
-            "fixed-physical-size convergence study). Provide the leaf spec "
+            "single patch_path: create the campaign empty "
+            "(create_campaign(name=...) with no patch_path), then add one leaf "
+            "per point with its own whole spec, varying as many spec nodes as "
+            "the study needs (e.g. grid cells and time_steps together for a "
+            "fixed-physical-size convergence study). A leaf added this way "
+            "records exactly the `point`/`parameter` you pass; it never "
+            "inherits a misleading point from an unrelated patch. Provide the "
+            "leaf spec "
             "exactly one way: inline as `spec`, or by reference as `spec_path` "
             "(a staged JSON spec under the server's spec directory, e.g. the "
             "`spec_path` build_spec(write_to=...) returned), so a large leaf "
