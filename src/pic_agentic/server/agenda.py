@@ -567,6 +567,11 @@ class AgendaService:
         and an actionable message instead of inventing a ranking; when analyses
         are recorded but none carries a recognised score the message says so.
 
+        The leaf sweep *coordinates* are threaded through (as an axis, never a
+        score) so an optimum on the edge of the tested range is not mistaken for
+        a converged interior optimum (beta-7 F2): an improving edge keeps the
+        sweep open and the suggestions extend it on that side.
+
         Args:
             rel_tol: Relative tolerance for the convergence check.
 
@@ -580,7 +585,11 @@ class AgendaService:
             campaign = self.store.load(Campaign)
         except Exception as exc:  # ruff: ignore[blind-except] - a tool must never raise
             return {"ok": False, "error": self.config.redact(str(exc))}
-        result = refine_summary(_analysed_points(campaign), rel_tol=rel_tol)
+        result = refine_summary(
+            _analysed_points(campaign),
+            rel_tol=rel_tol,
+            coordinates=_leaf_coordinates(campaign),
+        )
         response: dict[str, Any] = {"ok": True, **result}
         if result["analysed"] == 0:
             if campaign.analyses:
@@ -1421,6 +1430,27 @@ def _analysed_points(campaign: Campaign) -> dict[str, float | None]:
     for path, _sim in campaign.agenda.simulations():
         points[path] = _leaf_score(campaign.analyses.get(path))
     return points
+
+
+def _leaf_coordinates(campaign: Campaign) -> dict[str, float | None]:
+    """Extract ``leaf path -> swept coordinate`` from a campaign's leaves.
+
+    The sweep ``point`` is an axis position, not a measured score, so it is
+    handed to the refiner as ``coordinates``: enough to tell a rescaled flat
+    interior optimum from an improving edge optimum, without ever ranking on
+    it.  A leaf whose ``point`` is missing or non-numeric maps to ``None`` and
+    is ignored by the refiner.
+
+    Returns:
+        The ``path -> coordinate`` map (``None`` when a leaf has no numeric
+        point).
+
+    """
+    coordinates: dict[str, float | None] = {}
+    for path, sim in campaign.agenda.simulations():
+        value = next(iter(sim.point.values()), None) if sim.point else None
+        coordinates[path] = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return coordinates
 
 
 #: Analysis keys holding a scalar objective that refinement can rank.  The

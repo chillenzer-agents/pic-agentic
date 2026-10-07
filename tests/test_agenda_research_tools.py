@@ -145,6 +145,29 @@ async def test_suggest_refinement_ranks_recorded_analyses_not_sweep_values(tmp_p
     assert result["best"] == {"label": "leaf000", "value": pytest.approx(0.31)}
 
 
+async def test_suggest_refinement_does_not_converge_on_a_boundary_optimum(tmp_path: Path) -> None:
+    """F2 (beta-7) regression: the focal scan's best sits on the range minimum.
+
+    ``values=[4.0e-5, 4.6e-5, 5.2e-5]`` with the descending beta-7 scores make
+    ``leaf000`` (the range minimum) the best while still improving toward it.
+    The old code reported ``converged: true`` and ``suggestions: []``; the
+    server must thread the leaf coordinates through so the edge optimum keeps
+    the sweep open and proposes points *below* 4.0e-5.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=_sweep_file(tmp_path, [4.0e-5, 4.6e-5, 5.2e-5]))
+    scores = {"leaf000": 66715949903.0, "leaf001": 65595828126.0, "leaf002": 64137641778.0}
+    for path, score in scores.items():
+        assert await _call(config, "record_agenda_analysis", {"path": path, "analysis": {"score": score}}) == {
+            "ok": True,
+            "path": path,
+        }
+    result = await _call(config, "suggest_agenda_refinement", {"rel_tol": 0.05})
+    assert result["best"] == {"label": "leaf000", "value": pytest.approx(66715949903.0)}
+    assert result["converged"] is False
+    assert result["suggestions"]
+    assert all(s["value"] < 4.0e-5 for s in result["suggestions"])
+
+
 async def test_suggest_refinement_distinguishes_unscored_recorded_analyses(tmp_path: Path) -> None:
     """Beta-4 end state: analyses recorded, but none carries a ranked score.
 
