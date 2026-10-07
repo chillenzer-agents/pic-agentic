@@ -344,6 +344,13 @@ nodes do not follow:
 - finer `dx` also needs a CFL-consistent `delta_t_si` and step count — changing
   only the grid fails the compile with the Yee solver's CFL `static_assert`
   (`fields/MaxwellSolver/Yee/Yee.hpp`);
+- a super cell smaller than the pin's default `picongpu_super_cell_size`
+  (`(8, 8, 4)` in 3D, `(16, 16)` in 2D, `picmi/grid.py`) is not a free
+  performance knob: the default particle shape's stencil needs that much guard
+  margin, and a smaller choice such as `(2, 2, 2)` fails the build with the
+  Esirkepov `supercell or number of guard supercells is too small for stencil`
+  `static_assert`
+  (`fields/currentDeposition/Esirkepov/Esirkepov.hpp`);
 - a laser's Huygens surface must sit **outside** the 12-cell default PML absorber
   (`include/picongpu/param/fieldAbsorber.param`, `THICKNESS = 12`). The
   `GaussianLaser` default (16 cells) is right; an 8-cell placement segfaults at
@@ -392,6 +399,29 @@ escaped wire budget as any `submit_spec` applies and an over-cap leaf is refused
 at add time with `spec_exceeds_inline_limit`. Staging avoids re-typing, not the
 wire cap. `point`/`parameter` record the assignment and its human-readable
 label, as for a `create_campaign` leaf.
+
+### Distributing a run over several GPUs (F6)
+
+A run that exceeds one GPU's memory can be spread over several by setting the
+grid's `picongpu_n_gpus` (the pin maps it to `pypicongpu.Runner`'s `n_gpus`, and
+the template renders it into the batch script's `TBG_devices_{x,y,z}`):
+
+- a bare positive int `N` means `N` GPUs along **y**, i.e. `(1, N, 1)`, and a
+  `[N]` list is the same; a per-axis sequence such as `(1, 4, 1)` is taken
+  literally (`picmi/grid.py` `_normalise_n_gpus`);
+- every axis's `cell_cnt` must be divisible by `n_gpus[axis] * super_cell_size[axis]`
+  (the default super cell is `(8, 8, 4)` in 3D, `(16, 16)` in 2D), or the grid
+  is rejected;
+- each GPU is one MPI rank, and the pinned `rosi-hzdr/gpu-v100.tpl` template
+  hosts `TBG_numHostedGPUPerNode=4`, so the job requests
+  `ceil(total_GPUs / 4)` nodes with `--gres=gpu:` up to 4 per node.
+
+The partition's **node ceiling is not knowable from the spec**: a decomposition
+requesting more nodes than the partition allows does not fail, it stays
+`PENDING` with the Slurm reason `PartitionNodeLimit` (visible via `squeue`,
+which the beta-7 agent only learned from hand-pasted output — that observability
+gap is F3). Choose a decomposition that fits the target partition; when in
+doubt, request fewer nodes and verify the run starts.
 
 ### Campaign sweeps are self-describing
 
