@@ -734,6 +734,8 @@ async def test_create_empty_campaign_is_not_complete_and_takes_whole_spec_leaves
     tick = await _call(config, "advance_agenda", {})
     assert tick["empty"] is True
     assert tick["complete"] is False
+    # ``state`` must not contradict the forced ``complete: false``.
+    assert tick["state"] == "running"
     assert tick["submitted"] == []
 
     # Populate with whole-spec leaves that vary as many nodes as they like.

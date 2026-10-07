@@ -485,6 +485,13 @@ class AgendaService:
         if empty:
             result["empty"] = True
             result["complete"] = False
+            # A tick result sets ``state: "complete"`` for the structurally
+            # complete (leafless) campaign; keep it consistent with the forced
+            # ``complete: false`` by restoring the stored lifecycle state.
+            # ``agenda_status`` already reports the stored lifecycle state, so
+            # only the tick result carries the ``lifecycle`` key.
+            if "lifecycle" in result:
+                result["state"] = result["lifecycle"]
         return result
 
     def _campaign_has_no_leaves(self) -> bool:
