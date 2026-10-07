@@ -25,11 +25,19 @@ SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 STATE_RE = re.compile(r"JobState=(\w+)")
 
 #: ``sacct --parsable2`` accounting columns (fixed ``--format`` order):
-#: ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot``.
+#: ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES``.
 _MIN_ACCOUNTING_FIELDS = 3
 _COL_ELAPSED_RAW = 1
 _COL_ALLOC_CPUS = 2
-_COL_TRES = 3
+_COL_TRES_USAGE = 3
+_COL_TRES_ALLOC = 4
+
+#: TRES columns consulted for the GPU count, most authoritative first.  On this
+#: site ``TRESUsageInTot`` is empty for completed jobs, so the *allocation*
+#: (``AllocTRES``) is the fallback that keeps ``gpu_hours`` from reading 0 for
+#: every GPU job (F5).  ``AllocTRES`` describes the reserved GPUs, which for a
+#: GPU job equals the count whose wall-clock accrues GPU-hours.
+_GPU_TRES_COLUMNS = (_COL_TRES_USAGE, _COL_TRES_ALLOC)
 
 #: Signals the client will deliver.  A fixed set, so a wire string can never be
 #: interpolated into ``scontrol``/``scancel``.  ``TERM``/``ALRM`` are the M3
@@ -84,12 +92,14 @@ class JobAccounting(BaseModel):
 def parse_accounting(output: str) -> dict[int, JobAccounting]:
     """Parse ``sacct --parsable2`` output into per-job actual usage.
 
-    The expected columns are ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot`` (or a
-    ``--format`` subset in the same order); ``ElapsedRaw`` is seconds and
-    ``AllocCPUS`` is the allocated CPU count, so
-    ``core_hours = ElapsedRaw * AllocCPUS / 3600``.  A ``gres/gpu=N`` in the TRES
-    usage contributes ``gpu_hours = elapsed_hours * N``.  A malformed row is
-    skipped, never raised.
+    The expected columns are ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|
+    AllocTRES`` (or a ``--format`` subset in the same order); ``ElapsedRaw`` is
+    seconds and ``AllocCPUS`` is the allocated CPU count, so
+    ``core_hours = ElapsedRaw * AllocCPUS / 3600``.  The GPU count is read from
+    the first TRES column that carries a ``gres/gpu=N`` -- ``TRESUsageInTot``
+    first, then ``AllocTRES`` -- and contributes
+    ``gpu_hours = elapsed_hours * N``.  A malformed row is skipped, never raised;
+    a genuinely GPU-less job keeps ``gpu_hours == 0.0``.
 
     Args:
         output: The raw ``sacct --parsable2`` stdout.
@@ -103,7 +113,7 @@ def parse_accounting(output: str) -> dict[int, JobAccounting]:
     if not lines:
         return accounting
     # Column positions in the fixed ``--format=JobID,ElapsedRaw,AllocCPUS,
-    # TRESUsageInTot`` order; ``|`` is the ``--parsable2`` delimiter.
+    # TRESUsageInTot,AllocTRES`` order; ``|`` is the ``--parsable2`` delimiter.
     for line in lines[1:]:  # the first line is the header
         fields = [field.strip() for field in line.split("|")]
         if len(fields) < _MIN_ACCOUNTING_FIELDS:
@@ -115,8 +125,14 @@ def parse_accounting(output: str) -> dict[int, JobAccounting]:
         elapsed_raw = _int_or_none(fields[_COL_ELAPSED_RAW])
         alloc_cpus = _int_or_none(fields[_COL_ALLOC_CPUS])
         elapsed_hours = (elapsed_raw or 0) / 3600.0
-        tres = fields[_COL_TRES] if len(fields) > _COL_TRES else ""
-        gpu_count = _gpu_count(tres)
+        # TRESUsageInTot is empty on this site, so fall back to AllocTRES; both
+        # carry the same ``gres/gpu=N`` shape.
+        gpu_count = 0
+        for column in _GPU_TRES_COLUMNS:
+            if len(fields) > column:
+                gpu_count = _gpu_count(fields[column])
+                if gpu_count:
+                    break
         accounting[job_id] = JobAccounting(
             job_id=job_id,
             core_hours=elapsed_hours * (alloc_cpus or 0),
@@ -314,7 +330,7 @@ class SlurmClient:
             str(job_id),
             "--parsable2",
             "--noheader",
-            "--format=JobID,ElapsedRaw,AllocCPUS,TRESUsageInTot",
+            "--format=JobID,ElapsedRaw,AllocCPUS,TRESUsageInTot,AllocTRES",
         ]
         try:
             rc, stdout, _stderr = await self._run(argv)
@@ -323,7 +339,7 @@ class SlurmClient:
         if rc != 0:
             return None
         # --noheader is requested, but accept a header line too (older sacct).
-        rows = parse_accounting("JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot\n" + stdout)
+        rows = parse_accounting("JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES\n" + stdout)
         return rows.get(job_id)
 
     async def wait_for_job(self, job_id: int, *, timeout_s: float, interval_s: float = 5.0) -> JobInfo:
