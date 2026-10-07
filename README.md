@@ -464,6 +464,26 @@ results stay reachable). Treat those entries as the recorded history of runs
 that actually happened; use `list_simulations(active_only=true)` to hide
 terminal history when you only care about live work.
 
+### A live run survives a server restart
+
+The fleet registry is rebuilt on startup from the signed-room replay, so a run
+that is still building/queued/running keeps its `get_status`/`list_simulations`
+view across an MCP-server restart (and, because the simclient keeps following
+the SLURM job, it continues to receive lifecycle events). The transport
+back-paginates the room via `/messages` until the room's start, because the
+`/sync` window alone returns only the most recent handful of events: stopping at
+the tail would silently drop every run older than that window and make a
+still-RUNNING job read as if it had never been submitted.
+
+If the backfill could not cover the whole history (the safety cap was reached, or
+a pagination request failed), an id the registry does not know is reported as
+`error: "unknown_after_restart"` rather than the plain `"unknown_sim"`. That
+distinction matters: after a restart you cannot tell running/queued/gone apart
+from a bare `unknown_sim`, which is indistinguishable from "never submitted". On
+`unknown_after_restart`, re-check the cluster and the persisted results tree
+before concluding the run is gone; `unknown_sim` still means the id was never
+submitted (or the replay was complete).
+
 ### Build/queue phase, and when a run counts as stalled
 
 A run can spend 15-20 minutes between `accepted` and the SLURM `job_id`: the

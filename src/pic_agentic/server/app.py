@@ -171,6 +171,11 @@ class HelloRuntime:
         # a server restart.
         self.submit_service.set_client_capabilities(self.service.capabilities)
         self.submit_service.ingest_backfill(backfilled)
+        # The transport rebuilt as much of the signed-room history as it could
+        # (the whole timeline, or a partial page after a cap/error); record that
+        # so an unknown sim is reported distinctly when the replay was partial
+        # (F1: a live run must not read as one that never existed).
+        self.submit_service.set_history_complete(complete=getattr(self._transport, "history_complete", True))
         # With a human room configured, one pump loop serves both the signed RCP
         # room and the human chat (they share the sync position); otherwise the
         # plain RCP pump is enough.
@@ -1088,7 +1093,12 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "when its numeric diagnostics are all empty. A status is available "
             "for any simulation the signed room records, including runs whose "
             "campaign was since deleted with delete_campaign; such a run is "
-            "history, not live campaign state. `sim_id` is a spec label (shared "
+            "history, not live campaign state. The registry is rebuilt from the "
+            "signed-room replay on restart, so a still-running run keeps its "
+            "status across a server restart; if the replay could not cover the "
+            "whole room, an unknown id is reported as `error: "
+            "unknown_after_restart` (re-check the cluster/results) rather than "
+            "the plain `unknown_sim`. `sim_id` is a spec label (shared "
             "by identical specs and re-runs); `run_id` is this run's identity."
         ),
         annotations=_READ_ONLY,
@@ -1108,7 +1118,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "replay of the signed room), so it is independent of the campaign "
             "file: deleting a campaign with delete_campaign does not remove its "
             "already-run simulations from this list, and their results stay "
-            "reachable. Use active_only=true to hide terminal history."
+            "reachable. Use active_only=true to hide terminal history. The "
+            "registry is a replay of the signed room rebuilt on each server "
+            "restart, so a live run survives a restart; an id absent after an "
+            "incomplete replay is reported as error `unknown_after_restart`."
         ),
         annotations=_READ_ONLY,
     )
@@ -2134,7 +2147,7 @@ async def _status_tool(runtime: HelloRuntime, sim_id: str) -> dict[str, Any]:
     """
     record = runtime.get_sim(sim_id)
     if record is None:
-        return {"sim_id": sim_id, "known": False, "error": "unknown_sim"}
+        return {"sim_id": sim_id, "known": False, "error": runtime.submit_service.unknown_error()}
     projection = _status_dict(record)
     if record.active:
         try:
