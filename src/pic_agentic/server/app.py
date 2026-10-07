@@ -62,6 +62,7 @@ from pic_agentic.server.simulation import (
 from pic_agentic.server.spec_files import read_spec_file, write_spec_file
 from pic_agentic.simclient.safety import UnsafePathError
 from pic_agentic.simulation_build import SimulationBuildError
+from pic_agentic.slurm.client import is_permanent_reason
 from pic_agentic.transport.matrix import MatrixTransport
 
 if TYPE_CHECKING:
@@ -1079,7 +1080,14 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "`phase` is the coarse build-vs-queue-vs-run substate "
             "(building/queued/running/done/failed/cancelled): while `job_id` is "
             "null the run is `building`, which can take 15-20 minutes before the "
-            "SLURM job id appears, so a null `job_id` is not a fault. "
+            "SLURM job id appears, so a null `job_id` is not a fault. While the "
+            "job is queued, `slurm_state`/`slurm_reason` carry the scheduler's "
+            "state and its reason string (the `Reason=` from scontrol): "
+            "`slurm_blocked: true` means the reason is a permanent limit on the "
+            "current request (e.g. `PartitionNodeLimit`, a node/GPU count over "
+            "the partition cap) so the job will never start as submitted -- "
+            "change the allocation and resubmit; a transient reason such as "
+            "`Resources` or `Priority` is left `slurm_blocked: false`. "
             "A failed run also carries `error`, `error_code`, "
             "`failure_summary`, `stage`, `exit_code` and `exit_signal` (e.g. "
             "`error_code: build_failed`, `stage: build` for a compile failure), "
@@ -1102,8 +1110,12 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "List the simulations the server knows about, optionally only the "
             "still-active ones. Each row carries `phase` (building/queued/"
             "running/done/failed/cancelled), so a run with `job_id: null` in the "
-            "`building` phase is visibly mid-build rather than missing. Each row "
-            "also carries `suspect`, the all-zero health "
+            "`building` phase is visibly mid-build rather than missing. A queued "
+            "row also carries `slurm_state`/`slurm_reason` (the scheduler's "
+            "reason string) and `slurm_blocked: true` when that reason is a "
+            "permanent limit on the request (e.g. PartitionNodeLimit) -- such a "
+            "job will never start as submitted and needs a changed allocation. "
+            "Each row also carries `suspect`, the all-zero health "
             "warning for a completed empty run. This is the fleet registry (a "
             "replay of the signed room), so it is independent of the campaign "
             "file: deleting a campaign with delete_campaign does not remove its "
@@ -1120,6 +1132,9 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
                 "run_id": record.cmd_id,
                 "state": record.state,
                 "phase": record.phase,
+                "slurm_state": record.slurm_state,
+                "slurm_reason": record.slurm_reason,
+                "slurm_blocked": record.slurm_blocked,
                 "job_id": record.job_id,
                 "suspect": record.suspect,
                 "last_event_type": record.last_event_type,
@@ -1181,7 +1196,10 @@ def _register_reporting_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "`PIC_AGENTIC_MCP_TIMEOUT_MS`. `last_status.phase` is `building` while the simclient has "
             "not yet reported a scheduler job id (compile/prepare), else "
             "`queued`/`running`/`finalizing` (job done, linking results); no "
-            "state is ever invented. Pass "
+            "state is ever invented. A `last_status` with `slurm_blocked: true` "
+            "carries a permanent scheduler reason (e.g. `PartitionNodeLimit`) and "
+            "the note says so: the job cannot start as submitted, so change the "
+            "allocation and resubmit rather than waiting again. Pass "
             "`target_states=[...]` (any of accepted, simulation.submitted, "
             "workflow.finished, simulation.job_running, simulation.job_finished, "
             "simulation.step_finished, results.ready, simulation.failed, "
@@ -2159,6 +2177,8 @@ def _status_dict(record: SimRecord) -> dict[str, Any]:
         "state": record.state,
         "phase": record.phase,
         "slurm_state": record.slurm_state,
+        "slurm_reason": record.slurm_reason,
+        "slurm_blocked": record.slurm_blocked,
         "job_id": record.job_id,
         "step": record.step,
         "percent": record.percent,
@@ -2189,6 +2209,7 @@ def _merge_status(projection: dict[str, Any], live: dict[str, Any]) -> None:
     for field in (
         "state",
         "slurm_state",
+        "slurm_reason",
         "job_id",
         "step",
         "percent",
@@ -2204,6 +2225,8 @@ def _merge_status(projection: dict[str, Any], live: dict[str, Any]) -> None:
     # ``phase`` is derived from the (possibly updated) state/job_id, so it must
     # be recomputed after the overlay rather than merged as a raw field.
     projection["phase"] = simulation_phase(str(projection.get("state", "")), projection.get("job_id"))
+    # ``slurm_blocked`` is likewise derived, from the (possibly updated) reason.
+    projection["slurm_blocked"] = is_permanent_reason(projection.get("slurm_reason"))
 
 
 def _empty_events_note(record: SimRecord | None, *, filtered: bool) -> str:

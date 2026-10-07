@@ -52,6 +52,7 @@ from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd
 from pic_agentic.server.hello import AckTimeoutError, SendFn
 from pic_agentic.simclient.simulation import SimulationErrorCode
 from pic_agentic.simulation_build import BuiltSimulation, SimulationBuildError, build_runner_dump
+from pic_agentic.slurm.client import is_permanent_reason
 from pic_agentic.version import local_provenance
 
 log = logging.getLogger(__name__)
@@ -62,6 +63,21 @@ RunnerDumpBuilder = Callable[..., Awaitable[BuiltSimulation]]
 #: Registry states after which no further lifecycle event is expected.
 TERMINAL_STATES = frozenset(
     {
+        SimulationState.RESULTS_READY.value,
+        SimulationState.FAILED.value,
+        SimulationState.JOB_FAILED.value,
+        SimulationState.CANCELLED.value,
+    },
+)
+
+#: States at or after which the scheduler queue wait is over, so a carried
+#: pending reason is stale and must be dropped from the record (F3).
+_RUNNING_OR_LATER_STATES = frozenset(
+    {
+        SimulationState.JOB_RUNNING.value,
+        SimulationState.STEP_FINISHED.value,
+        SimulationState.CHECKPOINT.value,
+        SimulationState.JOB_FINISHED.value,
         SimulationState.RESULTS_READY.value,
         SimulationState.FAILED.value,
         SimulationState.JOB_FAILED.value,
@@ -123,6 +139,7 @@ _PULL_ACK_FOR_REQUEST: dict[SimulationType, SimulationType] = {
 _RECORD_FIELDS = (
     "job_id",
     "slurm_state",
+    "slurm_reason",
     "step",
     "percent",
     "walltime",
@@ -159,6 +176,10 @@ class SimRecord(BaseModel):
     job_id: int | None = None
     state: str = ""
     slurm_state: str | None = None
+    #: Scheduler ``Reason=`` for the latest observed SLURM state (F3): why a
+    #: pending job is not running (e.g. ``PartitionNodeLimit``), so a job that
+    #: can never schedule is distinguishable from one waiting its turn.
+    slurm_reason: str | None = None
     step: int | None = None
     percent: int | None = None
     walltime: str | None = None
@@ -185,6 +206,22 @@ class SimRecord(BaseModel):
     last_event_type: str | None = None
     last_event_ts: str | None = None
     active: bool = True
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def slurm_blocked(self) -> bool:
+        """Whether the scheduler reason means the job can never run as requested.
+
+        A ``PENDING`` job whose ``slurm_reason`` is a permanent limit (e.g.
+        ``PartitionNodeLimit``) will never start without a changed request, so
+        callers must not wait on it (F3).  A transient reason (``Resources``,
+        ``Priority``) is not flagged.
+
+        Returns:
+            True when :attr:`slurm_reason` is a curated permanent reason.
+
+        """
+        return is_permanent_reason(self.slurm_reason)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -704,6 +741,12 @@ class SubmitService:
         # hold a contradictory value).
         if state != SimulationState.RESULTS_READY.value:
             record.suspect = None
+        # The pending reason is scoped to the queue wait: once the job is
+        # running (or finished) a transient reason like ``Resources`` is stale
+        # and must not linger and read as a live block (F3).  A permanent reason
+        # is emitted only for a ``PENDING`` state the job never leaves.
+        if state in _RUNNING_OR_LATER_STATES:
+            record.slurm_reason = None
         record.state = state
         record.last_event_type = state or record.last_event_type
         record.last_event_ts = message.ts
@@ -1567,6 +1610,8 @@ def _record_status(record: SimRecord) -> dict[str, Any]:
         "state": record.state,
         "job_id": record.job_id,
         "slurm_state": record.slurm_state,
+        "slurm_reason": record.slurm_reason,
+        "slurm_blocked": record.slurm_blocked,
         "step": record.step,
         "percent": record.percent,
         "eta_s": record.eta_s,
@@ -1655,6 +1700,28 @@ def _wait_note(
             "still in the build/queue phase (no scheduler job id yet; a PIConGPU "
             "compile can take 15-20 min); call wait_for_simulation again to keep waiting"
         )
+    if record.slurm_blocked:
+        # A permanent scheduler reason means waiting again can never help: the
+        # request itself must change (F3).
+        return (
+            f"the scheduler reports {record.slurm_reason!r} for this job, a permanent "
+            "limit on the current request; it cannot start as submitted, so change the "
+            "allocation (e.g. fewer nodes/GPUs) and resubmit rather than waiting again"
+        )
+    return _timeout_wait_note(record, terminal_only=terminal_only)
+
+
+def _timeout_wait_note(record: SimRecord, *, terminal_only: bool) -> str:
+    """Phrase the generic "still not terminal" timeout note.
+
+    Args:
+        record: The latest-run record (job id already known).
+        terminal_only: Whether the caller waited only for terminal states.
+
+    Returns:
+        The note.
+
+    """
     if not terminal_only:
         return "the requested state was not reached before the deadline; call again to keep waiting"
     return (

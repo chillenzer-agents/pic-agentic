@@ -348,6 +348,109 @@ def test_status_dict_surfaces_failure_fields() -> None:
     assert status["exit_signal"] == "SIGSEGV"
 
 
+def test_status_dict_surfaces_the_pending_reason() -> None:
+    """F3: a blocked pending job reports its scheduler reason and a flag.
+
+    ``slurm_state: PENDING`` alone cannot tell a doomed job from one waiting its
+    turn, so ``get_status``/``list_simulations`` also expose ``slurm_reason``
+    and the derived ``slurm_blocked``.
+    """
+    from pic_agentic.server.app import _status_dict
+    from pic_agentic.server.simulation import SimRecord
+
+    record = SimRecord(
+        sim_id=SIM_ID,
+        cmd_id="c1",
+        state=SimulationState.SUBMITTED.value,
+        job_id=JOB_ID,
+        slurm_state="PENDING",
+        slurm_reason="PartitionNodeLimit",
+    )
+    status = _status_dict(record)
+    assert status["slurm_state"] == "PENDING"
+    assert status["slurm_reason"] == "PartitionNodeLimit"
+    assert status["slurm_blocked"] is True
+
+
+def test_status_dict_does_not_flag_a_transient_reason() -> None:
+    """A ``Resources`` wait is not a permanent block (F3 must not cry wolf)."""
+    from pic_agentic.server.app import _status_dict
+    from pic_agentic.server.simulation import SimRecord
+
+    record = SimRecord(
+        sim_id=SIM_ID,
+        cmd_id="c1",
+        state=SimulationState.SUBMITTED.value,
+        job_id=JOB_ID,
+        slurm_state="PENDING",
+        slurm_reason="Resources",
+    )
+    status = _status_dict(record)
+    assert status["slurm_reason"] == "Resources"
+    assert status["slurm_blocked"] is False
+
+
+def test_merge_status_recomputes_blocked_from_live_reason() -> None:
+    """A live ack changing the reason must update the derived ``slurm_blocked``."""
+    from pic_agentic.server.app import _merge_status
+
+    projection = {
+        "state": SimulationState.SUBMITTED.value,
+        "job_id": JOB_ID,
+        "slurm_state": "PENDING",
+        "slurm_reason": "Resources",
+        "slurm_blocked": False,
+    }
+    _merge_status(projection, {"slurm_state": "PENDING", "slurm_reason": "PartitionNodeLimit"})
+    assert projection["slurm_blocked"] is True
+
+
+def test_running_event_clears_a_stale_pending_reason() -> None:
+    """A transient reason must not linger once the job is running (F3)."""
+    service = _service()
+    service.on_message(
+        _event(
+            SimulationState.SUBMITTED,
+            ts="2026-09-25T10:00:01Z",
+            seq=1,
+            job_id=JOB_ID,
+            slurm_state="PENDING",
+            slurm_reason="Resources",
+        ),
+    )
+    assert service.get(SIM_ID).slurm_reason == "Resources"
+    service.on_message(_event(SimulationState.JOB_RUNNING, ts="2026-09-25T10:00:02Z", seq=2, job_id=JOB_ID))
+    record = service.get(SIM_ID)
+    assert record.slurm_reason is None
+    assert record.slurm_blocked is False
+
+
+async def test_get_status_projects_the_pending_reason() -> None:
+    """F3 end-to-end through the tool: a blocked job is legible from get_status."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    service = runtime.submit_service
+    service.on_message(
+        _event(
+            SimulationState.SUBMITTED,
+            ts="2026-09-25T10:00:01Z",
+            seq=2,
+            job_id=JOB_ID,
+            slurm_state="PENDING",
+            slurm_reason="PartitionNodeLimit",
+        ),
+    )
+    status = (await server.call_tool("get_status", {"sim_id": SIM_ID})).structured_content
+    row = (await server.call_tool("list_simulations", {})).structured_content["simulations"][0]
+    assert status["slurm_reason"] == "PartitionNodeLimit"
+    assert status["slurm_blocked"] is True
+    assert row["slurm_reason"] == "PartitionNodeLimit"
+    assert row["slurm_blocked"] is True
+
+
 def test_merge_status_keeps_projection_progress_the_ack_omits() -> None:
     """A live ack that omits a progress field must not erase the projection."""
     from pic_agentic.server.app import _merge_status

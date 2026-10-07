@@ -498,6 +498,32 @@ phase is computed with `simulation_phase` in
 `src/pic_agentic/protocol/simulation.py`; it is a pure projection of the
 existing event stream and adds no wire message.
 
+### Why a pending job is not running
+
+`slurm_state` alone cannot distinguish a job waiting its turn from one that can
+never start. The scheduler's own explanation — the `Reason=` field of
+`scontrol show job` — is therefore surfaced as `slurm_reason` on
+`get_status`/`list_simulations` (and on the wait's `last_status`). The derived
+`slurm_blocked` flag is `true` only for a curated set of *permanent* reasons
+(`PartitionNodeLimit`, `PartitionTimeLimit`, `PartitionConfig`, `MaxNodes`
+in `src/pic_agentic/slurm/client.py`): such a job cannot start as submitted, so
+`wait_for_simulation` says so in its note and `fleet_status` raises a `blocked`
+alert. Transient reasons (`Resources`, `Priority`, `QOSMax…`) stay
+`slurm_blocked: false` and are never reported as permanent. The simclient
+pushes a changed pending reason once, on the coarse poll cadence.
+
+### Recorded resource usage
+
+When a job reaches a terminal state, the simclient asks `sacct` for its actual
+resource usage and stamps `core_hours`/`gpu_hours` onto the terminal event (and
+the registry record). Both are computed from the same accounting row as
+`elapsed_hours × count`: `core_hours` from `AllocCPUS`, `gpu_hours` from the
+allocated GPU count. On this site `TRESUsageInTot` is empty for finished jobs,
+so the GPU count falls back to `AllocTRES` (`gres/gpu=N`); without that fallback
+every GPU job reported `gpu_hours: 0.0` while `core_hours` accrued. A genuinely
+GPU-less job keeps `gpu_hours: 0.0`. The accounting query is best-effort: a
+missing `sacct` or a malformed row is skipped, never raised.
+
 ### Build vs. run failure classification
 
 A failure inside the CWL workflow is classified by the step that failed. The
@@ -599,6 +625,10 @@ transport need not be started -- a wait only reads the registry.
   `job_id` (the compile/prepare window), else `queued`/`running`/`finalizing`.
   No lifecycle state is ever invented; a timeout during the build phase says so
   explicitly.
+- A `last_status` with `slurm_blocked: true` means the scheduler gave a
+  permanent reason (e.g. `PartitionNodeLimit`) and the note says so; repeating
+  the wait cannot help because the job cannot start as submitted — change the
+  allocation and resubmit.
 
 A single MCP tool call cannot hold the connection indefinitely, so the wait is
 bounded by `timeout_s` **and** by the MCP client's request timeout. The shipped

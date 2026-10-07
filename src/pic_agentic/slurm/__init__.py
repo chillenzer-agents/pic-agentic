@@ -10,12 +10,23 @@ charset or an absolute path to a server-controlled file (design section 6.4).
 """
 
 from pic_agentic.slurm.client import (
+    PERMANENT_REASONS,
     JobAccounting,
     JobInfo,
     SlurmClient,
     SlurmError,
     SlurmJobState,
+    is_permanent_reason,
     parse_accounting,
 )
 
-__all__ = ["JobAccounting", "JobInfo", "SlurmClient", "SlurmError", "SlurmJobState", "parse_accounting"]
+__all__ = [
+    "PERMANENT_REASONS",
+    "JobAccounting",
+    "JobInfo",
+    "SlurmClient",
+    "SlurmError",
+    "SlurmJobState",
+    "is_permanent_reason",
+    "parse_accounting",
+]
