@@ -99,6 +99,17 @@ def test_instructions_warn_about_the_super_cell_stencil_constraint() -> None:
     assert "too small for stencil" in SERVER_INSTRUCTIONS
 
 
+def test_instructions_explain_multi_gpu_distribution() -> None:
+    # F6 / beta-7: the task asked to spread a run over several GPUs to beat a
+    # single-GPU memory limit; the seeded instructions must name the mechanism
+    # (picongpu_n_gpus), the per-node GPU count, and that the partition's node
+    # ceiling is not knowable from the spec.
+    assert "picongpu_n_gpus" in SERVER_INSTRUCTIONS
+    assert "((1, N, 1))" in SERVER_INSTRUCTIONS
+    assert "4 GPUs per" in SERVER_INSTRUCTIONS
+    assert "PartitionNodeLimit" in SERVER_INSTRUCTIONS
+
+
 def test_instructions_warn_that_the_huygens_surface_must_clear_the_pml() -> None:
     # E1 (3): an 8-cell Huygens placement sits inside the 12-cell PML absorber
     # and segfaults at step 0; the GaussianLaser 16-cell default is right.

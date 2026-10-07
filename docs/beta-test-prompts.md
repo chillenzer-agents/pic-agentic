@@ -38,8 +38,8 @@ and then had to reverse-engineer `site-packages`; the pin uses
 `EnergyHistogram`/`FieldEnergyMonitor`. The installed package is authoritative.
 The seeded instructions also carry an inline
 `FieldEnergyMonitor(period=TimeStepSpec[::20, -1])` snippet (the beta-6 agent
-reverse-engineered that inclusive slice syntax from source), and three
-warnings a Runner-spec study needs: the spec is a *rendered snapshot* with
+reverse-engineered that inclusive slice syntax from source), and the
+constraints a Runner-spec / multi-GPU study needs: the spec is a *rendered snapshot* with
 denormalized fields, so patching only `sim.grid.cell_cnt` (or only `cell_size`)
 is a box-size, not a resolution, change — and box-size sweeps are allowed; a
 fixed-box resolution sweep must instead co-vary `cell_size`, `cell_cnt` and
@@ -50,8 +50,14 @@ default `picongpu_super_cell_size` (`(8, 8, 4)` in 3D, `(16, 16)` in 2D) fails
 the build with the Esirkepov "supercell or number of guard supercells is too
 small for stencil" `static_assert`, so it is not a free performance knob; and a
 laser's Huygens surface must sit outside the 12-cell default PML absorber (the
-`GaussianLaser` 16-cell default is right; 8 cells segfaults at step 0). Because
-the pin's `TimeStepSpec` is a plain class, not a pydantic model, `model_json_schema()` is
+`GaussianLaser` 16-cell default is right; 8 cells segfaults at step 0). To spread
+one run over several GPUs (e.g. to beat a single-GPU memory limit) the grid
+carries `picongpu_n_gpus` (a bare int `N` means `(1, N, 1)`, or a per-axis
+tuple); each GPU is one MPI rank and the pinned `gpu-v100` template hosts 4 per
+node, so a request over the partition's node ceiling stays `PENDING` with Slurm
+reason `PartitionNodeLimit` rather than failing — the ceiling is not knowable
+from the spec. Because the pin's `TimeStepSpec` is a plain class, not a
+pydantic model, `model_json_schema()` is
 unavailable for `TimeStepSpec`-backed diagnostics; the instructions point at the
 pinned classes under `lib/python/picongpu/picmi/diagnostics/` instead.
 
