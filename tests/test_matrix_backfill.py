@@ -35,9 +35,7 @@ RUN_CMD = "run-4"
 
 
 def _event(state: SimulationState, *, seq: int, ts: str, job_id: int | None = None, **fields: Any) -> RcpMessage:
-    message = build_submit_event(
-        sim=SIM, seq=seq, cmd_id=RUN_CMD, sim_id=SIM_ID, state=state, job_id=job_id, **fields
-    )
+    message = build_submit_event(sim=SIM, seq=seq, cmd_id=RUN_CMD, sim_id=SIM_ID, state=state, job_id=job_id, **fields)
     message.ts = ts
     return message.sign(SECRET)
 
@@ -130,11 +128,7 @@ async def test_backfill_paginates_to_reconstruct_older_runs() -> None:
         ),
     ]
     # The sync window holds only a later, unrelated event (a different run).
-    recent = [
-        _matrix_event(
-            _event(SimulationState.RESULTS_READY, seq=9, ts="2026-10-07T13:00:00Z", job_id=9), "$new1"
-        )
-    ]
+    recent = [_matrix_event(_event(SimulationState.RESULTS_READY, seq=9, ts="2026-10-07T13:00:00Z", job_id=9), "$new1")]
     client = _FakeClient(recent, older, prev_batch="p1")
     transport = _transport(client)
 
@@ -166,9 +160,7 @@ async def test_backfill_marks_incomplete_when_pagination_fails() -> None:
             msg = "boom"
             raise RuntimeError(msg)
 
-    recent = [
-        _matrix_event(_event(SimulationState.JOB_RUNNING, seq=2, ts="2026-10-07T13:00:00Z", job_id=9), "$r1")
-    ]
+    recent = [_matrix_event(_event(SimulationState.JOB_RUNNING, seq=2, ts="2026-10-07T13:00:00Z", job_id=9), "$r1")]
     client = _FailingClient(recent, [], prev_batch="p1")
     transport = _transport(client)
 
@@ -179,9 +171,7 @@ async def test_backfill_marks_incomplete_when_pagination_fails() -> None:
 
 async def test_backfill_without_prev_batch_stays_complete() -> None:
     """An empty/complete room reports a complete history and no paging."""
-    recent = [
-        _matrix_event(_event(SimulationState.JOB_RUNNING, seq=1, ts="2026-10-07T13:00:00Z", job_id=1), "$r1")
-    ]
+    recent = [_matrix_event(_event(SimulationState.JOB_RUNNING, seq=1, ts="2026-10-07T13:00:00Z", job_id=1), "$r1")]
     client = _FakeClient(recent, [], prev_batch=None)
     transport = _transport(client)
     backfilled = await transport.backfill()
