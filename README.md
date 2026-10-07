@@ -529,6 +529,15 @@ submit, organize) is reported as `run_failed`/`stage: "run"`. A simulation that
 actually runs and crashes is a SLURM job failure, reported separately as
 `simulation.job_failed` with the raw `exit_code`.
 
+A SLURM-side terminal event (a `job_failed`, or a `cancelled`) carries a
+synthesized `error`/`error_code` too, so it reaches the campaign's
+`failure_summary`/`failure_groups` instead of the useless "the failure reason
+was not reported". The reason names the scheduler state and, when the job died
+by signal, the signal (e.g. `error: "scheduler reported FAILED (SIGABRT)"`,
+`error_code: "scheduler_failed"`); a user cancel reports
+`error_code: "scheduler_cancelled"`. A partition-side reason (e.g.
+`PartitionNodeLimit`) is surfaced separately by the SLURM observability fields.
+
 Because the raw `error` is a cwltool `permanentFail` dump followed by a
 truncated C++ tail, the failure event also carries a bounded
 `failure_summary` naming the first compiler/CMake error line (and the `make`

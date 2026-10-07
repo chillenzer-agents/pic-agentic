@@ -170,6 +170,66 @@ async def test_failed_job_reports_exit_code(tmp_path) -> None:
     assert failed["exit_code"] == 3
 
 
+async def test_failed_job_reports_a_reason_and_code(tmp_path) -> None:
+    """F4: a scheduler-side failure carries a legible reason, not nothing.
+
+    The transcript's ``res-2.00x`` leaf failed with SIGABRT but the terminal
+    event carried no ``error``/``error_code``, so the campaign could only
+    report "the failure reason was not reported".  The follower synthesizes
+    both from the SLURM state and the signal-encoded exit code.
+    """
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.FAILED, exit_code=134),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    _state, fields = events[-1]
+    assert fields["error"] == "scheduler reported FAILED (SIGABRT)"
+    assert fields["error_code"] == "scheduler_failed"
+
+
+async def test_scheduler_error_fields_survive_the_event_builder(tmp_path) -> None:
+    """The synthesized reason must be a field the RCP event builder carries."""
+    from pic_agentic.protocol.simulation import build_submit_event
+
+    message = build_submit_event(
+        sim="abc12345",
+        seq=1,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_FAILED,
+        job_id=1,
+        error="scheduler reported FAILED (SIGABRT)",
+        error_code="scheduler_failed",
+    )
+    assert message.payload["error"] == "scheduler reported FAILED (SIGABRT)"
+    assert message.payload["error_code"] == "scheduler_failed"
+
+
+async def test_cancelled_job_reports_a_cancel_reason(tmp_path) -> None:
+    """A cancelled job reports why, with a distinct code."""
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.CANCELLED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    _state, fields = events[-1]
+    assert fields["error"] == "the job was cancelled"
+    assert fields["error_code"] == "scheduler_cancelled"
+
+
 async def test_nonzero_exit_on_completed_is_failed(tmp_path) -> None:
     stdout = tmp_path / "stdout"
     stdout.write_text("")
