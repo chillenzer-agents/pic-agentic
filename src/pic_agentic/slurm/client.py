@@ -23,6 +23,38 @@ from pydantic import BaseModel
 SAFE_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
 SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 STATE_RE = re.compile(r"JobState=(\w+)")
+#: ``Reason=<token>`` in ``scontrol show job``; the scheduler's human-readable
+#: pending/terminal explanation (e.g. ``PartitionNodeLimit``).  ``None`` is
+#: Slurm's sentinel for "no reason", not a reason string.
+REASON_RE = re.compile(r"\bReason=(\S+)")
+
+#: Reasons that mean the job can never be scheduled as requested, so a caller
+#: must change the request instead of waiting.  Kept deliberately small and
+#: literal: a transient reason (``Resources``, ``Priority``, ``QOSMax...``) must
+#: never be advertised as permanent.  ``PartitionNodeLimit`` -- the beta-7 case
+#: (a 40/32-node s=8 job exceeding the partition's node cap) -- is definitive.
+PERMANENT_REASONS = frozenset(
+    {
+        "PartitionNodeLimit",
+        "PartitionTimeLimit",
+        "PartitionConfig",
+        "MaxNodes",
+    },
+)
+
+
+def is_permanent_reason(reason: str | None) -> bool:
+    """Return whether a SLURM reason means the request can never schedule.
+
+    Args:
+        reason: The scheduler reason string, or None/``"None"``.
+
+    Returns:
+        True for a reason in :data:`PERMANENT_REASONS`.
+
+    """
+    return reason in PERMANENT_REASONS
+
 
 #: ``sacct --parsable2`` accounting columns (fixed ``--format`` order):
 #: ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES``.
@@ -73,11 +105,23 @@ class SlurmJobState(StrEnum):
 
 
 class JobInfo(BaseModel):
-    """A snapshot of one SLURM job."""
+    """A snapshot of one SLURM job.
+
+    ``reason`` carries the scheduler's explanation (``scontrol``'s
+    ``Reason=...``): for a pending job this is *why* it is not running yet
+    (e.g. ``PartitionNodeLimit``), which the bare state cannot convey.  It is
+    ``None`` when Slurm reports no reason.
+    """
 
     job_id: int
     state: SlurmJobState
     exit_code: int | None = None
+    reason: str | None = None
+
+    @property
+    def permanent(self) -> bool:
+        """Whether :attr:`reason` means the job can never schedule as requested."""
+        return is_permanent_reason(self.reason)
 
 
 class JobAccounting(BaseModel):
@@ -153,6 +197,31 @@ def _int_or_none(text: str) -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+def _parse_reason(output: str) -> str | None:
+    """Extract the ``Reason=`` field from ``scontrol show job`` output.
+
+    Slurm prints ``Reason=None`` when there is no reason (the common case for a
+    running/completed job); that sentinel maps to ``None`` so callers only ever
+    see a genuine reason string.  ``Reason=`` is always the first token of its
+    space-separated value; Slurm pads/truncates it to a fixed width, so the
+    token itself is the reason.
+
+    Args:
+        output: The raw ``scontrol show job`` stdout.
+
+    Returns:
+        The reason string, or None when absent or ``None``.
+
+    """
+    match = REASON_RE.search(output)
+    if not match:
+        return None
+    reason = match.group(1).strip()
+    if not reason or reason == "None":
+        return None
+    return reason
 
 
 def _gpu_count(tres: str) -> int:
@@ -306,7 +375,7 @@ class SlurmClient:
         exit_match = re.search(r"ExitCode=(\d+):(\d+)", stdout)
         if exit_match:
             exit_code = int(exit_match.group(1))
-        return JobInfo(job_id=job_id, state=state, exit_code=exit_code)
+        return JobInfo(job_id=job_id, state=state, exit_code=exit_code, reason=_parse_reason(stdout))
 
     async def job_accounting(self, job_id: int) -> JobAccounting | None:
         """Query ``sacct`` for one finished job's actual resource usage.

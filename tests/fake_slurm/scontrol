@@ -25,11 +25,13 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm"))
 
 
-def parse_entries(lines: list[str]) -> list[tuple[str, int]]:
-    """Group the file's non-empty lines into ``(state, exit_code)`` entries.
+def parse_entries(lines: list[str]) -> list[tuple[str, int, str | None]]:
+    """Group the file's non-empty lines into ``(state, exit_code, reason)``.
 
     A line that is a bare integer belongs to the preceding state line as its
-    exit code; any other line starts a new entry.
+    exit code; any other line starts a new entry.  An entry may carry an
+    optional third token: the SLURM ``Reason=`` string (e.g.
+    ``PENDING 0 PartitionNodeLimit``), which ``scontrol`` reports verbatim.
 
     Args:
         lines: The non-empty lines of the state file.
@@ -38,16 +40,18 @@ def parse_entries(lines: list[str]) -> list[tuple[str, int]]:
         The parsed entries, in file order.
 
     """
-    entries: list[tuple[str, int]] = []
+    entries: list[tuple[str, int, str | None]] = []
     for line in lines:
         token = line.split()
         if not token:
             continue
         if len(token) == 1 and token[0].lstrip("-").isdigit() and entries:
-            state, _ = entries[-1]
-            entries[-1] = (state, int(token[0]))
+            state, _, reason = entries[-1]
+            entries[-1] = (state, int(token[0]), reason)
             continue
-        entries.append((token[0], int(token[1]) if len(token) > 1 else 0))
+        exit_code = int(token[1]) if len(token) > 1 else 0
+        reason = token[2] if len(token) > 2 else None
+        entries.append((token[0], exit_code, reason))
     return entries
 
 
@@ -64,15 +68,24 @@ def main(argv: list[str]) -> int:
     lines = [line for line in state_file.read_text(encoding="utf-8").splitlines() if line.strip()]
     entries = parse_entries(lines)
     if not entries:
-        entries = [("UNKNOWN", 0)]
-    state, exit_code = entries[0]
+        entries = [("UNKNOWN", 0, None)]
+    state, exit_code, reason = entries[0]
     if len(entries) > 1:
-        remainder = "\n".join(f"{name} {code}" if code else name for name, code in entries[1:])
-        state_file.write_text(remainder + "\n", encoding="utf-8")
+
+        def _fmt(entry: tuple[str, int, str | None]) -> str:
+            name, code, entry_reason = entry
+            fields = [name]
+            if code or entry_reason is not None:
+                fields.append(str(code))
+            if entry_reason is not None:
+                fields.append(entry_reason)
+            return " ".join(fields)
+
+        state_file.write_text("\n".join(_fmt(entry) for entry in entries[1:]) + "\n", encoding="utf-8")
     # Mirror real `scontrol show job` layout: one attribute per line,
     # indented, JobId on the first line by itself.
     print(f"JobId={job_id} JobName=wrap")
-    print(f"   JobState={state} Reason=None")
+    print(f"   JobState={state} Reason={reason or 'None'}")
     print(f"   ExitCode={exit_code}:0 RunTime=00:00:01 TimeLimit=01:00:00")
     return 0
 
