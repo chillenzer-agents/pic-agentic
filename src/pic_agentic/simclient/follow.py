@@ -80,6 +80,9 @@ class TrackedSim(BaseModel):
     job_running_emitted: bool = False
     #: Whether a terminal event has been emitted.
     terminal_emitted: bool = False
+    #: Last scheduler reason emitted (F3): a pending job's ``Reason=`` is pushed
+    #: once per change so the registry can surface *why* it is not running.
+    last_slurm_reason: str | None = None
 
 
 def _eta_seconds(percent: int, step: int, avg_per_step_ms: int | None) -> int | None:
@@ -186,6 +189,25 @@ class JobFollower:
                         SimulationState.JOB_RUNNING,
                         job_id=self.tracked.job_id,
                         slurm_state=info.state.value,
+                    )
+                elif (
+                    info.state is SlurmJobState.PENDING
+                    and info.reason is not None
+                    and info.reason != self.tracked.last_slurm_reason
+                ):
+                    # Surface a pending job's scheduler reason (F3).  Without
+                    # this a ``PENDING (PartitionNodeLimit)`` job is
+                    # indistinguishable from one merely waiting its turn.  A
+                    # ``Reason=None`` wait carries no information, so it is not
+                    # emitted; a genuine reason is emitted on change only, so the
+                    # coarse cadence does not spam the room with one identical
+                    # event per tick.
+                    self.tracked.last_slurm_reason = info.reason
+                    await self.emit(
+                        SimulationState.SUBMITTED,
+                        job_id=self.tracked.job_id,
+                        slurm_state=info.state.value,
+                        slurm_reason=info.reason,
                     )
                 await self._tail_progress()
                 if info.state.terminal:
@@ -429,6 +451,7 @@ class JobFollower:
                 state,
                 job_id=self.tracked.job_id,
                 slurm_state=info.state.value,
+                slurm_reason=info.reason,
                 exit_code=info.exit_code,
                 **accounting,
             )
