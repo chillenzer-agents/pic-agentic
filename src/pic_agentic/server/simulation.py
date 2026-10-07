@@ -505,6 +505,36 @@ class SubmitService:
         #: returning waiter removes only its own event and cannot strand a
         #: sibling (M2).
         self._waiters: dict[str, set[asyncio.Event]] = {}
+        #: Whether the signed-room replay that built this registry reconstructed
+        #: the room's *whole* history.  When False, a sim the registry does not
+        #: know may simply be off the replayed page rather than never submitted,
+        #: so an unknown id is reported as ``unknown_after_restart`` instead of a
+        #: bare ``unknown_sim`` (F1).  Set by :meth:`set_history_complete`.
+        self.history_complete = True
+
+    def set_history_complete(self, *, complete: bool) -> None:
+        """Record whether the startup backfill reconstructed the whole history.
+
+        Args:
+            complete: True when the transport replayed the room from its start,
+                False when a page cap/error left the replay partial.
+
+        """
+        self.history_complete = complete
+
+    def unknown_error(self) -> str:
+        """Return the error code for a sim absent from the registry.
+
+        A genuinely never-submitted id is ``unknown_sim``; when the replay that
+        built the registry was incomplete the id may have existed before the
+        restart, so the distinct ``unknown_after_restart`` tells the caller to
+        re-check the cluster/results rather than assume it never existed (F1).
+
+        Returns:
+            ``"unknown_sim"`` or ``"unknown_after_restart"``.
+
+        """
+        return "unknown_sim" if self.history_complete else "unknown_after_restart"
 
     def set_client_capabilities(self, capabilities: ClientCapabilities | None) -> None:
         """Record the client capabilities learned from the ``hello`` handshake.

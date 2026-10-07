@@ -38,6 +38,7 @@ from pic_agentic.parsing.progress import parse_progress_line
 from pic_agentic.protocol.simulation import (
     PROGRESS_EVENT_STEP_PERCENT,
     SimulationState,
+    signal_from_exit_code,
 )
 from pic_agentic.simclient.simulation import find_stdout_path, link_run_results
 from pic_agentic.slurm import SlurmJobState
@@ -453,6 +454,8 @@ class JobFollower:
                 slurm_state=info.state.value,
                 slurm_reason=info.reason,
                 exit_code=info.exit_code,
+                error=_scheduler_failure_reason(state, info),
+                error_code=_scheduler_failure_code(state),
                 **accounting,
             )
 
@@ -475,6 +478,47 @@ class JobFollower:
         if accounting is None:
             return {}
         return {"core_hours": accounting.core_hours, "gpu_hours": accounting.gpu_hours}
+
+
+#: Synthetic failure code for a scheduler-side (run) failure, distinct from the
+#: simclient's build-stage ``build_failed``/``run_failed`` codes; it tells the
+#: campaign the terminal reason is the scheduler's, not a build error.
+SCHEDULER_FAILED_ERROR_CODE = "scheduler_failed"
+
+
+def _scheduler_failure_code(state: SimulationState) -> str:
+    """Return the stable error code for a scheduler-side terminal event.
+
+    Returns:
+        ``scheduler_cancelled`` for a user cancel, else ``scheduler_failed``.
+
+    """
+    return "scheduler_cancelled" if state is SimulationState.CANCELLED else SCHEDULER_FAILED_ERROR_CODE
+
+
+def _scheduler_failure_reason(state: SimulationState, info: JobInfo) -> str:
+    """Build a human-readable reason for a scheduler-side terminal event.
+
+    A SLURM ``job_failed``/``cancelled`` previously carried no ``error`` text,
+    so the campaign could only report "the failure reason was not reported"
+    (F4).  The scheduler already knows the state and the signal-encoded exit
+    code, so synthesize a legible reason from them (the simclient has no richer
+    scheduler reason here; a partition-side reason reaches the engine through a
+    separate observability field).
+
+    Returns:
+        A short reason naming the terminal state and, when it died by signal,
+        the signal (e.g. ``"scheduler reported FAILED (SIGABRT)"``).
+
+    """
+    if state is SimulationState.CANCELLED:
+        return "the job was cancelled"
+    signal = signal_from_exit_code(info.exit_code)
+    if signal is not None:
+        return f"scheduler reported {info.state.value} ({signal})"
+    if info.exit_code is not None:
+        return f"scheduler reported {info.state.value} (exit code {info.exit_code})"
+    return f"scheduler reported {info.state.value}"
 
 
 __all__ = ["JobFollower", "TrackedSim"]

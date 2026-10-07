@@ -67,6 +67,27 @@ async def test_failed_leaf_emits_failed_callback(tmp_path) -> None:
     assert [(c.path, c.kind) for c in result.callbacks] == [("a0", "failed")]
 
 
+async def test_failed_callback_without_error_still_names_the_code(tmp_path) -> None:
+    """F4: a code-bearing failure never reads as a bare 'not reported'.
+
+    The transcript's ``res-2.00x`` leaf failed with no ``error`` text at all;
+    the old fallback hid the machine-readable code behind the literal "the
+    failure reason was not reported".  The digest must name the code it has.
+    """
+    from pic_agentic.agenda.engine import Callback as EngineCallback
+    from pic_agentic.agenda.engine import TickResult, _compact_failures
+
+    result = TickResult(
+        state="running",
+        lifecycle="running",
+        callbacks=[EngineCallback(path="a0", kind="failed", error=None, error_code="scheduler_failed")],
+    )
+    _compact_failures(result)
+    (group,) = result.failure_groups
+    assert group.error_code == "scheduler_failed"
+    assert "scheduler_failed" in group.message
+
+
 async def test_restart_does_not_duplicate_callbacks(tmp_path) -> None:
     store = _store(tmp_path)
     store.save(Campaign(name="c", agenda=_agenda(1)))

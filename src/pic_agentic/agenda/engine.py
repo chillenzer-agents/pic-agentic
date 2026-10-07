@@ -1194,7 +1194,7 @@ def _compact_failures(result: TickResult) -> None:
     for callback in result.callbacks:
         if callback.kind != "failed":
             continue
-        reason = callback.error or "the failure reason was not reported"
+        reason = _failure_reason(callback)
         # ``stage`` is part of the key so two leaves failing with the same
         # code/message at different pipeline stages (e.g. build vs run) stay
         # distinct groups, matching the advertised grouping semantics.
@@ -1209,6 +1209,27 @@ def _compact_failures(result: TickResult) -> None:
             callback.error = _truncate(callback.error)
     result.failure_groups = [groups[key] for key in order]
     result.failure_summary = _failure_summary(result.failure_groups)
+
+
+def _failure_reason(callback: Callback) -> str:
+    """Return the reportable reason for one failed callback.
+
+    Prefer the callback's own ``error`` text.  When it is absent, do not fall
+    back to the bare literal "the failure reason was not reported" -- that hid
+    the one label the caller did have (the machine-readable ``error_code``) and
+    made every unreasoned failure indistinguishable.  Name the code when one is
+    present, and only when neither is available say the reason was not reported
+    (F4).
+
+    Returns:
+        A short human-readable reason.
+
+    """
+    if callback.error:
+        return callback.error
+    if callback.error_code:
+        return f"the failure reason was not reported (error_code={callback.error_code})"
+    return "the failure reason was not reported"
 
 
 def _failure_summary(groups: list[FailureGroup]) -> str | None:

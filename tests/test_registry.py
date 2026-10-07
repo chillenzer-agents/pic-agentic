@@ -415,3 +415,15 @@ def test_submit_command_from_server_is_not_projected() -> None:
     service.on_message(_submit_command())
     assert service.registry == {}
     assert service.event_log == []
+
+
+def test_unknown_error_distinguishes_partial_replay() -> None:
+    """F1: an absent id is ``unknown_sim`` only when the replay was complete."""
+    service = _service()
+    # A full backfill: an absent id was never submitted.
+    assert service.unknown_error() == "unknown_sim"
+    # An incomplete replay: the id may have existed before the restart.
+    service.set_history_complete(complete=False)
+    assert service.unknown_error() == "unknown_after_restart"
+    service.set_history_complete(complete=True)
+    assert service.unknown_error() == "unknown_sim"
