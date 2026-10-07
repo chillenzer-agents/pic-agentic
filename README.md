@@ -406,6 +406,20 @@ display: control characters are collapsed, while printable Unicode (units such
 as `µm`) is kept. Campaigns persisted before the field existed still load and
 advance: it is optional.
 
+### Sweep refinement does not stop on a boundary optimum
+
+`suggest_agenda_refinement` scores each leaf's **recorded analysis** (the sweep
+point is never a score) and reports the best point, whether the sweep has
+converged, and deterministic points to add next. Convergence is not just "the
+top two scores are close": the refiner also knows where the best leaf sits, so a
+flat top whose best point lies on the **edge** of the tested range and still
+improves outward is reported `converged: false`, and the suggestions **extend
+the range on that improving side** rather than bracketing a boundary optimum
+(e.g. a monotone focal scan whose range minimum scores highest). A flat optimum
+in the **interior** of the range, or a flat plateau at the edge with no outward
+slope, is still converged. Leaves without a numeric sweep `point` fall back to
+the score-spacing check, and fewer than two ranked analyses never converge.
+
 ### Campaign callbacks
 
 A durable campaign emits a **callback** each time a leaf reaches a terminal

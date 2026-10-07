@@ -1840,7 +1840,10 @@ def _register_research_tools(server: MCPServer, runtime: HelloRuntime) -> None:
             "`record_agenda_analysis` are ranked; with no analyses it returns "
             "`best: null` and `analysed: 0` (the sweep point is never a score). "
             "Convergence needs at least two ranked analyses, so a single analysis "
-            "reports `converged: false`."
+            "reports `converged: false`. A flat top score whose best leaf sits on "
+            "the *edge* of the tested range and still improves outward is **not** "
+            "converged: the suggestions then extend the range on the improving "
+            "side instead of stopping at a boundary optimum."
         ),
         annotations=_READ_ONLY,
     )
