@@ -614,7 +614,7 @@ async def test_direct_submission_under_a_different_revision_is_not_reused(tmp_pa
     not _HAS_PICONGPU,
     reason="requires the pinned picongpu so its installed provenance can win",
 )
-async def test_direct_submission_carried_revision_yields_to_an_installed_pin(tmp_path) -> None:
+async def test_direct_submission_carried_revision_yields_to_an_installed_pin(tmp_path, monkeypatch) -> None:
     """A carried revision cannot override the installed PIConGPU revision.
 
     ``_spec_provenance`` prefers this install's
@@ -622,12 +622,23 @@ async def test_direct_submission_carried_revision_yields_to_an_installed_pin(tmp
     carried in the spec.  On a host with the pinned PIConGPU both the direct run
     and a leaf carrying ``other-rev`` therefore resolve to the same installed
     revision and *do* reuse; only the installed revision decides.
-    """
-    from pic_agentic.version import local_provenance
 
-    agenda, service, built = _direct_service(tmp_path, picongpu_revision="")
+    The pinned PIConGPU reports its revision from pip's ``vcs_info``, which an
+    editable, non-git install (the test venv) does not record.  The deployment
+    supplies it through ``PIC_AGENTIC_PICONGPU_REVISION`` instead, so pin that
+    env var here to give the test the "installed pin" it asserts on rather than
+    failing on the fixture's editable install.
+    """
+    from pic_agentic.version import local_provenance, picongpu_revision
+
+    monkeypatch.setenv("PIC_AGENTIC_PICONGPU_REVISION", "installed-pin-rev")
+    # ``picongpu_revision`` memoises its answer, so a sibling test that already
+    # resolved the (empty) editable-install revision would otherwise keep it.
+    picongpu_revision.cache_clear()
     installed_revision = local_provenance()["picongpu_revision"]
     assert installed_revision, "a pinned picongpu must report its revision"
+
+    agenda, service, built = _direct_service(tmp_path, picongpu_revision="")
 
     mcp_t, sim_t = MemoryTransport.create_pair()
     responder = _DirectResponder(sim_t)
