@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from pic_agentic.protocol.simulation import (
-    DEFAULT_SUBMIT_SYSTEM,
     MAX_INLINE_PAYLOAD_BYTES,
     PAYLOAD_KEY,
     PayloadTooLargeError,
@@ -200,14 +199,20 @@ def test_command_header_carries_provenance_and_hash() -> None:
     assert set(json.loads(raw)["simulation"]) == {"sim"}
 
 
-def test_params_round_trip_and_default_submit_system() -> None:
+def test_params_round_trip_carries_no_submit_system() -> None:
+    """The submit command is cluster-local policy, never carried on the wire.
+
+    ``rc_params["tbg_submit"]`` is the single source of truth, so the wire
+    params must not include a ``submit_system`` key and ``picongpu_flags`` must
+    not map one to the ``submit`` alias.
+    """
     params = SubmitParams(build_jobs=4)
     command = build_submit_command(sim="s", seq=1, payload=_payload(), params=params)
-    assert command.payload["params"]["submit_system"] == DEFAULT_SUBMIT_SYSTEM
+    assert "submit_system" not in command.payload["params"]
     # picongpu_flags maps the design's build_* names to the aliases the pinned
     # PicBuildFlags/TBGFlags actually accept, and drops unset options (a False
     # build_force is dropped so picongpu keeps its own default).
-    assert params.picongpu_flags() == {"jobs": 4, "submit": DEFAULT_SUBMIT_SYSTEM}
+    assert params.picongpu_flags() == {"jobs": 4}
 
 
 def test_params_maps_every_field_to_its_picongpu_alias() -> None:
@@ -225,7 +230,6 @@ def test_params_maps_every_field_to_its_picongpu_alias() -> None:
         "preset": 3,
         "force": True,
         "cfg": "my.cfg",
-        "submit": "sbatch",
         "o": ["a=1"],
     }
 
