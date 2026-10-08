@@ -169,6 +169,30 @@ PYREV
     die "checkout $SRC ($BRANCH) lacks M3 result handling; set PIC_AGENTIC_BRANCH to the stack head (e.g. agent-onboarding)"
   fi
   log "capability check: simclient handles control + result requests"
+
+  # 4d. Submit-system self-check (F11).  pic-agentic no longer sends a submit
+  #     command on the wire: the pinned runner takes it from
+  #     ``rc_params["tbg_submit"]``, and the simclient refuses a submission
+  #     unless that resolves to the one value it can follow (``sbatch``).
+  #     Python ``rc_params`` does NOT read the shell ``TBG_SUBMIT`` a site
+  #     profile exports -- it reads ``picongpurc.toml`` (via ``PIC_RC``, a
+  #     parent dir, or ``~/.config/picongpu/``).  A clean login node therefore
+  #     has it unset and every submit would be rejected with
+  #     ``submit_system_mismatch``.  Verify up front and fail with the fix
+  #     rather than let the agent discover it on every run.
+  submit_system="$(
+    "$VENV/bin/python" - <<'PYSUB'
+from pic_agentic.simclient.simulation import _detect_submit_system
+print(_detect_submit_system() or "")
+PYSUB
+  )"
+  if [ "$submit_system" != "sbatch" ]; then
+    die "rc_params['tbg_submit'] is ${submit_system:-unset}, but pic-agentic can only follow 'sbatch'.
+       Set it for this login node, e.g.:
+         printf 'tbg_submit = \"sbatch\"\\n' > ~/.config/picongpu/picongpurc.toml   # or point PIC_RC at a site toml
+       (or source your site's PIConGPU profile that writes the matching picongpurc.toml)."
+  fi
+  log "submit-system check: rc_params['tbg_submit']=$submit_system"
 fi
 
 # 5. Interactive MAS device login (once).
