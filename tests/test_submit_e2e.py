@@ -108,6 +108,21 @@ async def _fake_builder(*, script_path, interpreter="", **_kw: object) -> BuiltS
     )
 
 
+def _skip_provenance(monkeypatch) -> None:
+    """Null the client's local provenance so a policy test is not preempted.
+
+    The shared ``fake_runner`` reports ``0.9.0-dev`` while a real pinned
+    PIConGPU reports ``0.9.0-"dev"``; ``prepare_submit`` checks provenance
+    before the submit-system guard, so on a host with the pin a policy test
+    would fail with ``version_mismatch`` first.  Blank local entries skip the
+    comparison.
+    """
+    monkeypatch.setattr(
+        "pic_agentic.simclient.client._local_provenance",
+        lambda: {"picongpu_version": "", "picongpu_revision": "", "schema_hash": ""},
+    )
+
+
 def _make_pair(shared_dir, *, builder=_fake_builder):
     mcp_t, sim_t = MemoryTransport.create_pair()
     service = SubmitService(
@@ -394,21 +409,29 @@ async def test_submit_rejected_when_handler_disabled(shared_dir, tmp_path, fake_
     assert ack.payload["state"] == SimulationState.FAILED.value
 
 
-async def test_submit_rejects_non_sbatch_submit_system(shared_dir, tmp_path, fake_runner) -> None:
+async def test_submit_rejects_a_submit_system_on_the_wire(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    """The wire must not carry a submit command at all.
+
+    ``rc_params["tbg_submit"]`` is authoritative, so a command that tries to
+    request one is malformed: ``SubmitParams(extra="forbid")`` rejects the
+    unknown key before any policy check.
+    """
+    _skip_provenance(monkeypatch)
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
     cmd_id, payload, _command = await service.build_payload(script)
-    # A command asking for local bash must be rejected outright.
-    local = build_submit_command(
-        sim=SIM, seq=1, payload=payload, params=SubmitParams(submit_system="bash"), cmd_id=cmd_id
-    ).sign(SECRET)
+    local = build_submit_command(sim=SIM, seq=1, payload=payload, params=SubmitParams(), cmd_id=cmd_id).sign(SECRET)
+    local.payload["params"]["submit_system"] = "bash"
+    local.sign(SECRET)
     ack = await client.handle(local)
     assert ack is not None
-    assert ack.payload["error_code"] == "submit_system_mismatch"
+    assert ack.payload["error_code"] == "payload_invalid"
 
 
-async def test_submit_mismatched_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+async def test_submit_rejects_non_sbatch_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    # The cluster declares how it submits; a non-sbatch value cannot be followed.
+    _skip_provenance(monkeypatch)
     monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: "bash")
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
@@ -419,15 +442,27 @@ async def test_submit_mismatched_local_submit_system(shared_dir, tmp_path, fake_
     assert ack.payload["error_code"] == "submit_system_mismatch"
 
 
-async def test_submit_accepts_when_local_submit_system_unset(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
-    # An unset tbg_submit is fine: the explicit submit=sbatch flag still wins.
+async def test_submit_rejects_unset_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    # An unset tbg_submit means the workflow would default to local bash (no
+    # scheduler job), so it must be rejected rather than silently run.
+    _skip_provenance(monkeypatch)
     monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: None)
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
     _cmd_id, _payload, command = await service.build_payload(script)
-    # sbatch requested, local unset: accepted (we only reject a known
-    # contradiction), so this documents the current policy.
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload["error_code"] == "submit_system_mismatch"
+
+
+async def test_submit_accepts_sbatch_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    _skip_provenance(monkeypatch)
+    monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: "sbatch")
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id, _payload, command = await service.build_payload(script)
     ack = await client.handle(command)
     assert ack is not None
     assert ack.payload.get("error_code") is None
@@ -539,13 +574,14 @@ async def test_replay_of_failed_submission_reports_failure(shared_dir, tmp_path,
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
+    # Force a pre-accept failure with a malformed params payload (the submit
+    # command is not a wire field, so adding one is rejected as payload_invalid).
     _cmd_id, _payload, command = await service.build_payload(script)
-    # Force a pre-accept failure by asking for a non-sbatch system.
     command.payload["params"]["submit_system"] = "bash"
     command.sign(SECRET)
     first = await client.handle(command)
     assert first is not None
-    assert first.payload["error_code"] == "submit_system_mismatch"
+    assert first.payload["error_code"] == "payload_invalid"
     # The replay must report the failure too, not a successful re-ack.
     command.transport_event_id = "$replay"
     second = await client.handle(command)

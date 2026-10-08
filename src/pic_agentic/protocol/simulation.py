@@ -42,7 +42,10 @@ from pic_agentic.version import WIRE_FORMAT_VERSION
 #: The only top-level key a transmitted runner spec may carry.
 ALLOWED_SIMULATION_KEYS = frozenset({"sim"})
 
-#: Default submit command; a payload asking for anything else is rejected.
+#: The submit command pic-agentic can follow (SLURM ``sbatch``).  This is *not*
+#: a wire default: the authoritative submit command is the cluster's
+#: ``rc_params["tbg_submit"]``, which the simclient requires to resolve to this
+#: value before it accepts a submission.
 DEFAULT_SUBMIT_SYSTEM = "sbatch"
 
 #: Cap on the *encoded* event content carried in one Matrix command.  Synapse's
@@ -515,10 +518,13 @@ class SubmitParams(BaseModel):
     The field names mirror the design's tool signature (``build_*``/``cfg_*``);
     :meth:`picongpu_flags` maps them to the aliases the pinned
     ``PicBuildFlags``/``TBGFlags`` models actually accept (``jobs``, ``cmake``,
-    ``preset``, ``force``, ``cfg``, ``submit``).  Passing the field names
-    straight through is silently ignored by pydantic (their validation aliases
-    do not include the ``build_`` prefix; ``populate_by_name`` is off), which
-    would drop ``submit_system`` and run the job locally via ``bash``.
+    ``preset``, ``force``, ``cfg``).  Passing the field names straight through
+    is silently ignored by pydantic (their validation aliases do not include the
+    ``build_`` prefix; ``populate_by_name`` is off), so the mapping is required.
+
+    The submit command is deliberately **not** carried here: it is cluster-local
+    policy, and ``rc_params["tbg_submit"]`` is its single source of truth (the
+    pinned runner itself defaults ``Runner.submit_system`` from it).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -528,10 +534,6 @@ class SubmitParams(BaseModel):
     build_preset: int | None = None
     build_force: bool = False
     cfg_file: str | None = None
-    #: The submit command; the simclient enforces its local ``tbg_submit``
-    #: matches this.  A NON-sbatch value cannot be requested over the wire:
-    #: ``prepare_submit`` rejects anything but ``sbatch`` outright.
-    submit_system: str = DEFAULT_SUBMIT_SYSTEM
     overwrite_vars: list[str] | None = None
 
     @field_validator("cfg_file")
@@ -596,7 +598,6 @@ class SubmitParams(BaseModel):
             "build_cmake": "cmake",
             "build_preset": "preset",
             "cfg_file": "cfg",
-            "submit_system": "submit",
             # The pinned TBGFlags accepts overwrite_vars only under the short
             # ``o`` alias (it has no populate_by_name), so the long name alone
             # would be silently ignored.

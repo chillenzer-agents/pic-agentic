@@ -265,9 +265,13 @@ raw callables; see `M2-SUBMIT-PLAN.md`).
 
 Enable the handler by pointing the cluster simclient at a writable shared
 directory (the `PIC_AGENTIC_SIM_SETUP_ROOT` environment variable; see
-`scripts/cluster_simclient.sh`). Cluster-local `rc_params` are never
-transmitted; the simclient asserts its local `tbg_submit` is `"sbatch"` so the
-workflow's local-`bash` default cannot silently submit a non-SLURM job.
+`scripts/cluster_simclient.sh`). The submit command is cluster-local policy and
+is never transmitted: `rc_params["tbg_submit"]` is its single source of truth
+(the pinned `Runner` itself defaults `submit_system` from it). The simclient
+requires that value to be `"sbatch"` — the only submit it can follow — and
+refuses an unset or non-`sbatch` `tbg_submit` rather than overriding it, since
+the workflow's own default for an unset value is a local `bash` run with no
+scheduler job to track.
 
 To exercise it against the cluster, after the `--setup`/`--run` connectivity
 check:
