@@ -1039,7 +1039,7 @@ class SimClient:
             job_id=result.get("job_id"),
             run_dir=str(result.get("run_dir", "")),
             stdout_path=result.get("stdout_path"),
-            submit_system=prepared.params.submit_system,
+            submit_system=prepared.submit_system,
         )
 
     async def _start_follower(

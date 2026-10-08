@@ -192,31 +192,37 @@ def _detect_submit_system() -> str | None:
     return str(value) if value else None
 
 
-def _check_submit_system(requested: str) -> None:
-    """Reject a request that would not submit via SLURM ``sbatch``.
+def _check_submit_system() -> str:
+    """Require the cluster's ``tbg_submit`` to name the followable submit.
 
-    The picongpu workflow default is ``"bash"`` (local execution on the
-    submission node, no SLURM job), so the request must itself be ``sbatch``
-    (the wire contract only supports SLURM), and a *configured* cluster-local
-    ``tbg_submit`` must not contradict it.  An unset ``tbg_submit`` is not an
-    error: the explicit ``submit="sbatch"`` flag still overrides the workflow
-    default, so the job lands on SLURM either way.
+    ``rc_params["tbg_submit"]`` is the single source of truth for how the
+    cluster submits a run; the pinned runner itself defaults
+    ``Runner.submit_system`` from it.  pic-agentic must not override it, but it
+    can only follow a SLURM ``sbatch`` submission: the workflow's own default
+    for an unset ``tbg_submit`` is ``"bash"`` (local execution on the submission
+    node, no scheduler job), which leaves nothing to follow and no parseable job
+    id.  A missing or non-``sbatch`` ``tbg_submit`` is therefore rejected with
+    an actionable error rather than silently submitting a job pic-agentic cannot
+    track.
 
-    Args:
-        requested: The submit system the command asked for.
+    Returns:
+        The validated submit command (always :data:`DEFAULT_SUBMIT_SYSTEM`).
 
     Raises:
-        SimulationExecutionError: If the request is not ``sbatch`` or a
-            configured cluster-local setting differs.
+        SimulationExecutionError: If the detected ``tbg_submit`` is not
+            ``sbatch`` (including when it is unset/unavailable).
 
     """
-    if requested != DEFAULT_SUBMIT_SYSTEM:
-        msg = f"only {DEFAULT_SUBMIT_SYSTEM!r} submissions are supported, got {requested!r}"
-        raise SimulationExecutionError(SimulationErrorCode.SUBMIT_SYSTEM_MISMATCH, msg)
     local = _detect_submit_system()
-    if local is not None and local != requested:
-        msg = f"cluster tbg_submit={local!r} but the command requests {requested!r}"
+    if local != DEFAULT_SUBMIT_SYSTEM:
+        detail = "is unset" if local is None else f"is {local!r}"
+        msg = (
+            f"cluster tbg_submit {detail}, but pic-agentic requires "
+            f"{DEFAULT_SUBMIT_SYSTEM!r} to follow the run; set TBG_SUBMIT="
+            f"{DEFAULT_SUBMIT_SYSTEM!r} in the cluster profile"
+        )
         raise SimulationExecutionError(SimulationErrorCode.SUBMIT_SYSTEM_MISMATCH, msg)
+    return DEFAULT_SUBMIT_SYSTEM
 
 
 def runner_from_payload(payload: SimulationPayload, config: SubmitConfig, token: str) -> Any:
@@ -286,6 +292,10 @@ class PreparedSubmit:
     params: SubmitParams
     runner: Any
     config: SubmitConfig
+    #: The cluster's detected submit command (``rc_params["tbg_submit"]``),
+    #: validated by :func:`_check_submit_system` to be the followable SLURM
+    #: submit.  Sourced from the cluster, never from the wire command.
+    submit_system: str = DEFAULT_SUBMIT_SYSTEM
 
 
 def prepare_submit(
@@ -344,13 +354,14 @@ def prepare_submit(
     except ValueError as exc:
         msg = f"invalid submit params: {exc}"
         raise SimulationExecutionError(SimulationErrorCode.PAYLOAD_INVALID, msg) from exc
-    _check_submit_system(submit_params.submit_system)
+    submit_system = _check_submit_system()
 
     return PreparedSubmit(
         payload=payload,
         params=submit_params,
         runner=runner_from_payload(payload, config, token),
         config=config,
+        submit_system=submit_system,
     )
 
 
@@ -1099,7 +1110,7 @@ async def execute_submit(
 
     job_id = job_id_reader(runner.run_dir, prepared.payload)
     if job_id is not None:
-        await emit(SimulationState.SUBMITTED, job_id=job_id, submit_system=prepared.params.submit_system)
+        await emit(SimulationState.SUBMITTED, job_id=job_id, submit_system=prepared.submit_system)
     # A submit system without a scheduler job id (e.g. local ``bash`` execution,
     # or a scheduler whose output has no parseable id) has nothing to report in
     # ``simulation.submitted``; the ``workflow.finished`` event below still fires
