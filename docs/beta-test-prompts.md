@@ -6,12 +6,19 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Beta-test prompts
 
-Two prompts for beta-testing the pic-agentic MCP server with an agent that has
+Three prompts for beta-testing the pic-agentic MCP server with an agent that has
 **not** seen this repository. They are deliberately framed the way a domain
 scientist would phrase a request: the agent gets a goal and the tool surface,
 not a recipe. Setup (cluster, transport, configuration, the pinned PIConGPU
 build) is assumed to be done by a human beforehand; the prompts only exercise
 what the agent can do from the tool surface plus the PIConGPU documentation.
+
+Prompts 1 and 1b test the **same physics question** at two depths: prompt 1 is
+the short baseline (a single coarse scan), prompt 1b is the extended arc a real
+study follows — coarse scan, then fine-grained optimisation around the
+candidate, then a resolution-scaling / convergence check. Use 1 as the quick
+smoke test and 1b when the campaign/refinement/scaling machinery is the thing
+under test.
 
 The server's seeded `instructions` point at the PyPIConGPU documentation
 (`python_package/foundations/defining_simulation`, published on readthedocs)
@@ -100,6 +107,66 @@ reachable because `create_campaign`'s dotted `patch_path` accepts list indices
 (`sim.laser.0....`); without that, the agent has to replace the whole laser list,
 which is a finding rather than a failure.
 
+## Prompt 1b — the full study arc: coarse scan, refinement, resolution scaling
+
+Prompt 1b asks the **same physics question** as prompt 1 but as the three-phase
+study a real campaign follows. It exercises `suggest_agenda_refinement` (the
+edge-optimum fix should make it extend the range rather than declare premature
+convergence), the `add_agenda_leaf` whole-spec escape hatch for the resolution
+sweep, and — optionally — the multi-GPU distribution the instructions now
+document. It is the prompt the latest beta run used; that run completed the
+coarse scan and the refinement but stalled on the multi-GPU resolution scaling,
+so this is the prompt most likely to surface cluster-boundary findings.
+
+> I want to understand how the laser focal position affects electron
+> acceleration in a laser wakefield accelerator, and I want to end up confident
+> in the answer rather than just a rough ranking.
+>
+> Start with a coarse scan over three focal positions around the middle of the
+> simulation box and tell me which one maximises the high-energy tail of the
+> electron energy spectrum. Then take the best candidate from that scan and
+> refine it with a finer sweep around it, so we actually land on the optimum
+> rather than the edge of whatever range we happened to test. Finally, take that
+> optimum and check that the result is converged with respect to the spacetime
+> resolution: run the same setup at a few successively finer resolutions — if a
+> single GPU cannot hold the finest run, spread it over multiple GPUs — and tell
+> me whether the high-energy-tail count has settled.
+>
+> Come back with a clear recommendation and the numbers behind it: the optimum
+> focal position, the trend across the refinement, and the resolution at which
+> the result stops changing appreciably. I don't care about the intermediate
+> bookkeeping — submit the runs, follow them, and give me the conclusion.
+
+What a successful run looks like:
+
+- **Coarse scan.** As prompt 1: a documented LWFA setup turned into a PICMI
+  script, a base spec from `build_spec`, a three-point campaign on the nested
+  focal-position component, followed to completion with recorded analyses.
+- **Refinement.** The agent uses `suggest_agenda_refinement` (or reasons the
+  trend itself) and adds leaves around the best point. If the coarse best sits
+  at the edge of the tested range and the objective is still improving toward
+  it, the helper must **not** report convergence — it should propose extending
+  the range on the improving side. A genuinely interior optimum is the expected
+  outcome (the last run's true optimum was interior to its initial range).
+- **Resolution scaling.** A fixed-physical-box resolution sweep is **not** one
+  `patch_path`: `cell_size`, `cell_cnt` and `cell_depth` must co-vary with a
+  CFL-consistent `delta_t_si` and matching `time_steps`. The intended route is
+  the `add_agenda_leaf` escape hatch over an **empty** campaign
+  (`create_campaign(name=...)` with no `patch_path`), one whole spec per
+  resolution. Spreading the finest runs over several GPUs uses the grid's
+  `picongpu_n_gpus`; a request over the partition's node ceiling stays
+  `PENDING` with a surfaced Slurm reason (`PartitionNodeLimit`) rather than
+  failing outright, and the agent should report that rather than looping.
+- The usable answer: the optimum focal position, the refinement trend, and a
+  resolution at which the tail count has converged within a stated tolerance
+  (with the trend across resolutions that justifies it).
+
+Verification notes for the maintainer: this prompt deliberately walks through
+all three of the cluster-boundary fixes (edge-optimum refinement, scheduler
+reason surfacing, multi-GPU distribution guidance). A run that completes the
+coarse scan and refinement but cannot make progress on the resolution scaling —
+without a clear, actionable reason from the tool surface — is the finding.
+
 ## Prompt 2 — open-ended study with no copy-paste source
 
 Prompt 2 is intentionally a study that appears in the documentation only in
@@ -126,7 +193,7 @@ resolution with its own whole spec (staged by `spec_path` if large). A
 transcript in which the agent abandons the campaign machinery entirely and
 hand-runs submissions is the H5 finding this documents against.
 
-## Checks common to both prompts
+## Checks common to all prompts
 
 - The agent never needs to edit pic-agentic or the PIConGPU sources; it works
   through the MCP tools only.
