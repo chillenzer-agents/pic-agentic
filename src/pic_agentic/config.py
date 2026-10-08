@@ -32,7 +32,6 @@ ENV_MAP = {
     "rcp_secret": "PIC_AGENTIC_RCP_SECRET",
     "message_dir": "PIC_AGENTIC_MESSAGE_DIR",
     "slurm_bin_dir": "PIC_AGENTIC_SLURM_BIN_DIR",
-    "submit_system": "PIC_AGENTIC_SUBMIT_SYSTEM",
     "job_wait_timeout_s": "PIC_AGENTIC_JOB_WAIT_TIMEOUT_S",
     "ack_timeout_s": "PIC_AGENTIC_ACK_TIMEOUT_S",
     "nio_store_dir": "PIC_AGENTIC_NIO_STORE_DIR",
@@ -77,7 +76,6 @@ class Config(BaseModel):
     message_dir: str = ""
     #: Directory holding the ``sbatch``/``scontrol``/``scancel`` executables.
     slurm_bin_dir: str = ""
-    submit_system: str = "sbatch"
     job_wait_timeout_s: float = 60.0
     #: Ack wait; must exceed ``job_wait_timeout_s`` for the M1 hello round trip.
     ack_timeout_s: float = 90.0
