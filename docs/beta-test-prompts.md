@@ -24,7 +24,13 @@ The server's seeded `instructions` point at the PyPIConGPU documentation
 (`python_package/foundations/defining_simulation`, published on readthedocs)
 and at `lib/python/examples/` in the PIConGPU source tree. Prompt 1 relies on
 that pointer; prompt 2 is meant to test whether the agent can compose a new
-study from the documentation without a verbatim snippet to copy.
+study from the documentation without a verbatim snippet to copy. Prompt 3 is
+the largest: it is a two-parameter sensitivity map distilled from the HZDR
+self-truncated-ionization LWFA work (Tiebel, M.Sc. 2024), and it is meant to
+exercise the whole research loop — dispersive laser, a 2-D grid that no single
+`patch_path` can express, per-leaf analysis with a scalar objective, and
+refinement — end to end. It is sized for a coarse grid of short runs, not the
+tens of high-resolution runs the source thesis used.
 
 Caveat for the pointer (picongpu upstream docs issue, not fixed here): the page's
 focal example is empty as written, and not only because it defines no plasma
@@ -184,14 +190,124 @@ no single documentation page to copy: the agent must pick a concrete setup from
 the docs, choose (and justify) an integrated quantity, express the resolution
 sweep, and interpret the result.
 
-This resolution sweep cannot be one `create_campaign` `patch_path`: holding the
-physical box size fixed means the grid cell count **and** `time_steps` must
+This resolution sweep cannot be one `create_campaign` `patch_path`: holding
+the physical box size fixed means the grid cell count **and** `time_steps` must
 co-vary, i.e. two spec nodes. The intended route is the `add_agenda_leaf` escape
 hatch — create the campaign **empty** (`create_campaign(name=...)` with no
 `patch_path`, so no identity patch is invented), then add one leaf per
 resolution with its own whole spec (staged by `spec_path` if large). A
 transcript in which the agent abandons the campaign machinery entirely and
 hand-runs submissions is the H5 finding this documents against.
+
+## Prompt 3 — reproduce an experimental LWFA spectrum by mapping laser chirp × focus
+
+> Our DRACO laser-wakefield shots give electron beams that are never quite as
+> clean as we would like, and I think the laser's chirp and the focus position
+> are the two knobs that actually matter. I have a measured spectrum I'd like to
+> reproduce — the model of it is below. Set up a realistic self-truncated
+> ionization-injection LWFA and map the group-delay dispersion against the focal
+> position over a coarse, defensible grid around the working point. For every
+> grid point, tell me the peak of the energy spectrum, the energy spread and a
+> divergence number, plus a single scalar "closeness to my target" that I can
+> rank. Then give me the map, the best setting, whether that optimum is real or
+> just the edge of what we tried, and where you'd look next. Submit it, follow
+> it to the end, and hand me the provenance — I don't care about the plumbing.
+>
+> ```python
+> import numpy as np
+> # model of my measured spectrum, d^2Q/dE dtheta  (energy x deflection angle)
+> e_peak, e_fwhm = 304.6209160391669, 43.31806325047056   # MeV
+> e_spread = e_fwhm / 2 / np.sqrt(2 * np.log(2))          # sigma_E   [MeV]
+> theta_spread = 1.9166438573524864                       # sigma_theta [mrad]
+> x = np.linspace(100, 500, 500)    # energy [MeV]
+> y = np.linspace(-20, 20, 500)     # deflection angle [mrad]
+> X, Y = np.meshgrid(x, y)
+> objective_hist = 2.0 * np.exp(-0.5 * (((X - e_peak) / e_spread) ** 2 + (Y / theta_spread) ** 2))
+> ```
+
+What a successful run looks like:
+
+- The agent recognises that a chirped pulse needs a **dispersive** laser, not
+  the plain Gaussian: it discovers `picmi.DispersivePulseLaser` (the pinned
+  class carrying `picongpu_gdd_si` / `picongpu_tod_si`; `GaussianLaser` cannot
+  express chirp). This class is **not** named in the seeded instructions or the
+  readthedocs page, so it must read the pinned `picmi.lasers` classes.
+- It builds a realistic base spec from a documented STII/LWFA setup, heavy
+  enough to reach injection and to put a signal in the spectrometer — the
+  `EnergyHistogram` gives the energy projection (peak, FWHM) and a `PhaseSpace`
+  or the `eSpec` binning gives the deflection-angle spread — and stages it with
+  `build_spec(write_to=...)`.
+- Because the study varies **two** spec nodes (the laser's `picongpu_gdd_si`
+  **and** `focus_pos_si`), it cannot be one `create_campaign` `patch_path`. The
+  intended route is the empty campaign plus one **whole-spec leaf per grid
+  point** (`create_campaign(name=...)` with no `patch_path`, then
+  `add_agenda_leaf` with `point={...}`/`parameter=...`, staged by `spec_path` if
+  large).
+- It advances the campaign, follows the leaves (surviving a reconnect), drains
+  the callbacks, and for each leaf reduces the run to the three moments
+  (`E_peak`, `FWHM_E`, `σ_θ`) with the result tools, turns them into a scalar
+  closeness to the target (e.g. a normalised distance, **or** the thesis'
+  bin-wise |sim − target| over the spectrum if the run exposes it), and records
+  it with **`record_agenda_analysis`** under a top-level **`score`** so
+  `suggest_agenda_refinement` can rank it.
+- It calls `suggest_agenda_refinement`, reads `converged`/`best`/the suggested
+  next points, and — if the best point sits on an **edge** of the grid and still
+  improves outward — adds the suggested points as new leaves and runs another
+  round.
+- It concludes with `conclude_agenda` and returns `campaign_provenance` (and,
+  if asked, `export_agenda_cwl`).
+
+The usable answer is a map/table of grid points → (peak energy, energy spread,
+divergence, closeness), the ranked best setting, and an explicit statement of
+whether the optimum is interior or a boundary that needs extending.
+
+### Why this is the hard one (findings it probes)
+
+- **Multi-node sweep.** Two swept nodes force H5's escape hatch at N×M scale
+  (drawing on H5/P2); a transcript that abandons the campaign machinery and
+  hand-runs submissions is the H5 finding this documents against.
+- **Unnamed pinned class.** `DispersivePulseLaser` (with `picongpu_gdd_si`,
+  `picongpu_tod_si`) is absent from the seeded snippet and the online page: the
+  H9 "use the pin, not the docs" discrimination, now for a *construction*
+  choice rather than a diagnostic name.
+- **A 2-D `focus_pos_si` patch would be list-indexed** (`...focus_pos_si.1.
+  component`); as whole-spec leaves each carries its own `point` so the
+  list-index trap is bypassed — a transcript that tries a single patch and
+  fails rather than falling back is a finding.
+- **Ranking direction.** `suggest_agenda_refinement` **maximises** scores, so a
+  distance-to-target objective (the thesis' own |sim − target|, or any "closer
+  is better" measure) must be sign-inverted before it is recorded as `score`; a
+  transcript that records a distance and then reports the worst point as the
+  optimum is the finding.
+- **The target array is not feedable.** The analysis language takes scalar
+  constants only (`run_analysis` expression tree), so a 500×500 target cannot be
+  compared bin-wise inside it; the agent must reduce the target to its moments
+  (`E_peak`, `FWHM_E`, `σ_θ`) and compare scalars, or otherwise justify how it
+  computes the agreement.
+- **Read the generator, not the names.** In the target snippet the amplitude is
+  the literal `2.0` — the `height`/`peak_height` argument is unused — so a
+  faithful reproduction depends on the actual expression, not on the labelled
+  peak height.
+- **Empty-run / `suspect` physics.** Large |GDD| (a long, low-intensity chirped
+  pulse, thesis §5.2.2) and off-centre focus (thesis: an early focus can defocus
+  to no injection) both risk a run that completes but injects nothing. The
+  agent must treat the `suspect` signal as inconclusive physics — not a clean
+  zero-energy "result" — and either rationalise the point or drop it.
+- **Interior vs edge.** The refinement step (beta-7 F2) must not be reported as
+  converged when the best grid point is on the boundary and still trending.
+
+### Sizing
+
+One round is a 2-D grid (≈3×3 to 4×4 short injections; a 4×4 map is the
+intended ceiling) plus a small refinement round; each leaf is a *coarse, short*
+run, not the thesis' production resolution. The target is the averaged,
+simplified experimental spectrometer from the source work (a single Gaussian in
+energy × angle; `E_peak` 304.6 MeV, `FWHM_E` 43.3 MeV, `σ_θ` 1.92 mrad), so
+"reproduce the experiment" is well-defined without the raw shot data. If the pin
+cannot express chirp and focus position in one laser type, or if the objective
+stays ill-posed, that patched-storefront limitation is itself the finding — the
+agent should say so and propose the nearest runnable study rather than silently
+substitute one.
 
 ## Checks common to all prompts
 
