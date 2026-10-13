@@ -1,0 +1,405 @@
+# SPDX-FileCopyrightText: 2026 Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf
+#
+# SPDX-License-Identifier: MIT
+
+"""Integration tests for the secure ``COMPUTE`` result op and the tool."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from pic_agentic import results
+from pic_agentic.protocol.simulation import ResultOp, ResultParams
+
+SIM_ID = "abcd1234"
+
+
+def _var(name: str) -> dict:
+    return {"kind": "var", "name": name}
+
+
+def _spectrum_program() -> dict:
+    return {
+        "output": {
+            "kind": "reduce",
+            "op": "histogram",
+            "bins": 4,
+            "operand": {
+                "kind": "binop",
+                "op": "add",
+                "left": {"kind": "binop", "op": "mul", "left": _var("px"), "right": _var("px")},
+                "right": {"kind": "binop", "op": "mul", "left": _var("py"), "right": _var("py")},
+            },
+        },
+        "selectors": [
+            {"kind": "var", "name": "px", "record": "E", "component": "x"},
+            {"kind": "var", "name": "py", "record": "E", "component": "y"},
+        ],
+    }
+
+
+@pytest.fixture
+def fake_compute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Build a simOutput dir plus a monkeypatched reader returning canned arrays."""
+    run = tmp_path / "run"
+    out = run / "simOutput"
+    out.mkdir(parents=True)
+    (out / "fields.bp").write_bytes(b"x")
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+
+    def fake_load(_path: Path, record: str | None, component: str | None, _iteration: object) -> list[float]:
+        table = {
+            ("E", "x"): [1.0, 2.0, 3.0],
+            ("E", "y"): [4.0, 5.0, 6.0],
+            ("rho", None): [0.0, 1.0],
+        }
+        key = (record or "E", component)
+        if key not in table:
+            msg = f"record {record!r}/{component!r} not found"
+            raise results.ResultsReaderError(msg)
+        return table[key]
+
+    monkeypatch.setattr(results, "_load_dataset", fake_load)
+    return run
+
+
+def test_compute_scalar_vector_and_histogram(fake_compute: Path) -> None:
+    run = fake_compute
+    # A scalar: sum of E.x.
+    scalar = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            record="E",
+            component="x",
+            program={"output": {"kind": "reduce", "op": "sum", "operand": _var("x")}},
+        ),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert scalar["stats"]["value"] == pytest.approx(6.0)
+    assert scalar["result"]["result_kind"] == "scalar"
+
+    # The spectrum-shaped program over the two components.
+    spec = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program()),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert spec["data_encoding"] == "float"
+    assert spec["n_points"] == 4
+    assert spec["result"]["result_kind"] == "array"
+
+
+def test_compute_honours_attrs_on_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """C1 regression: attrs-on-var must resolve the named record/component/iteration.
+
+    The P2 console built ``{"kind": "var", "record": "E", "component": "x",
+    "iteration": 536}`` nodes; ``_typecheck`` used to drop those and resolve the
+    first record/component at the last iteration, giving a plausible wrong value.
+    """
+    run = tmp_path / "run"
+    out = run / "simOutput"
+    out.mkdir(parents=True)
+    (out / "fields.bp").write_bytes(b"x")
+    monkeypatch.setattr(results, "_reader_name", lambda: "openpmd")
+    seen: list[tuple[object, object, object]] = []
+
+    def fake_load(_path: Path, record: str | None, component: str | None, iteration: object) -> list[float]:
+        seen.append((record, component, iteration))
+        table = {("E", "x"): [1.0, 2.0, 3.0], ("E", "y"): [4.0], ("E", "z"): [5.0, 6.0, 7.0]}
+        return table[record, component]
+
+    monkeypatch.setattr(results, "_load_dataset", fake_load)
+
+    def var(name: str, component: str) -> dict:
+        return {"kind": "var", "name": name, "record": "E", "component": component, "iteration": 536}
+
+    program = {
+        "output": {
+            "kind": "reduce",
+            "op": "sum",
+            "operand": {
+                "kind": "binop",
+                "op": "add",
+                "left": {"kind": "binop", "op": "mul", "left": var("Ex", "x"), "right": var("Ex", "x")},
+                "right": {"kind": "binop", "op": "mul", "left": var("Ez", "z"), "right": var("Ez", "z")},
+            },
+        },
+    }
+    result = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=program),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    assert result["stats"]["value"] == pytest.approx(1 + 4 + 9 + 25 + 36 + 49)
+    # Each selector was read with its own attrs, not the first/last defaults.
+    assert ("E", "x", 536) in seen
+    assert ("E", "z", 536) in seen
+
+
+def test_compute_result_carries_a_truthful_unit_note_and_selector_echo(fake_compute: Path) -> None:
+    """L4: the result states the normalized-unit convention and echoes selectors.
+
+    No physical unit is knowable from the raw openPMD components, so the ack
+    must say so explicitly rather than invent one, and name the record/component/
+    iteration each input came from.
+    """
+    spec = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program()),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = spec["result"]
+    assert "normalized" in metadata["unit_note"]
+    assert metadata["result_kind"] == "array"
+    assert metadata["selectors"] == [
+        {"name": "px", "record": "E", "component": "x", "iteration": None},
+        {"name": "py", "record": "E", "component": "y", "iteration": None},
+    ]
+
+
+def test_compute_reports_real_unit_metadata_when_the_file_records_it(
+    fake_compute: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3: openPMD unit metadata is surfaced, not denied.
+
+    The reviewer showed that ``Record_Component.unit_SI`` and
+    ``Mesh.unit_dimension`` *are* reachable; the note must not claim the reader
+    cannot retrieve them.  Here the reader is stubbed to expose them and the ack
+    must echo them per selector and drop the false negative claim.
+    """
+    monkeypatch.setattr(
+        results,
+        "_dataset_unit_info",
+        lambda *_args, **_kwargs: {"unit_SI": 100000.0, "unit_dimension": [1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0]},
+    )
+    spec = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program()),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = spec["result"]
+    assert "unit metadata for the mesh components" not in metadata["unit_note"]
+    assert metadata["selectors"][0]["unit_SI"] == pytest.approx(100000.0)
+    assert metadata["selectors"][0]["unit_dimension"] == [1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0]
+    assert "unit_SI" in metadata["unit_note"]
+
+
+def test_compute_bare_var_without_declared_selectors_is_not_called_unitless(fake_compute: Path) -> None:
+    """A bare ``var`` reads mesh data even when ``selectors`` is omitted."""
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            record="E",
+            component="x",
+            program={"output": {"kind": "reduce", "op": "sum", "operand": _var("x")}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    metadata = result["result"]
+    assert "unitless" not in metadata["unit_note"]
+    assert metadata["selectors"] == [{"name": "x", "record": "E", "component": "x", "iteration": None}]
+
+
+def test_compute_constant_program_unit_note_says_unitless(fake_compute: Path) -> None:
+    """A program that reads no mesh data is unitless, and the note says so."""
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            program={"output": {"kind": "const", "value": 2.0}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    assert result["stats"]["value"] == pytest.approx(2.0)
+    assert "unitless" in result["result"]["unit_note"]
+    assert result["result"]["selectors"] == []
+
+
+def test_compute_requires_a_program(fake_compute: Path) -> None:
+    result = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    assert result["error_code"] == "unsupported"
+
+
+def test_compute_without_reader_is_unavailable(fake_compute: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "_reader_name", lambda: None)
+    result = results.resolve_result(
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program={"output": {"kind": "const", "value": 1.0}}),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    assert result["error_code"] == "reader_unavailable"
+
+
+def test_compute_unknown_record_is_a_clean_error(fake_compute: Path) -> None:
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            program={"output": {"kind": "reduce", "op": "sum", "operand": _var("x")}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    # The raw selector names "x" but the fake table keys require a record;
+    # whatever the failure, it is shaped as data, never raised.
+    assert "error_code" in result
+
+
+def test_compute_oversized_output_is_capped(fake_compute: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(results, "MAX_RESULT_BYTES", 50)
+    result = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            record="E",
+            component="x",
+            program={"output": {"kind": "var", "name": "x"}},
+        ),
+        run_dir=fake_compute,
+        sim_id=SIM_ID,
+    )
+    assert result["error_code"] == "result_too_large"
+
+
+def test_invalid_program_is_rejected_by_the_model() -> None:
+    unsafe = {"output": {"kind": "unop", "op": "exec", "operand": {"kind": "const", "value": 1.0}}}
+    with pytest.raises(ValueError, match=r"validation error|unsafe|Input should"):
+        ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=unsafe)
+
+
+def test_compute_program_round_trips_on_the_wire() -> None:
+    """The program must survive the builder, not just the pydantic model.
+
+    Regression for a live bug: ``build_result_command`` omitted ``program``, so
+    every ``run_analysis``/``COMPUTE`` request reached the simclient with no
+    program and failed with "compute requires a program".
+    """
+    from pic_agentic.protocol.simulation import build_result_command
+
+    params = ResultParams(sim_id=SIM_ID, op=ResultOp.COMPUTE, program=_spectrum_program())
+    command = build_result_command(sim=SIM_ID, seq=1, params=params, cmd_id="c")
+    assert command.payload["program"] == _spectrum_program()
+    # A non-compute op must not carry a program key at all.
+    read = build_result_command(sim=SIM_ID, seq=2, params=ResultParams(sim_id=SIM_ID, op=ResultOp.READ), cmd_id="d")
+    assert "program" not in read.payload
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("openpmd_api") is None,
+    reason="openpmd_api not installed",
+)
+def test_compute_against_a_real_openpmd_series(tmp_path: Path) -> None:
+    """Evaluate a program against a real openPMD series (reader-API guard)."""
+    import numpy as np
+    import openpmd_api as api
+
+    from pic_agentic.analysis_eval import evaluate
+    from pic_agentic.analysis_program import AnalysisProgram
+
+    run = tmp_path / "run"
+    out = run / "simOutput"
+    out.mkdir(parents=True)
+    series = api.Series(str(out / "fields.h5"), api.Access.create)
+    mesh = series.iterations[0].meshes["E"]
+    mesh["x"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [4]))
+    mesh["x"].store_chunk(np.array([3.0, 0.0, 1.0, 0.0]))
+    mesh["y"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [4]))
+    mesh["y"].store_chunk(np.array([4.0, 0.0, 0.0, 0.0]))
+    series.close()
+
+    program = AnalysisProgram.model_validate(
+        {
+            "selectors": [
+                {"kind": "var", "name": "px", "record": "E", "component": "x"},
+                {"kind": "var", "name": "py", "record": "E", "component": "y"},
+            ],
+            "output": {
+                "kind": "reduce",
+                "op": "sum",
+                "operand": {
+                    "kind": "unop",
+                    "op": "sqrt",
+                    "operand": {
+                        "kind": "binop",
+                        "op": "add",
+                        "left": {
+                            "kind": "binop",
+                            "op": "mul",
+                            "left": {"kind": "var", "name": "px"},
+                            "right": {"kind": "var", "name": "px"},
+                        },
+                        "right": {
+                            "kind": "binop",
+                            "op": "mul",
+                            "left": {"kind": "var", "name": "py"},
+                            "right": {"kind": "var", "name": "py"},
+                        },
+                    },
+                },
+            },
+        },
+    )
+
+    def resolve(selector) -> list[float]:
+        return results._load_dataset(out / "fields.h5", selector.record, selector.component, None)
+
+    payload = evaluate(program, resolve)
+    # |(3,4)| + |(0,0)| + |(1,0)| + |(0,0)| = 5 + 0 + 1 + 0 = 6.
+    assert payload["result"] == pytest.approx(6.0)
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("openpmd_api") is None,
+    reason="openpmd_api not installed",
+)
+def test_compute_units_are_read_from_a_real_openpmd_series(tmp_path: Path) -> None:
+    """M3: a real series' ``unit_SI``/``unit_dimension`` are surfaced.
+
+    The reviewer showed the reader *can* reach the unit metadata, so the tool
+    must echo it rather than claim otherwise.  This reproduces the reviewer's
+    real-pin probe through :func:`results._dataset_unit_info` and the full
+    ``run_analysis`` ack.
+    """
+    import numpy as np
+    import openpmd_api as api
+
+    run = tmp_path / "run"
+    out = run / "simOutput"
+    out.mkdir(parents=True)
+    series = api.Series(str(out / "fields.h5"), api.Access.create)
+    mesh = series.iterations[0].meshes["E"]
+    mesh.unit_dimension = np.array([1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0])
+    mesh["x"].reset_dataset(api.Dataset(api.Datatype.DOUBLE, [2]))
+    mesh["x"].store_chunk(np.array([1.0, 2.0]))
+    mesh["x"].unit_SI = 100000.0
+    series.close()
+
+    info = results._dataset_unit_info(out / "fields.h5", "E", "x", None)
+    assert info["unit_SI"] == pytest.approx(100000.0)
+    assert info["unit_dimension"] == [1.0, 1.0, -3.0, -1.0, 0.0, 0.0, 0.0]
+
+    spec = results.resolve_result(
+        ResultParams(
+            sim_id=SIM_ID,
+            op=ResultOp.COMPUTE,
+            record="E",
+            component="x",
+            program={"output": {"kind": "reduce", "op": "sum", "operand": _var("x")}},
+        ),
+        run_dir=run,
+        sim_id=SIM_ID,
+    )
+    metadata = spec["result"]
+    assert metadata["selectors"][0]["unit_SI"] == pytest.approx(100000.0)
+    assert "unit metadata for the mesh components" not in metadata["unit_note"]

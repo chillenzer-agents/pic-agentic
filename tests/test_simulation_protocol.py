@@ -7,13 +7,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
 import pytest
 
 from pic_agentic.protocol.simulation import (
-    DEFAULT_SUBMIT_SYSTEM,
     MAX_INLINE_PAYLOAD_BYTES,
     PAYLOAD_KEY,
     PayloadTooLargeError,
@@ -26,6 +26,7 @@ from pic_agentic.protocol.simulation import (
     build_submit_event,
     payload_wire_bytes,
     provenance_mismatches,
+    simulation_phase,
     simulation_spec_from_runner_dump,
 )
 from pic_agentic.rcp import Kind, SenderRole, canonical_bytes
@@ -33,8 +34,20 @@ from pic_agentic.version import WIRE_FORMAT_VERSION
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pypicongpu_runner.json"
 #: Schema hash of the pinned tree (see pyproject [sim] pin); regenerated when
-#: the pin moves.  Guards against silent picongpu schema drift in CI.
-PINNED_SCHEMA_HASH = "f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9"
+#: the pin moves.  ``test_pinned_schema_hash_matches_the_installed_pin`` asserts
+#: it against the live hash, guarding against silent pypicongpu schema drift.
+PINNED_SCHEMA_HASH = "88fd92131ffdda77dc708e76afbff23c6760ee9520156c87033835e601de330e"
+
+#: Whether the pinned PIConGPU is importable in this interpreter.
+_HAS_PICONGPU = importlib.util.find_spec("picongpu") is not None
+
+
+@pytest.mark.skipif(not _HAS_PICONGPU, reason="needs the pinned pypicongpu schema")
+def test_pinned_schema_hash_matches_the_installed_pin() -> None:
+    """The recorded hash must track the pin, not a past one (drift guard)."""
+    from pic_agentic.version import runner_schema_hash
+
+    assert runner_schema_hash() == PINNED_SCHEMA_HASH
 
 
 def _runner_dump() -> dict:
@@ -44,7 +57,7 @@ def _runner_dump() -> dict:
 def _payload() -> SimulationPayload:
     return SimulationPayload.build(
         picongpu_version="0.9.0-dev",
-        picongpu_revision="91c3ee5fb4c9425b00d4673d9608f4370593cacf",
+        picongpu_revision="122160f6125eccd0606bb8ceb11c815c88ffaf2d",
         schema_hash=PINNED_SCHEMA_HASH,
         runner_dump=_runner_dump(),
     )
@@ -61,6 +74,24 @@ def test_spec_drops_cluster_local_dirs() -> None:
 def test_spec_requires_sim() -> None:
     with pytest.raises(UnsupportedPayloadError):
         simulation_spec_from_runner_dump({"setup_dir": "/x"})
+
+
+def test_simulation_phase_maps_lifecycle_states() -> None:
+    """H4: the phase derivation covers build/queue/run/terminal transitions."""
+    assert simulation_phase(SimulationState.ACCEPTED.value) == "building"
+    assert simulation_phase(SimulationState.WORKFLOW_FINISHED.value) == "building"
+    assert simulation_phase(SimulationState.WORKFLOW_FINISHED.value, 7) == "queued"
+    assert simulation_phase(SimulationState.SUBMITTED.value, 7) == "queued"
+    assert simulation_phase(SimulationState.JOB_RUNNING.value, 7) == "running"
+    assert simulation_phase(SimulationState.STEP_FINISHED.value, 7) == "running"
+    # A checkpoint is non-terminal: the simulation is still running.
+    assert simulation_phase(SimulationState.CHECKPOINT.value, 7) == "running"
+    assert simulation_phase(SimulationState.CHECKPOINT.value) == "running"
+    assert simulation_phase(SimulationState.RESULTS_READY.value, 7) == "done"
+    assert simulation_phase(SimulationState.JOB_FAILED.value, 7) == "failed"
+    assert simulation_phase(SimulationState.CANCELLED.value, 7) == "cancelled"
+    # An empty/unknown state still falls back to the pre-submit window.
+    assert simulation_phase("") == "building"
 
 
 def test_payload_hash_and_sim_id_are_deterministic() -> None:
@@ -133,7 +164,7 @@ def test_provenance_mismatches() -> None:
     payload = _payload()
     local = {
         "picongpu_version": "0.9.0-dev",
-        "picongpu_revision": "91c3ee5fb4c9425b00d4673d9608f4370593cacf",
+        "picongpu_revision": "122160f6125eccd0606bb8ceb11c815c88ffaf2d",
         "schema_hash": PINNED_SCHEMA_HASH,
     }
     assert provenance_mismatches(payload, local) == []
@@ -168,14 +199,20 @@ def test_command_header_carries_provenance_and_hash() -> None:
     assert set(json.loads(raw)["simulation"]) == {"sim"}
 
 
-def test_params_round_trip_and_default_submit_system() -> None:
+def test_params_round_trip_carries_no_submit_system() -> None:
+    """The submit command is cluster-local policy, never carried on the wire.
+
+    ``rc_params["tbg_submit"]`` is the single source of truth, so the wire
+    params must not include a ``submit_system`` key and ``picongpu_flags`` must
+    not map one to the ``submit`` alias.
+    """
     params = SubmitParams(build_jobs=4)
     command = build_submit_command(sim="s", seq=1, payload=_payload(), params=params)
-    assert command.payload["params"]["submit_system"] == DEFAULT_SUBMIT_SYSTEM
+    assert "submit_system" not in command.payload["params"]
     # picongpu_flags maps the design's build_* names to the aliases the pinned
     # PicBuildFlags/TBGFlags actually accept, and drops unset options (a False
     # build_force is dropped so picongpu keeps its own default).
-    assert params.picongpu_flags() == {"jobs": 4, "submit": DEFAULT_SUBMIT_SYSTEM}
+    assert params.picongpu_flags() == {"jobs": 4}
 
 
 def test_params_maps_every_field_to_its_picongpu_alias() -> None:
@@ -193,7 +230,6 @@ def test_params_maps_every_field_to_its_picongpu_alias() -> None:
         "preset": 3,
         "force": True,
         "cfg": "my.cfg",
-        "submit": "sbatch",
         "o": ["a=1"],
     }
 
@@ -358,3 +394,85 @@ def test_ack_and_event_shape() -> None:
     event = build_submit_event(sim="s", seq=3, cmd_id="c", sim_id="abcd1234", state=SimulationState.SUBMITTED, job_id=7)
     assert event.kind is Kind.EVENT
     assert event.payload["job_id"] == 7
+
+
+def test_slurm_reason_rides_the_event_and_status_ack() -> None:
+    """F3: the scheduler reason is carried on both the pending event and the ack."""
+    from pic_agentic.protocol.simulation import build_status_ack
+
+    event = build_submit_event(
+        sim="s",
+        seq=6,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.SUBMITTED,
+        job_id=7,
+        slurm_state="PENDING",
+        slurm_reason="PartitionNodeLimit",
+    )
+    assert event.payload["slurm_reason"] == "PartitionNodeLimit"
+    # An event without a reason omits the field rather than carrying null.
+    running = build_submit_event(
+        sim="s",
+        seq=7,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_RUNNING,
+        job_id=7,
+    )
+    assert "slurm_reason" not in running.payload
+
+    ack = build_status_ack(
+        sim="s",
+        seq=8,
+        cmd_id="c",
+        sim_id="abcd1234",
+        in_reply_to=None,
+        state=SimulationState.SUBMITTED.value,
+        slurm_state="PENDING",
+        slurm_reason="PartitionNodeLimit",
+        job_id=7,
+    )
+    assert ack.payload["slurm_reason"] == "PartitionNodeLimit"
+
+
+def test_signal_from_exit_code() -> None:
+    """B2: a signal-death exit status maps to a bounded signal annotation."""
+    from pic_agentic.protocol.simulation import signal_from_exit_code
+
+    assert signal_from_exit_code(139) == "SIGSEGV"
+    assert signal_from_exit_code(35584) == "SIGSEGV"
+    assert signal_from_exit_code(137) == "SIGKILL"
+    assert signal_from_exit_code(143) == "SIGTERM"
+    # A normal or unknown status carries no signal.
+    assert signal_from_exit_code(0) is None
+    assert signal_from_exit_code(1) is None
+    assert signal_from_exit_code(128) is None
+    assert signal_from_exit_code(None) is None
+    assert signal_from_exit_code(128 + 99) == "signal 99"
+
+
+def test_failed_event_annotates_a_signal_death() -> None:
+    """B2: an event's raw exit_code is accompanied by exit_signal, unchanged."""
+    event = build_submit_event(
+        sim="s",
+        seq=4,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_FAILED,
+        job_id=7,
+        exit_code=139,
+    )
+    assert event.payload["exit_code"] == 139
+    assert event.payload["exit_signal"] == "SIGSEGV"
+    # A non-signal exit code adds no annotation.
+    normal = build_submit_event(
+        sim="s",
+        seq=5,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_FAILED,
+        job_id=7,
+        exit_code=1,
+    )
+    assert "exit_signal" not in normal.payload

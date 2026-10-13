@@ -64,6 +64,61 @@ The pin points at the `chillenzer-agents/picongpu` fork stack head that
 provides lossless `Runner` round-tripping (`pyproject.toml` `[sim]`). Installing
 it requires `git`; the offline test suite does not need it.
 
+### Clean install for an agent host
+
+A host that exposes this MCP server to an LLM agent must install it as a
+**package**, never run it from a checkout. `scripts/install-mcp.sh` is the
+supported production path:
+
+```bash
+bash scripts/install-mcp.sh          # install + register + preflight
+bash scripts/install-mcp.sh --check  # read-only acceptance checks
+bash scripts/install-mcp.sh reset    # clear campaign/reuse state only
+```
+
+It installs `pic-agentic[sim]` non-editably from a pinned 40-hex commit into a
+dedicated venv, writes the 0600 config, registers the server under the
+`pic-agentic` key in `~/.config/opencode/opencode.json`, and runs preflights
+(tool surface, installed-revision/capability, plus a room/secret rendezvous
+check).
+
+A fresh beta run needs a new room + shared RCP secret. The shipped
+`pic-agentic-setup` console script mints both from the installed package (no
+repo checkout): it uses the config's MAS refresh chain to create the room,
+generates a 32-byte hex secret, writes the 0600 state file, and prints the
+cluster-side exports:
+
+```bash
+pic-agentic-setup --state ~/.config/pic-agentic/cluster-check.json \
+  --sim cluster --message-dir /scratch/<user>/pic-agentic/shared
+```
+
+This is the same implementation the developer driver
+`scripts/local_mcp_check.py --setup` calls, so the two cannot drift. The
+environment topology it assumes:
+
+- **The agent sees only the MCP tool surface.** The pic-agentic source, this
+  README, `AGENTS.md`, `docs/beta-test-prompts.md`, the tests and the git
+  history must not be reachable from the agent's workspace or home. The server
+  is a wheel in a venv; the installer fetches the one helper script it needs
+  from a pinned raw URL and deletes it, leaving no checkout behind.
+- **Secrets stay in the 0600 config** (`~/.config/pic-agentic/config.toml`) or
+  the MCP `environment` block — never in the workspace, logs, or tool output.
+- **The cluster-side simclient uses the same room, secret and pinned stack.**
+  The preflight fails loudly when the configured secret verifies none of the
+  room's RCP messages, which is the signature of a stale/mismatched secret. On
+  a fresh room with no traffic yet it only warns (there is nothing to verify
+  against), and it verifies either role's messages since both sign with the
+  same shared secret.
+- **A stale pin fails loudly.** The installer asserts the venv's installed
+  `pic-agentic` revision equals the pin and that its simclient carries the M3
+  result handling and non-blocking dispatch, both at install time and in
+  `--check`, so the old blocking control plane cannot be shipped silently.
+
+The end-to-end invariants and the beta acceptance checks are recorded in the
+beta-container handover; the installer's `--check` mode implements the
+machine-checkable ones.
+
 ## Authentication (MAS-fronted homeservers)
 
 Production homeservers such as `chat.academiccloud.de` are fronted by Matrix
@@ -210,9 +265,13 @@ raw callables; see `M2-SUBMIT-PLAN.md`).
 
 Enable the handler by pointing the cluster simclient at a writable shared
 directory (the `PIC_AGENTIC_SIM_SETUP_ROOT` environment variable; see
-`scripts/cluster_simclient.sh`). Cluster-local `rc_params` are never
-transmitted; the simclient asserts its local `tbg_submit` is `"sbatch"` so the
-workflow's local-`bash` default cannot silently submit a non-SLURM job.
+`scripts/cluster_simclient.sh`). The submit command is cluster-local policy and
+is never transmitted: `rc_params["tbg_submit"]` is its single source of truth
+(the pinned `Runner` itself defaults `submit_system` from it). The simclient
+requires that value to be `"sbatch"` — the only submit it can follow — and
+refuses an unset or non-`sbatch` `tbg_submit` rather than overriding it, since
+the workflow's own default for an unset value is a local `bash` run with no
+scheduler job to track.
 
 To exercise it against the cluster, after the `--setup`/`--run` connectivity
 check:
@@ -223,6 +282,445 @@ python scripts/local_mcp_check.py --submit --picmi-script ./my_simulation.py
 
 The MCP server needs the `[sim]` extra to build the payload (run the check in
 that venv, or point `--picongpu-python` at it).
+
+### Campaign specs by reference
+
+A Runner spec is tens of KiB, so an agent should never hand-copy one into the
+LLM. `build_spec(picmi_script, write_to="base.json")` builds the spec and stages
+a JSON copy under the server's spec directory, returning its absolute
+`spec_path`; because the caller consumes the staged file by reference, the
+inline `spec` is omitted from the result by default (pass `include_spec=true` to
+force the inline copy back, or `include_spec=false` to omit it without staging).
+`create_campaign` then takes `base_spec_path=<spec_path>` instead of an inline
+`base_spec` (provide exactly one of the two). The staged file is ordinary JSON
+(`{"sim": ...}`) and the
+staging root is the configured `PIC_AGENTIC_SPEC_DIR`, or a `spec/`
+subdirectory of `PIC_AGENTIC_MESSAGE_DIR` when unset. `base_spec_path` is
+LLM-controlled, so it is resolved **strictly inside that root** (safe charset,
+symlinks resolved on both sides) and refused otherwise; a path such as
+`/etc/passwd` never reaches an open. Staged files are capped at 4 MiB
+(`MAX_SPEC_FILE_BYTES`) — larger than the 48 KiB inline cap because the bytes
+are server-local and never cross the homeserver.
+
+### Use the pinned API, not the online docs (H9)
+
+An agent writing a PICMI script must target the **installed** `picongpu`
+package, whose version is the pinned commit in `pyproject.toml` (see the
+`picongpu_revision` in every build result). The readthedocs pages can describe a
+newer release than the pin, and the beta-5 transcripts show an agent
+reverse-engineering `site-packages` after copying names that do not exist
+there. In particular, on the beta-5 pin
+
+- the diagnostics are `picmi.diagnostics.NativeFieldDump`,
+  `DerivedFieldDump`, `PhaseSpace`, `EnergyHistogram`, `FieldEnergyMonitor`,
+  `Checkpoint`, `MacroParticleCount`, … — **not** the readthedocs
+  `FieldDiagnostic` / `PhaseSpaceDiagnostic`;
+- do not build the input by hand with `sim.write_input_file()`; define the
+  `picmi.Simulation` and let the `build_spec` / `submit_simulation` tools build
+  it (`sim.write_input_file()` is the build-only equivalent in-script;
+  `sim.picongpu_run()` builds **and** runs it locally, which is not what the
+  tools do — they build a Runner spec and submit it to the cluster);
+- distributions keep the PICMI names (`picmi.UniformDistribution(density=...,
+  rms_velocity=[...])`, `picmi.GaussianDistribution(...)`).
+
+The seeded `instructions` carry a minimal, verified snippet using
+`picmi.Cartesian3DGrid`, `picmi.ElectromagneticSolver`, `picmi.Species`,
+`picmi.UniformDistribution`, `picmi.PseudoRandomLayout` and
+`picmi.Simulation`, so an agent has a compiling starting point without reading
+the pin's source. A second inline snippet shows a version-matched
+`picmi.diagnostics.FieldEnergyMonitor(period=picmi.diagnostics.TimeStepSpec[::20,
+-1])`, the diagnostic the beta-6 agent had to reverse-engineer from source.
+
+### Runner specs are rendered snapshots (E1)
+
+A Runner spec obtained from `build_spec` is a **rendered snapshot** with
+denormalized fields, not a live model: the physical box is
+`cell_size * cell_cnt` per axis, and `delta_t_si`/`time_steps` carry the time
+extent. Patching one node therefore changes the physics in a way the other
+nodes do not follow:
+
+- patching only `sim.grid.cell_cnt` (or only `cell_size`) is a **box-size**, not
+  a resolution, change — and that is allowed, because a box-size sweep is a
+  legitimate study; a **fixed-box resolution** sweep must instead co-vary
+  `cell_size`, `cell_cnt` and `cell_depth` together with a CFL-consistent
+  `delta_t_si` and matching `time_steps` (a whole `sim.grid` patch, or one whole
+  spec per leaf via `add_agenda_leaf(spec_path=...)`);
+- finer `dx` also needs a CFL-consistent `delta_t_si` and step count — changing
+  only the grid fails the compile with the Yee solver's CFL `static_assert`
+  (`fields/MaxwellSolver/Yee/Yee.hpp`);
+- a super cell smaller than the pin's default `picongpu_super_cell_size`
+  (`(8, 8, 4)` in 3D, `(16, 16)` in 2D, `picmi/grid.py`) is not a free
+  performance knob: the default particle shape's stencil needs that much guard
+  margin, and a smaller choice such as `(2, 2, 2)` fails the build with the
+  Esirkepov `supercell or number of guard supercells is too small for stencil`
+  `static_assert`
+  (`fields/currentDeposition/Esirkepov/Esirkepov.hpp`);
+- a laser's Huygens surface must sit **outside** the 12-cell default PML absorber
+  (`include/picongpu/param/fieldAbsorber.param`, `THICKNESS = 12`). The
+  `GaussianLaser` default (16 cells) is right; an 8-cell placement segfaults at
+  step 0 (exit 139).
+
+`model_json_schema()` is unavailable for diagnostics whose `period` is a
+`TimeStepSpec`: the pin's `TimeStepSpec` (defined in
+`picongpu/picmi/diagnostics/timestepspec.py`, a plain class rather than a
+pydantic model) does not come from the PICMI standard package, so pydantic
+cannot build a JSON schema for it. The instructions point the agent at the
+pinned classes under `lib/python/picongpu/picmi/diagnostics/` instead.
+
+### Multi-node studies need explicit leaves (H5)
+
+`create_campaign` expresses a **single-path** sweep: one `patch_path`, one list
+of values. **Box-size sweeps are allowed**: a lone `sim.grid.cell_cnt` patch
+holds `cell_size` (the resolution) fixed and varies the physical box, and a lone
+`sim.grid.cell_size` patch changes the resolution at a fixed cell count — both
+are legitimate and accepted (the per-axis forms such as `sim.grid.cell_cnt.x`
+too). A *fixed-box resolution convergence* study, by contrast, must co-vary more
+than one spec node (e.g. the grid cell count **and** `time_steps`, holding the
+physical box size fixed) and so cannot be one `patch_path`. Because a Runner spec
+is a rendered snapshot with denormalised fields, a lone `cell_cnt`/`cell_size`
+patch silently changes either the box or the resolution; to keep that from
+misleading an agent that intended the other study, `create_campaign` records a
+non-blocking `warnings` entry on its result naming the effect (it never refuses).
+The genuinely arithmetic invariants a patch can break (stale `cell_depth`, an
+explicit `grid_dist` that no longer sums to `cell_cnt`, and the solver's CFL
+`c·dt ≤ dx` stability limit) *are* checked on every `create_campaign`-patched
+leaf and refused with an actionable message. A whole-spec `add_agenda_leaf` leaf,
+which owns every node, is not checked against these derived invariants.
+`add_agenda_leaf` is the escape hatch:
+create the campaign empty — `create_campaign(name=...)` with no `patch_path`
+and no `values` persists a leafless campaign that reports `empty: true` and
+`complete: false` — then add one leaf per study point carrying its own whole
+spec, so any number of nodes can differ between leaves. Creating the campaign
+bare avoids inventing a meaningless identity patch: seeded leaves would carry a
+`point`/label derived from that unrelated field, while an added whole-spec leaf
+records exactly the `point`/`parameter` you pass (or stays point-less). A leaf
+spec may be inline (`spec=`) or, for a large spec, staged by reference
+(`add_agenda_leaf(name, spec_path=...)`) exactly like
+`create_campaign(base_spec_path=...)` — the same safe staging root and the same
+4 MiB *input file* cap. Staging lifts only the input-side (re-typing) limit: the
+leaf spec is still validated through the submission path, so the same 48 KiB
+escaped wire budget as any `submit_spec` applies and an over-cap leaf is refused
+at add time with `spec_exceeds_inline_limit`. Staging avoids re-typing, not the
+wire cap. `point`/`parameter` record the assignment and its human-readable
+label, as for a `create_campaign` leaf.
+
+### Distributing a run over several GPUs (F6)
+
+A run that exceeds one GPU's memory can be spread over several by setting the
+grid's `picongpu_n_gpus` (the pin maps it to `pypicongpu.Runner`'s `n_gpus`, and
+the template renders it into the batch script's `TBG_devices_{x,y,z}`):
+
+- a bare positive int `N` means `N` GPUs along **y**, i.e. `(1, N, 1)`, and a
+  `[N]` list is the same; a per-axis sequence such as `(1, 4, 1)` is taken
+  literally (`picmi/grid.py` `_normalise_n_gpus`);
+- every axis's `cell_cnt` must be divisible by `n_gpus[axis] * super_cell_size[axis]`
+  (the default super cell is `(8, 8, 4)` in 3D, `(16, 16)` in 2D), or the grid
+  is rejected;
+- each GPU is one MPI rank, and the pinned `rosi-hzdr/gpu-v100.tpl` template
+  hosts `TBG_numHostedGPUPerNode=4`, so the job requests
+  `ceil(total_GPUs / 4)` nodes with `--gres=gpu:` up to 4 per node.
+
+The partition's **node ceiling is not knowable from the spec**: a decomposition
+requesting more nodes than the partition allows does not fail, it stays
+`PENDING` with the Slurm reason `PartitionNodeLimit` (visible via `squeue`,
+which the beta-7 agent only learned from hand-pasted output — that observability
+gap is F3). Choose a decomposition that fits the target partition; when in
+doubt, request fewer nodes and verify the run starts.
+
+### Campaign sweeps are self-describing
+
+A campaign leaf records the sweep assignment in `point` as
+`{last path segment: value}` — recorded for provenance, not scored (only a
+recorded analysis with a top-level `score`/`value`/`peak` is ranked) — but
+the key alone is opaque: sweeping the list-indexed laser focal component
+`sim.laser.0.focus_pos_si.1.component` would only show
+`point={"component": 4.4e-5}`. Each leaf therefore also records
+`sweep_parameter`, a human-readable name derived from `patch_path` by dropping
+the list indices while keeping every field name
+(`sim.laser.focus_pos_si.component`). Pass `parameter="focal y [m]"` to
+`create_campaign` (or `add_agenda_leaf`) to override the derived name with your
+own label. `sweep_parameter` appears in `agenda_status`, the `!leaves` view and
+the campaign RO-Crate. The derived and explicit labels are both sanitised for
+display: control characters are collapsed, while printable Unicode (units such
+as `µm`) is kept. Campaigns persisted before the field existed still load and
+advance: it is optional.
+
+### Sweep refinement does not stop on a boundary optimum
+
+`suggest_agenda_refinement` scores each leaf's **recorded analysis** (the sweep
+point is never a score) and reports the best point, whether the sweep has
+converged, and deterministic points to add next. Convergence is not just "the
+top two scores are close": the refiner also knows where the best leaf sits, so a
+flat top whose best point lies on the **edge** of the tested range and still
+improves outward is reported `converged: false`, and the suggestions **extend
+the range on that improving side** rather than bracketing a boundary optimum
+(e.g. a monotone focal scan whose range minimum scores highest). A flat optimum
+in the **interior** of the range, or a flat plateau at the edge with no outward
+slope, is still converged. Leaves without a numeric sweep `point` fall back to
+the score-spacing check, and fewer than two ranked analyses never converge.
+
+### Campaign callbacks
+
+A durable campaign emits a **callback** each time a leaf reaches a terminal
+status (done or failed). Callbacks are only decision points: the agent reacts by
+analysing the run, refining the agenda or declaring the conclusion. An MCP
+server cannot call the agent, so callbacks are exposed two ways and the
+distinction matters:
+
+- `advance_agenda` returns the callbacks emitted by **that tick** inline under
+  `callbacks`. Inline callbacks do **not** consume the stored copy, so the same
+  decision point is returned again by the next means below.
+- `take_agenda_callbacks` drains the persisted store and clears it. Use it to
+  recover callbacks from ticks you did not observe (e.g. after a server
+  restart); it is **destructive**, so a repeat call returns an empty list and
+  drained callbacks are gone.
+
+In short: react to the inline list for the tick you just ran, and drain only to
+catch decision points you might otherwise miss. `advance_agenda` also reports
+`state: "complete"` (rather than the stored `running` lifecycle state) once
+every leaf is terminal; the stored lifecycle is preserved in the `lifecycle`
+field, so a finished **paused**/**stopped** campaign reads `state: "complete"`
+with `lifecycle: "paused"`/`"stopped"` rather than hiding the pause/stop.
+
+### Lost acknowledgements are deferred, not failures
+
+When the simclient accepts a submission but its acknowledgement is lost (or it
+died before recording an outcome), it replays a **pending idempotency record**
+whose error code is `outcome_unknown`. The job may well be running, so the
+engine does **not** mark the leaf failed: it stays `planned` and is retried on
+the next tick under the same exactly-once command id, which re-acks the original
+job instead of submitting a second one. Such a leaf is reported separately in
+the tick's `deferred` list and in `agenda_status` (`deferred: true`, plus
+`deferred_attempts` and `deferred_since`), so a lost acknowledgement is never
+presented as a physics failure. Retrying is bounded by **elapsed wall-clock
+time**, not by a tick count: the pending record only becomes terminal when the
+simclient *finishes the build* (which can take minutes), while an agent can call
+`advance_agenda` several times in seconds. Counting ticks would therefore fail a
+leaf whose job is still building — the very harm the deferral exists to avoid.
+Once `now - deferred_since` exceeds `agenda_deferred_outcome_timeout_s`
+(`PIC_AGENTIC_AGENDA_DEFERRED_OUTCOME_TIMEOUT_S`, default 900 s) the leaf is
+failed with an `outcome_unknown` code (the job may still exist — check
+`list_simulations`/`get_status` and clean it up). That code is forced on the
+deferred/give-up leaf even when an older client still sends
+`rejected_by_policy` alongside the sentinel string, and the same code is
+surfaced on a `hello` replay of a pending record. A *genuine* rejection (bad
+payload, policy, version drift) is terminal immediately and keeps its
+`rejected_by_policy`-style code.
+
+### Deleting a campaign does not forget its simulations
+
+`delete_campaign` removes only the persisted campaign (and its reuse registry),
+so a fresh campaign can be created. The **fleet registry** is a replay of the
+signed room, not the campaign file, so the simulations the deleted campaign
+already ran remain visible in `list_simulations` and `get_status` (and their
+results stay reachable). Treat those entries as the recorded history of runs
+that actually happened; use `list_simulations(active_only=true)` to hide
+terminal history when you only care about live work.
+
+### A live run survives a server restart
+
+The fleet registry is rebuilt on startup from the signed-room replay, so a run
+that is still building/queued/running keeps its `get_status`/`list_simulations`
+view across an MCP-server restart (and, because the simclient keeps following
+the SLURM job, it continues to receive lifecycle events). The transport
+back-paginates the room via `/messages` until the room's start, because the
+`/sync` window alone returns only the most recent handful of events: stopping at
+the tail would silently drop every run older than that window and make a
+still-RUNNING job read as if it had never been submitted.
+
+If the backfill could not cover the whole history (the safety cap was reached, or
+a pagination request failed), an id the registry does not know is reported as
+`error: "unknown_after_restart"` rather than the plain `"unknown_sim"`. That
+distinction matters: after a restart you cannot tell running/queued/gone apart
+from a bare `unknown_sim`, which is indistinguishable from "never submitted". On
+`unknown_after_restart`, re-check the cluster and the persisted results tree
+before concluding the run is gone; `unknown_sim` still means the id was never
+submitted (or the replay was complete).
+
+### Build/queue phase, and when a run counts as stalled
+
+A run can spend 15-20 minutes between `accepted` and the SLURM `job_id`: the
+simclient builds the setup locally and only then parses the job id out of
+`submission_information.txt`. During that window `job_id` is `null`, there are
+no step/percent values and `get_events` is empty — which is normal, not wedged.
+`get_logs` serves the captured compiler output tail while the build is running
+(the same stderr that later appears in a failure `error`); before any output is
+captured it answers "still building", not the misleading "not started yet".
+
+To make that window legible, every status surface carries a derived `phase`
+field (`building`/`queued`/`running`/`done`/`failed`/`cancelled`):
+
+- `building` — accepted, no `job_id` yet (local CWL build, and the queue wait
+  for the job id to be parsed; the event stream cannot separate the two, so the
+  bucket is deliberately best-effort).
+- `queued` — a `job_id` exists but no running/job-progress event has arrived.
+- `running` — a `simulation.job_running`, `simulation.step_finished` or the
+  non-terminal `simulation.checkpoint` event has been seen.
+- `done`/`failed`/`cancelled` — terminal outcomes.
+
+`get_status`, `list_simulations` and `get_events` report `phase`; the
+`fleet_status` summary reports `by_phase`, and `get_events` adds a `note`
+explaining an empty event list (build/queue window, finished run, or an
+excluding filter).
+
+`fleet_status`'s `stalled` alert fires only for a `running` record that has gone
+`fleet_stall_after_s` (default 900 s) without a lifecycle event. A
+`building`/`queued` record is explicitly exempt — it is expected to be silent
+for many minutes — while a genuinely idle running job is still flagged. The
+phase is computed with `simulation_phase` in
+`src/pic_agentic/protocol/simulation.py`; it is a pure projection of the
+existing event stream and adds no wire message.
+
+### Why a pending job is not running
+
+`slurm_state` alone cannot distinguish a job waiting its turn from one that can
+never start. The scheduler's own explanation — the `Reason=` field of
+`scontrol show job` — is therefore surfaced as `slurm_reason` on
+`get_status`/`list_simulations` (and on the wait's `last_status`). The derived
+`slurm_blocked` flag is `true` only for a curated set of *permanent* reasons
+(`PartitionNodeLimit`, `PartitionTimeLimit`, `PartitionConfig`, `MaxNodes`
+in `src/pic_agentic/slurm/client.py`): such a job cannot start as submitted, so
+`wait_for_simulation` says so in its note and `fleet_status` raises a `blocked`
+alert. Transient reasons (`Resources`, `Priority`, `QOSMax…`) stay
+`slurm_blocked: false` and are never reported as permanent. The simclient
+pushes a changed pending reason once, on the coarse poll cadence.
+
+### Recorded resource usage
+
+When a job reaches a terminal state, the simclient asks `sacct` for its actual
+resource usage and stamps `core_hours`/`gpu_hours` onto the terminal event (and
+the registry record). Both are computed from the same accounting row as
+`elapsed_hours × count`: `core_hours` from `AllocCPUS`, `gpu_hours` from the
+allocated GPU count. On this site `TRESUsageInTot` is empty for finished jobs,
+so the GPU count falls back to `AllocTRES` (`gres/gpu=N`); without that fallback
+every GPU job reported `gpu_hours: 0.0` while `core_hours` accrued. A genuinely
+GPU-less job keeps `gpu_hours: 0.0`. The accounting query is best-effort: a
+missing `sacct` or a malformed row is skipped, never raised.
+
+### Build vs. run failure classification
+
+A failure inside the CWL workflow is classified by the step that failed. The
+workflow's `build_step` is the PIConGPU compile (`pic-build`), so a compile
+error — e.g. a CFL `static_assert` in the Yee solver — is reported as
+`error_code: build_failed`, `stage: "build"`, not the misleading
+`run_failed`/`stage: "run"`. A failure in any other workflow step (prepare,
+submit, organize) is reported as `run_failed`/`stage: "run"`. A simulation that
+actually runs and crashes is a SLURM job failure, reported separately as
+`simulation.job_failed` with the raw `exit_code`.
+
+A SLURM-side terminal event (a `job_failed`, or a `cancelled`) carries a
+synthesized `error`/`error_code` too, so it reaches the campaign's
+`failure_summary`/`failure_groups` instead of the useless "the failure reason
+was not reported". The reason names the scheduler state and, when the job died
+by signal, the signal (e.g. `error: "scheduler reported FAILED (SIGABRT)"`,
+`error_code: "scheduler_failed"`); a user cancel reports
+`error_code: "scheduler_cancelled"`. A partition-side reason (e.g.
+`PartitionNodeLimit`) is surfaced separately by the SLURM observability fields.
+
+Because the raw `error` is a cwltool `permanentFail` dump followed by a
+truncated C++ tail, the failure event also carries a bounded
+`failure_summary` naming the first compiler/CMake error line (and the `make`
+tail), so the cause is readable without scrolling the dump; the full text stays
+in `error`. A signal-death `exit_code` (139 = SIGSEGV, 137 = SIGKILL, 143 =
+SIGTERM, and the raw wait-status `<< 8` form) is annotated as `exit_signal`
+alongside the unchanged numeric value.
+
+The `error`, `error_code`, `failure_summary`, `stage`, `exit_code` and
+`exit_signal` fields are all carried by the `get_status` projection as well as
+the failure event and `wait_for_simulation.last_status`, so a build failure is
+legible from whichever status surface the caller polls.
+
+### `sim_id` is a spec label, not a run id
+
+A simulation's `sim_id` is only the first 8 hex of its payload hash (32 bits):
+it is a **content label**, so two byte-identical specs — and two re-runs of the
+same spec — share it. It is deliberately *not* a unique run identity, and it is
+too short to be a reliable cache key. The run identity is the **`run_id`** (the
+submission's stable command id): returned by `submit_simulation`, exposed in
+`get_status`/`list_simulations`, and carried per campaign leaf in
+`agenda_status` and the RO-Crate. Two re-runs of one spec therefore report the
+same `sim_id` but different `run_id`s, which is how you tell a re-run from a
+distinct study point.
+
+### Content-addressed reuse
+
+Reuse keys on the **full** content key — the wire payload, the provenance tuple
+and the leaf's **sweep point** — not on `sim_id`, so a spec that already
+completed is *linked* to that run instead of being submitted again.
+`advance_agenda` reports such leaves under `reused`; `agenda_status` marks them
+with `reused: true` and their `run_id`; the RO-Crate flags them `reused`.
+**Reuse requires identical content, provenance and sweep point**: two
+byte-identical specs at *different* points (e.g. `point={"x": 1.0}` and
+`point={"x": 2.0}`) are **different simulations** and never reuse one another,
+so a leaf's provenance cannot attribute its result to a point that never ran.
+Finer-grained reuse (e.g. point-insensitive reuse of the same physics) is future
+work. A **bare `submit_simulation` counts too**, but it has *no* sweep point: it
+is recorded as pending the moment the cluster accepts it and promoted to
+reusable when its `results.ready` event arrives (only a run whose results exist
+is reused), so a completed ad-hoc run is reused by a later point-less,
+otherwise-identical campaign leaf rather than re-run — never by a point-carrying
+leaf. The provenance tuple is part of the key, and it names the **server's**
+effective provenance (its configured/local PIConGPU revision/schema; a
+spec-carried revision is only a fallback for a server without a local pin).
+Identical physics therefore does **not** reuse across a changed server pin or
+schema — the result would not be attributable to a run the server can vouch for.
+A revision carried inside a leaf's own spec does not change the key when the
+server has a configured revision, so it cannot be used to force a re-run.
+
+### Waiting for a simulation, not polling
+
+`wait_for_simulation(sim_id, target_states=None, timeout_s=1800, poll_interval_s=2)`
+blocks until a simulation reaches a target lifecycle state, so an agent does not
+have to spin on `get_status`/`list_simulations` with `sleep` after a
+`submit_simulation`. The wait is **event-driven** over the fleet registry (the
+simclient's pushed lifecycle events wake it), so it returns on the terminal
+transition rather than on the poll cadence; `poll_interval_s` is only the
+ceiling on a wakeup, which keeps a dropped event from wedging the call. The
+transport need not be started -- a wait only reads the registry.
+
+- The default `target_states` is the terminal set
+  (`results.ready`/`simulation.failed`/`simulation.job_failed`/
+  `simulation.cancelled`); the alias `"terminal"` expands to it. Pass explicit
+  names (e.g. `["simulation.job_running"]`) to return earlier. An unknown name
+  is a soft error.
+- On timeout the tool returns `timed_out: true` (`ok: true`, `matched: false`)
+  with the **last-known** status and the condensed event history -- this is data,
+  not an error. Call it again to keep waiting. If the run is already terminal but
+  in a state you did not request (e.g. `simulation.failed` while waiting for
+  `results.ready`), the call returns immediately (`timed_out: false`,
+  `matched: false`) with a note that no requested state is reachable.
+- `timeout_s` is bounded to `[0.1, 3600]` s and validated, not silently
+  clamped. The default (1800 s) accommodates the 15-20 min PIConGPU compile plus
+  the start of the queue wait; longer waits repeat the call.
+- The server also knows the MCP client's request budget (`PIC_AGENTIC_MCP_TIMEOUT_MS`,
+  a single knob the setup scripts stamp into **both** the opencode entry `timeout`
+  and the server env var at install time, so a fresh install starts them equal;
+  editing the entry `timeout` afterwards can make the two diverge, which
+  `install-mcp.sh --check` detects). A `timeout_s` that
+  would outlast that budget (minus a small skew) is refused **up front** with a
+  soft `{"ok": false, "error": "wait_exceeds_client_timeout", ...}` carrying the
+  budget — not clamped, not the client's opaque `-32001`. Pass a smaller
+  `timeout_s` and poll+repeat, or raise `PIC_AGENTIC_MCP_TIMEOUT_MS`. If the
+  budget is unknown (no env var), the tool validates only, exactly as before.
+- `last_status.phase` is a derived label over what the event stream already
+  reported: `building` while the simclient has not yet emitted a scheduler
+  `job_id` (the compile/prepare window), else `queued`/`running`/`finalizing`.
+  No lifecycle state is ever invented; a timeout during the build phase says so
+  explicitly.
+- A `last_status` with `slurm_blocked: true` means the scheduler gave a
+  permanent reason (e.g. `PartitionNodeLimit`) and the note says so; repeating
+  the wait cannot help because the job cannot start as submitted — change the
+  allocation and resubmit.
+
+A single MCP tool call cannot hold the connection indefinitely, so the wait is
+bounded by `timeout_s` **and** by the MCP client's request timeout. The shipped
+setup scripts register the server with a 3900 s request budget (comfortably above
+the 3600 s `timeout_s` ceiling plus the 5 s safety skew) and pass the same value
+to the server as `PIC_AGENTIC_MCP_TIMEOUT_MS`, so a default wait is never refused
+and an over-budget wait is refused with a clear `wait_exceeds_client_timeout`
+error rather than the client's opaque `-32001` (the same budget the async result
+path already relies on). For a longer wait, raise `PIC_AGENTIC_MCP_TIMEOUT_MS`
+(both scripts honour it).
 
 ## Security model (M1)
 
@@ -264,6 +762,141 @@ table is also read, with the environment taking precedence):
 | `PIC_AGENTIC_SIM_SETUP_ROOT` | Shared-FS root for generated setups (enables M2 submit) |
 | `PIC_AGENTIC_CLUSTER_TEMPLATE_DIR` | Cluster-local picongpu template directory |
 | `PIC_AGENTIC_CLUSTER_PRESET` | Cluster-local CMake preset name |
+| `PIC_AGENTIC_SPEC_DIR` | Staging dir for path-referenced campaign specs (default: `spec/` under `PIC_AGENTIC_MESSAGE_DIR`) |
+
+## Results tools
+
+The MCP server exposes a read-only results surface over a run's linked
+`simOutput`:
+
+| Tool | Purpose |
+|------|---------|
+| `describe_results` | scandir-only manifest (path, format, size) |
+| `get_result_slice` | bounded 1D slice of one openPMD record/component |
+| `get_result_image` | bounded base64 PNG thumbnail of one openPMD record |
+| `read_result` | a small text tail (file, or captured stdout/stderr) |
+| `read_plugin_result` | a bounded summary from a shipped PIConGPU plugin reader |
+| `analyze_output` | physics-first answer + RO-Crate/metadata/openPMD/plugin sections |
+| `export_results` | a transfer ticket (the bulk data never moves itself) |
+
+`describe_results` labels each file with a `format`: `openpmd-adios2` /
+`openpmd-hdf5` for openPMD series, `text` / `dir` / `binary`, or a **plugin
+reader name** when the filename matches one. The plugin match is a filename-only
+heuristic; the reader re-validates the file and returns a clean `no_results` on
+a mismatch.
+
+The openPMD readers accept the `h5` (HDF5) and `bp`/`bp5` (ADIOS2) suffixes the
+pinned `openpmd_api` 0.17.1 can actually open; `.hdf5` is **not** advertised
+because that backend rejects it ("Unknown file format"). ADIOS2 series are
+directories (`fields_000050.bp/`), which iteration discovery and the plugin
+target resolver both accept.
+
+`read_plugin_result` runs one registered reader on the cluster (in-process, over
+the same 48 KiB wire budget as the other results) and returns a bounded summary:
+
+| Reader | Output | Summary |
+|--------|--------|---------|
+| `energy_histogram` | `*_energyHistogram_*.dat` | bins/counts (keV), window count, `n_nonzero_bins`, populated `min_energy_kev`/`max_energy_kev` |
+| `energy_fields` | `fields_energy.dat` | integrated E/B field energy [J] vs step, per-component min/max/last |
+| `emittance` | `*_emittance_*.dat` | slice positions/emittances, total, peak |
+| `transition_radiation` | `*_transRad_<iter>.dat` | omega/intensity spectrum, peak |
+| `phase_space` | `PhaseSpace_<sp>_<filter>_<ps>_<iter>.h5` | axis ranges, projected marginals, peak bin |
+| `radiation` | `*_radAmplitudes_<iter>_0_0_0.h5` | direction-summed spectrum, peak |
+| `calorimeter` | `*_calorimeter_<filter>_<iter>.h5` | yaw/pitch marginals, energy edges |
+| `png` | `*_png_<axis>_<slice>_<iter>.png` | metadata only (dimensions, path); image via `export` |
+
+The `energy_fields` reader reads the `EnergyFields` plugin's plain-text
+`fields_energy.dat` (header `#step total[Joule] Bx[Joule] ... Ez[Joule]`) with the
+engine's own parser — the file ships no `picongpu.extra.plugins.data` reader, so
+before this reader existed `describe_results` mislabelled it `binary` and
+`read_result` refused it. Its summary carries the total-energy trajectory
+(`step`/`total_J`) plus per-component `component_{last,min,max}_J`, scalar
+min/max/last totals, the selected row's own `total_J_selected`, and the step
+range; `iteration` selects one reported step
+(`last` by default). No optional reader is needed. `read_result` serves the file
+directly as a bounded text tail as well. The history is read under an 8 MiB cap;
+a file larger than that is clipped to whole leading rows and the summary reports
+`truncated: true` with a `warning` naming the covered step range, so a partial
+trajectory (and the peak over it) is never presented as the complete history.
+A capped file whose window holds no complete row (e.g. one very long line)
+still returns a `truncated: true` summary with unknown (`null`) totals and an
+explicit warning rather than an empty-looking error, so a genuinely absent
+artifact stays distinguishable from an unreadable window.
+
+The `energy_histogram` reader reports `count_in_window` for a [keV] window that
+is **requestable** with `min_kev`/`max_kev` (both or neither, non-negative,
+`max_kev > min_kev`). Bins are half-open `[lower, upper)`, so a bin is counted
+when its **lower** edge lies in the window `[min_kev, max_kev)`: a bin ending
+exactly at `max_kev` is excluded, i.e. a ">= 5 MeV" window starts at the 5 MeV
+bin's lower edge rather than counting the 4.9--5.0 MeV bin (L1). The first bin's
+lower edge is the histogram's configured `minEnergy`, read from the file header,
+so a non-zero-minimum histogram (e.g. 1--2 MeV) reports its real edges and the
+exact `[minEnergy, first_upper)` window is not miscounted by assuming a 0 keV
+start. When the window
+is omitted it is derived from the populated bins: the common 100--1000 keV window
+is kept only when the whole populated span lies inside it, and otherwise it is
+widened to that span, so the default always captures the whole population instead
+of clipping a spectrum that starts above or spans past 1000 keV (e.g. an LWFA
+spectrum beginning at a few MeV). The summary always carries `n_nonzero_bins`
+plus the populated `min_energy_kev`/`max_energy_kev` (the half-open span's lower
+edge and upper edge), and warns whenever `count_in_window` captures less than 90%
+of the total (including `0`), so a partial or mis-window is obvious rather than a
+silent undercount.
+
+All openPMD readers accept the `h5` and `bp`/`bp5` suffixes. `species_filter`
+is honoured where the reader's filename carries a filter component; the
+`radiation` reader has none, so a non-default `species_filter` is rejected with
+`unsupported` rather than silently ignored.
+
+`iteration` defaults to `last`. A missing PIConGPU (or, for the openPMD/image
+readers, `openpmd_api`/`imageio`) degrades that reader to `reader_unavailable`;
+readers degrade independently, so `png` still works without `openpmd_api`.
+
+`analyze_output` answers physics questions deterministically (no LLM). It reuses
+the same bounded plugin summaries as `read_plugin_result` — so a run whose only
+artifact is a text plugin histogram still reports the populated energy range,
+the maximum energy and the counts — and only then adds the RO-Crate, run-metadata
+and openPMD bookkeeping. To keep the ack small the two bulk run-metadata
+sections (`rc_params`, `rendering_context`) are returned **trimmed**: their values
+are replaced by `{"_trimmed": true, "n_fields": <count>, "fields": [...]}`, the
+field *names* only, which is all the answer's provenance needs. The
+`pypicongpu_runner.json` section and all other metadata are returned in full.
+When no openPMD output **and** no plugin histogram exist
+(or the optional readers are not installed), the answer says so explicitly
+instead of falling back to metadata alone.
+
+A physics question is answered only from physics: a query token that happens to
+appear in the experiment name or run metadata (e.g. a run named `energy scan`
+asked "what is the maximum energy?") never masquerades as the answer. In a
+run with more than one species, `analyze_output` resolves each plugin reader's
+species from the PyPIConGPU rendering context (the diagnostic's configured
+species), so an electron histogram is not satisfied by a coexisting hydrogen
+file; the arrays in the section are sampled, and `downsampled` says so.
+
+A numeric plugin summary whose value array is entirely zero carries an explicit
+`warning` (an empty spectrum is a legitimate outcome, so it is transparency, not
+an error). That same all-zero warning is reused as the **"successful-but-empty"
+health signal** for a completed simulation: the simclient probes the run's
+numeric artifacts when it emits `results.ready` (and again when a later status
+pull promotes the run) and, when every present numeric artifact is all-zero,
+stamps the warning onto the run. It surfaces as `suspects` in
+`advance_agenda`, `suspect`/`suspect_count` in `agenda_status`, a `suspect` count
+and alert in `fleet_status`, a `suspect` field on the leaf's `done` callback and
+in `campaign_report`, and `suspect` in `get_status`/`list_simulations`. This is
+what lets the loop distinguish "physics ran and succeeded" from "physics ran and
+was empty" (the beta-4 empty-campaign case) without a reviewer reading a
+histogram by hand.
+
+The probe is deliberately narrow: only the numeric *text* readers
+(`energy_histogram`, `energy_fields`, `emittance`, `transition_radiation`) are
+examined, and *every* matching artifact of each is read, so a populated species
+clears a run with another empty one. A run whose energy histogram is all-zero
+while a phase-space or radiation diagnostic is populated is still flagged; treat
+the signal as "no particles in the numeric diagnostics", not "no particles at
+all". A populated-but-clipped diagnostic does not trip the probe: it keys on an
+explicit all-zero marker rather than on the mere presence of a `warning` (a
+mis-window histogram and a truncated field-energy history both warn without
+being empty).
 
 ## Tests and tooling
 

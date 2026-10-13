@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pic_agentic.protocol.simulation import (
     SimulationPayload,
+    SimulationStage,
     SimulationState,
     SubmitParams,
     build_submit_ack,
@@ -135,6 +136,78 @@ def test_events_accumulate_into_one_record() -> None:
     assert record.active is True
 
 
+def test_results_ready_projects_the_suspect_flag() -> None:
+    """The registry carries the F4 health flag off the results.ready event."""
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(_event(SimulationState.JOB_FINISHED, seq=2, job_id=1, slurm_state="COMPLETED", exit_code=0))
+    service.on_message(
+        _event(
+            SimulationState.RESULTS_READY,
+            seq=3,
+            job_id=1,
+            results_linked=True,
+            suspect="energy_histogram is all zeros",
+        ),
+    )
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.active is False
+    assert record.suspect == "energy_histogram is all zeros"
+
+
+def test_non_suspect_run_has_no_flag() -> None:
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(_event(SimulationState.RESULTS_READY, seq=2, job_id=1, results_linked=True))
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.suspect is None
+
+
+def test_suspect_flag_is_cleared_on_a_non_results_ready_event() -> None:
+    """A ``suspect`` payload on a non-terminal event must not stick (m1).
+
+    ``_RECORD_FIELDS`` projects any field a payload carries; the allow-list in
+    :meth:`_project_event` keeps the F4 flag tied to ``results.ready`` so a
+    buggy client cannot stamp a running record as suspect.
+    """
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(_event(SimulationState.RESULTS_READY, seq=2, job_id=1, results_linked=True, suspect="empty"))
+    service.on_message(
+        _event(SimulationState.STEP_FINISHED, cmd_id="cmd-2", seq=3, job_id=1, step=10, suspect="stale-empty"),
+    )
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.state == SimulationState.STEP_FINISHED.value
+    assert record.suspect is None
+
+
+def test_submit_ack_cannot_inject_suspect() -> None:
+    """An ack carrying ``suspect`` never promotes it onto a non-terminal record.
+
+    The submit ack is projected by :meth:`_project_ack`, which reads only the
+    failure fields; the F4 flag travels on events (and the status pull is
+    merged at the tool boundary), so a rogue ack payload must not seed it.
+    """
+    service = _service()
+    ack = build_submit_ack(
+        sim=SIM,
+        seq=1,
+        cmd_id=CMD_ID,
+        sim_id=SIM_ID,
+        state=SimulationState.ACCEPTED,
+        in_reply_to=None,
+        job_id=None,
+    )
+    ack.payload["suspect"] = "should-be-ignored"
+    service.on_message(ack.sign(SECRET))
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.suspect is None
+
+
 def test_terminal_state_marks_inactive() -> None:
     service = _service()
     service.on_message(_ack())
@@ -157,6 +230,27 @@ def test_job_failed_and_simulation_failed_are_terminal() -> None:
         assert record is not None
         assert record.active is False
         assert record.exit_code == 3
+
+
+def test_build_failure_projects_code_stage_and_summary() -> None:
+    """B1: a build failure event's failure_summary/stage is kept on the record."""
+    service = _service()
+    service.on_message(_ack())
+    service.on_message(
+        _event(
+            SimulationState.FAILED,
+            seq=2,
+            error="workflow failed: Completed permanentFail\n... Yee.hpp error",
+            error_code="build_failed",
+            stage=SimulationStage.BUILD,
+            failure_summary="Yee.hpp(56): error: CFL static_assert",
+        )
+    )
+    record = service.get(SIM_ID)
+    assert record is not None
+    assert record.error_code == "build_failed"
+    assert record.stage == "build"
+    assert record.failure_summary == "Yee.hpp(56): error: CFL static_assert"
 
 
 def test_an_event_omitting_a_field_does_not_erase_it() -> None:
@@ -321,3 +415,15 @@ def test_submit_command_from_server_is_not_projected() -> None:
     service.on_message(_submit_command())
     assert service.registry == {}
     assert service.event_log == []
+
+
+def test_unknown_error_distinguishes_partial_replay() -> None:
+    """F1: an absent id is ``unknown_sim`` only when the replay was complete."""
+    service = _service()
+    # A full backfill: an absent id was never submitted.
+    assert service.unknown_error() == "unknown_sim"
+    # An incomplete replay: the id may have existed before the restart.
+    service.set_history_complete(complete=False)
+    assert service.unknown_error() == "unknown_after_restart"
+    service.set_history_complete(complete=True)
+    assert service.unknown_error() == "unknown_sim"

@@ -23,6 +23,58 @@ from pydantic import BaseModel
 SAFE_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
 SUBMITTED_RE = re.compile(r"Submitted batch job (\d+)")
 STATE_RE = re.compile(r"JobState=(\w+)")
+#: ``Reason=<token>`` in ``scontrol show job``; the scheduler's human-readable
+#: pending/terminal explanation (e.g. ``PartitionNodeLimit``).  ``None`` is
+#: Slurm's sentinel for "no reason", not a reason string.
+REASON_RE = re.compile(r"\bReason=(\S+)")
+
+#: Reasons that mean the job can never be scheduled as requested, so a caller
+#: must change the request instead of waiting.  Kept deliberately small and
+#: literal: a transient reason (``Resources``, ``Priority``, ``QOSMax...``) must
+#: never be advertised as permanent.  ``PartitionNodeLimit`` -- the beta-7 case
+#: (a 40/32-node s=8 job exceeding the partition's node cap) -- is definitive.
+PERMANENT_REASONS = frozenset(
+    {
+        "PartitionNodeLimit",
+        "PartitionTimeLimit",
+        "PartitionConfig",
+        "MaxNodes",
+    },
+)
+
+
+def is_permanent_reason(reason: str | None) -> bool:
+    """Return whether a SLURM reason means the request can never schedule.
+
+    Args:
+        reason: The scheduler reason string, or None/``"None"``.
+
+    Returns:
+        True for a reason in :data:`PERMANENT_REASONS`.
+
+    """
+    return reason in PERMANENT_REASONS
+
+
+#: ``sacct --parsable2`` accounting columns (fixed ``--format`` order):
+#: ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES``.
+_MIN_ACCOUNTING_FIELDS = 3
+_COL_ELAPSED_RAW = 1
+_COL_ALLOC_CPUS = 2
+_COL_TRES_USAGE = 3
+_COL_TRES_ALLOC = 4
+
+#: TRES columns consulted for the GPU count, most authoritative first.  On this
+#: site ``TRESUsageInTot`` is empty for completed jobs, so the *allocation*
+#: (``AllocTRES``) is the fallback that keeps ``gpu_hours`` from reading 0 for
+#: every GPU job (F5).  ``AllocTRES`` describes the reserved GPUs, which for a
+#: GPU job equals the count whose wall-clock accrues GPU-hours.
+_GPU_TRES_COLUMNS = (_COL_TRES_USAGE, _COL_TRES_ALLOC)
+
+#: Signals the client will deliver.  A fixed set, so a wire string can never be
+#: interpolated into ``scontrol``/``scancel``.  ``TERM``/``ALRM`` are the M3
+#: stop paths (PIConGPU's ``SIGTERM``/``SIGALRM`` handlers).
+ALLOWED_SIGNALS = frozenset({"USR1", "USR2", "KILL", "TERM", "ALRM"})
 
 
 class SlurmError(RuntimeError):
@@ -53,11 +105,134 @@ class SlurmJobState(StrEnum):
 
 
 class JobInfo(BaseModel):
-    """A snapshot of one SLURM job."""
+    """A snapshot of one SLURM job.
+
+    ``reason`` carries the scheduler's explanation (``scontrol``'s
+    ``Reason=...``): for a pending job this is *why* it is not running yet
+    (e.g. ``PartitionNodeLimit``), which the bare state cannot convey.  It is
+    ``None`` when Slurm reports no reason.
+    """
 
     job_id: int
     state: SlurmJobState
     exit_code: int | None = None
+    reason: str | None = None
+
+    @property
+    def permanent(self) -> bool:
+        """Whether :attr:`reason` means the job can never schedule as requested."""
+        return is_permanent_reason(self.reason)
+
+
+class JobAccounting(BaseModel):
+    """Actual resource usage reported by ``sacct`` for one finished job."""
+
+    job_id: int
+    core_hours: float = 0.0
+    gpu_hours: float = 0.0
+    is_gpu: bool = False
+
+
+def parse_accounting(output: str) -> dict[int, JobAccounting]:
+    """Parse ``sacct --parsable2`` output into per-job actual usage.
+
+    The expected columns are ``JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|
+    AllocTRES`` (or a ``--format`` subset in the same order); ``ElapsedRaw`` is
+    seconds and ``AllocCPUS`` is the allocated CPU count, so
+    ``core_hours = ElapsedRaw * AllocCPUS / 3600``.  The GPU count is read from
+    the first TRES column that carries a ``gres/gpu=N`` -- ``TRESUsageInTot``
+    first, then ``AllocTRES`` -- and contributes
+    ``gpu_hours = elapsed_hours * N``.  A malformed row is skipped, never raised;
+    a genuinely GPU-less job keeps ``gpu_hours == 0.0``.
+
+    Args:
+        output: The raw ``sacct --parsable2`` stdout.
+
+    Returns:
+        ``{job_id: JobAccounting}`` for the base jobs that parsed.
+
+    """
+    accounting: dict[int, JobAccounting] = {}
+    lines = output.splitlines()
+    if not lines:
+        return accounting
+    # Column positions in the fixed ``--format=JobID,ElapsedRaw,AllocCPUS,
+    # TRESUsageInTot,AllocTRES`` order; ``|`` is the ``--parsable2`` delimiter.
+    for line in lines[1:]:  # the first line is the header
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < _MIN_ACCOUNTING_FIELDS:
+            continue
+        try:
+            job_id = int(fields[0].split(".")[0])
+        except ValueError:
+            continue
+        elapsed_raw = _int_or_none(fields[_COL_ELAPSED_RAW])
+        alloc_cpus = _int_or_none(fields[_COL_ALLOC_CPUS])
+        elapsed_hours = (elapsed_raw or 0) / 3600.0
+        # TRESUsageInTot is empty on this site, so fall back to AllocTRES; both
+        # carry the same ``gres/gpu=N`` shape.
+        gpu_count = 0
+        for column in _GPU_TRES_COLUMNS:
+            if len(fields) > column:
+                gpu_count = _gpu_count(fields[column])
+                if gpu_count:
+                    break
+        accounting[job_id] = JobAccounting(
+            job_id=job_id,
+            core_hours=elapsed_hours * (alloc_cpus or 0),
+            gpu_hours=elapsed_hours * gpu_count,
+            is_gpu=gpu_count > 0,
+        )
+    return accounting
+
+
+def _int_or_none(text: str) -> int | None:
+    """Parse an integer field, returning None when it is not one.
+
+    Returns:
+        The integer, or None.
+
+    """
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _parse_reason(output: str) -> str | None:
+    """Extract the ``Reason=`` field from ``scontrol show job`` output.
+
+    Slurm prints ``Reason=None`` when there is no reason (the common case for a
+    running/completed job); that sentinel maps to ``None`` so callers only ever
+    see a genuine reason string.  ``Reason=`` is always the first token of its
+    space-separated value; Slurm pads/truncates it to a fixed width, so the
+    token itself is the reason.
+
+    Args:
+        output: The raw ``scontrol show job`` stdout.
+
+    Returns:
+        The reason string, or None when absent or ``None``.
+
+    """
+    match = REASON_RE.search(output)
+    if not match:
+        return None
+    reason = match.group(1).strip()
+    if not reason or reason == "None":
+        return None
+    return reason
+
+
+def _gpu_count(tres: str) -> int:
+    """Extract ``N`` from a ``gres/gpu=N`` TRES usage field.
+
+    Returns:
+        The GPU count, or 0 when absent/malformed.
+
+    """
+    match = re.search(r"gres/gpu=(\d+)", tres)
+    return int(match.group(1)) if match else 0
 
 
 def validate_shared_path(path: str, base_dir: str) -> str:
@@ -200,7 +375,41 @@ class SlurmClient:
         exit_match = re.search(r"ExitCode=(\d+):(\d+)", stdout)
         if exit_match:
             exit_code = int(exit_match.group(1))
-        return JobInfo(job_id=job_id, state=state, exit_code=exit_code)
+        return JobInfo(job_id=job_id, state=state, exit_code=exit_code, reason=_parse_reason(stdout))
+
+    async def job_accounting(self, job_id: int) -> JobAccounting | None:
+        """Query ``sacct`` for one finished job's actual resource usage.
+
+        Uses ``--parsable2`` with a fixed, argument-array command (never a
+        shell), so the job id is an integer and cannot be interpolated.  A
+        failure (``sacct`` missing, no accounting row, malformed output) is
+        returned as ``None`` rather than raised: actual-cost reconciliation is
+        best-effort and must never block a tick.
+
+        Args:
+            job_id: The SLURM job id.
+
+        Returns:
+            The parsed accounting, or None when unavailable.
+
+        """
+        argv = [
+            self._exe("sacct"),
+            "-j",
+            str(job_id),
+            "--parsable2",
+            "--noheader",
+            "--format=JobID,ElapsedRaw,AllocCPUS,TRESUsageInTot,AllocTRES",
+        ]
+        try:
+            rc, stdout, _stderr = await self._run(argv)
+        except SlurmError:
+            return None
+        if rc != 0:
+            return None
+        # --noheader is requested, but accept a header line too (older sacct).
+        rows = parse_accounting("JobID|ElapsedRaw|AllocCPUS|TRESUsageInTot|AllocTRES\n" + stdout)
+        return rows.get(job_id)
 
     async def wait_for_job(self, job_id: int, *, timeout_s: float, interval_s: float = 5.0) -> JobInfo:
         """Poll a job until it reaches a terminal state or ``timeout_s`` passes.
@@ -224,19 +433,27 @@ class SlurmClient:
                 return info
             await asyncio.sleep(interval_s)
 
-    async def signal(self, job_id: int, signal: str, *, batch: bool = True) -> None:
-        """Send a signal via ``scancel``; ``signal`` comes from a fixed set.
+    async def signal(self, job_id: int, signal: str, *, batch: bool = False) -> None:
+        """Send a signal to a job's steps via ``scancel --signal``.
+
+        By default the signal reaches every job *step* (the running application
+        ranks) but not the batch shell -- the M3 requirement, since the batch
+        shell does not trap signals on this site.  ``batch=True`` targets only
+        the batch shell instead (for a shell that explicitly traps the signal);
+        it must not be used for a plain ``srun``-launched application, whose
+        ranks would be missed.
 
         Args:
             job_id: The SLURM job id.
-            signal: One of ``USR1``, ``USR2``, ``KILL``.
-            batch: Whether to target the batch step (``--batch``).
+            signal: One of :data:`ALLOWED_SIGNALS`.
+            batch: Target only the batch shell (``--batch``) instead of the
+                steps.  Defaults to False (all steps).
 
         Raises:
             SlurmError: If the signal is not allowed or ``scancel`` fails.
 
         """
-        if signal not in {"USR1", "USR2", "KILL"}:
+        if signal not in ALLOWED_SIGNALS:
             msg = f"unsupported signal: {signal}"
             raise SlurmError(msg)
         argv = [self._exe("scancel"), f"--signal={signal}"]
@@ -253,16 +470,75 @@ class SlurmClient:
 
         Args:
             job_id: The SLURM job id.
-            mode: ``graceful`` (USR2, step-boundary stop) or ``hard`` (KILL).
+            mode: ``graceful`` (USR2 to all steps, step-boundary stop) or
+                ``hard`` (SIGKILL to all steps).
 
         Raises:
-            SlurmError: If ``mode`` is unknown or the signal fails.
+            SlurmError: If ``mode`` is unknown or the command fails.
 
         """
         if mode == "graceful":
             await self.signal(job_id, "USR2")
         elif mode == "hard":
-            await self.signal(job_id, "KILL", batch=False)
+            await self.signal(job_id, "KILL")
         else:
             msg = f"unknown cancel mode: {mode}"
             raise SlurmError(msg)
+
+    async def signal_job(self, job_id: int, signal: str) -> str:
+        """Deliver a signal to every task of a job via ``scancel --signal``.
+
+        This is the M3 control path: PIConGPU installs its handlers in every MPI
+        rank and each rank must receive the signal.  The job is launched as a
+        batch script that runs PIConGPU in an ``srun`` step, and
+        ``scancel --signal=<SIG> <job>`` signals all job *steps* (the running
+        PIConGPU ranks) while leaving the batch shell itself untouched -- which
+        matters for checkpoint-only, where the job must survive the signal.
+        ``scontrol signal`` does NOT exist in Slurm (a stale M3-contract
+        assumption, rejected live by Slurm 24.05).  ``signal`` is checked against
+        the fixed allow-list, so a wire value never reaches the command.
+
+        Args:
+            job_id: The SLURM job id.
+            signal: One of :data:`ALLOWED_SIGNALS`.
+
+        Returns:
+            The combined stdout and stderr of ``scancel``.
+
+        Raises:
+            SlurmError: If the signal is not allowed or ``scancel`` fails.
+
+        """
+        if signal not in ALLOWED_SIGNALS:
+            msg = f"unsupported signal: {signal}"
+            raise SlurmError(msg)
+        argv = [self._exe("scancel"), f"--signal={signal}", str(job_id)]
+        rc, stdout, stderr = await self._run(argv)
+        if rc != 0:
+            msg = f"scancel --signal={signal} failed ({rc}): {stderr.strip() or stdout.strip()}"
+            raise SlurmError(msg)
+        return (stdout + stderr).strip()
+
+    async def cancel_job(self, job_id: int) -> str:
+        """Hard-cancel a job via plain ``scancel``.
+
+        A bare ``scancel <job>`` sends SIGCONT, then SIGTERM, then SIGKILL after
+        the configured grace period -- the documented immediate job death.
+        (``scontrol cancel`` does not exist in Slurm.)
+
+        Args:
+            job_id: The SLURM job id.
+
+        Returns:
+            The combined stdout and stderr of ``scancel``.
+
+        Raises:
+            SlurmError: If ``scancel`` fails.
+
+        """
+        argv = [self._exe("scancel"), str(job_id)]
+        rc, stdout, stderr = await self._run(argv)
+        if rc != 0:
+            msg = f"scancel failed ({rc}): {stderr.strip() or stdout.strip()}"
+            raise SlurmError(msg)
+        return (stdout + stderr).strip()

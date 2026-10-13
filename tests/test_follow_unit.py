@@ -149,6 +149,72 @@ async def test_running_is_emitted_only_once(tmp_path) -> None:
     assert [state for state, _ in events].count(SimulationState.JOB_RUNNING) == 1
 
 
+async def _until(predicate, *, within_s: float = 1.0) -> None:
+    """Poll ``predicate`` until true or ``within_s`` elapses."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within_s
+    while not predicate():
+        if loop.time() >= deadline:
+            msg = "condition not met before timeout"
+            raise TimeoutError(msg)
+        await asyncio.sleep(0.005)
+
+
+async def test_pending_reason_events_are_deduplicated(tmp_path) -> None:
+    """F3: two identical pending reasons yield one event, a change yields a new one."""
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    reasons = ["PartitionNodeLimit", "PartitionNodeLimit", "Resources"]
+
+    async def job_info(_job_id: int) -> JobInfo:
+        return JobInfo(job_id=4711, state=SlurmJobState.PENDING, reason=reasons.pop(0) if reasons else "Resources")
+
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=job_info,
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events, emit = _collector()
+    follower.emit = emit
+    task = asyncio.create_task(follower.run())
+    await _until(lambda: follower.tracked.last_slurm_reason == "Resources")
+    follower.stop()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    emitted = [fields["slurm_reason"] for state, fields in events if state is SimulationState.SUBMITTED]
+    assert emitted == ["PartitionNodeLimit", "Resources"]
+
+
+async def test_pending_reason_none_emits_nothing(tmp_path) -> None:
+    """An ordinary ``Reason=None`` queue wait must not generate pending events."""
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    calls = {"n": 0}
+
+    async def job_info(_job_id: int) -> JobInfo:
+        calls["n"] += 1
+        return JobInfo(job_id=4711, state=SlurmJobState.RUNNING, reason=None)
+
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=job_info,
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events, emit = _collector()
+    follower.emit = emit
+    task = asyncio.create_task(follower.run())
+    await _until(lambda: calls["n"] >= 2)
+    follower.stop()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert [fields.get("slurm_reason") for state, fields in events if state is SimulationState.SUBMITTED] == []
+
+
 async def test_failed_job_reports_exit_code(tmp_path) -> None:
     stdout = tmp_path / "stdout"
     stdout.write_text("")
@@ -168,6 +234,66 @@ async def test_failed_job_reports_exit_code(tmp_path) -> None:
     failed = events[-1][1]
     assert failed["slurm_state"] == "FAILED"
     assert failed["exit_code"] == 3
+
+
+async def test_failed_job_reports_a_reason_and_code(tmp_path) -> None:
+    """F4: a scheduler-side failure carries a legible reason, not nothing.
+
+    The transcript's ``res-2.00x`` leaf failed with SIGABRT but the terminal
+    event carried no ``error``/``error_code``, so the campaign could only
+    report "the failure reason was not reported".  The follower synthesizes
+    both from the SLURM state and the signal-encoded exit code.
+    """
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.FAILED, exit_code=134),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    _state, fields = events[-1]
+    assert fields["error"] == "scheduler reported FAILED (SIGABRT)"
+    assert fields["error_code"] == "scheduler_failed"
+
+
+async def test_scheduler_error_fields_survive_the_event_builder(tmp_path) -> None:
+    """The synthesized reason must be a field the RCP event builder carries."""
+    from pic_agentic.protocol.simulation import build_submit_event
+
+    message = build_submit_event(
+        sim="abc12345",
+        seq=1,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_FAILED,
+        job_id=1,
+        error="scheduler reported FAILED (SIGABRT)",
+        error_code="scheduler_failed",
+    )
+    assert message.payload["error"] == "scheduler reported FAILED (SIGABRT)"
+    assert message.payload["error_code"] == "scheduler_failed"
+
+
+async def test_cancelled_job_reports_a_cancel_reason(tmp_path) -> None:
+    """A cancelled job reports why, with a distinct code."""
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(tmp_path, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.CANCELLED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    _state, fields = events[-1]
+    assert fields["error"] == "the job was cancelled"
+    assert fields["error_code"] == "scheduler_cancelled"
 
 
 async def test_nonzero_exit_on_completed_is_failed(tmp_path) -> None:
@@ -307,6 +433,65 @@ async def test_missing_link_emits_results_ready_once_link_exists(tmp_path) -> No
     states = [state for state, _ in events]
     assert states[-2:] == [SimulationState.JOB_FINISHED, SimulationState.RESULTS_READY]
     assert events[-1][1]["results_linked"] is True
+
+
+async def test_results_ready_carries_the_suspect_flag_for_an_empty_run(tmp_path, monkeypatch) -> None:
+    """The follower attaches the all-zero health flag to the terminal event (F4).
+
+    The probe is monkeypatched so the test does not need a real plugin reader;
+    the wiring (best-effort probe -> ``suspect`` field on ``results.ready``) is
+    what is under test.
+    """
+    from plugin_fixtures import energy_histogram_dat, write_output_unit
+
+    from pic_agentic import results
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output = run_dir / "simOutput"
+    output.mkdir()
+    write_output_unit(run_dir)
+    energy_histogram_dat(run_dir, zero=True)
+    (run_dir / "link_results.sh").write_text(f'#!/bin/bash\nln -sfn "{output}" "$1"\n')
+    warning = "energy_histogram is all zeros; the run may have no particles in range"
+    monkeypatch.setattr(results, "probe_vacuity", lambda _sim_id, **_kw: warning)
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(run_dir, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.COMPLETED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    ready = next(fields for state, fields in events if state is SimulationState.RESULTS_READY)
+    assert ready["suspect"] == warning
+
+
+async def test_results_ready_omits_suspect_for_a_populated_run(tmp_path, monkeypatch) -> None:
+    from pic_agentic import results
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    output = run_dir / "simOutput"
+    output.mkdir()
+    (run_dir / "link_results.sh").write_text(f'#!/bin/bash\nln -sfn "{output}" "$1"\n')
+    monkeypatch.setattr(results, "probe_vacuity", lambda _sim_id, **_kw: None)
+    stdout = tmp_path / "stdout"
+    stdout.write_text("")
+    follower = JobFollower(
+        sim="abc12345",
+        emit=None,  # type: ignore[arg-type]
+        tracked=_tracked(run_dir, stdout_path=stdout),
+        job_info=_running_sequence(SlurmJobState.RUNNING, SlurmJobState.COMPLETED),
+        initial_interval_s=0.01,
+        max_interval_s=0.02,
+    )
+    events = await _run_to_terminal(follower)
+    ready = next(fields for state, fields in events if state is SimulationState.RESULTS_READY)
+    assert "suspect" not in ready
 
 
 async def test_stop_ends_the_loop(tmp_path) -> None:

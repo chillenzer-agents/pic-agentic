@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nio import AsyncClient, AsyncClientConfig, RoomMessageText, SyncResponse
+from nio import AsyncClient, AsyncClientConfig, MessageDirection, RoomMessagesResponse, RoomMessageText, SyncResponse
 
 from pic_agentic.rcp.envelope import RCP_NAMESPACE, RcpMessage
 
@@ -32,6 +32,18 @@ log = logging.getLogger(__name__)
 
 #: Retry delay after a failed Matrix sync.
 _SYNC_RETRY_S = 1.0
+
+#: Page size for back-paginating the room timeline via ``/messages``.  The
+#: ``/sync`` window is small (10 events by default), so a long campaign can have
+#: more RCP events than one sync returns; backfill walks older pages to
+#: reconstruct the full signed-room history the registry is projected from.
+_BACKFILL_PAGE_LIMIT = 100
+
+#: Safety cap on the total number of events backfill will accumulate.  Bounds
+#: memory for a very long room; when the cap is hit the history is marked
+#: *incomplete* (see :attr:`MatrixTransport.history_complete`) so an
+#: unreconstructed run is not silently mistaken for one that never existed.
+_MAX_BACKFILL_EVENTS = 10_000
 
 
 class MatrixTransport:
@@ -71,6 +83,11 @@ class MatrixTransport:
         self._sync_timeout_ms = sync_timeout_ms
         self._since: str | None = None
         self._closed = False
+        #: Whether the last :meth:`backfill` reconstructed the *whole* signed
+        #: timeline (True) or stopped early once its safety cap was reached
+        #: (False).  When False the caller must not treat an absent run as one
+        #: that never existed -- see the registry's ``unknown_after_restart``.
+        self.history_complete = True
 
     async def _refresh_token(self) -> None:
         """Swap in a fresh access token before a request, when configured."""
@@ -88,7 +105,6 @@ class MatrixTransport:
 
         Raises:
             ValueError: If the message is not signed.
-            RuntimeError: If ``room_send`` reports a failure.
 
         """
         if message.sig is None:
@@ -96,8 +112,74 @@ class MatrixTransport:
             raise ValueError(msg)
         # to_content re-signs only when sig is None, which we have excluded.
         content: dict[str, Any] = message.to_content()
+        return await self._send_content(self._room_id, content)
+
+    async def send_text(self, room_id: str, text: str) -> str:
+        """Send a plain human-readable text message to a room.
+
+        Args:
+            room_id: The target room (the configured RCP room, or the human
+                room when different).
+            text: The message body.
+
+        Returns:
+            The Matrix event id.
+
+        """
+        content = {"msgtype": "m.text", "body": text}
+        return await self._send_content(room_id, content)
+
+    async def send_image(
+        self,
+        room_id: str,
+        png: bytes,
+        *,
+        body: str = "image",
+        filename: str = "plot.png",
+        mimetype: str = "image/png",
+    ) -> str:
+        """Upload a PNG and send it as an ``m.image`` message.
+
+        Args:
+            room_id: The target room.
+            png: The PNG bytes.
+            body: The message body / alt text.
+            filename: The uploaded file name.
+            mimetype: The content type.
+
+        Returns:
+            The Matrix event id.
+
+        Raises:
+            RuntimeError: If the upload or the send fails.
+
+        """
         await self._refresh_token()
-        response = await self._client.room_send(self._room_id, "m.room.message", content)
+        response, _ = await self._client.upload(png, content_type=mimetype, filename=filename)
+        content_uri = getattr(response, "content_uri", None)
+        if not content_uri:
+            msg = f"media upload failed: {getattr(response, 'message', response)}"
+            raise RuntimeError(msg)
+        content = {
+            "msgtype": "m.image",
+            "body": body,
+            "url": content_uri,
+            "info": {"mimetype": mimetype, "size": len(png)},
+        }
+        return await self._send_content(room_id, content)
+
+    async def _send_content(self, room_id: str, content: dict[str, Any]) -> str:
+        """Send one content object and return its event id.
+
+        Returns:
+            The Matrix event id.
+
+        Raises:
+            RuntimeError: If ``room_send`` reports a failure.
+
+        """
+        await self._refresh_token()
+        response = await self._client.room_send(room_id, "m.room.message", content)
         event_id = getattr(response, "event_id", None)
         if event_id is None:
             msg = f"room_send failed: {getattr(response, 'message', response)}"
@@ -112,14 +194,117 @@ class MatrixTransport:
         return response
 
     async def backfill(self) -> list[RcpMessage]:
-        """Fetch currently known RCP messages.
+        """Fetch the *whole* currently-known RCP history of the room.
+
+        The first ``/sync`` window is small (10 events by default) and stays
+        clamped at 10 even when a longer ``limit`` is requested without a
+        filter, so a single sync returns only the tail of a busy campaign.  The
+        registry is projected from this replay, so stopping at the tail would
+        silently drop every run older than the last ten events -- exactly the
+        "a live job reads as gone after a restart" failure.  This walks the
+        ``prev_batch`` token back through ``/messages`` until the room's start
+        (or the safety cap) and returns the events oldest-first.
 
         Returns:
-            The RCP messages in the room timeline at this point.
+            The RCP messages in the room timeline at this point, oldest first.
 
         """
         response = await self._sync()
-        return self._extract(response)
+        messages: list[RcpMessage] = []
+        joined = getattr(response.rooms, "join", {}) or {}
+        room = joined.get(self._room_id)
+        prev_batch = getattr(getattr(room, "timeline", None), "prev_batch", None) if room is not None else None
+        self.history_complete = True
+        while prev_batch and len(messages) < _MAX_BACKFILL_EVENTS:
+            page = await self._backfill_page(prev_batch)
+            if page is None:
+                # A pagination error leaves the history partial: do not claim
+                # completeness (an absent run may simply be off the page).
+                self.history_complete = False
+                break
+            older, prev_batch = page
+            if not older:
+                break
+            messages = older + messages
+        if len(messages) >= _MAX_BACKFILL_EVENTS:
+            self.history_complete = False
+        # The sync window is the newest slice; the paged events are older, so
+        # they precede it to keep the whole replay oldest-first.
+        return messages + self._extract(response)
+
+    async def _backfill_page(self, from_token: str) -> tuple[list[RcpMessage], str | None] | None:
+        """Fetch one older page of the room timeline via ``/messages``.
+
+        Args:
+            from_token: The ``prev_batch`` token to page backwards from.
+
+        Returns:
+            ``(messages_oldest_first, next_prev_token)``; ``next_prev_token`` is
+            None at the room start.  Returns None on a request failure so the
+            caller degrades to a partial (incomplete) history rather than
+            aborting the whole backfill.
+
+        """
+        await self._refresh_token()
+        try:
+            response = await self._client.room_messages(
+                self._room_id,
+                start=from_token,
+                direction=MessageDirection.back,
+                limit=_BACKFILL_PAGE_LIMIT,
+            )
+        except Exception as exc:  # ruff: ignore[blind-except] - a pagination error must not kill startup  # pragma: no cover
+            log.warning("matrix backfill pagination failed: %s", exc)
+            return None
+        if not isinstance(response, RoomMessagesResponse):
+            log.warning("matrix backfill pagination error: %s", getattr(response, "message", response))
+            return None
+        # ``/messages`` returns events newest-first for a backward page; reverse
+        # to keep the accumulated history oldest-first.
+        page = self._extract_events(list(reversed(response.chunk)))
+        return page, response.end
+
+    async def human_messages(self) -> list[tuple[str, str, str]]:
+        """Return plain (non-RCP) text messages since the last call.
+
+        A human room carries ordinary ``m.room.message`` events rather than
+        signed RCP envelopes.  Each returned tuple is
+        ``(room_id, sender, body)``; the caller applies the bot/room filters.
+        This shares the sync position with :meth:`receive`, so a caller must not
+        run both loops against the same transport instance -- use
+        :meth:`drain` to consume both in one loop.
+
+        Returns:
+            The ``(room_id, sender, body)`` tuples from joined rooms.
+
+        """
+        _rcp, human = await self.drain()
+        return human
+
+    async def drain(self) -> tuple[list[RcpMessage], list[tuple[str, str, str]]]:
+        """Run one sync and return both the RCP messages and the human chat.
+
+        Keeps a single sync position for both streams, so a server pump can
+        consume signed RCP envelopes and ordinary human messages in one loop.
+
+        Returns:
+            A ``(rcp_messages, human_messages)`` pair; human messages are
+            ``(room_id, sender, body)`` tuples from joined rooms.
+
+        """
+        response = await self._sync()
+        rcp = self._extract(response)
+        human: list[tuple[str, str, str]] = []
+        joined = getattr(response.rooms, "join", {}) or {}
+        for room_id, room in joined.items():
+            for event in room.timeline.events:
+                if not isinstance(event, RoomMessageText):
+                    continue
+                content = getattr(event, "source", {}).get("content")
+                if isinstance(content, dict) and RCP_NAMESPACE in content:
+                    continue  # an RCP message, not human chat
+                human.append((room_id, event.sender, event.body))
+        return rcp, human
 
     async def receive(self) -> AsyncIterator[RcpMessage]:
         """Yield RCP messages as they arrive.
@@ -149,7 +334,19 @@ class MatrixTransport:
         room = joined.get(self._room_id)
         if room is None:
             return messages
-        for event in room.timeline.events:
+        return self._extract_events(list(room.timeline.events))
+
+    @staticmethod
+    def _extract_events(events: list[Any]) -> list[RcpMessage]:
+        """Extract the RCP messages from a list of Matrix timeline events.
+
+        Returns:
+            The verified-shaped RCP messages, in the events' own order; a
+            non-RCP or malformed event is skipped.
+
+        """
+        messages: list[RcpMessage] = []
+        for event in events:
             if not isinstance(event, RoomMessageText):
                 continue
             content = getattr(event, "source", {}).get("content")

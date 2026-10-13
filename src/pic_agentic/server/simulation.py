@@ -16,6 +16,7 @@ lifecycle events (``simulation.submitted``/``workflow.finished``/
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
@@ -23,21 +24,36 @@ from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from pic_agentic.protocol.simulation import (
     LOG_STREAMS,
+    MAX_INLINE_PAYLOAD_BYTES,
+    ClientCapabilities,
+    ControlParams,
+    ResultOp,
+    ResultParams,
+    SimulationOp,
     SimulationPayload,
     SimulationState,
     SimulationType,
     SubmitParams,
+    build_control_command,
     build_logs_command,
+    build_result_command,
     build_status_command,
     build_submit_command,
+    client_capability_mismatch,
+    payload_wire_size,
+    signal_from_exit_code,
+    simulation_phase,
 )
 from pic_agentic.rcp import Kind, RcpMessage, SenderRole, SequenceState, new_cmd_id
 from pic_agentic.server.hello import AckTimeoutError, SendFn
+from pic_agentic.simclient.simulation import SimulationErrorCode
 from pic_agentic.simulation_build import BuiltSimulation, SimulationBuildError, build_runner_dump
+from pic_agentic.slurm.client import is_permanent_reason
+from pic_agentic.version import local_provenance
 
 log = logging.getLogger(__name__)
 
@@ -50,8 +66,56 @@ TERMINAL_STATES = frozenset(
         SimulationState.RESULTS_READY.value,
         SimulationState.FAILED.value,
         SimulationState.JOB_FAILED.value,
+        SimulationState.CANCELLED.value,
     },
 )
+
+#: States at or after which the scheduler queue wait is over, so a carried
+#: pending reason is stale and must be dropped from the record (F3).
+_RUNNING_OR_LATER_STATES = frozenset(
+    {
+        SimulationState.JOB_RUNNING.value,
+        SimulationState.STEP_FINISHED.value,
+        SimulationState.CHECKPOINT.value,
+        SimulationState.JOB_FINISHED.value,
+        SimulationState.RESULTS_READY.value,
+        SimulationState.FAILED.value,
+        SimulationState.JOB_FAILED.value,
+        SimulationState.CANCELLED.value,
+    },
+)
+
+#: Every state name a caller may name as a wait target, plus the special
+#: ``"terminal"`` alias that expands to :data:`TERMINAL_STATES`.
+_KNOWN_WAIT_STATES = frozenset(state.value for state in SimulationState)
+
+#: Default bound for :meth:`SubmitService.wait_for_state`.  Deliberately large
+#: enough to cover a 15-20 min PIConGPU compile plus the queue wait; a caller
+#: that needs longer calls again (the tool returns ``timed_out``, never an
+#: error).
+DEFAULT_WAIT_TIMEOUT_S = 1800.0
+
+#: Floor for ``timeout_s`` (rejects zero/negative); small enough for tests.
+MIN_WAIT_TIMEOUT_S = 0.1
+
+#: Ceiling for ``timeout_s``: a single MCP tool call must not hold the
+#: connection indefinitely.  Callers wait in bounded slices.
+MAX_WAIT_TIMEOUT_S = 3600.0
+
+#: Safety margin, in seconds, between a requested wait ``timeout_s`` and the
+#: known MCP client budget.  The client must stay on the wire a moment longer
+#: than the server blocks (transport/serialisation overhead), so a wait is only
+#: accepted when ``timeout_s + skew <= client budget``.  Without the margin a
+#: request that "fits" the budget exactly still races the client's own timer.
+WAIT_CLIENT_TIMEOUT_SKEW_S = 5.0
+
+#: Default wakeup cadence.  The wait is event-driven (it wakes as soon as a
+#: lifecycle event is projected); the poll is only the ceiling for a wakeup so a
+#: lost event cannot wedge the call until the deadline.
+DEFAULT_WAIT_POLL_S = 2.0
+
+#: Floor for ``poll_interval_s``.
+MIN_WAIT_POLL_S = 0.05
 
 #: Cap on the retained event log (the registry is projected from it and, on a
 #: fresh start, from the signed-room backfill).
@@ -65,6 +129,8 @@ MAX_EVENT_PAGE = 200
 _PULL_ACK_FOR_REQUEST: dict[SimulationType, SimulationType] = {
     SimulationType.STATUS_COMMAND: SimulationType.STATUS_ACK,
     SimulationType.LOGS_COMMAND: SimulationType.LOGS_ACK,
+    SimulationType.CONTROL_COMMAND: SimulationType.CONTROL_ACK,
+    SimulationType.RESULT_COMMAND: SimulationType.RESULT_ACK,
 }
 
 #: Fields projected from an event/ack payload into a :class:`SimRecord` when the
@@ -73,14 +139,26 @@ _PULL_ACK_FOR_REQUEST: dict[SimulationType, SimulationType] = {
 _RECORD_FIELDS = (
     "job_id",
     "slurm_state",
+    "slurm_reason",
     "step",
     "percent",
     "walltime",
     "avg_per_step",
     "eta_s",
     "exit_code",
+    "core_hours",
+    "gpu_hours",
     "run_dir",
+    "error",
+    "error_code",
+    "failure_summary",
+    "stage",
+    "suspect",
 )
+
+#: The failure-reason subset of :data:`_RECORD_FIELDS`, projected from a submit
+#: ack as well (a rejection reports its reason on the ack, not as an event).
+_FAILURE_FIELDS = ("error", "error_code", "failure_summary", "stage")
 
 
 class SimRecord(BaseModel):
@@ -98,16 +176,68 @@ class SimRecord(BaseModel):
     job_id: int | None = None
     state: str = ""
     slurm_state: str | None = None
+    #: Scheduler ``Reason=`` for the latest observed SLURM state (F3): why a
+    #: pending job is not running (e.g. ``PartitionNodeLimit``), so a job that
+    #: can never schedule is distinguishable from one waiting its turn.
+    slurm_reason: str | None = None
     step: int | None = None
     percent: int | None = None
     walltime: str | None = None
     avg_per_step: str | None = None
     eta_s: int | None = None
     exit_code: int | None = None
+    #: Actual resource usage reported on the terminal lifecycle event (gap 4).
+    core_hours: float | None = None
+    gpu_hours: float | None = None
     run_dir: str | None = None
+    #: Human-readable failure reason reported by the simclient (ack or event).
+    error: str | None = None
+    #: Stable machine-readable failure code (e.g. ``unsupported``).
+    error_code: str | None = None
+    #: A short, human-readable cause extracted from a long raw ``error`` (e.g.
+    #: the compiler line from a cwltool ``permanentFail`` dump).
+    failure_summary: str | None = None
+    #: Pipeline stage the failure occurred in, when the simclient reported one.
+    stage: str | None = None
+    #: The "successful-but-empty" health flag: the all-zero warning text when the
+    #: run completed but its only numeric artifact reads zero (F4).  None when
+    #: the run is not suspect or was never probed.
+    suspect: str | None = None
     last_event_type: str | None = None
     last_event_ts: str | None = None
     active: bool = True
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def slurm_blocked(self) -> bool:
+        """Whether the scheduler reason means the job can never run as requested.
+
+        A ``PENDING`` job whose ``slurm_reason`` is a permanent limit (e.g.
+        ``PartitionNodeLimit``) will never start without a changed request, so
+        callers must not wait on it (F3).  A transient reason (``Resources``,
+        ``Priority``) is not flagged.
+
+        Returns:
+            True when :attr:`slurm_reason` is a curated permanent reason.
+
+        """
+        return is_permanent_reason(self.slurm_reason)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def phase(self) -> str:
+        """The coarse run phase (H4): build vs queue vs run.
+
+        Derived from :attr:`state` and :attr:`job_id` so a caller polling the
+        registry can tell a long build/queue wait apart from a genuinely idle
+        running job.  See
+        :func:`~pic_agentic.protocol.simulation.simulation_phase`.
+
+        Returns:
+            One of the ``SimulationPhase`` values.
+
+        """
+        return simulation_phase(self.state, self.job_id)
 
 
 def condense_events(
@@ -177,12 +307,126 @@ class SubmitOutcome(BaseModel):
     acked: bool = False
     error: str | None = None
     error_code: str | None = None
+    #: Pipeline stage the rejection occurred in, when the ack carries one.
+    stage: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def run_id(self) -> str:
+        """The run-batch identity of this submission.
+
+        Distinct from :attr:`sim_id`: ``sim_id`` is a **spec label** (the first
+        8 hex of the payload hash, shared by every identical spec and every
+        re-run), while ``run_id`` is the submission's stable command id and
+        names *this* run.  Two re-runs of the same spec therefore report the
+        same ``sim_id`` but different ``run_id`` -- the identity a user needs to
+        tell a re-run from a distinct study point.
+
+        Returns:
+            The submission's command id (32 lowercase hex).
+
+        """
+        return self.cmd_id
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def ok(self) -> bool:
         """Whether the command was accepted without an error."""
         return not self.error
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def outcome_unknown(self) -> bool:
+        """Whether the ack reported the submission outcome as unknown.
+
+        True when the simclient found a *pending* idempotency record (it died
+        after accepting the command but before recording an outcome): the job
+        may exist or be running, and the exactly-once ``cmd_id`` makes a retry
+        safe.  Callers must treat this as transient (defer and retry), not as a
+        rejection.  Keyed on the stable :data:`SimulationErrorCode.OUTCOME_UNKNOWN`
+        code, with the legacy error string as a fallback for an older client
+        that does not yet carry the code.
+        """
+        return self.error_code == SimulationErrorCode.OUTCOME_UNKNOWN.value or bool(
+            self.error and self.error.startswith("already_submitted:outcome_unknown"),
+        )
+
+
+class WaitOutcome(BaseModel):
+    """The result of one bounded wait for a simulation to reach a state.
+
+    A timeout is data (``timed_out=True``) carrying the last-known record, not
+    an error: the wait is a convenience over the event stream, so "not yet"
+    must never be reported as a failure.  The caller decides whether to wait
+    again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    #: The state the wait resolved on (the requested target, or the last-known
+    #: state on a timeout).
+    state: str
+    #: Whether ``state`` is one the caller asked to wait for.
+    matched: bool
+    #: True iff the deadline elapsed before any target was reached.
+    timed_out: bool
+    #: Seconds actually waited (bounded by the deadline).
+    waited_s: float
+    #: The target states the wait was watching (the expanded set for
+    #: ``"terminal"``), so a caller can see what it was waiting for.
+    target_states: list[str] = Field(default_factory=list)
+    #: The terminal/requested events observed for this simulation in the
+    #: registry's event log, oldest first (bounded by ``condense_events``).
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    #: The last-known registry projection at return time (progress and failure
+    #: detail); never invented -- it is exactly what the event stream says.
+    last_status: dict[str, Any] = Field(default_factory=dict)
+    #: A build/queue-phase note when no scheduler job id is known yet, so a
+    #: timeout during the 15-20 min compile/queue window is not read as a hang.
+    note: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        """Whether the wait executed (a timeout is data, not a failure).
+
+        Always True for a constructed outcome: the only failure mode -- a bad
+        ``sim_id`` or target -- is rejected before a :class:`WaitOutcome` is
+        built (the tool then returns ``ok: false`` with an ``error``).  Use
+        ``matched``/``timed_out`` to distinguish a reached target from a
+        deadline, never ``ok``.
+        """
+        return True
+
+
+class BuiltSpec(BaseModel):
+    """A dry-run build result: a Runner spec plus the size it would occupy.
+
+    Plain data (no runtime resources), so the pydantic model carries both the
+    wire spec an agenda leaf needs and the provenance/size fields that make the
+    48 KiB inline limit visible to the caller before any job is submitted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The wire spec (``{"sim": <pypicongpu Simulation dump>}``) for a leaf.
+    spec: dict[str, Any]
+    picongpu_version: str = ""
+    picongpu_revision: str = ""
+    schema_hash: str = ""
+    #: Escaped homeserver-facing size of the payload built from ``spec``.
+    wire_bytes: int
+    #: The inline submission budget ``wire_bytes`` is measured against.
+    inline_limit_bytes: int = MAX_INLINE_PAYLOAD_BYTES
+    #: Whether ``wire_bytes`` fits the inline cap and can be submitted as-is.
+    within_inline_limit: bool
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ok(self) -> bool:
+        """Whether the spec was built (the build itself never fails here)."""
+        return True
 
 
 class SubmitService:
@@ -198,6 +442,8 @@ class SubmitService:
         ack_timeout_s: float = 90.0,
         runner_dump_builder: RunnerDumpBuilder = build_runner_dump,
         event_log_max: int = DEFAULT_EVENT_LOG_MAX,
+        results_root: str = "",
+        client_timeout_s: float | None = None,
     ) -> None:
         """Create a service for one simulation.
 
@@ -209,6 +455,13 @@ class SubmitService:
             ack_timeout_s: Maximum wait for an ack (submit and pull).
             runner_dump_builder: Subprocess runner-dump builder (test seam).
             event_log_max: Maximum retained lifecycle events.
+            results_root: Optional local mirror of a run's ``simOutput`` used
+                for the contract-4 ``readable`` check; never moved from.
+            client_timeout_s: The known MCP client request budget, in seconds,
+                or None when unknown.  When set, a ``wait_for_state`` request
+                whose ``timeout_s`` would outlast the budget is refused up
+                front (a clear error) instead of blocking until the client
+                kills the request with an opaque timeout (D1).
 
         """
         self.sim = sim
@@ -218,6 +471,8 @@ class SubmitService:
         self.ack_timeout_s = ack_timeout_s
         self.runner_dump_builder = runner_dump_builder
         self.event_log_max = event_log_max
+        self.results_root = results_root
+        self.client_timeout_s = client_timeout_s
         self.sequences = SequenceState()
         self._pending: dict[str, asyncio.Future[RcpMessage]] = {}
         #: Pending status/logs pulls, keyed by cmd_id, and the ack type each
@@ -230,6 +485,100 @@ class SubmitService:
         #: ``get_events``/``condense_events`` read from.
         self.event_log: list[RcpMessage] = []
         self.registry: dict[str, SimRecord] = {}
+        #: Optional callback ``(spec, sim_id, run_id) -> None`` invoked when a
+        #: bare ``submit_simulation`` is accepted, so the run can be recorded as
+        #: pending reuse (H7).  ``spec`` is the wire payload's simulation mapping
+        #: (``{"sim": ...}``); ``run_id`` is the submission's stable command id.
+        self.on_direct_submission: Callable[..., None] | None = None
+        #: Optional callback invoked with a run's stable command id (its
+        #: run-batch identity) when its ``results.ready`` event is projected.
+        #: The agenda service uses it to promote a direct submission's pending
+        #: reuse entry once the result exists; the command id -- not the spec --
+        #: is carried by the event, so the attribution survives a restart.
+        self.on_run_ready: Callable[[str], None] | None = None
+        #: Latest capability set the simclient advertised over the ``hello``
+        #: handshake; None until a hello runs or the client predates the probe.
+        self.client_capabilities: ClientCapabilities | None = None
+        #: Wakeup queues for live :meth:`wait_for_state` callers, keyed by
+        #: ``sim_id``.  Each waiter owns its own ``asyncio.Event`` so a
+        #: projected event wakes *every* concurrent waiter for the sim; a
+        #: returning waiter removes only its own event and cannot strand a
+        #: sibling (M2).
+        self._waiters: dict[str, set[asyncio.Event]] = {}
+        #: Whether the signed-room replay that built this registry reconstructed
+        #: the room's *whole* history.  When False, a sim the registry does not
+        #: know may simply be off the replayed page rather than never submitted,
+        #: so an unknown id is reported as ``unknown_after_restart`` instead of a
+        #: bare ``unknown_sim`` (F1).  Set by :meth:`set_history_complete`.
+        self.history_complete = True
+
+    def set_history_complete(self, *, complete: bool) -> None:
+        """Record whether the startup backfill reconstructed the whole history.
+
+        Args:
+            complete: True when the transport replayed the room from its start,
+                False when a page cap/error left the replay partial.
+
+        """
+        self.history_complete = complete
+
+    def unknown_error(self) -> str:
+        """Return the error code for a sim absent from the registry.
+
+        A genuinely never-submitted id is ``unknown_sim``; when the replay that
+        built the registry was incomplete the id may have existed before the
+        restart, so the distinct ``unknown_after_restart`` tells the caller to
+        re-check the cluster/results rather than assume it never existed (F1).
+
+        Returns:
+            ``"unknown_sim"`` or ``"unknown_after_restart"``.
+
+        """
+        return "unknown_sim" if self.history_complete else "unknown_after_restart"
+
+    def set_client_capabilities(self, capabilities: ClientCapabilities | None) -> None:
+        """Record the client capabilities learned from the ``hello`` handshake.
+
+        Args:
+            capabilities: The advertised set, or None to clear it.
+
+        """
+        self.client_capabilities = capabilities
+
+    def capability_mismatch(
+        self,
+        *,
+        op: ResultOp | SimulationOp | None = None,
+        request_type: SimulationType | None = None,
+    ) -> str | None:
+        """Return a version-drift message when the client cannot handle a request.
+
+        A proactive guard: when the client advertised its capabilities in the
+        ``hello`` handshake and the requested op/type is absent, name the drift
+        rather than sending a command the client answers opaquely.  An unknown
+        client (no advertisement yet) yields None, so the reactive per-ack guard
+        remains the backstop for a server that never ran a hello.
+
+        Args:
+            op: The result/control op about to be sent.
+            request_type: The request ``type`` value about to be sent.
+
+        Returns:
+            The actionable mismatch message, or None when the request is safe.
+
+        """
+        if self.client_capabilities is None:
+            return None
+        type_value = request_type.value if request_type is not None else ""
+        missing = self.client_capabilities.unsupported(
+            op=op,
+            request_type=type_value,
+        )
+        if missing is None:
+            return None
+        if type_value and missing == type_value:
+            return client_capability_mismatch(self.client_capabilities, request_type=type_value)
+        return client_capability_mismatch(self.client_capabilities, op=op.value if op is not None else missing)
 
     async def build_payload(
         self,
@@ -271,6 +620,42 @@ class SubmitService:
         ).sign(self.secret)
         return command_id, payload, command
 
+    async def build_spec(self, script_path: Path) -> BuiltSpec:
+        """Build the wire spec for a PICMI script **without** submitting it.
+
+        Runs the same disposable-subprocess builder and payload validation as
+        :meth:`build_payload`, then returns the inline wire spec (``{"sim":
+        ...}``) an agenda leaf or a later ``submit_spec`` call needs.  The
+        payload is fully validated here (allow-list and the 48 KiB inline cap)
+        so the caller learns the failure mode up front rather than at submit
+        time; ``payload_wire_size`` reports the escaped size the homeserver
+        would see, and ``within_inline_limit`` is False when it would not fit.
+
+        Args:
+            script_path: Path to the PICMI script (already resolved).
+
+        Returns:
+            The built wire spec plus its provenance and wire size.
+
+        """
+        built = await self.runner_dump_builder(script_path=script_path, interpreter=self.picongpu_python)
+        payload = SimulationPayload.build(
+            picongpu_version=built.picongpu_version,
+            picongpu_revision=self.picongpu_revision or built.picongpu_revision,
+            schema_hash=built.schema_hash,
+            runner_dump=built.runner,
+        )
+        payload.check_allowlist()
+        size = payload_wire_size(payload)
+        return BuiltSpec(
+            spec=payload.simulation,
+            picongpu_version=payload.picongpu_version,
+            picongpu_revision=payload.picongpu_revision,
+            schema_hash=payload.schema_hash,
+            wire_bytes=size,
+            within_inline_limit=size <= MAX_INLINE_PAYLOAD_BYTES,
+        )
+
     def on_message(self, message: RcpMessage) -> None:
         """Feed an inbound message; resolve pending futures and project events.
 
@@ -287,7 +672,12 @@ class SubmitService:
             self._append_event_log(message)
             self._project_event(message)
             return
-        if message.kind is Kind.ACK and message.type in {SimulationType.STATUS_ACK, SimulationType.LOGS_ACK}:
+        if message.kind is Kind.ACK and message.type in {
+            SimulationType.STATUS_ACK,
+            SimulationType.LOGS_ACK,
+            SimulationType.CONTROL_ACK,
+            SimulationType.RESULT_ACK,
+        }:
             # Match the ack's *kind* to the pending request, not just its
             # cmd_id: a mis-routed ``logs_ack`` carrying a status request's
             # cmd_id must not resolve the status future.
@@ -374,11 +764,35 @@ class SubmitService:
             value = payload.get(field)
             if value is not None:
                 setattr(record, field, value)
+        # The F4 health flag is only meaningful on a completed run's
+        # ``results.ready`` event.  An event allow-list keeps a buggy or
+        # replayed client from stamping ``suspect`` onto a still-running record
+        # (the fleet/agenda guards would ignore it, but the record should never
+        # hold a contradictory value).
+        if state != SimulationState.RESULTS_READY.value:
+            record.suspect = None
+        # The pending reason is scoped to the queue wait: once the job is
+        # running (or finished) a transient reason like ``Resources`` is stale
+        # and must not linger and read as a live block (F3).  A permanent reason
+        # is emitted only for a ``PENDING`` state the job never leaves.
+        if state in _RUNNING_OR_LATER_STATES:
+            record.slurm_reason = None
         record.state = state
         record.last_event_type = state or record.last_event_type
         record.last_event_ts = message.ts
         record.active = state not in TERMINAL_STATES
         self.registry[sim_id] = record
+        if state == SimulationState.RESULTS_READY.value and self.on_run_ready is not None:
+            # The result now exists, so the run is reusable.  Keyed by the run's
+            # command id (its run-batch identity), which the event carries, so a
+            # direct submission's pending reuse entry can be promoted without
+            # the spec -- including on a post-restart backfill.  Best-effort:
+            # a hook failure must never break event projection.
+            try:
+                self.on_run_ready(cmd_id)
+            except Exception as exc:  # ruff: ignore[blind-except] - a hook must never break projection
+                log.warning("on_run_ready hook failed for %s: %s", sim_id, exc)
+        self._wake_waiters(sim_id)
 
     def _project_ack(self, message: RcpMessage) -> None:
         """Register the simulation named by a submit ack, before its first event.
@@ -396,6 +810,22 @@ class SubmitService:
         # A replayed ack from an older run must not touch the latest record.
         if cmd_id and cmd_id != record.cmd_id:
             return
+        # An outcome-unknown ack (a pending idempotency record) is *not* a
+        # lifecycle state: the job may be running, and the exactly-once cmd_id
+        # makes the next tick's retry re-ack it.  Projecting the ack's
+        # ``state=failed``/``error`` here would falsely mark the sim failed in
+        # the registry, the observation would then fold the leaf terminal, and
+        # the retry (which is the whole point) could never run.  Register the sim
+        # as known but leave its state/error untouched.
+        ack_error_code = payload.get("error_code")
+        ack_error = payload.get("error")
+        if ack_error_code == SimulationErrorCode.OUTCOME_UNKNOWN.value or (
+            isinstance(ack_error, str) and ack_error.startswith("already_submitted:outcome_unknown")
+        ):
+            if record.last_event_ts is None:
+                record.last_event_ts = message.ts
+            self.registry[sim_id] = record
+            return
         # The ack seeds a fresh record only: a late or re-delivered ack must
         # never regress a state already projected from a later event.
         state = str(payload.get("state", ""))
@@ -405,6 +835,12 @@ class SubmitService:
             record.active = state not in TERMINAL_STATES
         if payload.get("job_id") is not None:
             record.job_id = payload["job_id"]
+        # A rejected submission carries its reason on the ack (not an event), so
+        # project the failure fields here too.
+        for field in _FAILURE_FIELDS:
+            value = payload.get(field)
+            if value is not None:
+                setattr(record, field, value)
         if record.last_event_ts is None:
             record.last_event_ts = message.ts
         self.registry[sim_id] = record
@@ -472,6 +908,163 @@ class SubmitService:
             return [record for record in records if record.active]
         return records
 
+    def _wake_waiters(self, sim_id: str) -> None:
+        """Wake every live :meth:`wait_for_state` caller for ``sim_id``.
+
+        Called after an event is projected so a wait returns promptly on the
+        transition it is watching instead of on its poll ceiling.
+
+        Args:
+            sim_id: The simulation whose record just advanced.
+
+        """
+        for event in self._waiters.get(sim_id, set()):
+            event.set()
+
+    async def wait_for_state(
+        self,
+        sim_id: str,
+        *,
+        target_states: Iterable[str] | None = None,
+        timeout_s: float = DEFAULT_WAIT_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_WAIT_POLL_S,
+    ) -> WaitOutcome:
+        """Block until ``sim_id`` reaches a target state, or the deadline.
+
+        The wait is **event-driven**: :meth:`_project_event` sets a wakeup
+        when a lifecycle event for this simulation is projected, so the call
+        returns on the terminal transition rather than on the poll cadence.
+        ``poll_interval_s`` is only the ceiling on a wakeup (and bounds how
+        often the pending status is re-read), so a dropped event cannot wedge
+        the call past the deadline.
+
+        This does not itself pull from the cluster: it waits on the registry the
+        simclient's pushed events feed.  For the build/queue phase in which the
+        simclient has not yet emitted a scheduler job id, the outcome's
+        ``last_status.phase`` reads ``"building"`` (never an invented lifecycle
+        state); the wait then keeps watching until the deadline.
+
+        Args:
+            sim_id: The simulation to wait on.
+            target_states: State names to wait for.  Defaults to the terminal
+                set (:data:`TERMINAL_STATES`); the special name ``"terminal"``
+                expands to that set.  Unknown names are rejected.
+            timeout_s: Bounded wait, in seconds.  Must lie within
+                ``[MIN_WAIT_TIMEOUT_S, MAX_WAIT_TIMEOUT_S]``, else a
+                ``ValueError`` is raised.
+            poll_interval_s: Wakeup ceiling, in seconds.  Clamped to at least
+                :data:`MIN_WAIT_POLL_S`.
+
+        Returns:
+            The :class:`WaitOutcome`; a deadline elapse yields
+            ``timed_out=True`` with the last-known status, never an error.
+
+        Raises:
+            KeyError: If ``sim_id`` is unknown to the registry.
+
+        A ``timeout_s`` that would outlast the known MCP client request budget
+        (when one is configured) is refused via :func:`_check_client_budget` as
+        a ``WaitExceedsClientTimeoutError`` -- a ``ValueError`` the wait tool
+        degrades to a soft error, never a clamp.
+
+        """
+        targets, terminal_only = _resolve_wait_targets(target_states)
+        timeout = _validate_timeout(timeout_s)
+        # Resolve the simulation first: an unknown id is the caller's primary
+        # mistake, and reporting a budget detail for it would be misleading.
+        if self.get(sim_id) is None:
+            msg = f"unknown simulation {sim_id!r}"
+            raise KeyError(msg)
+        _check_client_budget(timeout, self.client_timeout_s)
+        interval = max(poll_interval_s, MIN_WAIT_POLL_S)
+        wakeup = asyncio.Event()
+        self._waiters.setdefault(sim_id, set()).add(wakeup)
+        started = asyncio.get_running_loop().time()
+        deadline = started + timeout
+        try:
+            while True:
+                record = self.get(sim_id)
+                if record is not None and record.state in targets:
+                    observed = record.state
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                # A terminal run that is not a requested target can never reach
+                # one (terminal is monotonic), so return at once instead of
+                # burning the whole deadline (M3).
+                if record is not None and record.state in TERMINAL_STATES:
+                    return self._wait_outcome(
+                        sim_id,
+                        state=record.state,
+                        matched=False,
+                        timed_out=False,
+                        waited_s=asyncio.get_running_loop().time() - started,
+                        targets=sorted(targets),
+                        terminal_only=terminal_only,
+                    )
+                if remaining <= 0:
+                    observed = record.state if record is not None else ""
+                    return self._wait_outcome(
+                        sim_id,
+                        state=observed,
+                        matched=False,
+                        timed_out=True,
+                        waited_s=asyncio.get_running_loop().time() - started,
+                        targets=sorted(targets),
+                        terminal_only=terminal_only,
+                    )
+                wakeup.clear()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(wakeup.wait(), timeout=min(interval, remaining))
+        finally:
+            waiters = self._waiters.get(sim_id)
+            if waiters is not None:
+                waiters.discard(wakeup)
+                if not waiters:
+                    self._waiters.pop(sim_id, None)
+        return self._wait_outcome(
+            sim_id,
+            state=observed,
+            matched=True,
+            timed_out=False,
+            waited_s=asyncio.get_running_loop().time() - started,
+            targets=sorted(targets),
+            terminal_only=terminal_only,
+        )
+
+    def _wait_outcome(
+        self,
+        sim_id: str,
+        *,
+        state: str,
+        matched: bool,
+        timed_out: bool,
+        waited_s: float,
+        targets: list[str],
+        terminal_only: bool,
+    ) -> WaitOutcome:
+        """Assemble a :class:`WaitOutcome` from the current registry state.
+
+        Returns:
+            The outcome, its events/status taken verbatim from the event log
+            and registry projection (never invented).
+
+        """
+        record = self.get(sim_id)
+        # The whole condensed history (all states), so the caller sees the path
+        # to the matched state, not only the target rows.
+        events = condense_events(self.event_log, sim_id=sim_id, limit=MAX_EVENT_PAGE)
+        return WaitOutcome(
+            sim_id=sim_id,
+            state=state,
+            matched=matched,
+            timed_out=timed_out,
+            waited_s=round(waited_s, 3),
+            target_states=targets,
+            events=events,
+            last_status=_record_status(record) if record is not None else {},
+            note=_wait_note(record, matched=matched, timed_out=timed_out, terminal_only=terminal_only),
+        )
+
     def _outcome_from_ack(self, cmd_id: str, ack: RcpMessage) -> SubmitOutcome:
         return SubmitOutcome(
             sim=self.sim,
@@ -482,6 +1075,7 @@ class SubmitService:
             acked=True,
             error=ack.payload.get("error"),
             error_code=ack.payload.get("error_code"),
+            stage=ack.payload.get("stage"),
         )
 
     async def submit(
@@ -500,13 +1094,131 @@ class SubmitService:
 
         Returns:
             The outcome; ``state`` is the simclient's first ack state (normally
-            ``accepted``).
+            ``accepted``).  A missing ack surfaces as the
+            :class:`~pic_agentic.server.hello.AckTimeoutError` raised by
+            :meth:`_dispatch`.
+
+        """
+        cmd_id, payload, command = await self.build_payload(script_path, params=params)
+        outcome = await self._dispatch(send, cmd_id, command)
+        if outcome.ok and self.on_direct_submission is not None:
+            # H7: a bare submit_simulation must be recorded so a later identical
+            # campaign leaf is reused instead of re-run.  The spec's wire form
+            # is the same ``{"sim": ...}`` the campaign holds, so the content
+            # key agrees.  Best-effort: registry bookkeeping must never fail a
+            # submission that the simclient already accepted.
+            try:
+                self.on_direct_submission(payload.simulation, sim_id=outcome.sim_id, run_id=cmd_id)
+            except Exception as exc:  # ruff: ignore[blind-except] - bookkeeping is best-effort
+                log.warning("direct reuse record failed for sim %s: %s", outcome.sim_id, exc)
+        return outcome
+
+    async def submit_spec(
+        self,
+        send: SendFn,
+        runner_dump: dict[str, Any],
+        *,
+        params: SubmitParams | None = None,
+        cmd_id: str | None = None,
+    ) -> SubmitOutcome:
+        """Build, send and await one ``submit_simulation`` from a Runner spec.
+
+        Unlike :meth:`submit`, the payload is built directly from an
+        already-produced ``Runner.model_dump(mode="json")`` (an agenda leaf
+        holds such a spec), skipping the PICMI-to-Runner subprocess builder.
+        The provenance tuple is taken from this install via
+        :func:`~pic_agentic.version.local_provenance` (falling back to the
+        configured ``picongpu_revision`` and then to a ``provenance`` block
+        carried inside the spec, so a server without PIConGPU can still carry
+        the authoring revision), and the payload is still validated by
+        :meth:`~pic_agentic.protocol.simulation.SimulationPayload.check_allowlist`.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            runner_dump: A full runner dump (or a wire spec carrying ``sim``).
+            params: Optional build/run flags.
+            cmd_id: Optional stable idempotency key; a retried submission of the
+                same spec re-uses it so the simclient replays its recorded ack
+                instead of running the job twice.
+
+        Returns:
+            The outcome; ``state`` is the simclient's first ack state.
+
+        """
+        cmd_id, _payload, command = self._build_spec_payload(runner_dump, params=params, cmd_id=cmd_id)
+        return await self._dispatch(send, cmd_id, command)
+
+    def prepare_spec(self, runner_dump: dict[str, Any]) -> SimulationPayload:
+        """Build and allow-list a Runner spec exactly as a submission would.
+
+        The shared validation front-end for every path that turns an existing
+        spec into a submit command: :meth:`_build_spec_payload` (submission) and
+        the agenda's ``create_campaign`` (campaign creation) both call this, so
+        a leaf is validated by the same allow-list check it will meet at submit
+        time -- and rejected at creation rather than at the next tick.  No
+        command is signed and no sequence is consumed.
+
+        Args:
+            runner_dump: A full runner dump (or a wire spec carrying ``sim``).
+
+        Returns:
+            The validated payload; an allow-list failure propagates from
+            ``SimulationPayload.check_allowlist``.
+
+        """
+        provenance = _spec_provenance(runner_dump, self.picongpu_revision)
+        payload = SimulationPayload.build(
+            picongpu_version=provenance["picongpu_version"],
+            picongpu_revision=provenance["picongpu_revision"],
+            schema_hash=provenance["schema_hash"],
+            runner_dump=runner_dump,
+        )
+        payload.check_allowlist()
+        return payload
+
+    def _build_spec_payload(
+        self,
+        runner_dump: dict[str, Any],
+        *,
+        params: SubmitParams | None = None,
+        cmd_id: str | None = None,
+    ) -> tuple[str, SimulationPayload, RcpMessage]:
+        """Wrap a Runner spec directly in a signed submit command.
+
+        Mirrors :meth:`build_payload` but skips the ``runner_dump_builder`` (the
+        spec already exists), so it is synchronous.  The provenance tuple is
+        resolved with :func:`_spec_provenance`, which falls back from the local
+        install to a ``provenance`` mapping carried by the spec.
+
+        Returns:
+            The ``(cmd_id, payload, command)`` triple, the command signed.
+
+        """
+        command_id = cmd_id or new_cmd_id()
+        payload = self.prepare_spec(runner_dump)
+        seq = self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER)
+        command = build_submit_command(
+            sim=self.sim,
+            seq=seq,
+            payload=payload,
+            params=params,
+            cmd_id=command_id,
+        ).sign(self.secret)
+        return command_id, payload, command
+
+    async def _dispatch(self, send: SendFn, cmd_id: str, command: RcpMessage) -> SubmitOutcome:
+        """Send one signed submit command and await its ack.
+
+        Shared by :meth:`submit` and :meth:`submit_spec` so the pending-future
+        bookkeeping lives in one place.
+
+        Returns:
+            The outcome built from the ack.
 
         Raises:
             AckTimeoutError: If no ack arrives within the configured wait.
 
         """
-        cmd_id, _payload, command = await self.build_payload(script_path, params=params)
         future: asyncio.Future[RcpMessage] = asyncio.get_running_loop().create_future()
         self._pending[cmd_id] = future
         try:
@@ -534,6 +1246,14 @@ class SubmitService:
             The ``status_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
 
         """
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value="",
+            op=None,
+            request_type=SimulationType.STATUS_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
         return await self._fetch(
             send,
             sim_id,
@@ -572,6 +1292,14 @@ class SubmitService:
         if stream not in LOG_STREAMS:
             msg = f"unknown log stream {stream!r}; expected one of {LOG_STREAMS}"
             raise ValueError(msg)
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value="",
+            op=None,
+            request_type=SimulationType.LOGS_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
         return await self._fetch(
             send,
             sim_id,
@@ -584,6 +1312,162 @@ class SubmitService:
                 cmd_id=cmd_id,
             ),
         )
+
+    async def control(self, send: SendFn, sim_id: str, op: SimulationOp) -> dict[str, Any]:
+        """Send a control request and await its ack.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            sim_id: The simulation to control.
+            op: The control verb (checkpoint/stop/cancel).
+
+        Returns:
+            The ``control_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
+
+        """
+        params = ControlParams(sim_id=sim_id, op=op)
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value=op.value,
+            op=op,
+            request_type=SimulationType.CONTROL_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
+        return await self._fetch(
+            send,
+            sim_id,
+            lambda cmd_id: build_control_command(
+                sim=self.sim,
+                seq=self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER),
+                params=params,
+                cmd_id=cmd_id,
+            ),
+        )
+
+    def _capability_error(
+        self,
+        *,
+        sim_id: str,
+        op_value: str,
+        op: ResultOp | SimulationOp | None,
+        request_type: SimulationType,
+    ) -> dict[str, Any] | None:
+        """Return a soft error dict when the client cannot handle the request.
+
+        Returns:
+            The ``unsupported_by_client`` payload, or None when the request is
+            safe to send (or the client never advertised its capabilities).
+
+        """
+        mismatch = self.capability_mismatch(op=op, request_type=request_type)
+        if mismatch is None:
+            return None
+        return {
+            "sim_id": sim_id,
+            "op": op_value,
+            "error": mismatch,
+            "error_code": "unsupported_by_client",
+        }
+
+    async def fetch_result(self, send: SendFn, params: ResultParams) -> dict[str, Any]:
+        """Send a results request and await its ack.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            params: The validated result request (op plus its knobs).
+
+        Returns:
+            The ``result_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
+
+        """
+        sim_id = params.sim_id
+        capability_error = self._capability_error(
+            sim_id=sim_id,
+            op_value=params.op.value,
+            op=params.op,
+            request_type=SimulationType.RESULT_COMMAND,
+        )
+        if capability_error is not None:
+            return capability_error
+        payload = await self._fetch(
+            send,
+            sim_id,
+            lambda cmd_id: build_result_command(
+                sim=self.sim,
+                seq=self.sequences.next_seq(self.sim, SenderRole.MCP_SERVER),
+                params=params,
+                cmd_id=cmd_id,
+            ),
+        )
+        self._mark_readable(sim_id, payload)
+        return payload
+
+    async def fetch_manifest(self, send: SendFn, sim_id: str) -> dict[str, Any]:
+        """Send a ``describe`` result request and await its ack.
+
+        Convenience wrapper over :meth:`fetch_result` for the common manifest
+        pull.
+
+        Args:
+            send: Async callable ``send(RcpMessage) -> event_id``.
+            sim_id: The simulation to describe.
+
+        Returns:
+            The ``result_ack`` payload, or ``{"sim_id", "error"}`` on timeout.
+
+        """
+        return await self.fetch_result(send, ResultParams(sim_id=sim_id, op=ResultOp.DESCRIBE))
+
+    def _mark_readable(self, sim_id: str, payload: dict[str, Any]) -> None:
+        """Annotate a result ack with the contract-4 local-mirror readability.
+
+        When ``results_root`` is configured and
+        ``results_root/<sim_id>/simOutput/<path>`` exists, the corresponding
+        ``ResultRef.readable`` (and ``ResultManifest.readable_local``) are set.
+        This is a pure existence check: no data is moved and nothing outside
+        the mirror is touched.
+
+        Args:
+            sim_id: The simulation the ack belongs to.
+            payload: The ``result_ack`` payload, updated in place.
+
+        """
+        if not self.results_root:
+            return
+        root = Path(self.results_root).expanduser().resolve()
+        base = (root / sim_id / "simOutput").resolve()
+        # ``sim_id`` is LLM-supplied: refuse anything that escapes the mirror
+        # root, so the readability flag cannot become an existence oracle for
+        # arbitrary paths.
+        if base != root and root not in base.parents:
+            return
+        manifest = payload.get("manifest")
+        if isinstance(manifest, dict):
+            manifest["readable_local"] = base.is_dir()
+            files = manifest.get("files")
+            if isinstance(files, list):
+                for ref in files:
+                    if isinstance(ref, dict) and isinstance(ref.get("path"), str):
+                        ref["readable"] = self._mirror_has(base, ref["path"])
+        result = payload.get("result")
+        if isinstance(result, dict):
+            for ref in (result, result.get("ref")):
+                if isinstance(ref, dict) and isinstance(ref.get("path"), str):
+                    ref["readable"] = self._mirror_has(base, ref["path"])
+
+    @staticmethod
+    def _mirror_has(base: Path, relpath: str) -> bool:
+        """Whether ``relpath`` exists inside ``base`` without escaping it.
+
+        Returns:
+            True when the contained path exists.
+
+        """
+        candidate = (base / relpath).resolve()
+        if candidate != base and base not in candidate.parents:
+            return False
+        return candidate.exists()
 
     async def _fetch(self, send: SendFn, sim_id: str, build: Callable[[str], RcpMessage]) -> dict[str, Any]:
         """Sign, send and await one request/response pull.
@@ -614,6 +1498,268 @@ class SubmitService:
         return dict(ack.payload)
 
 
+def _resolve_wait_targets(target_states: Iterable[str] | None) -> tuple[frozenset[str], bool]:
+    """Expand and validate the requested wait target states.
+
+    Args:
+        target_states: The caller's names, or None for the terminal default.
+
+    Returns:
+        ``(targets, terminal_only)`` where ``targets`` is the expanded set and
+        ``terminal_only`` records that the caller asked only for the terminal
+        set (used to phrase the build/queue note).
+
+    Raises:
+        ValueError: If any name is unknown.
+
+    """
+    if target_states is None:
+        return TERMINAL_STATES, True
+    requested = list(target_states)
+    if not requested or requested == ["terminal"]:
+        return TERMINAL_STATES, True
+    targets: set[str] = set()
+    for name in requested:
+        if name == "terminal":
+            targets |= TERMINAL_STATES
+            continue
+        if name not in _KNOWN_WAIT_STATES:
+            msg = f"unknown wait target state {name!r}"
+            raise ValueError(msg)
+        targets.add(name)
+    return frozenset(targets), targets <= TERMINAL_STATES
+
+
+class WaitExceedsClientTimeoutError(ValueError):
+    """A requested wait would outlast the known MCP client request budget.
+
+    Raised *before* the wait blocks so the caller gets a clear, actionable
+    message instead of the MCP client killing the request with an opaque
+    ``-32001`` timeout.  Subclasses :class:`ValueError` so the existing
+    soft-error handling in the wait tool catches it unchanged.  Deliberately
+    *not* a clamp: H10 chose validated-not-clamped, and the point of this error
+    is to tell the caller the real budget and how to proceed.
+
+    Attributes:
+        requested_s: The ``timeout_s`` the caller asked for.
+        client_timeout_s: The known client budget, in seconds.
+        limit_s: The largest ``timeout_s`` that fits the budget (budget minus
+            the safety skew).
+
+    """
+
+    def __init__(self, requested_s: float, client_timeout_s: float, limit_s: float) -> None:
+        """Build the error with the numbers the message reports.
+
+        Args:
+            requested_s: The requested ``timeout_s``.
+            client_timeout_s: The known client budget, in seconds.
+            limit_s: The largest acceptable ``timeout_s``.
+
+        """
+        self.requested_s = requested_s
+        self.client_timeout_s = client_timeout_s
+        self.limit_s = limit_s
+        msg = (
+            f"wait_exceeds_client_timeout: timeout_s={requested_s:g} would outlast the MCP client "
+            f"request budget of {client_timeout_s:g} s (limit {limit_s:g} s); pass a smaller timeout_s "
+            "(poll+repeat) or raise PIC_AGENTIC_MCP_TIMEOUT_MS"
+        )
+        super().__init__(msg)
+
+
+def _check_client_budget(timeout_s: float, client_timeout_s: float | None) -> None:
+    """Refuse a wait that would outlast the known MCP client request budget.
+
+    The MCP framework never tells the server the client's per-request timeout,
+    so the setup scripts stamp the effective budget into
+    ``PIC_AGENTIC_MCP_TIMEOUT_MS`` (surfaced as ``client_timeout_s``).  Without
+    it the server can only validate ``timeout_s`` (the H10 contract); with it, a
+    request the client would abort with an opaque ``-32001`` becomes a clear
+    pre-block error.  A small skew keeps the client on the wire longer than the
+    server blocks, so a wait that "fits" exactly does not race the client timer.
+
+    Args:
+        timeout_s: The already-validated requested wait.
+        client_timeout_s: The known client budget in seconds, or None.
+
+    Raises:
+        WaitExceedsClientTimeoutError: If ``timeout_s`` plus the skew exceeds
+            the budget.
+
+    """
+    if client_timeout_s is None:
+        return
+    limit_s = client_timeout_s - WAIT_CLIENT_TIMEOUT_SKEW_S
+    if timeout_s > limit_s:
+        raise WaitExceedsClientTimeoutError(timeout_s, client_timeout_s, limit_s)
+
+
+def _validate_timeout(timeout_s: float) -> float:
+    """Validate a requested wait timeout against the supported bounds.
+
+    A bounded wait is the whole point of the primitive, so an out-of-range
+    request is refused explicitly rather than silently clamped: the caller
+    learns the real limit instead of getting a shorter wait than it asked for.
+
+    Args:
+        timeout_s: The caller's requested bound.
+
+    Returns:
+        ``timeout_s`` as a float, unchanged.
+
+    Raises:
+        ValueError: If ``timeout_s`` is outside
+            ``[MIN_WAIT_TIMEOUT_S, MAX_WAIT_TIMEOUT_S]``.
+
+    """
+    value = float(timeout_s)
+    if not MIN_WAIT_TIMEOUT_S <= value <= MAX_WAIT_TIMEOUT_S:
+        msg = f"timeout_s must be between {MIN_WAIT_TIMEOUT_S:g} and {MAX_WAIT_TIMEOUT_S:g} seconds, got {value:g}"
+        raise ValueError(msg)
+    return value
+
+
+def _record_status(record: SimRecord) -> dict[str, Any]:
+    """Project one record into the wait's ``last_status`` block.
+
+    A non-terminal record with no scheduler ``job_id`` is reported with
+    ``phase: "building"`` (the build/prepare/queue window) so a caller is told
+    "still building", not "still running"; a record with a job id is
+    ``phase: "queued"``/``"running"`` from its state.  The data is the
+    registry's own projection, never invented.
+
+    Args:
+        record: The latest-run record for the simulation.
+
+    Returns:
+        A JSON-safe status dict.
+
+    """
+    status: dict[str, Any] = {
+        "state": record.state,
+        "job_id": record.job_id,
+        "slurm_state": record.slurm_state,
+        "slurm_reason": record.slurm_reason,
+        "slurm_blocked": record.slurm_blocked,
+        "step": record.step,
+        "percent": record.percent,
+        "eta_s": record.eta_s,
+        "error": record.error,
+        "error_code": record.error_code,
+        "failure_summary": record.failure_summary,
+        "exit_signal": signal_from_exit_code(record.exit_code),
+        "active": record.active,
+    }
+    phase = _record_phase(record)
+    if phase is not None:
+        status["phase"] = phase
+    return status
+
+
+def _record_phase(record: SimRecord) -> str | None:
+    """Derive a build/queue/running phase hint from a record.
+
+    ``None`` for a terminal record (no phase is meaningful).  The hint is
+    purely a relabelling of the states the event stream already reported, so it
+    never asserts more than the registry knows.
+
+    Args:
+        record: The latest-run record.
+
+    Returns:
+        ``"building"``, ``"queued"``, ``"running"``, ``"finalizing"`` or None.
+
+    """
+    # If a canonical ``phase`` ever lands on the record (H4/workstream C), use
+    # it rather than deriving a second opinion: the registry stays the single
+    # source of truth for the phase label.
+    canonical = getattr(record, "phase", None)
+    if isinstance(canonical, str) and canonical:
+        return canonical
+    if record.state in TERMINAL_STATES:
+        return None
+    if record.job_id is None:
+        # accepted / workflow.finished with no scheduler id yet: the compile and
+        # prepare stages, before sbatch returned a job id.
+        return "building"
+    if record.state == SimulationState.JOB_RUNNING.value or record.slurm_state == "RUNNING":
+        return "running"
+    if record.state == SimulationState.JOB_FINISHED.value:
+        # The scheduler job is done; the simclient is linking/probing results.
+        return "finalizing"
+    return "queued"
+
+
+def _wait_note(
+    record: SimRecord | None,
+    *,
+    matched: bool,
+    timed_out: bool,
+    terminal_only: bool,
+) -> str | None:
+    """Phrase the human-readable note for a wait outcome.
+
+    A timeout during the build/queue window is deliberately called out: a
+    PIConGPU compile can take 15-20 min and the queue wait longer, so "no
+    terminal state yet" is not a hang and the caller should wait again.
+
+    Args:
+        record: The latest-run record, if known.
+        matched: Whether the wait resolved on a requested target.
+        timed_out: Whether the wait hit its deadline.
+        terminal_only: Whether the caller waited only for terminal states.
+
+    Returns:
+        The note, or None when the outcome needs no explanation.
+
+    """
+    if not timed_out:
+        # The only non-timeout return that needs a note: the run is already
+        # terminal but not a requested target, so it can never reach one.
+        if not matched and record is not None and record.state in TERMINAL_STATES:
+            return (
+                f"the run reached terminal state {record.state!r}, which is not one "
+                "of the requested targets; no further state transition is expected"
+            )
+        return None
+    if record is None:
+        return "unsupported: the simulation is not in the registry"
+    if record.job_id is None:
+        return (
+            "still in the build/queue phase (no scheduler job id yet; a PIConGPU "
+            "compile can take 15-20 min); call wait_for_simulation again to keep waiting"
+        )
+    if record.slurm_blocked:
+        # A permanent scheduler reason means waiting again can never help: the
+        # request itself must change (F3).
+        return (
+            f"the scheduler reports {record.slurm_reason!r} for this job, a permanent "
+            "limit on the current request; it cannot start as submitted, so change the "
+            "allocation (e.g. fewer nodes/GPUs) and resubmit rather than waiting again"
+        )
+    return _timeout_wait_note(record, terminal_only=terminal_only)
+
+
+def _timeout_wait_note(record: SimRecord, *, terminal_only: bool) -> str:
+    """Phrase the generic "still not terminal" timeout note.
+
+    Args:
+        record: The latest-run record (job id already known).
+        terminal_only: Whether the caller waited only for terminal states.
+
+    Returns:
+        The note.
+
+    """
+    if not terminal_only:
+        return "the requested state was not reached before the deadline; call again to keep waiting"
+    return (
+        f"last-known state {record.state!r}; the run is not terminal yet, "
+        "call wait_for_simulation again to keep waiting"
+    )
+
+
 def resolve_script(picmi_script: str, *, workdir: Path) -> Path:
     """Resolve the tool's ``picmi_script`` argument to a file path.
 
@@ -636,15 +1782,53 @@ def resolve_script(picmi_script: str, *, workdir: Path) -> Path:
     return Path(name)
 
 
+def _spec_provenance(runner_dump: dict[str, Any], fallback_revision: str) -> dict[str, str]:
+    """Resolve the provenance tuple for a direct spec submission.
+
+    Prefers this install's:func:`~pic_agentic.version.local_provenance`; when
+    that is unavailable (a server without the pinned PIConGPU) it falls back to
+    a ``provenance`` mapping carried inside the spec, then to the configured
+    revision.  A spec produced on a host with PIConGPU therefore still names its
+    authoring revision when submitted from a PIConGPU-less server.
+
+    Args:
+        runner_dump: The Runner spec (or a wire spec carrying ``sim``).
+        fallback_revision: The configured ``picongpu_revision``.
+
+    Returns:
+        ``{"picongpu_version", "picongpu_revision", "schema_hash"}``.
+
+    """
+    local = local_provenance()
+    carried = runner_dump.get("provenance")
+    carried = carried if isinstance(carried, dict) else {}
+    return {
+        "picongpu_version": local["picongpu_version"] or str(carried.get("picongpu_version", "")),
+        "picongpu_revision": fallback_revision
+        or local["picongpu_revision"]
+        or str(carried.get("picongpu_revision", "")),
+        "schema_hash": local["schema_hash"] or str(carried.get("schema_hash", "")),
+    }
+
+
 __all__ = [
     "DEFAULT_EVENT_LOG_MAX",
+    "DEFAULT_WAIT_POLL_S",
+    "DEFAULT_WAIT_TIMEOUT_S",
     "MAX_EVENT_PAGE",
+    "MAX_WAIT_TIMEOUT_S",
+    "MIN_WAIT_POLL_S",
+    "MIN_WAIT_TIMEOUT_S",
     "TERMINAL_STATES",
+    "WAIT_CLIENT_TIMEOUT_SKEW_S",
     "AckTimeoutError",
+    "BuiltSpec",
     "SimRecord",
     "SimulationBuildError",
     "SubmitOutcome",
     "SubmitService",
+    "WaitExceedsClientTimeoutError",
+    "WaitOutcome",
     "condense_events",
     "resolve_script",
 ]

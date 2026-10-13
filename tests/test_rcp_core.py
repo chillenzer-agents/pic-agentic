@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from pic_agentic.rcp import (
@@ -23,6 +25,7 @@ from pic_agentic.rcp import (
     sign,
     verify,
 )
+from pic_agentic.rcp.envelope import FLOAT_TAG
 
 SECRET = "0123456789abcdef" * 2
 
@@ -203,3 +206,133 @@ def test_sig_not_covered_by_signature() -> None:
     msg.sig = "hmac-sha256:" + "0" * 64
     # A forged sig does not verify, but the signed payload is unaffected by it.
     assert not msg.verify(SECRET)
+
+
+def _synapse_canonical_json(value: object) -> object:
+    """Mimic Synapse's ``canonicaljson``: raise on ANY float in event content.
+
+    The reference homeserver refuses an event whose content carries a float
+    (``Bad JSON value: float``), whether finite or not, in a value *or a key*.
+    This encoder is the offline stand-in for that rule: if it accepts the
+    content, Synapse will too.
+
+    Returns:
+        ``value`` unchanged, so it can be chained into a JSON dump.
+
+    Raises:
+        TypeError: If a float is found anywhere in ``value``.
+
+    """
+    if isinstance(value, float):
+        msg = f"Synapse would reject the float {value!r}"
+        raise TypeError(msg)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _synapse_canonical_json(key)
+            _synapse_canonical_json(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _synapse_canonical_json(item)
+    return value
+
+
+def test_no_float_survives_into_matrix_event_content() -> None:
+    """A payload full of floats must be wire-safe (regression: live terminal event)."""
+    msg = make(
+        kind=Kind.EVENT,
+        payload={
+            "cmd_id": "c",
+            "job_id": 571830,
+            "core_hours": 0.0027777,
+            "gpu_hours": 0.0,
+            "data": [1.0, 2.5, 3.0],
+            "stats": {"min": 1.0, "mean": 2.1666, "n": 3},
+            "nested": [{"x": 0.5}],
+        },
+    ).sign(SECRET)
+    content = msg.to_content()
+    # The whole Matrix content object, not just the RCP envelope, is float-free.
+    _synapse_canonical_json(content)
+    json.dumps(content, allow_nan=False)  # allow_nan=False also proves no NaN/Inf slipped through
+
+
+def test_float_wire_encoding_roundtrips_and_verifies() -> None:
+    msg = make(kind=Kind.EVENT, payload={"core_hours": 0.0027777, "gpu_hours": 0.0, "data": [1.0, 2.5]}).sign(SECRET)
+    raw = msg.to_content()["io.picongpu.rcp"]
+    # The wire form carries no float, and the tagged form is what got signed.
+    _synapse_canonical_json(raw)
+    restored = RcpMessage.from_dict(raw)
+    assert restored.verify(SECRET)
+    # ``repr`` round-trips a float bit-exactly; assert on it rather than ``==``.
+    assert repr(restored.payload["core_hours"]) == repr(0.0027777)
+    assert repr(restored.payload["gpu_hours"]) == repr(0.0)
+    assert [repr(item) for item in restored.payload["data"]] == [repr(1.0), repr(2.5)]
+
+
+def test_non_finite_floats_are_made_wire_safe() -> None:
+    for value in (float("inf"), float("-inf"), float("nan")):
+        msg = make(kind=Kind.EVENT, payload={"usage": value}).sign(SECRET)
+        content = msg.to_content()
+        _synapse_canonical_json(content)
+        restored = RcpMessage.from_dict(content["io.picongpu.rcp"])
+        assert restored.verify(SECRET)
+        assert str(restored.payload["usage"]) == str(value)
+
+
+def test_booleans_are_not_treated_as_floats() -> None:
+    msg = make(payload={"ok": True, "n": 2, "name": "x"}).sign(SECRET)
+    restored = RcpMessage.from_dict(msg.to_content()["io.picongpu.rcp"])
+    assert restored.payload == {"ok": True, "n": 2, "name": "x"}
+    assert restored.verify(SECRET)
+
+
+def test_float_tag_like_user_mapping_is_not_corrupted() -> None:
+    """A genuine mapping shaped like the tag must survive, not become a float."""
+    original = {"x": {FLOAT_TAG: "1.0"}, "y": {FLOAT_TAG: "not-a-number"}}
+    msg = make(kind=Kind.EVENT, payload=original).sign(SECRET)
+    raw = msg.to_content()["io.picongpu.rcp"]
+    _synapse_canonical_json(raw)
+    restored = RcpMessage.from_dict(raw)
+    assert restored.verify(SECRET)
+    assert restored.payload == original
+    # The encoded form must differ from encoding a real float (bijectivity).
+    assert msg.to_dict()["payload"]["x"] != {FLOAT_TAG: "1.0"}
+
+
+def test_non_json_scalars_are_normalized_and_roundtrip() -> None:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from uuid import UUID
+
+    msg = make(
+        kind=Kind.EVENT,
+        payload={"when": datetime(2026, 1, 1, tzinfo=UTC), "amount": Decimal("1.5"), "uid": UUID(int=0)},
+    ).sign(SECRET)
+    raw = msg.to_content()["io.picongpu.rcp"]
+    _synapse_canonical_json(raw)
+    # sign() no longer raises, and the signature still verifies after the trip.
+    restored = RcpMessage.from_dict(raw)
+    assert restored.verify(SECRET)
+    assert restored.payload["when"] == "2026-01-01T00:00:00Z"
+    assert restored.payload["amount"] == "1.5"
+
+
+def test_float_dict_keys_do_not_reach_the_wire() -> None:
+    msg = make(payload={"mapping": {1.5: "x", 2: "y"}}).sign(SECRET)
+    content = msg.to_content()
+    _synapse_canonical_json(content)
+
+
+def test_malformed_float_tag_is_rejected_on_receive() -> None:
+    raw = make(kind=Kind.EVENT, payload={"x": 1.0}).sign(SECRET).to_content()["io.picongpu.rcp"]
+    raw["payload"]["x"] = {FLOAT_TAG: "not-a-number"}
+    with pytest.raises(ValueError, match="malformed"):
+        RcpMessage.from_dict(raw)
+
+
+def test_signature_binds_the_float_free_wire_form() -> None:
+    """Tampering the float value on the wire must invalidate the signature."""
+    msg = make(kind=Kind.EVENT, payload={"core_hours": 1.0}).sign(SECRET)
+    raw = msg.to_content()["io.picongpu.rcp"]
+    raw["payload"]["core_hours"] = {"$rcp_float": "999.0"}
+    assert not RcpMessage.from_dict(raw).verify(SECRET)

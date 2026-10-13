@@ -38,6 +38,7 @@ from pic_agentic.parsing.progress import parse_progress_line
 from pic_agentic.protocol.simulation import (
     PROGRESS_EVENT_STEP_PERCENT,
     SimulationState,
+    signal_from_exit_code,
 )
 from pic_agentic.simclient.simulation import find_stdout_path, link_run_results
 from pic_agentic.slurm import SlurmJobState
@@ -45,7 +46,7 @@ from pic_agentic.slurm import SlurmJobState
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from pic_agentic.slurm import JobInfo
+    from pic_agentic.slurm import JobAccounting, JobInfo
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,9 @@ class TrackedSim(BaseModel):
     job_running_emitted: bool = False
     #: Whether a terminal event has been emitted.
     terminal_emitted: bool = False
+    #: Last scheduler reason emitted (F3): a pending job's ``Reason=`` is pushed
+    #: once per change so the registry can surface *why* it is not running.
+    last_slurm_reason: str | None = None
 
 
 def _eta_seconds(percent: int, step: int, avg_per_step_ms: int | None) -> int | None:
@@ -117,6 +121,7 @@ class JobFollower:
         job_info: Callable[[int], Awaitable[JobInfo]],
         initial_interval_s: float = 30.0,
         max_interval_s: float = 300.0,
+        job_accounting: Callable[[int], Awaitable[JobAccounting | None]] | None = None,
     ) -> None:
         """Create a follower.
 
@@ -127,6 +132,9 @@ class JobFollower:
             job_info: Async callable returning a :class:`~pic_agentic.slurm.JobInfo`.
             initial_interval_s: First (and reset) poll interval in seconds.
             max_interval_s: Cap for the backing-off poll interval in seconds.
+            job_accounting: Optional async callable returning the actual
+                resource usage of a finished job (gap 4); when given, the
+                terminal event carries ``core_hours``/``gpu_hours``.
 
         """
         self.sim = sim
@@ -135,6 +143,7 @@ class JobFollower:
         self.job_info = job_info
         self.initial_interval_s = initial_interval_s
         self.max_interval_s = max_interval_s
+        self.job_accounting = job_accounting
         self._stopped = False
         #: Last emitted ``percent // PROGRESS_EVENT_STEP_PERCENT`` bucket; 0 so
         #: the pre-first-boundary (0-24 %) range never emits on its own.
@@ -181,6 +190,25 @@ class JobFollower:
                         SimulationState.JOB_RUNNING,
                         job_id=self.tracked.job_id,
                         slurm_state=info.state.value,
+                    )
+                elif (
+                    info.state is SlurmJobState.PENDING
+                    and info.reason is not None
+                    and info.reason != self.tracked.last_slurm_reason
+                ):
+                    # Surface a pending job's scheduler reason (F3).  Without
+                    # this a ``PENDING (PartitionNodeLimit)`` job is
+                    # indistinguishable from one merely waiting its turn.  A
+                    # ``Reason=None`` wait carries no information, so it is not
+                    # emitted; a genuine reason is emitted on change only, so the
+                    # coarse cadence does not spam the room with one identical
+                    # event per tick.
+                    self.tracked.last_slurm_reason = info.reason
+                    await self.emit(
+                        SimulationState.SUBMITTED,
+                        job_id=self.tracked.job_id,
+                        slurm_state=info.state.value,
+                        slurm_reason=info.reason,
                     )
                 await self._tail_progress()
                 if info.state.terminal:
@@ -313,6 +341,64 @@ class JobFollower:
                 )
                 self._last_emitted_bucket = parsed.percent // PROGRESS_EVENT_STEP_PERCENT
 
+    def _scan_manifest(self) -> dict[str, object] | None:
+        """Build the light results manifest for ``results.ready``.
+
+        The results engine is imported lazily and guarded: a worktree that has
+        not yet merged it must not break following, so a missing engine (or any
+        scan failure) simply yields ``None`` and the event omits the manifest.
+
+        Returns:
+            The manifest dump, or None when the engine is unavailable.
+
+        """
+        try:
+            from pic_agentic.results import scan_output  # ruff: ignore[import-outside-top-level] - lazy seam
+        except ImportError:
+            return None
+        run_dir = Path(self.tracked.run_dir)
+        try:
+            manifest = scan_output(
+                run_dir / "simOutput",
+                sim_id=self.tracked.sim_id,
+                run_dir=str(run_dir),
+            )
+        except Exception:  # ruff: ignore[blind-except] - a manifest is best-effort event data
+            log.warning("results manifest scan failed for sim %s", self.tracked.sim_id)
+            return None
+        return manifest.model_dump()
+
+    def _probe_vacuity(self) -> str | None:
+        """Classify a completed run's numeric artifacts as suspect or not (F4).
+
+        A beta-4 campaign reported three ``done`` leaves with no failures while
+        producing zero electrons; only a human reading an all-zero histogram
+        caught it.  Computing the flag here attaches the same all-zero warning
+        that ``read_plugin_result`` already emits to the terminal
+        ``results.ready`` event, so ``get_status``/``fleet_status`` and the
+        agenda callbacks can surface it without opening any result file.
+
+        The probe is imported lazily and guarded exactly like
+        :meth:`_scan_manifest`: a worktree whose results engine is absent (or a
+        run with no numeric artifact / no optional reader installed) simply
+        yields ``None`` (not suspect).  Reading a plugin does open the file, so
+        the caller runs this in a worker thread.
+
+        Returns:
+            The all-zero warning text when the run is suspect, else None.
+
+        """
+        try:
+            from pic_agentic.results import probe_vacuity  # ruff: ignore[import-outside-top-level] - lazy seam
+        except ImportError:
+            return None
+        run_dir = Path(self.tracked.run_dir)
+        try:
+            return probe_vacuity(self.tracked.sim_id, run_dir=run_dir)
+        except Exception:  # ruff: ignore[blind-except] - the health probe is best-effort event data
+            log.warning("vacuity probe failed for sim %s", self.tracked.sim_id)
+            return None
+
     async def _emit_terminal(self, info: JobInfo) -> None:
         """Emit the terminal lifecycle events and stop following.
 
@@ -323,12 +409,14 @@ class JobFollower:
         if self.tracked.terminal_emitted:
             return
         self.tracked.terminal_emitted = True
+        accounting = await self._accounting_fields()
         if info.state is SlurmJobState.COMPLETED and info.exit_code in {None, 0}:
             await self.emit(
                 SimulationState.JOB_FINISHED,
                 job_id=self.tracked.job_id,
                 slurm_state=info.state.value,
                 exit_code=info.exit_code,
+                **accounting,
             )
             linked = await asyncio.to_thread(link_run_results, Path(self.tracked.run_dir))
             # ``results.ready`` is only claimed once ``run_dir/simOutput`` really
@@ -338,11 +426,14 @@ class JobFollower:
             # latest payload); a later status pull promotes it via
             # ``SimClient._state_for_info`` once the link appears.
             if linked:
-                await self.emit(
-                    SimulationState.RESULTS_READY,
-                    job_id=self.tracked.job_id,
-                    results_linked=True,
-                )
+                manifest = self._scan_manifest()
+                suspect = await asyncio.to_thread(self._probe_vacuity)
+                fields: dict[str, object] = {"job_id": self.tracked.job_id, "results_linked": True, **accounting}
+                if manifest is not None:
+                    fields["manifest"] = manifest
+                if suspect is not None:
+                    fields["suspect"] = suspect
+                await self.emit(SimulationState.RESULTS_READY, **fields)
             else:
                 await self.emit(
                     SimulationState.JOB_FINISHED,
@@ -350,14 +441,84 @@ class JobFollower:
                     slurm_state=info.state.value,
                     exit_code=info.exit_code,
                     results_linked=False,
+                    **accounting,
                 )
         else:
+            # A user-requested cancel is reported as its own terminal state so
+            # callers can distinguish "I stopped it" from an actual job failure;
+            # every other non-clean terminal state stays ``job_failed``.
+            state = SimulationState.CANCELLED if info.state is SlurmJobState.CANCELLED else SimulationState.JOB_FAILED
             await self.emit(
-                SimulationState.JOB_FAILED,
+                state,
                 job_id=self.tracked.job_id,
                 slurm_state=info.state.value,
+                slurm_reason=info.reason,
                 exit_code=info.exit_code,
+                error=_scheduler_failure_reason(state, info),
+                error_code=_scheduler_failure_code(state),
+                **accounting,
             )
+
+    async def _accounting_fields(self) -> dict[str, float]:
+        """Return the actual-cost event fields for the terminal event.
+
+        Returns:
+            ``{"core_hours", "gpu_hours"}`` when the accounting lookup succeeds,
+            else an empty dict (best-effort; never raises).
+
+        """
+        job_id = self.tracked.job_id
+        if self.job_accounting is None or job_id is None:
+            return {}
+        try:
+            accounting = await self.job_accounting(job_id)
+        except Exception:  # ruff: ignore[blind-except] - accounting is best-effort event data
+            log.warning("sacct accounting failed for sim %s job %s", self.sim, job_id)
+            return {}
+        if accounting is None:
+            return {}
+        return {"core_hours": accounting.core_hours, "gpu_hours": accounting.gpu_hours}
+
+
+#: Synthetic failure code for a scheduler-side (run) failure, distinct from the
+#: simclient's build-stage ``build_failed``/``run_failed`` codes; it tells the
+#: campaign the terminal reason is the scheduler's, not a build error.
+SCHEDULER_FAILED_ERROR_CODE = "scheduler_failed"
+
+
+def _scheduler_failure_code(state: SimulationState) -> str:
+    """Return the stable error code for a scheduler-side terminal event.
+
+    Returns:
+        ``scheduler_cancelled`` for a user cancel, else ``scheduler_failed``.
+
+    """
+    return "scheduler_cancelled" if state is SimulationState.CANCELLED else SCHEDULER_FAILED_ERROR_CODE
+
+
+def _scheduler_failure_reason(state: SimulationState, info: JobInfo) -> str:
+    """Build a human-readable reason for a scheduler-side terminal event.
+
+    A SLURM ``job_failed``/``cancelled`` previously carried no ``error`` text,
+    so the campaign could only report "the failure reason was not reported"
+    (F4).  The scheduler already knows the state and the signal-encoded exit
+    code, so synthesize a legible reason from them (the simclient has no richer
+    scheduler reason here; a partition-side reason reaches the engine through a
+    separate observability field).
+
+    Returns:
+        A short reason naming the terminal state and, when it died by signal,
+        the signal (e.g. ``"scheduler reported FAILED (SIGABRT)"``).
+
+    """
+    if state is SimulationState.CANCELLED:
+        return "the job was cancelled"
+    signal = signal_from_exit_code(info.exit_code)
+    if signal is not None:
+        return f"scheduler reported {info.state.value} ({signal})"
+    if info.exit_code is not None:
+        return f"scheduler reported {info.state.value} (exit code {info.exit_code})"
+    return f"scheduler reported {info.state.value}"
 
 
 __all__ = ["JobFollower", "TrackedSim"]

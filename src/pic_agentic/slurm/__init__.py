@@ -9,6 +9,24 @@ that reaches a shell is either a server-generated identifier with a safe
 charset or an absolute path to a server-controlled file (design section 6.4).
 """
 
-from pic_agentic.slurm.client import JobInfo, SlurmClient, SlurmError, SlurmJobState
+from pic_agentic.slurm.client import (
+    PERMANENT_REASONS,
+    JobAccounting,
+    JobInfo,
+    SlurmClient,
+    SlurmError,
+    SlurmJobState,
+    is_permanent_reason,
+    parse_accounting,
+)
 
-__all__ = ["JobInfo", "SlurmClient", "SlurmError", "SlurmJobState"]
+__all__ = [
+    "PERMANENT_REASONS",
+    "JobAccounting",
+    "JobInfo",
+    "SlurmClient",
+    "SlurmError",
+    "SlurmJobState",
+    "is_permanent_reason",
+    "parse_accounting",
+]

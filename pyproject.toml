@@ -35,6 +35,8 @@ dependencies = [
   # Used directly by the MAS token-refresh client (also a matrix-nio dependency,
   # but we import it ourselves, so it is declared explicitly).
   "aiohttp>=3.9",
+  # The agenda model serialises/emits CWL, which is YAML.
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -50,13 +52,14 @@ dev = [
 # light and Python-version bump proof.  The pin is the fork stack head that
 # carries lossless ``Runner`` round-trip; see M2-SUBMIT-PLAN.md section 1.
 sim = [
-  "picongpu @ git+https://github.com/chillenzer-agents/picongpu@91c3ee5fb4c9425b00d4673d9608f4370593cacf#subdirectory=lib/python",
+  "picongpu @ git+https://github.com/chillenzer-agents/picongpu@122160f6125eccd0606bb8ceb11c815c88ffaf2d#subdirectory=lib/python",
   "cwltool==3.2.20260720092025",
 ]
 
 [project.scripts]
 pic-agentic-mcp = "pic_agentic.server.__main__:main"
 pic-agentic-simclient = "pic_agentic.simclient.__main__:main"
+pic-agentic-setup = "pic_agentic.server.setup:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pic_agentic"]
@@ -74,7 +77,9 @@ addopts = "-ra --strict-config --strict-markers"
 markers = [
   "integration: requires a local homeserver or SLURM (skipped when unavailable)",
 ]
-filterwarnings = ["error"]
+filterwarnings = [
+  "error",
+]
 
 [tool.ruff]
 line-length = 120
@@ -108,6 +113,9 @@ ignore = [
   "S603",
   # Constructors legitimately take many keyword arguments.
   "PLR0913",
+  # HelloRuntime is a thin facade whose public methods are the MCP tool
+  # handlers; one method per tool is the intended shape, not an oversight.
+  "PLR0904",
   # CLI entry points print by design.
   "T201",
 ]
@@ -134,6 +142,9 @@ author = "Institute of Radiation Physics, Helmholtz-Zentrum Dresden-Rossendorf"
   "DOC201",
   "DOC501",
   "INP001",
+  # Reader stand-in fixtures must keep the exact (mixed-case) method names of
+  # the shipped PIConGPU classes.
+  "N802",
   "PLC0415",
   # Tests intentionally exercise private helpers (env allow-list, wire
   # normalisation, marker parsing) that have no public entry point.

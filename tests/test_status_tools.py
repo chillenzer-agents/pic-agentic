@@ -262,6 +262,297 @@ async def test_get_status_tool_merges_the_live_view() -> None:
     assert payload["since_last_event_s"] is not None
 
 
+async def test_get_status_reports_progress_from_step_finished_events() -> None:
+    """A running sim's projection carries step/percent/eta_s (mid-run progress).
+
+    The bounded ``step_finished`` events carry the progress, so the registry
+    projection (used without a live pull, and as the fallback when a live ack
+    omits a field) must expose it while the job runs, not only at completion.
+    """
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    service = runtime.submit_service
+    service.on_message(_event(SimulationState.JOB_RUNNING, ts="2026-09-25T10:00:00Z", seq=1, job_id=JOB_ID))
+    service.on_message(
+        _event(
+            SimulationState.STEP_FINISHED,
+            ts="2026-09-25T10:00:01Z",
+            seq=2,
+            step=250,
+            percent=25,
+            walltime="1min 0sec 0msec",
+            avg_per_step="4msec",
+            eta_s=750,
+        )
+    )
+    result = await server.call_tool("get_status", {"sim_id": SIM_ID})
+    payload = result.structured_content
+    assert payload["state"] == SimulationState.STEP_FINISHED.value
+    assert payload["step"] == 250
+    assert payload["percent"] == 25
+    assert payload["eta_s"] == 750
+    assert payload["walltime"] == "1min 0sec 0msec"
+
+
+async def test_get_status_surfaces_the_suspect_flag() -> None:
+    """get_status and list_simulations must carry the F4 health flag (M1).
+
+    The PR documents the flag reaching get_status/fleet_status; fleet_status was
+    wired but the two registry-backed tools omitted it, so an operator asking
+    about a single terminal run saw a clean one.
+    """
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.RESULTS_READY.value
+    record.active = False
+    record.suspect = "energy_histogram is all zeros"
+    runtime.submit_service.registry[SIM_ID] = record
+
+    status = (await server.call_tool("get_status", {"sim_id": SIM_ID})).structured_content
+    assert status["suspect"] == "energy_histogram is all zeros"
+    rows = (await server.call_tool("list_simulations", {})).structured_content["simulations"]
+    assert rows[0]["suspect"] == "energy_histogram is all zeros"
+
+
+def test_status_dict_surfaces_failure_fields() -> None:
+    """B1: a terminal build failure is legible from the get_status projection.
+
+    The event payload and ``last_status`` carry these fields, but the primary
+    ``get_status`` projection omitted them, so ``stage=build`` was invisible on
+    the surface an operator actually polls.
+    """
+    from pic_agentic.server.app import _status_dict
+    from pic_agentic.server.simulation import SimRecord
+
+    record = SimRecord(
+        sim_id=SIM_ID,
+        cmd_id="c1",
+        state=SimulationState.FAILED.value,
+        error_code="build_failed",
+        stage="build",
+        failure_summary="Yee.hpp(56): error: CFL static_assert",
+        exit_code=139,
+    )
+    status = _status_dict(record)
+    assert status["error_code"] == "build_failed"
+    assert status["stage"] == "build"
+    assert status["failure_summary"] == "Yee.hpp(56): error: CFL static_assert"
+    assert status["exit_code"] == 139
+    assert status["exit_signal"] == "SIGSEGV"
+
+
+def test_status_dict_surfaces_the_pending_reason() -> None:
+    """F3: a blocked pending job reports its scheduler reason and a flag.
+
+    ``slurm_state: PENDING`` alone cannot tell a doomed job from one waiting its
+    turn, so ``get_status``/``list_simulations`` also expose ``slurm_reason``
+    and the derived ``slurm_blocked``.
+    """
+    from pic_agentic.server.app import _status_dict
+    from pic_agentic.server.simulation import SimRecord
+
+    record = SimRecord(
+        sim_id=SIM_ID,
+        cmd_id="c1",
+        state=SimulationState.SUBMITTED.value,
+        job_id=JOB_ID,
+        slurm_state="PENDING",
+        slurm_reason="PartitionNodeLimit",
+    )
+    status = _status_dict(record)
+    assert status["slurm_state"] == "PENDING"
+    assert status["slurm_reason"] == "PartitionNodeLimit"
+    assert status["slurm_blocked"] is True
+
+
+def test_status_dict_does_not_flag_a_transient_reason() -> None:
+    """A ``Resources`` wait is not a permanent block (F3 must not cry wolf)."""
+    from pic_agentic.server.app import _status_dict
+    from pic_agentic.server.simulation import SimRecord
+
+    record = SimRecord(
+        sim_id=SIM_ID,
+        cmd_id="c1",
+        state=SimulationState.SUBMITTED.value,
+        job_id=JOB_ID,
+        slurm_state="PENDING",
+        slurm_reason="Resources",
+    )
+    status = _status_dict(record)
+    assert status["slurm_reason"] == "Resources"
+    assert status["slurm_blocked"] is False
+
+
+def test_merge_status_recomputes_blocked_from_live_reason() -> None:
+    """A live ack changing the reason must update the derived ``slurm_blocked``."""
+    from pic_agentic.server.app import _merge_status
+
+    projection = {
+        "state": SimulationState.SUBMITTED.value,
+        "job_id": JOB_ID,
+        "slurm_state": "PENDING",
+        "slurm_reason": "Resources",
+        "slurm_blocked": False,
+    }
+    _merge_status(projection, {"slurm_state": "PENDING", "slurm_reason": "PartitionNodeLimit"})
+    assert projection["slurm_blocked"] is True
+
+
+def test_running_event_clears_a_stale_pending_reason() -> None:
+    """A transient reason must not linger once the job is running (F3)."""
+    service = _service()
+    service.on_message(
+        _event(
+            SimulationState.SUBMITTED,
+            ts="2026-09-25T10:00:01Z",
+            seq=1,
+            job_id=JOB_ID,
+            slurm_state="PENDING",
+            slurm_reason="Resources",
+        ),
+    )
+    assert service.get(SIM_ID).slurm_reason == "Resources"
+    service.on_message(_event(SimulationState.JOB_RUNNING, ts="2026-09-25T10:00:02Z", seq=2, job_id=JOB_ID))
+    record = service.get(SIM_ID)
+    assert record.slurm_reason is None
+    assert record.slurm_blocked is False
+
+
+async def test_get_status_projects_the_pending_reason() -> None:
+    """F3 end-to-end through the tool: a blocked job is legible from get_status."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    service = runtime.submit_service
+    service.on_message(
+        _event(
+            SimulationState.SUBMITTED,
+            ts="2026-09-25T10:00:01Z",
+            seq=2,
+            job_id=JOB_ID,
+            slurm_state="PENDING",
+            slurm_reason="PartitionNodeLimit",
+        ),
+    )
+    status = (await server.call_tool("get_status", {"sim_id": SIM_ID})).structured_content
+    row = (await server.call_tool("list_simulations", {})).structured_content["simulations"][0]
+    assert status["slurm_reason"] == "PartitionNodeLimit"
+    assert status["slurm_blocked"] is True
+    assert row["slurm_reason"] == "PartitionNodeLimit"
+    assert row["slurm_blocked"] is True
+
+
+def test_merge_status_keeps_projection_progress_the_ack_omits() -> None:
+    """A live ack that omits a progress field must not erase the projection."""
+    from pic_agentic.server.app import _merge_status
+
+    projection = {"step": 250, "percent": 25, "eta_s": 750, "walltime": "1min 0sec 0msec"}
+    _merge_status(projection, {"state": "simulation.job_running", "step": None, "percent": None, "eta_s": None})
+    assert projection["state"] == "simulation.job_running"
+    assert projection["step"] == 250
+    assert projection["percent"] == 25
+    assert projection["eta_s"] == 750
+    # A non-null ack value does override the projection.
+    _merge_status(projection, {"percent": 40})
+    assert projection["percent"] == 40
+
+
+async def test_get_status_reports_phase_transitions() -> None:
+    """H4: get_status/list_simulations expose the build-vs-queue substate.
+
+    The phase is derived from the record's state and job id: ``accepted`` with
+    no job id is ``building``; a job id without a running event is ``queued``;
+    a running/job-progress event is ``running``; a completed run is ``done``.
+    """
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    service = runtime.submit_service
+
+    async def phase() -> str:
+        status = (await server.call_tool("get_status", {"sim_id": SIM_ID})).structured_content
+        rows = (await server.call_tool("list_simulations", {})).structured_content["simulations"]
+        assert status["phase"] == rows[0]["phase"]
+        return status["phase"]
+
+    service.on_message(_event(SimulationState.ACCEPTED, ts="2026-09-25T10:00:00Z", seq=1))
+    assert await phase() == "building"
+
+    service.on_message(_event(SimulationState.WORKFLOW_FINISHED, ts="2026-09-25T10:00:01Z", seq=2, job_id=JOB_ID))
+    assert await phase() == "queued"
+
+    service.on_message(_event(SimulationState.JOB_RUNNING, ts="2026-09-25T10:00:02Z", seq=3, job_id=JOB_ID))
+    assert await phase() == "running"
+
+    service.on_message(_event(SimulationState.RESULTS_READY, ts="2026-09-25T10:10:00Z", seq=4, job_id=JOB_ID))
+    assert await phase() == "done"
+
+
+async def test_get_events_explains_an_empty_building_phase() -> None:
+    """H4: an empty get_events result names the build phase instead of silence."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.ACCEPTED.value
+    record.active = True
+
+    payload = (await server.call_tool("get_events", {"sim_id": SIM_ID})).structured_content
+    assert payload["events"] == []
+    assert payload["phase"] == "building"
+    assert "building" in payload["note"]
+    assert "SLURM job" in payload["note"]
+
+
+async def test_get_events_terminal_note_does_not_blame_filters() -> None:
+    """A finished, unfiltered empty result must not point at `since`/`types`."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.RESULTS_READY.value
+    record.active = False
+
+    payload = (await server.call_tool("get_events", {"sim_id": SIM_ID})).structured_content
+    assert payload["events"] == []
+    assert payload["phase"] == "done"
+    assert "finished" in payload["note"]
+    assert "filters" not in payload["note"]
+
+
+async def test_get_events_terminal_note_with_filter_mentions_filters() -> None:
+    """A finished run whose filter excluded everything says so honestly."""
+    from pic_agentic.config import Config
+    from pic_agentic.server.app import build_server
+
+    config = Config(rcp_secret=SECRET)
+    server, runtime = build_server(config, SIM)
+    record = runtime.submit_service._record_for(SIM_ID, cmd_id="c1")
+    record.state = SimulationState.RESULTS_READY.value
+    record.active = False
+
+    payload = (
+        await server.call_tool("get_events", {"sim_id": SIM_ID, "types": ["simulation.job_running"]})
+    ).structured_content
+    assert payload["events"] == []
+    assert "filters" in payload["note"]
+
+
 async def test_get_status_redacts_secrets() -> None:
     from pic_agentic.config import Config
     from pic_agentic.server.app import build_server

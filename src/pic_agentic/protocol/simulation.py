@@ -30,18 +30,22 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import signal
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, FiniteFloat, computed_field, field_validator, model_validator
 
-from pic_agentic.rcp import Kind, RcpMessage, SenderRole, canonical_bytes, new_cmd_id
+from pic_agentic.rcp import Kind, RcpMessage, SenderRole, canonical_bytes, encode_wire, new_cmd_id
 from pic_agentic.version import WIRE_FORMAT_VERSION
 
 #: The only top-level key a transmitted runner spec may carry.
 ALLOWED_SIMULATION_KEYS = frozenset({"sim"})
 
-#: Default submit command; a payload asking for anything else is rejected.
+#: The submit command pic-agentic can follow (SLURM ``sbatch``).  This is *not*
+#: a wire default: the authoritative submit command is the cluster's
+#: ``rc_params["tbg_submit"]``, which the simclient requires to resolve to this
+#: value before it accepts a submission.
 DEFAULT_SUBMIT_SYSTEM = "sbatch"
 
 #: Cap on the *encoded* event content carried in one Matrix command.  Synapse's
@@ -101,6 +105,12 @@ class SimulationType(StrEnum):
     STATUS_ACK = "rcp.status_ack"
     LOGS_COMMAND = "rcp.logs_request"
     LOGS_ACK = "rcp.logs_ack"
+    #: M3 request/response: control verbs (checkpoint/stop/cancel) and
+    #: results access (describe/slice/read/export), both demand-driven pulls.
+    CONTROL_COMMAND = "rcp.control_request"
+    CONTROL_ACK = "rcp.control_ack"
+    RESULT_COMMAND = "rcp.result_request"
+    RESULT_ACK = "rcp.result_ack"
 
 
 class SimulationState(StrEnum):
@@ -126,6 +136,248 @@ class SimulationState(StrEnum):
     STEP_FINISHED = "simulation.step_finished"
     RESULTS_READY = "results.ready"
     FAILED = "simulation.failed"
+    #: M3 control outcomes: a checkpoint was requested (non-terminal; the
+    #: simulation keeps running) and a graceful stop/cancel ended the job.
+    CHECKPOINT = "simulation.checkpoint"
+    CANCELLED = "simulation.cancelled"
+
+
+class SimulationOp(StrEnum):
+    """M3 control verbs (``rcp.control_request``).
+
+    Mapped 1:1 onto PIConGPU's signal handler (``pmacc/simulationControl/
+    signal.cpp``) delivered to every MPI rank via ``scancel --signal=<SIG>``:
+    ``checkpoint``->``SIGUSR1`` (dump a checkpoint at the next common step and
+    keep running), ``stop``->``SIGTERM`` (clean stop at the next step),
+    ``checkpoint_and_stop``->``SIGALRM`` (checkpoint *then* stop) and
+    ``cancel``->plain ``scancel`` (immediate job death).  ``scontrol signal`` is
+    NOT a Slurm command (a stale early-design assumption).
+    """
+
+    CHECKPOINT = "checkpoint"
+    STOP = "stop"
+    CHECKPOINT_AND_STOP = "checkpoint_and_stop"
+    CANCEL = "cancel"
+
+
+#: Control op -> the signal delivered to the job's tasks; ``None`` means the op
+#: uses a plain ``scancel`` instead of ``scancel --signal``.
+CONTROL_SIGNAL: dict[SimulationOp, str | None] = {
+    SimulationOp.CHECKPOINT: "USR1",
+    SimulationOp.STOP: "TERM",
+    SimulationOp.CHECKPOINT_AND_STOP: "ALRM",
+    SimulationOp.CANCEL: None,
+}
+
+#: Control ops that require the job to be ``RUNNING`` (a queued job has no
+#: process with the handlers installed).  ``CANCEL`` works pre-launch too.
+CONTROL_REQUIRES_RUNNING = frozenset(
+    {SimulationOp.CHECKPOINT, SimulationOp.STOP, SimulationOp.CHECKPOINT_AND_STOP},
+)
+
+
+class ResultOp(StrEnum):
+    """M3 results-access verbs (``rcp.result_request``).
+
+    ``describe`` scans the linked output directory (no openPMD needed);
+    ``slice``/``stats``/``image``/``read`` reduce on the cluster via the
+    optional openPMD reader; ``export`` returns a transfer ticket and never
+    moves the bulk data itself.
+    """
+
+    DESCRIBE = "describe"
+    SLICE = "slice"
+    STATS = "stats"
+    IMAGE = "image"
+    EXPORT = "export"
+    READ = "read"
+    #: Milestone A: compose the RO-Crate + pypicongpu metadata + a deterministic
+    #: ``answer`` summary (no LLM call) for one run.
+    ANALYZE = "analyze"
+    #: Secure tailored analysis: evaluate a validated declarative program
+    #: (selectors + expression AST + reductions) on the cluster.  No code is
+    #: executed; see :mod:`pic_agentic.analysis_program`.
+    COMPUTE = "compute"
+    #: G1: run one of PIConGPU's shipped plugin readers on the cluster and
+    #: return a bounded summary.  The reader is selected by name from
+    #: :data:`PLUGIN_READER_NAMES`.
+    PLUGIN = "plugin"
+
+
+#: Registered PIConGPU plugin readers, by the name carried in
+#: :attr:`ResultParams.reader`.  The first four are the text plugins (the field
+#: energy monitor is parsed by the engine's own stdlib parser, not a shipped
+#: ``picongpu.extra.plugins.data`` reader); the last four are the openPMD/image
+#: readers (phase space, radiation, calorimeter, PNG).  The full registry
+#: (filename pattern, reader class, allowed kwargs) lives in
+#: :mod:`pic_agentic.results`; the names are frozen here so the wire model can
+#: validate ``reader`` without importing the optional engine.
+PLUGIN_READER_NAMES = (
+    "energy_histogram",
+    "energy_fields",
+    "emittance",
+    "transition_radiation",
+    "phase_space",
+    "radiation",
+    "calorimeter",
+    "png",
+)
+
+
+class ClientCapabilities(BaseModel):
+    """What one deployed cluster client can handle.
+
+    Advertised by the simclient in its ``hello`` ack so the server can tell a
+    version drift *before* sending an op the older client cannot handle.  The
+    sets are the enum member values compiled into the client, so a client that
+    predates a new op simply does not list it.
+
+    Each set is ``None`` when the advertisement did not carry it.  ``None``
+    means *unknown*, not *empty*: a partial or forward-compatible advertisement
+    that omits a set must never be read as "supports nothing" and must never
+    block a request.  Only an explicitly advertised, non-``None`` set can
+    reject.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: The client's package version, for a drift message that names both sides.
+    client_version: str = ""
+    #: ``ResultOp`` values the client recognises, or None when not advertised.
+    result_ops: frozenset[str] | None = None
+    #: ``SimulationOp`` values the client recognises, or None when not advertised.
+    control_ops: frozenset[str] | None = None
+    #: Request ``type`` values (``rcp.*``) whose handler is compiled in, or None
+    #: when not advertised.
+    supported_types: frozenset[str] | None = None
+
+    @classmethod
+    def current(cls, *, client_version: str = "") -> ClientCapabilities:
+        """Return the capabilities of this (running) client code.
+
+        Returns:
+            The capability set derived from the compiled enums and the enabled
+            handlers.
+
+        """
+        return cls(
+            client_version=client_version,
+            result_ops=frozenset(op.value for op in ResultOp),
+            control_ops=frozenset(op.value for op in SimulationOp),
+            supported_types=frozenset(
+                {
+                    SimulationType.COMMAND.value,
+                    SimulationType.STATUS_COMMAND.value,
+                    SimulationType.LOGS_COMMAND.value,
+                    SimulationType.CONTROL_COMMAND.value,
+                    SimulationType.RESULT_COMMAND.value,
+                }
+            ),
+        )
+
+    def supports_result_op(self, op: str) -> bool:
+        """Whether the client advertised support for a result op.
+
+        Returns:
+            True when the op is listed, or when ``result_ops`` was not
+            advertised (unknown, so never a blocker).
+
+        """
+        return self.result_ops is None or op in self.result_ops
+
+    def supports_control_op(self, op: str) -> bool:
+        """Whether the client advertised support for a control op.
+
+        Returns:
+            True when the op is listed, or when ``control_ops`` was not
+            advertised (unknown, so never a blocker).
+
+        """
+        return self.control_ops is None or op in self.control_ops
+
+    def supports_type(self, request_type: str) -> bool:
+        """Whether the client advertised a handler for a request type.
+
+        Returns:
+            True when the type is listed, or when ``supported_types`` was not
+            advertised (unknown, so never a blocker).
+
+        """
+        return not request_type or self.supported_types is None or request_type in self.supported_types
+
+    def unsupported(self, *, op: ResultOp | SimulationOp | None = None, request_type: str = "") -> str | None:
+        """Return the capability label this client cannot handle, if any.
+
+        Args:
+            op: The requested result/control op, when the request carries one.
+            request_type: The request ``type`` value.
+
+        Returns:
+            A human-readable label such as ``plugin``, ``control op 'stop'`` or
+            the request type, or None when the client supports the request or
+            did not advertise the relevant set (unknown is never a blocker).
+
+        """
+        if request_type and not self.supports_type(request_type):
+            return request_type
+        if isinstance(op, ResultOp) and not self.supports_result_op(op.value):
+            return op.value
+        if isinstance(op, SimulationOp) and not self.supports_control_op(op.value):
+            return op.value
+        return None
+
+
+def client_capability_mismatch(capabilities: ClientCapabilities, *, op: str = "", request_type: str = "") -> str:
+    """Compose the actionable version-drift message for an unsupported request.
+
+    Args:
+        capabilities: The client's advertised capabilities.
+        op: The unknown op name (``ResultOp``/``SimulationOp`` value).
+        request_type: The unknown request ``type`` value.
+
+    Returns:
+        A user-facing message naming the missing capability and the client's
+        reported version, leaving it to the user to decide which side to update
+        (the client could be older *or* the server ahead of it).
+
+    """
+    if op:
+        missing = f"operation {op!r}"
+    elif request_type:
+        missing = f"request type {request_type!r}"
+    else:
+        missing = "this request"
+    version = f" (client version {capabilities.client_version})" if capabilities.client_version else ""
+    return (
+        f"cluster client does not support {missing}{version}: "
+        "the deployed simclient did not advertise this capability; "
+        "check for a version drift between the client and the MCP server and update the side that is behind"
+    )
+
+
+#: Upper bound on the *escaped* wire size of one result ack (reduced arrays,
+#: text tails or a thumbnail).  Deliberately the same 48 KiB budget as
+#: :data:`MAX_INLINE_PAYLOAD_BYTES`: Synapse rejects event content above its
+#: (64 KiB default) limit, and a rejected ack would surface as a silent pull
+#: timeout rather than a clean error.  Results above this are answered with a
+#: ``RESULT_TOO_LARGE`` error instead of being sent.
+MAX_RESULT_BYTES = 48 * 1024
+
+#: Cap on the number of reduced points a ``slice`` may return.
+SLICE_MAX_POINTS = 4096
+
+#: Cap on the bytes of a single ``read`` (text) response.
+RESULT_TEXT_MAX_BYTES = 48 * 1024
+
+#: ``path`` argument of a result request: a relative path under ``simOutput``.
+#: The strict charset excludes absolute paths, ``..`` and shell
+#: metacharacters; the client additionally refuses escapes from its base.
+_RESULT_REL_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+#: ``species`` filter argument: a PIConGPU species or particle-filter name, a
+#: bare identifier.  Kept stricter than ``path`` (no ``/``: a species never
+#: contains a directory separator) so a plugin request cannot name a file.
+_RESULT_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 class SimulationStage(StrEnum):
@@ -137,12 +389,124 @@ class SimulationStage(StrEnum):
     RUN = "run"
 
 
+class SimulationPhase(StrEnum):
+    """Coarse run phase, exposed so build time is distinguishable from queue time.
+
+    This is a *derived* observation over the existing lifecycle stream (the
+    server projects it from the record's state and job id), not a new wire
+    event.  The pinned simclient emits only one coarse ``accepted`` ack and has
+    no pre-``job_id`` stage event, so ``BUILDING`` and ``QUEUED`` are the two
+    best-effort buckets for the window between ``accepted`` and the SLURM job:
+
+    - ``BUILDING``: accepted, but the simclient has not yet reported a job id.
+      This covers the local CWL build/prepare/submit workflow *and* the SLURM
+      queue wait for the job id to be parsed, which the event stream cannot
+      separate (see ``docs`` and the ``get_events`` description).
+    - ``QUEUED``: a job id exists but no event has confirmed the job running
+      (the ``submitted``/``workflow.finished`` window; SLURM ``PENDING``).
+    - ``RUNNING``: a running/job-progress event has been seen.
+    - ``DONE``/``FAILED``/``CANCELLED``: terminal outcomes.
+
+    The phase is deliberately conservative for the stall heuristic: only
+    ``RUNNING`` means the record is expected to tick progress, so an idle build
+    or queue wait never reads as ``stalled``.
+    """
+
+    BUILDING = "building"
+    QUEUED = "queued"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+#: Direct lifecycle-state -> phase table for the states whose phase does not
+#: depend on whether a job id is known.
+_PHASE_BY_STATE: dict[str, SimulationPhase] = {
+    SimulationState.RESULTS_READY.value: SimulationPhase.DONE,
+    SimulationState.JOB_FINISHED.value: SimulationPhase.DONE,
+    SimulationState.FAILED.value: SimulationPhase.FAILED,
+    SimulationState.JOB_FAILED.value: SimulationPhase.FAILED,
+    SimulationState.CANCELLED.value: SimulationPhase.CANCELLED,
+    SimulationState.JOB_RUNNING.value: SimulationPhase.RUNNING,
+    SimulationState.STEP_FINISHED.value: SimulationPhase.RUNNING,
+    # A checkpoint request is a non-terminal mid-run outcome: the simulation
+    # keeps running, so it must count as RUNNING (and stay eligible for the
+    # ``stalled`` heuristic) rather than fall through to the queued bucket.
+    SimulationState.CHECKPOINT.value: SimulationPhase.RUNNING,
+}
+
+
+def simulation_phase(state: str, job_id: int | None = None) -> str:
+    """Derive the coarse run phase from the lifecycle state and job id.
+
+    The mapping is a pure projection of the event stream the server already
+    keeps (see :class:`SimulationPhase` for why ``BUILDING`` and ``QUEUED`` are
+    best-effort despite the simclient's coarse acks).
+
+    Args:
+        state: The lifecycle state value (``SimulationState`` or a raw string).
+        job_id: The SLURM job id, if one is known for the run.
+
+    Returns:
+        One of the :class:`SimulationPhase` values.
+
+    """
+    normalized = str(state or "")
+    direct = _PHASE_BY_STATE.get(normalized)
+    if direct is not None:
+        return direct.value
+    # The remaining states (``accepted``/``submitted``/``workflow.finished`` or
+    # an unknown/empty state) sit in the pre-submit window until a job id
+    # exists: with one, the SLURM job is queued; without one, the local build
+    # (or an unparsed id for a non-scheduler run) is still in progress.
+    if job_id is not None:
+        return SimulationPhase.QUEUED.value
+    return SimulationPhase.BUILDING.value
+
+
 #: Progress events at least this far apart (percent) are emitted; the terminal
 #: event is always emitted.  Matches the design's condensation (section 4.2).
 PROGRESS_EVENT_STEP_PERCENT = 25
 
 #: Log streams ``get_logs`` can request.
 LOG_STREAMS = ("stdout", "stderr", "workflow")
+
+#: A shell/SLURM encodes a signal death as ``128 + signal``; a raw wait status
+#: carries it in the high byte (``<< 8``).  ``_EXIT_STATUS_BYTE`` is the largest
+#: value that is a canonical (non-shifted) exit status.
+_SIGNAL_EXIT_BASE = 128
+_EXIT_STATUS_BYTE = 255
+
+
+def signal_from_exit_code(exit_code: int | None) -> str | None:
+    """Return the signal a shell-style exit status died from, if any.
+
+    A process killed by signal *N* is reported by a shell/SLURM in the canonical
+    ``128 + N`` form (e.g. 139 = SIGSEGV, 137 = SIGKILL, 143 = SIGTERM).  Some
+    sources (e.g. a raw wait status) instead carry the status in the high byte
+    (``(128 + N) << 8``, so 35584 = ``139 << 8`` = SIGSEGV); both encodings are
+    recognised.  A bounded human annotation makes a raw ``exit_code`` legible
+    without changing the numeric value on the wire.
+
+    Args:
+        exit_code: The raw exit status, or None.
+
+    Returns:
+        The signal name (e.g. ``"SIGSEGV"``), or None when the status is not a
+        signal death (or is unknown).
+
+    """
+    if exit_code is None or exit_code <= _SIGNAL_EXIT_BASE:
+        return None
+    status = exit_code >> 8 if exit_code > _EXIT_STATUS_BYTE else exit_code
+    if status <= _SIGNAL_EXIT_BASE:
+        return None
+    signum = status - _SIGNAL_EXIT_BASE
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
 
 
 class SubmitParams(BaseModel):
@@ -154,10 +518,13 @@ class SubmitParams(BaseModel):
     The field names mirror the design's tool signature (``build_*``/``cfg_*``);
     :meth:`picongpu_flags` maps them to the aliases the pinned
     ``PicBuildFlags``/``TBGFlags`` models actually accept (``jobs``, ``cmake``,
-    ``preset``, ``force``, ``cfg``, ``submit``).  Passing the field names
-    straight through is silently ignored by pydantic (their validation aliases
-    do not include the ``build_`` prefix; ``populate_by_name`` is off), which
-    would drop ``submit_system`` and run the job locally via ``bash``.
+    ``preset``, ``force``, ``cfg``).  Passing the field names straight through
+    is silently ignored by pydantic (their validation aliases do not include the
+    ``build_`` prefix; ``populate_by_name`` is off), so the mapping is required.
+
+    The submit command is deliberately **not** carried here: it is cluster-local
+    policy, and ``rc_params["tbg_submit"]`` is its single source of truth (the
+    pinned runner itself defaults ``Runner.submit_system`` from it).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -167,10 +534,6 @@ class SubmitParams(BaseModel):
     build_preset: int | None = None
     build_force: bool = False
     cfg_file: str | None = None
-    #: The submit command; the simclient enforces its local ``tbg_submit``
-    #: matches this.  A NON-sbatch value cannot be requested over the wire:
-    #: ``prepare_submit`` rejects anything but ``sbatch`` outright.
-    submit_system: str = DEFAULT_SUBMIT_SYSTEM
     overwrite_vars: list[str] | None = None
 
     @field_validator("cfg_file")
@@ -235,7 +598,6 @@ class SubmitParams(BaseModel):
             "build_cmake": "cmake",
             "build_preset": "preset",
             "cfg_file": "cfg",
-            "submit_system": "submit",
             # The pinned TBGFlags accepts overwrite_vars only under the short
             # ``o`` alias (it has no populate_by_name), so the long name alone
             # would be silently ignored.
@@ -397,6 +759,27 @@ def provenance_mismatches(payload: SimulationPayload, local: dict[str, str]) -> 
     return mismatches
 
 
+def payload_wire_size(payload: SimulationPayload) -> int:
+    """Return the homeserver-facing size of an inline payload, in bytes.
+
+    This is the same measure :func:`payload_wire_bytes` enforces: the canonical
+    payload body is carried as a JSON *string* inside the event content, so the
+    escaped form (``json.dumps`` doubles every quote/backslash) plus
+    :data:`_ENVELOPE_ALLOWANCE_BYTES` is what the homeserver's event limit sees.
+    Exposed so the dry-run builder can report the size it would send without
+    building the binary body.
+
+    Args:
+        payload: The payload to measure.
+
+    Returns:
+        The escaped body size plus the envelope allowance.
+
+    """
+    body = payload.model_dump_json(exclude_computed_fields=True)
+    return len(json.dumps(body, ensure_ascii=True).encode("ascii")) + _ENVELOPE_ALLOWANCE_BYTES
+
+
 def payload_wire_bytes(payload: SimulationPayload) -> bytes:
     """Serialise a payload for inline transport, enforcing the size cap.
 
@@ -426,8 +809,7 @@ def payload_wire_bytes(payload: SimulationPayload) -> bytes:
     # The body is carried as a JSON string inside the event content, so measure
     # the escaped form (json.dumps doubles every quote/backslash) plus the
     # envelope budget -- that is what the homeserver's 64 KiB event limit sees.
-    encoded = len(json.dumps(body.decode("utf-8"), ensure_ascii=True).encode("ascii"))
-    size = encoded + _ENVELOPE_ALLOWANCE_BYTES
+    size = payload_wire_size(payload)
     if size > MAX_INLINE_PAYLOAD_BYTES:
         msg = (
             f"encoded simulation payload is ~{size} bytes; the inline limit is "
@@ -495,6 +877,7 @@ def build_submit_ack(
     job_id: int | None = None,
     error: str | None = None,
     error_code: str | None = None,
+    failure_summary: str | None = None,
 ) -> RcpMessage:
     """Build the simclient's acknowledgement of a submit command.
 
@@ -507,6 +890,8 @@ def build_submit_ack(
         payload["error"] = error
     if error_code:
         payload["error_code"] = error_code
+    if failure_summary:
+        payload["failure_summary"] = failure_summary
     return RcpMessage(
         sim=sim,
         kind=Kind.ACK,
@@ -529,6 +914,7 @@ def build_submit_event(
     stage: SimulationStage | None = None,
     error: str | None = None,
     error_code: str | None = None,
+    failure_summary: str | None = None,
     submit_system: str | None = None,
     results_linked: bool | None = None,
     step: int | None = None,
@@ -537,7 +923,12 @@ def build_submit_event(
     avg_per_step: str | None = None,
     eta_s: int | None = None,
     slurm_state: str | None = None,
+    slurm_reason: str | None = None,
     exit_code: int | None = None,
+    core_hours: float | None = None,
+    gpu_hours: float | None = None,
+    manifest: dict[str, Any] | None = None,
+    suspect: str | None = None,
 ) -> RcpMessage:
     """Build one M2 lifecycle event.
 
@@ -557,8 +948,14 @@ def build_submit_event(
         payload["error"] = error
     if error_code:
         payload["error_code"] = error_code
+    if failure_summary:
+        payload["failure_summary"] = failure_summary
     if results_linked is not None:
         payload["results_linked"] = results_linked
+    if manifest is not None:
+        payload["manifest"] = manifest
+    if suspect:
+        payload["suspect"] = suspect
     payload.update(
         {
             key: value
@@ -569,11 +966,19 @@ def build_submit_event(
                 ("avg_per_step", avg_per_step),
                 ("eta_s", eta_s),
                 ("slurm_state", slurm_state),
+                ("slurm_reason", slurm_reason),
                 ("exit_code", exit_code),
+                ("core_hours", core_hours),
+                ("gpu_hours", gpu_hours),
             )
             if value is not None
         },
     )
+    # A raw signal-death status (e.g. 139) gets a bounded human annotation
+    # alongside the unchanged numeric ``exit_code`` (B2).
+    exit_signal = signal_from_exit_code(exit_code)
+    if exit_signal is not None:
+        payload["exit_signal"] = exit_signal
     return RcpMessage(
         sim=sim,
         kind=Kind.EVENT,
@@ -651,6 +1056,7 @@ def build_status_ack(
     in_reply_to: str | None,
     state: str,
     slurm_state: str | None = None,
+    slurm_reason: str | None = None,
     job_id: int | None = None,
     step: int | None = None,
     percent: int | None = None,
@@ -660,8 +1066,14 @@ def build_status_ack(
     exit_code: int | None = None,
     error: str | None = None,
     error_code: str | None = None,
+    failure_summary: str | None = None,
+    suspect: str | None = None,
 ) -> RcpMessage:
     """Build the simclient's live-status response (M2b).
+
+    ``suspect`` carries the "successful-but-empty" health flag (F4) when the
+    status pull promotes a completed run to ``results.ready`` without a prior
+    terminal event, so the flag cannot be lost through the status-pull door.
 
     Returns:
         The unsigned ``rcp.status_ack`` message.
@@ -673,6 +1085,7 @@ def build_status_ack(
             key: value
             for key, value in (
                 ("slurm_state", slurm_state),
+                ("slurm_reason", slurm_reason),
                 ("job_id", job_id),
                 ("step", step),
                 ("percent", percent),
@@ -680,8 +1093,11 @@ def build_status_ack(
                 ("avg_per_step", avg_per_step),
                 ("eta_s", eta_s),
                 ("exit_code", exit_code),
+                ("exit_signal", signal_from_exit_code(exit_code)),
                 ("error", error),
                 ("error_code", error_code),
+                ("failure_summary", failure_summary),
+                ("suspect", suspect),
             )
             if value is not None
         },
@@ -731,6 +1147,429 @@ def build_logs_ack(
         sim=sim,
         kind=Kind.ACK,
         type=SimulationType.LOGS_ACK,
+        seq=seq,
+        sender_role=SenderRole.SIMCLIENT,
+        in_reply_to=in_reply_to,
+        payload=payload,
+    )
+
+
+class ControlParams(BaseModel):
+    """One M3 control request (``rcp.control_request``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    op: SimulationOp
+
+
+class ResultParams(BaseModel):
+    """One M3 results request (``rcp.result_request``).
+
+    Only the knobs relevant to the selected :class:`ResultOp` are meaningful;
+    the rest stay unset.  ``path`` is a relative path under the run's linked
+    ``simOutput`` directory and is validated against a strict charset so it can
+    never escape that directory or reach a shell.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    op: ResultOp
+    path: str | None = None
+    record: str | None = None
+    component: str | None = None
+    iteration: int | str | None = None
+    axis: int | None = None
+    index: int | None = None
+    downsample: int | None = None
+    stream: str | None = None
+    tail: int | None = None
+    #: The declarative analysis program for ``COMPUTE`` (validated by
+    #: :class:`~pic_agentic.analysis_program.AnalysisProgram` before evaluation).
+    program: dict[str, Any] | None = None
+    #: The registered PIConGPU plugin reader for ``PLUGIN`` (one of
+    #: :data:`PLUGIN_READER_NAMES`).
+    reader: str | None = None
+    #: The particle species whose plugin output is read (``PLUGIN``).
+    species: str | None = None
+    #: The particle-filter name (``PLUGIN``).  ``None`` means "unspecified" and
+    #: is normalized to PIConGPU's default ``"all"`` filter by the reader path;
+    #: leaving it unset keeps it off the wire for non-plugin result ops.
+    species_filter: str | None = None
+    #: Energy-histogram window lower/upper edge [keV] for ``PLUGIN`` with the
+    #: ``energy_histogram`` reader.  When unset the reader derives the window
+    #: from the populated bins, so the default always covers the populated range
+    #: rather than clipping it to the old fixed 100--1000 keV window (F2).
+    #: Both edges must be given together, be non-negative and have the maximum
+    #: exceed the minimum.  When set they are forwarded on the wire for any
+    #: ``PLUGIN`` reader; readers other than ``energy_histogram`` ignore them.
+    min_kev: FiniteFloat | None = None
+    max_kev: FiniteFloat | None = None
+
+    @model_validator(mode="after")
+    def _validate_energy_window(self) -> ResultParams:
+        """Require a coherent, paired energy window when one is given.
+
+        Returns:
+            The validated model.
+
+        Raises:
+            ValueError: If only one edge is set, an edge is negative, or
+                ``max_kev <= min_kev``.
+
+        """
+        if (self.min_kev is None) != (self.max_kev is None):
+            msg = "min_kev and max_kev must be set together"
+            raise ValueError(msg)
+        if self.min_kev is not None and self.min_kev < 0:
+            msg = f"min_kev ({self.min_kev}) must be non-negative"
+            raise ValueError(msg)
+        if self.max_kev is not None and self.max_kev < 0:
+            msg = f"max_kev ({self.max_kev}) must be non-negative"
+            raise ValueError(msg)
+        if self.min_kev is not None and self.max_kev is not None and self.max_kev <= self.min_kev:
+            msg = f"max_kev ({self.max_kev}) must be greater than min_kev ({self.min_kev})"
+            raise ValueError(msg)
+        return self
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str | None) -> str | None:
+        """Reject a ``path`` that is absolute, escaping, or unsafe.
+
+        Returns:
+            The validated relative path, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the path is unsafe.
+
+        """
+        if value is None:
+            return None
+        if value.startswith("/") or not _RESULT_REL_RE.match(value) or ".." in value.split("/"):
+            msg = f"unsafe result path: {value!r}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("stream")
+    @classmethod
+    def _validate_stream(cls, value: str | None) -> str | None:
+        """Restrict a text ``read`` to the two captured streams.
+
+        Returns:
+            The validated stream name, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the stream is not ``stdout``/``stderr``.
+
+        """
+        if value is None:
+            return None
+        if value not in {"stdout", "stderr"}:
+            msg = f"unknown result stream {value!r}; expected 'stdout' or 'stderr'"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("reader")
+    @classmethod
+    def _validate_reader(cls, value: str | None) -> str | None:
+        """Restrict a ``PLUGIN`` request to a registered reader name.
+
+        Returns:
+            The validated reader name, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the name is not in :data:`PLUGIN_READER_NAMES`.
+
+        """
+        if value is None:
+            return None
+        if value not in PLUGIN_READER_NAMES:
+            msg = f"unknown plugin reader {value!r}; expected one of {PLUGIN_READER_NAMES}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("species", "species_filter")
+    @classmethod
+    def _validate_species_name(cls, value: str | None) -> str | None:
+        """Reject a species/filter name outside the safe identifier charset.
+
+        The value is interpolated into the output filename, so it must never
+        carry a path separator or shell metacharacter.
+
+        Returns:
+            The validated name, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the name contains an unsafe character.
+
+        """
+        if value is None:
+            return None
+        if not _RESULT_NAME_RE.match(value):
+            msg = f"unsafe species name: {value!r}"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("program")
+    @classmethod
+    def _validate_program(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Validate a ``COMPUTE`` program (and its source-size cap) eagerly.
+
+        Validating here means an invalid or oversized program is rejected by the
+        model, before it can reach the evaluator and before any data is read.
+
+        Returns:
+            The validated program dict, or ``None`` when unset.
+
+        Raises:
+            ValueError: If the program is invalid, too large, or non-finite.
+
+        """
+        if value is None:
+            return None
+        from pic_agentic.analysis_program import (  # ruff: ignore[import-outside-top-level] - avoids a protocol/models cycle
+            MAX_SOURCE_BYTES,
+            AnalysisProgram,
+        )
+
+        encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if len(encoded) > MAX_SOURCE_BYTES:
+            msg = f"analysis program exceeds {MAX_SOURCE_BYTES} bytes"
+            raise ValueError(msg)
+        try:
+            AnalysisProgram.model_validate(value)
+        except Exception as exc:
+            msg = f"invalid analysis program: {exc}"
+            raise ValueError(msg) from exc
+        return value
+
+
+class ResultRef(BaseModel):
+    """A reference to one output file or directory (never its contents)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    uri: str
+    #: The sniffed format: ``openpmd-adios2``/``openpmd-hdf5``, ``text``,
+    #: ``dir``, ``binary``, or a registered plugin reader name
+    #: (:data:`PLUGIN_READER_NAMES`) when the filename matches one.  The match
+    #: is a filename-only heuristic; the reader re-validates the file.
+    format: str
+    size_bytes: int
+    sha256: str | None = None
+    records: list[str] = []
+    iterations: list[int] = []
+    #: Whether the file is resolvable in the *server's* optional local mirror.
+    readable: bool = False
+
+
+class ResultManifest(BaseModel):
+    """The light, scandir-level description of a run's linked output.
+
+    Deliberately does not open the files: it is cheap enough to attach to the
+    ``results.ready`` event and fast enough to answer without the optional
+    openPMD reader.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim_id: str
+    run_dir: str
+    output_dir: str | None = None
+    total_bytes: int = 0
+    #: ``"openpmd"`` when the optional reader is importable, else ``None``.
+    reader: str | None = None
+    readable_local: bool = False
+    files: list[ResultRef] = []
+    #: Set when ``files`` was shortened to fit the ack wire budget; the summary
+    #: fields remain exact.
+    truncated: bool = False
+
+
+def _outcome_payload(**fields: Any) -> dict[str, Any]:
+    """Drop ``None`` fields from a payload dict.
+
+    Returns:
+        The payload with only non-``None`` values.
+
+    """
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def build_control_command(
+    *,
+    sim: str,
+    seq: int,
+    params: ControlParams,
+    cmd_id: str | None = None,
+    in_reply_to: str | None = None,
+) -> RcpMessage:
+    """Build the MCP-server-to-simclient control request (M3).
+
+    Returns:
+        The unsigned ``rcp.control_request`` command.
+
+    """
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.COMMAND,
+        type=SimulationType.CONTROL_COMMAND,
+        seq=seq,
+        sender_role=SenderRole.MCP_SERVER,
+        in_reply_to=in_reply_to,
+        payload={"cmd_id": cmd_id or new_cmd_id(), "sim_id": params.sim_id, "op": params.op.value},
+    )
+
+
+def build_control_ack(
+    *,
+    sim: str,
+    seq: int,
+    cmd_id: str,
+    sim_id: str,
+    op: SimulationOp,
+    ok: bool,
+    in_reply_to: str | None,
+    job_id: int | None = None,
+    signal: str | None = None,
+    slurm_reason: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> RcpMessage:
+    """Build the simclient's control response (M3).
+
+    Returns:
+        The unsigned ``rcp.control_ack`` message.
+
+    """
+    payload: dict[str, Any] = {"cmd_id": cmd_id, "sim_id": sim_id, "op": op.value, "ok": ok}
+    payload.update(
+        _outcome_payload(
+            job_id=job_id,
+            signal=signal,
+            slurm_reason=slurm_reason,
+            state=state,
+            error=error,
+            error_code=error_code,
+        ),
+    )
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.ACK,
+        type=SimulationType.CONTROL_ACK,
+        seq=seq,
+        sender_role=SenderRole.SIMCLIENT,
+        in_reply_to=in_reply_to,
+        payload=payload,
+    )
+
+
+def build_result_command(
+    *,
+    sim: str,
+    seq: int,
+    params: ResultParams,
+    cmd_id: str | None = None,
+    in_reply_to: str | None = None,
+) -> RcpMessage:
+    """Build the MCP-server-to-simclient results request (M3).
+
+    Returns:
+        The unsigned ``rcp.result_request`` command.
+
+    """
+    payload: dict[str, Any] = {"cmd_id": cmd_id or new_cmd_id(), "sim_id": params.sim_id, "op": params.op.value}
+    payload.update(
+        _outcome_payload(
+            path=params.path,
+            record=params.record,
+            component=params.component,
+            iteration=params.iteration,
+            axis=params.axis,
+            index=params.index,
+            downsample=params.downsample,
+            stream=params.stream,
+            tail=params.tail,
+            program=params.program,
+            reader=params.reader,
+            species=params.species,
+            species_filter=params.species_filter,
+            min_kev=params.min_kev,
+            max_kev=params.max_kev,
+        ),
+    )
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.COMMAND,
+        type=SimulationType.RESULT_COMMAND,
+        seq=seq,
+        sender_role=SenderRole.MCP_SERVER,
+        in_reply_to=in_reply_to,
+        payload=payload,
+    )
+
+
+def build_result_ack(
+    *,
+    sim: str,
+    seq: int,
+    cmd_id: str,
+    sim_id: str,
+    op: ResultOp,
+    in_reply_to: str | None,
+    manifest: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    data: list[float] | str | None = None,
+    data_encoding: str | None = None,
+    n_points: int | None = None,
+    stats: dict[str, float | int] | None = None,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> RcpMessage:
+    """Build the simclient's results response (M3).
+
+    ``data`` is either a reduced numeric array (``data_encoding="float"``), a
+    base64 thumbnail (``"png"``) or a list of text lines (``"text"``); all are
+    bounded by :data:`MAX_RESULT_BYTES` at the client before building.
+
+    Returns:
+        The unsigned ``rcp.result_ack`` message.
+
+    """
+    payload: dict[str, Any] = {"cmd_id": cmd_id, "sim_id": sim_id, "op": op.value}
+    payload.update(
+        _outcome_payload(
+            manifest=manifest,
+            result=result,
+            data=data,
+            data_encoding=data_encoding,
+            n_points=n_points,
+            stats=stats,
+            error=error,
+            error_code=error_code,
+        ),
+    )
+    # Single chokepoint: a result ack must fit the homeserver event budget, so
+    # an over-budget encoding is replaced by a clean RESULT_TOO_LARGE error
+    # rather than being sent and rejected (which would look like a pull timeout).
+    # Measure the *encoded* payload: a float is carried as the larger tagged
+    # object {"$rcp_float": "..."}, so the raw form would under-count.
+    if len(json.dumps(encode_wire(payload), ensure_ascii=True, separators=(",", ":"))) > MAX_RESULT_BYTES:
+        payload = {
+            "cmd_id": cmd_id,
+            "sim_id": sim_id,
+            "op": op.value,
+            "error": "result exceeds the ack wire budget",
+            "error_code": "result_too_large",
+        }
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.ACK,
+        type=SimulationType.RESULT_ACK,
         seq=seq,
         sender_role=SenderRole.SIMCLIENT,
         in_reply_to=in_reply_to,

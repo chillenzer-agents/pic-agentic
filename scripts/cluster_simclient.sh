@@ -52,7 +52,8 @@ MESSAGE_DIR="${PIC_AGENTIC_MESSAGE_DIR:-$WORKDIR/shared}"
 SIM_SETUP_ROOT="${PIC_AGENTIC_SIM_SETUP_ROOT:-$WORKDIR/sims}"
 CLUSTER_TEMPLATE_DIR="${PIC_AGENTIC_CLUSTER_TEMPLATE_DIR:-}"
 CLUSTER_PRESET="${PIC_AGENTIC_CLUSTER_PRESET:-}"
-PICONGPU_REVISION="${PIC_AGENTIC_PICONGPU_REVISION:-91c3ee5fb4c9425b00d4673d9608f4370593cacf}"
+PICONGPU_REVISION="${PIC_AGENTIC_PICONGPU_REVISION:-122160f6125eccd0606bb8ceb11c815c88ffaf2d}"
+PICONGPU_REPO_URL="${PIC_AGENTIC_PICONGPU_REPO_URL:-https://github.com/chillenzer-agents/picongpu}"
 JOB_WAIT_S="${PIC_AGENTIC_JOB_WAIT_TIMEOUT_S:-600}"
 ACK_S="${PIC_AGENTIC_ACK_TIMEOUT_S:-900}"
 POLL_S="${PIC_AGENTIC_POLL_INTERVAL_S:-30}"
@@ -133,6 +134,65 @@ else
   # the extra, so the `sdist`/`wheel` build needs git on the login node.
   log "installing with the [sim] extra (pinned picongpu + cwltool)"
   "$VENV/bin/python" -m pip install --quiet -e "${SRC}[sim]"
+
+  # 4b. pip does NOT upgrade an already-installed git dependency when only the
+  #     pinned revision changes, so the picongpu wheel silently lags the server
+  #     when the pin is bumped.  The simclient then rejects every submit with
+  #     `version_mismatch` (schema_hash differs) -- and the explicit
+  #     PIC_AGENTIC_PICONGPU_REVISION export below masks the revision check, so
+  #     the schema hash is the only signal.  Detect the drift and force-refresh.
+  installed_rev="$(
+    "$VENV/bin/python" - <<'PYREV'
+import json
+try:
+    from importlib.metadata import distribution
+    info = json.loads(distribution("picongpu").read_text("direct_url.json") or "{}")
+    print(info.get("vcs_info", {}).get("commit_id", ""))
+except Exception:
+    print("")
+PYREV
+  )"
+  if [ "$installed_rev" != "$PICONGPU_REVISION" ]; then
+    log "picongpu drift: installed=${installed_rev:-none} wanted=$PICONGPU_REVISION; force-reinstalling"
+    "$VENV/bin/python" -m pip install --quiet --force-reinstall --no-deps \
+      "picongpu @ git+${PICONGPU_REPO_URL}@${PICONGPU_REVISION}#subdirectory=lib/python"
+  else
+    log "picongpu revision matches the pin ($PICONGPU_REVISION)"
+  fi
+
+  # 4c. Capability self-check: the git checkout must carry the M3 control+result
+  #     wiring.  A checkout on an older branch (e.g. the default 'main', which is
+  #     M2b-era) accepts submits but answers every result read with a
+  #     hello_ack/rejected_by_policy, so the agent can never read results.  Fail
+  #     loudly rather than run a client that silently cannot do the job.
+  if ! grep -q "SimulationType.RESULT_COMMAND," "$SRC/src/pic_agentic/simclient/client.py"; then
+    die "checkout $SRC ($BRANCH) lacks M3 result handling; set PIC_AGENTIC_BRANCH to the stack head (e.g. agent-onboarding)"
+  fi
+  log "capability check: simclient handles control + result requests"
+
+  # 4d. Submit-system self-check (F11).  pic-agentic no longer sends a submit
+  #     command on the wire: the pinned runner takes it from
+  #     ``rc_params["tbg_submit"]``, and the simclient refuses a submission
+  #     unless that resolves to the one value it can follow (``sbatch``).
+  #     Python ``rc_params`` does NOT read the shell ``TBG_SUBMIT`` a site
+  #     profile exports -- it reads ``picongpurc.toml`` (via ``PIC_RC``, a
+  #     parent dir, or ``~/.config/picongpu/``).  A clean login node therefore
+  #     has it unset and every submit would be rejected with
+  #     ``submit_system_mismatch``.  Verify up front and fail with the fix
+  #     rather than let the agent discover it on every run.
+  submit_system="$(
+    "$VENV/bin/python" - <<'PYSUB'
+from pic_agentic.simclient.simulation import _detect_submit_system
+print(_detect_submit_system() or "")
+PYSUB
+  )"
+  if [ "$submit_system" != "sbatch" ]; then
+    die "rc_params['tbg_submit'] is ${submit_system:-unset}, but pic-agentic can only follow 'sbatch'.
+       Set it for this login node, e.g.:
+         printf 'tbg_submit = \"sbatch\"\\n' > ~/.config/picongpu/picongpurc.toml   # or point PIC_RC at a site toml
+       (or source your site's PIConGPU profile that writes the matching picongpurc.toml)."
+  fi
+  log "submit-system check: rc_params['tbg_submit']=$submit_system"
 fi
 
 # 5. Interactive MAS device login (once).

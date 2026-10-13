@@ -15,7 +15,7 @@ import os
 import tomllib
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 DEFAULT_CONFIG_PATH = Path("~/.config/pic-agentic/config.toml").expanduser()
 
@@ -32,7 +32,6 @@ ENV_MAP = {
     "rcp_secret": "PIC_AGENTIC_RCP_SECRET",
     "message_dir": "PIC_AGENTIC_MESSAGE_DIR",
     "slurm_bin_dir": "PIC_AGENTIC_SLURM_BIN_DIR",
-    "submit_system": "PIC_AGENTIC_SUBMIT_SYSTEM",
     "job_wait_timeout_s": "PIC_AGENTIC_JOB_WAIT_TIMEOUT_S",
     "ack_timeout_s": "PIC_AGENTIC_ACK_TIMEOUT_S",
     "nio_store_dir": "PIC_AGENTIC_NIO_STORE_DIR",
@@ -45,6 +44,16 @@ ENV_MAP = {
     "cluster_template_dir": "PIC_AGENTIC_CLUSTER_TEMPLATE_DIR",
     "cluster_preset": "PIC_AGENTIC_CLUSTER_PRESET",
     "sim_setup_root": "PIC_AGENTIC_SIM_SETUP_ROOT",
+    "results_root": "PIC_AGENTIC_RESULTS_ROOT",
+    "spec_dir": "PIC_AGENTIC_SPEC_DIR",
+    "agenda_file": "PIC_AGENTIC_AGENDA_FILE",
+    "agenda_require_approval": "PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL",
+    "agenda_approve_over_est_core_hours": "PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS",
+    "agenda_deferred_outcome_timeout_s": "PIC_AGENTIC_AGENDA_DEFERRED_OUTCOME_TIMEOUT_S",
+    "fleet_stall_after_s": "PIC_AGENTIC_FLEET_STALL_AFTER_S",
+    "human_room_id": "PIC_AGENTIC_HUMAN_ROOM_ID",
+    "notify": "PIC_AGENTIC_NOTIFY",
+    "mcp_timeout_ms": "PIC_AGENTIC_MCP_TIMEOUT_MS",
 }
 
 REDACTED = "[REDACTED]"
@@ -67,7 +76,6 @@ class Config(BaseModel):
     message_dir: str = ""
     #: Directory holding the ``sbatch``/``scontrol``/``scancel`` executables.
     slurm_bin_dir: str = ""
-    submit_system: str = "sbatch"
     job_wait_timeout_s: float = 60.0
     #: Ack wait; must exceed ``job_wait_timeout_s`` for the M1 hello round trip.
     ack_timeout_s: float = 90.0
@@ -98,6 +106,84 @@ class Config(BaseModel):
     #: Base directory on the shared file system under which the simclient
     #: creates per-simulation ``input``/``run`` directories.
     sim_setup_root: str = ""
+    #: Optional local mirror of a run's ``simOutput`` on the server host.  When
+    #: set, the result tools mark a ``ResultRef``/``ResultManifest`` as
+    #: ``readable``/``readable_local`` iff ``<results_root>/<sim_id>/simOutput``
+    #: resolves there.  The server never moves data (design section 4).
+    results_root: str = ""
+    #: Directory staging JSON wire-spec files the agent obtains by reference
+    #: (``build_spec(write_to=...)`` -> ``create_campaign(base_spec_path=...)``)
+    #: so tens-of-KiB specs never round-trip through the LLM.  Empty disables
+    #: path-based specs (only inline ``base_spec`` is accepted); a non-empty
+    #: value is the *only* root a ``base_spec_path`` may resolve under.
+    spec_dir: str = ""
+    #: Path to the persisted campaign file the agenda tools advance.  Empty
+    #: means the default ``campaign.json`` under the message directory.
+    agenda_file: str = ""
+    #: Gate every agenda submission behind explicit approval (the engine holds
+    #: ``planned`` leaves as ``pending_approval`` until approved).
+    agenda_require_approval: bool = False
+    #: Gate agenda submissions whose estimated core-hours exceed this threshold.
+    agenda_approve_over_est_core_hours: float | None = None
+    #: Wall-clock seconds a leaf may stay deferred (outcome-unknown) before the
+    #: engine fails it with an ``outcome_unknown`` code.  Raise it for clusters
+    #: whose builds take longer than the 15-minute default (kept equal to
+    #: ``pic_agentic.agenda.engine.DEFAULT_DEFERRED_OUTCOME_TIMEOUT_S``).
+    agenda_deferred_outcome_timeout_s: float = 900.0
+    #: How long a **running** simulation may go without a lifecycle event before
+    #: the fleet view reports it as stalled.  Records still in the build/queue
+    #: phase (no running event yet) are exempt: the window between ``accepted``
+    #: and the SLURM job legitimately runs 15-20 min with no event (H3).
+    fleet_stall_after_s: float = 900.0
+    #: Matrix room id for human chat (``!status``, ``!fleet``, ``!png ...``).
+    #: Empty disables the human-command handler.
+    human_room_id: str = ""
+    #: Whether to push a one-line notification to the human room after a tick.
+    notify: bool = False
+    #: The MCP client's per-request budget, in milliseconds, as registered with
+    #: opencode (``"timeout"`` in the ``pic-agentic`` server entry).  The MCP
+    #: framework does not pass this to the server, so the setup scripts stamp it
+    #: into the same env var (``PIC_AGENTIC_MCP_TIMEOUT_MS``) they use to size
+    #: the client entry; the server then knows the budget against which it must
+    #: bound a blocking tool call.  ``None`` means "unknown" (no env var): the
+    #: wait tool then validates only, exactly as before.
+    mcp_timeout_ms: int | None = None
+
+    @field_validator("mcp_timeout_ms", mode="before")
+    @classmethod
+    def _unparseable_timeout_is_unknown(cls, value: object) -> object:
+        """Treat a malformed ``PIC_AGENTIC_MCP_TIMEOUT_MS`` as "unknown".
+
+        The field's contract is that ``None`` means "the client budget is not
+        known", so a typo (``""``/``"abc"``) must degrade to that state rather
+        than abort ``Config.load`` (and the server) at startup.  A valid value
+        is passed through unchanged.
+
+        Returns:
+            The value unchanged when it is already ``None`` or parses as an
+            integer, else ``None``.
+
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return value
+
+    def mcp_client_timeout_s(self) -> float | None:
+        """Return the known MCP client request budget in seconds.
+
+        Returns:
+            ``mcp_timeout_ms / 1000`` when the budget is known and positive,
+            else ``None`` (the server must then validate without a budget).
+
+        """
+        if self.mcp_timeout_ms is None or self.mcp_timeout_ms <= 0:
+            return None
+        return self.mcp_timeout_ms / 1000.0
 
     @classmethod
     def load(cls, path: Path | None = None) -> Config:

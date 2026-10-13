@@ -103,8 +103,23 @@ async def _fake_builder(*, script_path, interpreter="", **_kw: object) -> BuiltS
     return BuiltSimulation(
         runner=_runner_dump(),
         picongpu_version="0.9.0-dev",
-        picongpu_revision="91c3ee5fb4c9425b00d4673d9608f4370593cacf",
+        picongpu_revision="122160f6125eccd0606bb8ceb11c815c88ffaf2d",
         schema_hash="f6471fe1244f6a9d819951e090a281862b58b5b7170b5ae209b8841c3d94e4d9",
+    )
+
+
+def _skip_provenance(monkeypatch) -> None:
+    """Null the client's local provenance so a policy test is not preempted.
+
+    The shared ``fake_runner`` reports ``0.9.0-dev`` while a real pinned
+    PIConGPU reports ``0.9.0-"dev"``; ``prepare_submit`` checks provenance
+    before the submit-system guard, so on a host with the pin a policy test
+    would fail with ``version_mismatch`` first.  Blank local entries skip the
+    comparison.
+    """
+    monkeypatch.setattr(
+        "pic_agentic.simclient.client._local_provenance",
+        lambda: {"picongpu_version": "", "picongpu_revision": "", "schema_hash": ""},
     )
 
 
@@ -214,6 +229,71 @@ async def test_submit_is_idempotent_on_replay(shared_dir, tmp_path, fake_runner)
     assert second.payload["state"] == SimulationState.WORKFLOW_FINISHED.value
     # The replay did not rebuild the setup.
     assert len(fake_runner) == 1
+
+
+async def test_submit_spec_stable_cmd_id_replays_without_duplicate(shared_dir, tmp_path, fake_runner) -> None:
+    """A stable idempotency key makes a retried spec submission exactly-once.
+
+    The agenda engine derives a deterministic cmd_id per leaf; after a crash a
+    fresh engine re-uses it, and the simclient must replay its recorded ack
+    rather than run a second job.
+    """
+    _mcp_t, sim_t, service, client = _make_pair(shared_dir)
+    key = "a" * 32
+    cmd_id, _payload, command = service._build_spec_payload({"sim": {"time_steps": 4}}, cmd_id=key)
+    assert cmd_id == key
+
+    first = await client.handle(command)
+    assert first is not None
+    assert first.payload["cmd_id"] == key
+    assert len(fake_runner) == 1
+
+    # New process, same shared dir: the durable record re-acks the same job.
+    fresh = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared_dir,
+        submit_config=SubmitConfig(setup_root=shared_dir / "sims"),
+        poll_interval_s=0.05,
+    )
+    command.transport_event_id = "$backfill"
+    replayed = await fresh.handle(command)
+    assert replayed is not None
+    assert replayed.payload["sim_id"] == first.payload["sim_id"]
+    assert len(fake_runner) == 1
+
+
+async def test_submit_pending_record_reports_outcome_unknown_code(shared_dir, tmp_path, fake_runner) -> None:
+    """A pending record's replay carries the stable ``outcome_unknown`` code.
+
+    The C2 fix classifies the lost ack on this code, not a substring: a pending
+    idempotency record (a crash mid-build) must be distinguishable from a real
+    ``rejected_by_policy`` rejection.
+    """
+    from pic_agentic.simclient.client import ProcessedCommand
+
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    key = "b" * 32
+    cmd_id, _payload, command = service._build_spec_payload({"sim": {"time_steps": 4}}, cmd_id=key)
+    assert cmd_id == key
+    # Mimic the pre-execution record a crash leaves behind (unknown outcome).
+    client._persist_processed(
+        ProcessedCommand(cmd_id=key, payload_hash=command.payload["header"]["payload_hash"], sim_id="declared1"),
+    )
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload["error"] == "already_submitted:outcome_unknown"
+    assert ack.payload["error_code"] == "outcome_unknown"
+    # No job was launched.
+    assert fake_runner == []
+
+
+async def test_submit_spec_without_cmd_id_generates_one(shared_dir, tmp_path, fake_runner) -> None:
+    _mcp_t, _sim_t, service, _client = _make_pair(shared_dir)
+    cmd_id, _payload, _command = service._build_spec_payload({"sim": {"time_steps": 4}})
+    assert len(cmd_id) == 32
 
 
 async def test_submit_replay_after_restart_reacks_without_rebuilding(shared_dir, tmp_path, fake_runner) -> None:
@@ -329,21 +409,29 @@ async def test_submit_rejected_when_handler_disabled(shared_dir, tmp_path, fake_
     assert ack.payload["state"] == SimulationState.FAILED.value
 
 
-async def test_submit_rejects_non_sbatch_submit_system(shared_dir, tmp_path, fake_runner) -> None:
+async def test_submit_rejects_a_submit_system_on_the_wire(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    """The wire must not carry a submit command at all.
+
+    ``rc_params["tbg_submit"]`` is authoritative, so a command that tries to
+    request one is malformed: ``SubmitParams(extra="forbid")`` rejects the
+    unknown key before any policy check.
+    """
+    _skip_provenance(monkeypatch)
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
     cmd_id, payload, _command = await service.build_payload(script)
-    # A command asking for local bash must be rejected outright.
-    local = build_submit_command(
-        sim=SIM, seq=1, payload=payload, params=SubmitParams(submit_system="bash"), cmd_id=cmd_id
-    ).sign(SECRET)
+    local = build_submit_command(sim=SIM, seq=1, payload=payload, params=SubmitParams(), cmd_id=cmd_id).sign(SECRET)
+    local.payload["params"]["submit_system"] = "bash"
+    local.sign(SECRET)
     ack = await client.handle(local)
     assert ack is not None
-    assert ack.payload["error_code"] == "submit_system_mismatch"
+    assert ack.payload["error_code"] == "payload_invalid"
 
 
-async def test_submit_mismatched_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+async def test_submit_rejects_non_sbatch_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    # The cluster declares how it submits; a non-sbatch value cannot be followed.
+    _skip_provenance(monkeypatch)
     monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: "bash")
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
@@ -354,15 +442,27 @@ async def test_submit_mismatched_local_submit_system(shared_dir, tmp_path, fake_
     assert ack.payload["error_code"] == "submit_system_mismatch"
 
 
-async def test_submit_accepts_when_local_submit_system_unset(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
-    # An unset tbg_submit is fine: the explicit submit=sbatch flag still wins.
+async def test_submit_rejects_unset_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    # An unset tbg_submit means the workflow would default to local bash (no
+    # scheduler job), so it must be rejected rather than silently run.
+    _skip_provenance(monkeypatch)
     monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: None)
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
     _cmd_id, _payload, command = await service.build_payload(script)
-    # sbatch requested, local unset: accepted (we only reject a known
-    # contradiction), so this documents the current policy.
+    ack = await client.handle(command)
+    assert ack is not None
+    assert ack.payload["error_code"] == "submit_system_mismatch"
+
+
+async def test_submit_accepts_sbatch_local_submit_system(shared_dir, tmp_path, fake_runner, monkeypatch) -> None:
+    _skip_provenance(monkeypatch)
+    monkeypatch.setattr(sim_mod, "_detect_submit_system", lambda: "sbatch")
+    _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+    _cmd_id, _payload, command = await service.build_payload(script)
     ack = await client.handle(command)
     assert ack is not None
     assert ack.payload.get("error_code") is None
@@ -474,19 +574,77 @@ async def test_replay_of_failed_submission_reports_failure(shared_dir, tmp_path,
     _mcp_t, _sim_t, service, client = _make_pair(shared_dir)
     script = tmp_path / "picmi_script.py"
     script.write_text("# picmi\n")
+    # Force a pre-accept failure with a malformed params payload (the submit
+    # command is not a wire field, so adding one is rejected as payload_invalid).
     _cmd_id, _payload, command = await service.build_payload(script)
-    # Force a pre-accept failure by asking for a non-sbatch system.
     command.payload["params"]["submit_system"] = "bash"
     command.sign(SECRET)
     first = await client.handle(command)
     assert first is not None
-    assert first.payload["error_code"] == "submit_system_mismatch"
+    assert first.payload["error_code"] == "payload_invalid"
     # The replay must report the failure too, not a successful re-ack.
     command.transport_event_id = "$replay"
     second = await client.handle(command)
     assert second is not None
     assert second.payload["error"] is not None
     assert second.payload["state"] == SimulationState.FAILED.value
+
+
+async def test_failed_submission_event_carries_build_classification(
+    shared_dir, tmp_path, fake_runner, monkeypatch
+) -> None:
+    """B1 end-to-end: a compile failure reaches the room's failed event.
+
+    The event must carry ``error_code=build_failed``, ``stage=build`` and a
+    bounded ``failure_summary`` naming the compiler cause, so the agent does not
+    have to read the raw cwltool dump.
+    """
+    mcp_t, _sim_t, service, client = _make_pair(shared_dir)
+    # The shared ``fake_runner`` reports ``0.9.0-dev`` while a real pinned
+    # PIConGPU reports e.g. ``0.9.0-"dev"``, so ``prepare_submit`` would reject
+    # the command with ``version_mismatch`` before ``_run_workflow`` is reached.
+    # This test targets the *workflow-failure* path, not provenance, so null the
+    # client's local tuple (blank local entries skip the provenance comparison).
+    monkeypatch.setattr(
+        "pic_agentic.simclient.client._local_provenance",
+        lambda: {"picongpu_version": "", "picongpu_revision": "", "schema_hash": ""},
+    )
+    script = tmp_path / "picmi_script.py"
+    script.write_text("# picmi\n")
+
+    build_detail = (
+        "WARNING cwltool: [job build_step_2] exited with status: 5\n"
+        ".../Yee.hpp(56): error: no instance of function template matches\n"
+        "gmake: *** [Makefile:136: all] Error 2"
+    )
+
+    def failing_workflow(runner: object, capture: list[str] | None = None) -> str:
+        if capture is not None:
+            capture.append(build_detail)
+        msg = "Completed permanentFail"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(sim_mod, "_run_workflow", failing_workflow)
+    _cmd_id, _payload, command = await service.build_payload(script)
+    ack = await client.handle(command)
+    assert ack is not None
+    # The direct ``handle`` path emits lifecycle events to the sim-side
+    # transport without a server pump; drain them (the client sends on
+    # ``sim_t``, so they surface on ``mcp_t``) and inspect the payloads.
+    sent: list[dict] = []
+    while True:
+        try:
+            message = await asyncio.wait_for(anext(mcp_t.receive()), timeout=0.2)
+        except (TimeoutError, StopAsyncIteration):
+            break
+        sent.append(message.payload)
+    failed_events = [payload for payload in sent if payload.get("state") == SimulationState.FAILED.value]
+    assert failed_events
+    failed = failed_events[-1]
+    assert failed["error_code"] == "build_failed"
+    assert failed["stage"] == "build"
+    assert "Yee.hpp" in failed["failure_summary"]
+    assert "permanentFail" in failed["error"]
 
 
 async def test_submit_rejects_unsupported_simulation_key(shared_dir, tmp_path, fake_runner) -> None:

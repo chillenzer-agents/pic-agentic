@@ -99,3 +99,53 @@ def test_m2_submit_fields_from_toml_and_defaults(tmp_path) -> None:
     assert not cfg.picongpu_python
     assert not cfg.cluster_template_dir
     assert not cfg.cluster_preset
+
+
+def test_agenda_policy_fields_from_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PIC_AGENTIC_AGENDA_FILE", "/shared/campaign.json")
+    monkeypatch.setenv("PIC_AGENTIC_AGENDA_REQUIRE_APPROVAL", "true")
+    monkeypatch.setenv("PIC_AGENTIC_AGENDA_APPROVE_OVER_EST_CORE_HOURS", "120.5")
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.agenda_file == "/shared/campaign.json"
+    assert cfg.agenda_require_approval is True
+    assert cfg.agenda_approve_over_est_core_hours == pytest.approx(120.5)
+
+
+def test_spec_dir_from_env_and_toml(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PIC_AGENTIC_SPEC_DIR", "/shared/specs")
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.spec_dir == "/shared/specs"
+    assert not Config(spec_dir="").spec_dir
+
+
+def test_mcp_timeout_env_is_read(tmp_path, monkeypatch) -> None:
+    """The server learns the client request budget from the env var (D1)."""
+    monkeypatch.setenv("PIC_AGENTIC_MCP_TIMEOUT_MS", "300000")
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.mcp_timeout_ms == 300000
+    assert cfg.mcp_client_timeout_s() == pytest.approx(300.0)
+
+
+def test_mcp_timeout_unknown_preserves_none(tmp_path, monkeypatch) -> None:
+    """No env var -> budget unknown -> the wait tool must validate only."""
+    monkeypatch.delenv("PIC_AGENTIC_MCP_TIMEOUT_MS", raising=False)
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.mcp_timeout_ms is None
+    assert cfg.mcp_client_timeout_s() is None
+
+
+@pytest.mark.parametrize("raw", ["0", "-1"])
+def test_mcp_timeout_non_positive_is_unknown(raw: str, tmp_path, monkeypatch) -> None:
+    """A nonsensical budget is treated as unknown rather than as a zero bound."""
+    monkeypatch.setenv("PIC_AGENTIC_MCP_TIMEOUT_MS", raw)
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.mcp_client_timeout_s() is None
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "12.5", "  "])
+def test_mcp_timeout_malformed_is_unknown(raw: str, tmp_path, monkeypatch) -> None:
+    """A malformed budget degrades to unknown instead of aborting startup."""
+    monkeypatch.setenv("PIC_AGENTIC_MCP_TIMEOUT_MS", raw)
+    cfg = Config.load(tmp_path / "missing.toml")
+    assert cfg.mcp_timeout_ms is None
+    assert cfg.mcp_client_timeout_s() is None
