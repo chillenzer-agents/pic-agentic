@@ -886,7 +886,9 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
         description=(
             "Reduce one openPMD record/component of a simulation to a bounded "
             "1D slice (axis/index/downsample optional; iteration 'last' by "
-            "default). Requires the openPMD reader on the cluster."
+            "default). The openPMD series is discovered under the run's "
+            "simOutput (optionally narrowed by `path`). Requires the openPMD "
+            "reader on the cluster."
         ),
         annotations=_READ_ONLY,
     )
@@ -894,6 +896,7 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
         sim_id: str,
         record: str,
         *,
+        path: str | None = None,
         component: str | None = None,
         iteration: int | str = "last",
         axis: int = 0,
@@ -904,6 +907,7 @@ def _register_control_result_tools(server: MCPServer, runtime: HelloRuntime) -> 
             runtime,
             ResultOp.SLICE,
             sim_id=sim_id,
+            path=path,
             record=record,
             component=component,
             iteration=iteration,

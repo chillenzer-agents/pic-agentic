@@ -29,8 +29,8 @@ from pic_agentic.results import scan_output
 _SECRET_KEY_RE = re.compile(r"secret|token|password|key", re.IGNORECASE)
 
 #: openPMD filename suffix -> backend name (the suffix survives even when the
-#: ``.bp`` series is itself a directory in ADIOS2).
-_OPENPMD_SUFFIXES = {".bp": "adios2", ".h5": "hdf5", ".hdf5": "hdf5"}
+#: ``.bp``/``.bp5`` series is itself a directory in ADIOS2).
+_OPENPMD_SUFFIXES = {".bp": "adios2", ".bp5": "adios2", ".h5": "hdf5", ".hdf5": "hdf5"}
 
 #: Numeric run of an openPMD file stem, e.g. ``sim_00000100`` -> ``100``.
 _ITERATION_RE = re.compile(r"\d+")

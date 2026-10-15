@@ -228,6 +228,7 @@ async def test_tool_registration_shape() -> None:
     assert set(tools["get_result_slice"].input_schema["properties"]) == {
         "sim_id",
         "record",
+        "path",
         "component",
         "iteration",
         "axis",

@@ -1083,6 +1083,7 @@ def build_result_command(
             downsample=params.downsample,
             stream=params.stream,
             tail=params.tail,
+            program=params.program,
         ),
     )
     return RcpMessage(
