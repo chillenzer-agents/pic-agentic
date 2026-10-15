@@ -56,6 +56,20 @@ def _valid_spec() -> dict:
     return _campaign_spec(2)
 
 
+def _add_spec() -> dict:
+    """Return a valid leaf spec with a distinct payload for ``add_agenda_leaf``.
+
+    ``add_agenda_leaf`` validates through the submission path (allow-list +
+    pinned-schema round-trip + inline cap), so the minimal ``_SPEC`` used by the
+    store-level tests is rejected under the real pin.  Bumping ``time_steps``
+    keeps the payload distinct from the seeded ``leaf0`` while remaining a valid
+    ``Runner`` dump.
+    """
+    base = _valid_spec()
+    base["sim"]["time_steps"] += 1
+    return base
+
+
 def _campaign_file(tmp_path: Path, *, name: str = "campaign", leaves: int = 1) -> str:
     """Write a campaign file with ``leaves`` specs and return its path."""
     agenda = AgendaGroup(name="group")
@@ -580,7 +594,7 @@ async def test_delete_campaign_description_notes_the_registry_survives() -> None
 
 async def test_add_leaf_is_submitted_by_the_next_tick(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
-    added = await _call(config, "add_agenda_leaf", {"name": "refined", "spec": {"sim": {"replica": 9}}})
+    added = await _call(config, "add_agenda_leaf", {"name": "refined", "spec": _add_spec()})
     assert added == {"ok": True, "path": "refined"}
     tick = await _call(config, "advance_agenda", {})
     assert "refined" in tick["submitted"]
@@ -588,9 +602,32 @@ async def test_add_leaf_is_submitted_by_the_next_tick(tmp_path) -> None:
 
 async def test_add_duplicate_leaf_is_a_soft_error(tmp_path) -> None:
     config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
-    result = await _call(config, "add_agenda_leaf", {"name": "leaf0", "spec": {"sim": {"replica": 1}}})
+    result = await _call(config, "add_agenda_leaf", {"name": "leaf0", "spec": _add_spec()})
     assert result["ok"] is False
     assert result["error"] == "duplicate_leaf"
+
+
+async def test_add_duplicate_leaf_wins_over_an_invalid_spec(tmp_path) -> None:
+    """A duplicate name is reported as ``duplicate_leaf`` even if the spec is invalid."""
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(config, "add_agenda_leaf", {"name": "leaf0", "spec": {"sim": {"replica": 9}}})
+    assert result["ok"] is False
+    assert result["error"] == "duplicate_leaf"
+
+
+async def test_add_leaf_refuses_an_invalid_spec(tmp_path) -> None:
+    """``add_agenda_leaf`` validates through the submission path at add time.
+
+    A spec that is not an allow-listed ``{"sim": ...}`` wire is refused in both
+    the offline and real-pin venvs (the pinned-schema round-trip is a no-op
+    without the pin), so it must never be persisted and only fail at submit.
+    """
+    config = Config(rcp_secret=SECRET, agenda_file=_campaign_file(tmp_path))
+    result = await _call(config, "add_agenda_leaf", {"name": "bad", "spec": {"not_sim": 1}})
+    assert result["ok"] is False
+    assert result["error"] == "invalid_campaign_spec"
+    campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)
+    assert "bad" not in campaign.agenda.entries
 
 
 async def test_add_leaf_without_campaign_is_a_soft_error(tmp_path) -> None:
@@ -812,7 +849,7 @@ async def test_add_agenda_leaf_records_the_parameter_label(tmp_path) -> None:
     result = await _call(
         config,
         "add_agenda_leaf",
-        {"name": "refined", "spec": {"sim": {"replica": 9}}, "point": {"component": 5.0}, "parameter": "focal y"},
+        {"name": "refined", "spec": _add_spec(), "point": {"component": 5.0}, "parameter": "focal y"},
     )
     assert result == {"ok": True, "path": "refined"}
     campaign = AgendaStore(tmp_path, filename="campaign.json").load(Campaign)

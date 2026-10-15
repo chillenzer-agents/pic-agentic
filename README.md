@@ -298,6 +298,51 @@ symlinks resolved on both sides) and refused otherwise; a path such as
 (`MAX_SPEC_FILE_BYTES`) — larger than the 48 KiB inline cap because the bytes
 are server-local and never cross the homeserver.
 
+### Use the pinned API, not the online docs (H9)
+
+An agent writing a PICMI script must target the **installed** `picongpu`
+package, whose version is the pinned commit in `pyproject.toml` (see the
+`picongpu_revision` in every build result). The readthedocs pages can describe a
+newer release than the pin, and the beta-5 transcripts show an agent
+reverse-engineering `site-packages` after copying names that do not exist
+there. In particular, on the beta-5 pin
+
+- the diagnostics are `picmi.diagnostics.NativeFieldDump`,
+  `DerivedFieldDump`, `PhaseSpace`, `EnergyHistogram`, `FieldEnergyMonitor`,
+  `Checkpoint`, `MacroParticleCount`, … — **not** the readthedocs
+  `FieldDiagnostic` / `PhaseSpaceDiagnostic`;
+- do not build the input by hand with `sim.write_input_file()`; define the
+  `picmi.Simulation` and let the `build_spec` / `submit_simulation` tools build
+  it (`sim.write_input_file()` is the build-only equivalent in-script;
+  `sim.picongpu_run()` builds **and** runs it locally, which is not what the
+  tools do — they build a Runner spec and submit it to the cluster);
+- distributions keep the PICMI names (`picmi.UniformDistribution(density=...,
+  rms_velocity=[...])`, `picmi.GaussianDistribution(...)`).
+
+The seeded `instructions` carry a minimal, verified snippet using
+`picmi.Cartesian3DGrid`, `picmi.ElectromagneticSolver`, `picmi.Species`,
+`picmi.UniformDistribution`, `picmi.PseudoRandomLayout` and
+`picmi.Simulation`, so an agent has a compiling starting point without reading
+the pin's source.
+
+### Multi-node studies need explicit leaves (H5)
+
+`create_campaign` expresses a **single-path** sweep: one `patch_path`, one list
+of values. A resolution convergence study must co-vary more than one spec node
+(e.g. the grid cell count **and** `time_steps`, holding the physical box size
+fixed) and so cannot be one `patch_path`. `add_agenda_leaf` is the escape hatch:
+create the base campaign, then add one leaf per study point carrying its own
+whole spec, so any number of nodes can differ between leaves. A leaf spec may be
+inline (`spec=`) or, for a large spec, staged by reference
+(`add_agenda_leaf(name, spec_path=...)`) exactly like
+`create_campaign(base_spec_path=...)` — the same safe staging root and the same
+4 MiB *input file* cap. Staging lifts only the input-side (re-typing) limit: the
+leaf spec is still validated through the submission path, so the same 48 KiB
+escaped wire budget as any `submit_spec` applies and an over-cap leaf is refused
+at add time with `spec_exceeds_inline_limit`. Staging avoids re-typing, not the
+wire cap. `point`/`parameter` record the assignment and its human-readable
+label, as for a `create_campaign` leaf.
+
 ### Campaign sweeps are self-describing
 
 A campaign leaf records the sweep assignment in `point` as
