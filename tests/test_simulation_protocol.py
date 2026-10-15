@@ -390,3 +390,45 @@ def test_ack_and_event_shape() -> None:
     event = build_submit_event(sim="s", seq=3, cmd_id="c", sim_id="abcd1234", state=SimulationState.SUBMITTED, job_id=7)
     assert event.kind is Kind.EVENT
     assert event.payload["job_id"] == 7
+
+
+def test_signal_from_exit_code() -> None:
+    """B2: a signal-death exit status maps to a bounded signal annotation."""
+    from pic_agentic.protocol.simulation import signal_from_exit_code
+
+    assert signal_from_exit_code(139) == "SIGSEGV"
+    assert signal_from_exit_code(35584) == "SIGSEGV"
+    assert signal_from_exit_code(137) == "SIGKILL"
+    assert signal_from_exit_code(143) == "SIGTERM"
+    # A normal or unknown status carries no signal.
+    assert signal_from_exit_code(0) is None
+    assert signal_from_exit_code(1) is None
+    assert signal_from_exit_code(128) is None
+    assert signal_from_exit_code(None) is None
+    assert signal_from_exit_code(128 + 99) == "signal 99"
+
+
+def test_failed_event_annotates_a_signal_death() -> None:
+    """B2: an event's raw exit_code is accompanied by exit_signal, unchanged."""
+    event = build_submit_event(
+        sim="s",
+        seq=4,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_FAILED,
+        job_id=7,
+        exit_code=139,
+    )
+    assert event.payload["exit_code"] == 139
+    assert event.payload["exit_signal"] == "SIGSEGV"
+    # A non-signal exit code adds no annotation.
+    normal = build_submit_event(
+        sim="s",
+        seq=5,
+        cmd_id="c",
+        sim_id="abcd1234",
+        state=SimulationState.JOB_FAILED,
+        job_id=7,
+        exit_code=1,
+    )
+    assert "exit_signal" not in normal.payload

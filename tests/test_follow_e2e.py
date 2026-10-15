@@ -410,11 +410,13 @@ async def test_status_unknown_sim_is_ack_error(shared_dir, tmp_path, fake_runner
 
 
 async def test_logs_for_a_known_but_not_yet_tracked_sim(shared_dir, tmp_path, fake_runner) -> None:
-    """A submitted sim with no follower yet reports ``logs_not_available``.
+    """A submitted sim with no follower yet reports it is still building.
 
     Regression (live beta run): a build in flight has its ``sim_id`` persisted
     but no ``TrackedSim``/log file, so ``get_logs`` answered ``unknown_sim`` --
     which reads like a bug even though the sim was known to ``get_status``.
+    The message says "still building" (not the misleading "not started yet")
+    and, when no build output is captured, keeps the ``logs_not_available`` code.
     """
     from pic_agentic.simclient.client import ProcessedCommand
 
@@ -433,7 +435,8 @@ async def test_logs_for_a_known_but_not_yet_tracked_sim(shared_dir, tmp_path, fa
     logs_ack = await client.handle(logs_cmd)
     assert logs_ack is not None
     assert logs_ack.payload["error_code"] == "logs_not_available"
-    assert "not started yet" in logs_ack.payload["error"]
+    assert "still building" in logs_ack.payload["error"]
+    assert "not started yet" not in logs_ack.payload["error"]
 
     # A genuinely unknown sim still reports ``unknown_sim``.
     other = build_logs_command(sim=SIM, seq=2, sim_id="nope1234", cmd_id="m").sign(SECRET)
@@ -478,6 +481,82 @@ async def test_logs_for_a_persisted_failed_sim_reports_the_failure(shared_dir, t
     assert logs_ack.payload["error_code"] == "unsupported"
     assert "failed before any log" in logs_ack.payload["error"]
     assert "not started yet" not in logs_ack.payload["error"]
+
+
+async def test_logs_during_build_returns_the_live_compiler_tail(shared_dir, tmp_path) -> None:
+    """B2: get_logs serves the captured build tail instead of "not started"."""
+    shared, _state_dir = shared_dir
+    _mcp_t, sim_t = MemoryTransport.create_pair()
+    client = SimClient(
+        sim=SIM,
+        secret=SECRET,
+        transport=sim_t,
+        slurm=SlurmClient(bin_dir=str(FAKE_BIN)),
+        message_dir=shared,
+        submit_config=SubmitConfig(setup_root=shared / "sims"),
+    )
+    # Simulate an in-flight build: a persisted (pending) record, the run dir in
+    # the active-builds map, and the live tail fed through the same seam
+    # ``_run_workflow`` uses.
+    from pic_agentic.simclient.client import ProcessedCommand
+
+    client._persist_processed(ProcessedCommand(cmd_id="build999", sim_id="build999"))
+    run_dir = tmp_path / "build-run"
+    client._active_builds["build999"] = str(run_dir)
+    tail = sim_mod._register_live_build_tail(run_dir)
+    tail.add("gmake: building main.x.cpp.o\n")
+    tail.add("nvcc fatal: unsupported gpu architecture\n")
+
+    logs_cmd = build_logs_command(sim=SIM, seq=1, sim_id="build999", cmd_id="l").sign(SECRET)
+    logs_ack = await client.handle(logs_cmd)
+    assert logs_ack is not None
+    assert logs_ack.payload["lines"] == ["gmake: building main.x.cpp.o", "nvcc fatal: unsupported gpu architecture"]
+    assert logs_ack.payload["total_lines"] == 2
+    assert "error" not in logs_ack.payload
+    assert "not started yet" not in str(logs_ack.payload)
+
+
+def test_live_build_tail_is_bounded_and_unregistered(tmp_path) -> None:
+    """B2: the live tail keeps only the recent lines and is dropped on unregister."""
+    run_dir = tmp_path / "run"
+    tail = sim_mod._register_live_build_tail(run_dir)
+    for index in range(sim_mod._BUILD_TAIL_LINES + 50):
+        tail.add(f"line {index}\n")
+    assert len(tail.lines()) == sim_mod._BUILD_TAIL_LINES
+    assert tail.lines()[-1] == f"line {sim_mod._BUILD_TAIL_LINES + 49}"
+    assert sim_mod.live_build_log(run_dir)
+    sim_mod._unregister_live_build_tail(run_dir)
+    assert sim_mod.live_build_log(run_dir) == []
+
+
+def test_live_build_tail_byte_accounting_survives_auto_eviction() -> None:
+    """B2: ``_bytes`` tracks the deque's own ``maxlen`` eviction.
+
+    A burst of many short lines fills the deque past ``maxlen``, so the oldest
+    lines are dropped by the deque itself; the byte total must reflect only the
+    retained lines, otherwise it over-counts and the explicit byte-budget
+    eviction then pops still-needed lines (briefly emptying the tail).
+    """
+    tail = sim_mod._RingTail()
+    for index in range(60000):
+        tail.add(f"compiling main.x.cpp.o {index}\n")
+    lines = tail.lines()
+    assert len(lines) == sim_mod._BUILD_TAIL_LINES
+    assert tail._bytes == sum(len(line) for line in lines)
+    assert tail._bytes <= sim_mod._MAX_BUILD_TAIL_BYTES
+
+
+def test_live_build_tail_byte_budget_evicts_before_emptying() -> None:
+    """B2: the byte backstop drops whole lines but never the live tail entirely."""
+    tail = sim_mod._RingTail()
+    for _ in range(20000):
+        tail.add("short\n")
+    for _ in range(50):
+        tail.add("x" * 2048 + "\n")
+    lines = tail.lines()
+    assert lines, "the tail must not be emptied by the byte backstop"
+    assert tail._bytes == sum(len(line) for line in lines)
+    assert tail._bytes <= sim_mod._MAX_BUILD_TAIL_BYTES
 
 
 async def test_pull_rejected_when_submit_disabled(shared_dir, tmp_path) -> None:

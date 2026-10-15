@@ -424,8 +424,10 @@ terminal history when you only care about live work.
 A run can spend 15-20 minutes between `accepted` and the SLURM `job_id`: the
 simclient builds the setup locally and only then parses the job id out of
 `submission_information.txt`. During that window `job_id` is `null`, there are
-no step/percent values, `get_events` is empty and the logs read "not started
-yet" — which is normal, not wedged.
+no step/percent values and `get_events` is empty — which is normal, not wedged.
+`get_logs` serves the captured compiler output tail while the build is running
+(the same stderr that later appears in a failure `error`); before any output is
+captured it answers "still building", not the misleading "not started yet".
 
 To make that window legible, every status surface carries a derived `phase`
 field (`building`/`queued`/`running`/`done`/`failed`/`cancelled`):
@@ -450,6 +452,30 @@ for many minutes — while a genuinely idle running job is still flagged. The
 phase is computed with `simulation_phase` in
 `src/pic_agentic/protocol/simulation.py`; it is a pure projection of the
 existing event stream and adds no wire message.
+
+### Build vs. run failure classification
+
+A failure inside the CWL workflow is classified by the step that failed. The
+workflow's `build_step` is the PIConGPU compile (`pic-build`), so a compile
+error — e.g. a CFL `static_assert` in the Yee solver — is reported as
+`error_code: build_failed`, `stage: "build"`, not the misleading
+`run_failed`/`stage: "run"`. A failure in any other workflow step (prepare,
+submit, organize) is reported as `run_failed`/`stage: "run"`. A simulation that
+actually runs and crashes is a SLURM job failure, reported separately as
+`simulation.job_failed` with the raw `exit_code`.
+
+Because the raw `error` is a cwltool `permanentFail` dump followed by a
+truncated C++ tail, the failure event also carries a bounded
+`failure_summary` naming the first compiler/CMake error line (and the `make`
+tail), so the cause is readable without scrolling the dump; the full text stays
+in `error`. A signal-death `exit_code` (139 = SIGSEGV, 137 = SIGKILL, 143 =
+SIGTERM, and the raw wait-status `<< 8` form) is annotated as `exit_signal`
+alongside the unchanged numeric value.
+
+The `error`, `error_code`, `failure_summary`, `stage`, `exit_code` and
+`exit_signal` fields are all carried by the `get_status` projection as well as
+the failure event and `wait_for_simulation.last_status`, so a build failure is
+legible from whichever status surface the caller polls.
 
 ### `sim_id` is a spec label, not a run id
 
