@@ -200,6 +200,11 @@ class AgendaSim(BaseModel):
     actual_gpu_hours: float | None = None
     #: Whether the leaf ran on a GPU (so actual GPU-hours are counted).
     is_gpu: bool = False
+    #: Whether this leaf was satisfied by content-addressed reuse of an earlier
+    #: identical run instead of being submitted.  A reused leaf accrues no
+    #: estimated usage and is exempt from actual-cost reconciliation (the cost
+    #: was accounted by the campaign that first ran it).
+    reused: bool = False
 
     @field_validator("name")
     @classmethod

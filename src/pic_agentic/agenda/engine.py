@@ -47,6 +47,7 @@ from pic_agentic.agenda.planner import (
 )
 
 if TYPE_CHECKING:
+    from pic_agentic.agenda.reuse import ReuseRecord
     from pic_agentic.agenda.store import AgendaStore
 
 #: Async ``(spec, idempotency_key) -> sim_id`` submission callable.  The key is
@@ -56,6 +57,16 @@ SubmitFn = Callable[[dict[str, Any], str], Awaitable[str]]
 
 #: ``() -> {sim_id: state}`` observation callable.
 ObserveFn = Callable[[], Mapping[str, str]]
+
+#: ``(key) -> ReuseRecord | None``: lookup a completed run to reuse.
+ReuseLookupFn = Callable[[str], "ReuseRecord | None"]
+#: ``(key, sim_id, state) -> None``: record a completed run.
+ReuseRecordFn = Callable[[str, str, str], None]
+
+#: ``(spec) -> key``: the content key for reuse.  Defaults to the wire hash
+#: (``{"sim": ...}``); the server overrides it to fold in the provenance tuple,
+#: so a result produced under a different PIConGPU revision is not reused.
+ReuseKeyFn = Callable[[Mapping[str, Any]], str]
 
 #: ``() -> {sim_id: ActualUsage}`` actual-cost observation callable (gap 4).
 ActualsFn = Callable[[], Mapping[str, "ActualUsage"]]
@@ -78,6 +89,11 @@ _ACTIVE_STATUSES = frozenset({"planned", "submitted", "running"})
 
 #: Leaf statuses that count as an in-flight job for the concurrency cap.
 _RUNNING_STATUSES = frozenset({"submitted", "running"})
+
+#: Observed ``SimulationState`` values whose run has linked results on disk and
+#: is therefore safe to record as reusable.  ``results.ready`` is the state that
+#: guarantees ``run_dir/simOutput`` exists (``job_finished`` alone may not).
+_REUSABLE_OBSERVED_STATES = frozenset({"results.ready"})
 
 
 class DuplicateSpecError(RuntimeError):
@@ -125,6 +141,9 @@ class TickResult(BaseModel):
     waiting: list[str] = Field(default_factory=list)
     done: list[str] = Field(default_factory=list)
     failed: list[str] = Field(default_factory=list)
+    #: Leaves linked to an already-completed identical run instead of being
+    #: submitted again (content-addressed reuse).
+    reused: list[str] = Field(default_factory=list)
     complete: bool = False
     usage: BudgetUsage = BudgetUsage()
     #: Decision-point callbacks emitted this tick (newly done/failed leaves).
@@ -151,6 +170,9 @@ class AgendaEngine:
         policy: EnginePolicy | None = None,
         approve: Callable[[str], bool] | None = None,
         actuals: ActualsFn | None = None,
+        reuse_lookup: ReuseLookupFn | None = None,
+        reuse_record: ReuseRecordFn | None = None,
+        reuse_key: ReuseKeyFn | None = None,
     ) -> None:
         """Create an engine.
 
@@ -166,6 +188,15 @@ class AgendaEngine:
             actuals: Optional ``() -> {sim_id: ActualUsage}`` callable supplying
                 the cluster's actual cost for finished runs (gap 4); when given,
                 a finished leaf's usage estimate is corrected to the actual.
+            reuse_lookup: Optional ``(key) -> ReuseRecord | None`` that returns
+                a completed run whose key matches, so the leaf is linked to it
+                instead of being submitted again.  Without it (and without
+                ``reuse_record``) no reuse is attempted.
+            reuse_record: Optional ``(key, sim_id, state)`` called when a leaf
+                finishes successfully, so a later identical spec can reuse it.
+            reuse_key: Optional ``(spec) -> key`` content key.  Defaults to the
+                wire hash; the server folds in the provenance tuple so a result
+                from a different PIConGPU revision is not reused.
 
         """
         self.store = store
@@ -175,6 +206,9 @@ class AgendaEngine:
         self.policy = policy or EnginePolicy()
         self.approve = approve
         self.actuals = actuals
+        self.reuse_lookup = reuse_lookup
+        self.reuse_record = reuse_record
+        self.reuse_key = reuse_key or _wire_hash
 
     async def tick(self) -> TickResult:
         """Run one durable, idempotent engine tick.
@@ -188,7 +222,8 @@ class AgendaEngine:
         # the last tick) so only genuine transitions to done/failed emit.
         before = {path: sim.status for path, sim in campaign.agenda.simulations()}
         budget = self.budget_override or campaign.budget
-        campaign, steps = self._plan(campaign, budget)
+        observed = self.observe()
+        campaign, steps, reused = self._plan(campaign, budget, observed)
         # Refuse a campaign whose submissions would collide *before* submitting
         # anything: a duplicate payload maps two leaves to one sim_id, so a
         # partial tick would leave a leaf running against a corrupted
@@ -201,8 +236,28 @@ class AgendaEngine:
         # the callback is already on disk rather than lost (the next tick would
         # see the leaf already terminal and emit nothing).
         campaign, emitted = self._emit_callbacks(campaign, before)
-        result = TickResult(state=campaign.state, callbacks=list(emitted))
+        result = TickResult(state=campaign.state, callbacks=list(emitted), reused=list(reused))
         self.store.save(campaign)
+        campaign = await self._run_steps(campaign, steps, result, budget)
+        result.complete = _is_complete(campaign.agenda)
+        result.usage = campaign.usage
+        self._record_reuse(campaign, observed, before)
+        self.store.save(campaign)
+        return result
+
+    async def _run_steps(
+        self,
+        campaign: Campaign,
+        steps: list[tuple[str, PlanStep]],
+        result: TickResult,
+        budget: Budget,
+    ) -> Campaign:
+        """Execute the planner's steps in order, updating ``result`` in place.
+
+        Returns:
+            The campaign after all steps (incrementally persisted).
+
+        """
         in_flight = campaign.usage.jobs_running
         concurrency_cap = budget.max_concurrent_jobs
         for path, step in steps:
@@ -212,24 +267,11 @@ class AgendaEngine:
                     result.callbacks.append(terminal)
                 _bucket(result, path, step.action)
                 continue
-            if campaign.state != "running":
-                # Paused/stopped: observe, fold and emit callbacks as usual, but
-                # hold every submission (no gate, no usage).  Resuming simply
-                # lets the next tick submit the still-planned leaves.
-                result.held.append(path)
-                continue
-            if len(result.submitted) >= self.policy.max_submits_per_tick:
-                result.waiting.append(path)
-                continue
-            if concurrency_cap is not None and in_flight >= concurrency_cap:
-                # The concurrency headroom is enforced here so one tick cannot
-                # over-fill (the planner also caps, but the observed in-flight
-                # count is authoritative).
-                result.waiting.append(path)
-                continue
-            leaf = leaf_at(campaign.agenda, path)
-            if not self._may_submit(leaf, step):
-                result.pending_approval.append(path)
+            blocked = self._submission_block(campaign, path, step, result, in_flight=in_flight, cap=concurrency_cap)
+            if blocked is not None:
+                {"held": result.held, "waiting": result.waiting, "pending_approval": result.pending_approval}[
+                    blocked
+                ].append(path)
                 continue
             campaign, failure, deferred = await self._submit_one(campaign, path, step)
             if deferred:
@@ -248,10 +290,44 @@ class AgendaEngine:
             # Incremental persistence: a crash after this point must not
             # resubmit the leaf (the next tick sees its recorded sim_id).
             self.store.save(campaign)
-        result.complete = _is_complete(campaign.agenda)
-        result.usage = campaign.usage
-        self.store.save(campaign)
-        return result
+        return campaign
+
+    def _submission_block(
+        self,
+        campaign: Campaign,
+        path: str,
+        step: PlanStep,
+        result: TickResult,
+        *,
+        in_flight: int,
+        cap: int | None,
+    ) -> str | None:
+        """Return the bucket a step is held in, or None when it may proceed.
+
+        Encodes the lifecycle, per-tick, concurrency and approval gates in one
+        place so the submission loop stays flat.  ``result`` is only read (for
+        the per-tick submission count).
+
+        Returns:
+            ``"held"``, ``"waiting"`` or ``"pending_approval"`` when blocked,
+            else None.
+
+        """
+        if campaign.state != "running":
+            # Paused/stopped: observe, fold and emit callbacks as usual, but
+            # hold every submission (no gate, no usage).  Resuming simply lets
+            # the next tick submit the still-planned leaves.
+            return "held"
+        if len(result.submitted) >= self.policy.max_submits_per_tick:
+            return "waiting"
+        if cap is not None and in_flight >= cap:
+            # The concurrency headroom is enforced here so one tick cannot
+            # over-fill (the planner also caps, but the observed in-flight count
+            # is authoritative).
+            return "waiting"
+        if not self._may_submit(leaf_at(campaign.agenda, path), step):
+            return "pending_approval"
+        return None
 
     async def _submit_one(
         self,
@@ -287,6 +363,34 @@ class AgendaEngine:
             callback = Callback(path=path, kind="failed", sim_id=leaf.sim_id, ts=utc_now_iso())
             updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
             return updated, callback, False
+
+    def _record_reuse(self, campaign: Campaign, observed: Mapping[str, str], before: Mapping[str, str]) -> None:
+        """Offer leaves that newly reached a *reusable* state to the registry.
+
+        Only leaves that (a) transitioned since the pre-tick statuses, (b) are
+        observed ``results.ready`` (the state that guarantees the run's
+        ``simOutput`` exists -- ``job_finished`` alone may lack results), and
+        (c) were not themselves reused are offered.  Recording every done leaf
+        each tick would rewrite the registry needlessly; keying on the transition
+        keeps it to one write per newly-finished run.  Best-effort: a registry
+        write must never break a tick.
+
+        """
+        if self.reuse_record is None:
+            return
+        by_sim = {sim.sim_id: (path, sim) for path, sim in campaign.agenda.simulations() if sim.sim_id}
+        for sim_id, state in observed.items():
+            if state not in _REUSABLE_OBSERVED_STATES or sim_id not in by_sim:
+                continue
+            path, sim = by_sim[sim_id]
+            if sim.reused or before.get(path) == "done":
+                # Already terminal before this tick (or itself reused): no new
+                # run to record.
+                continue
+            try:
+                self.reuse_record(self.reuse_key(sim.spec), sim.sim_id or sim_id, "done")
+            except Exception:  # ruff: ignore[blind-except] - recording is best-effort
+                log.warning("reuse record failed for sim %s", sim.sim_id)
 
     @staticmethod
     def _emit_callbacks(campaign: Campaign, before: Mapping[str, str]) -> tuple[Campaign, list[Callback]]:
@@ -337,7 +441,12 @@ class AgendaEngine:
         updated = campaign.model_copy(update={"agenda": agenda, "callbacks": [*campaign.callbacks, callback]})
         return updated, callback
 
-    def _plan(self, campaign: Campaign, budget: Budget) -> tuple[Campaign, list[tuple[str, PlanStep]]]:
+    def _plan(
+        self,
+        campaign: Campaign,
+        budget: Budget,
+        observed: Mapping[str, str],
+    ) -> tuple[Campaign, list[tuple[str, PlanStep]], list[str]]:
         """Fold observed states into the campaign and compute next actions.
 
         The folded agenda is written back into the returned campaign so that a
@@ -347,20 +456,54 @@ class AgendaEngine:
         reflects reality across ticks.
 
         Returns:
-            The campaign with the folded agenda, and ``(path, step)`` pairs in
-            planner order.
+            The campaign with the folded agenda, ``(path, step)`` pairs in
+            planner order, and the paths satisfied by content-addressed reuse
+            this tick.
 
         """
-        observed = self.observe()
         by_sim = {sim.sim_id: path for path, sim in campaign.agenda.simulations() if sim.sim_id}
         path_states = {by_sim[sim_id]: state for sim_id, state in observed.items() if sim_id in by_sim}
         agenda = apply_states(campaign.agenda, path_states)
+        # Content-addressed reuse runs *before* admission and the gates: a leaf
+        # satisfied by an earlier identical run spends no cluster resources, so
+        # it must not be blocked by the budget/concurrency/approval that guard
+        # real submissions (and it must not wedge completion when a cap is hit).
+        agenda, reused = self._apply_reuse(agenda)
         usage = campaign.usage.model_copy(
             update={"jobs_running": sum(1 for _, sim in agenda.simulations() if sim.status in _RUNNING_STATUSES)},
         )
         agenda, usage = self._reconcile_actuals(agenda, usage)
         steps = next_actions(agenda, {}, budget=budget, usage=usage)
-        return campaign.model_copy(update={"agenda": agenda, "usage": usage}), [(s.path, s) for s in steps]
+        return campaign.model_copy(update={"agenda": agenda, "usage": usage}), [(s.path, s) for s in steps], reused
+
+    def _apply_reuse(self, agenda: AgendaGroup) -> tuple[AgendaGroup, list[str]]:
+        """Mark every planned leaf with a registry hit as ``done`` (reused).
+
+        Pure: returns a new agenda.  A reused leaf records the earlier run's
+        ``sim_id`` and the ``reused`` flag, so it neither accrues estimated usage
+        nor is reconciled against the cluster's actuals (the cost belonged to the
+        run that first executed it).  Doing this before planning means the leaf
+        is never a submission step, so it cannot be blocked by admission/gates.
+
+        Returns:
+            The agenda with reused leaves folded to ``done``, and their paths.
+
+        """
+        if self.reuse_lookup is None:
+            return agenda, []
+        updated = agenda.model_copy(deep=True)
+        reused: list[str] = []
+        for path, sim in updated.simulations():
+            if sim.status != "planned":
+                continue
+            record = self.reuse_lookup(self.reuse_key(sim.spec))
+            if record is None:
+                continue
+            sim.sim_id = record.sim_id
+            sim.status = "done"
+            sim.reused = True
+            reused.append(path)
+        return updated, reused
 
     def _reconcile_actuals(self, agenda: AgendaGroup, usage: BudgetUsage) -> tuple[AgendaGroup, BudgetUsage]:
         """Replace finished leaves' estimated usage with the cluster's actuals.
@@ -384,6 +527,11 @@ class AgendaEngine:
             return agenda, usage
         updated = agenda.model_copy(deep=True)
         for _, sim in updated.simulations():
+            if sim.reused:
+                # A reused leaf was never run by this campaign; its cost was
+                # accounted where it first executed.  Re-charging it here would
+                # retroactively consume this campaign's budget for nothing.
+                continue
             if sim.status not in {"done", "failed"} or sim.actual_core_hours is not None or not sim.sim_id:
                 continue
             actual = actuals.get(sim.sim_id)
